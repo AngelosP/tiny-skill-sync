@@ -1,0 +1,9 @@
+# Shared build settings. Note: setting the RUSTFLAGS environment variable replaces `rustflags` below.
+
+[build]
+# Several agent-driven projects share this machine; keep a build from taking every core.
+jobs = 4
+
+[target.x86_64-pc-windows-msvc]
+# Static C runtime: no Visual C++ redistributable needed, and measured as fast as the dynamic one (spike S3).
+rustflags = ["-C", "target-feature=+crt-static"]

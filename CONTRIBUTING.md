@@ -1,0 +1,145 @@
+# Contributing
+
+How to build, test and measure tiny-skill-sync. Read [ARCHITECTURE.md](ARCHITECTURE.md) first for how it works, and
+[AGENTS.md](AGENTS.md) for the rules every change follows.
+
+## What you need
+
+- Windows 10 or 11, x64.
+- Rust, stable, MSVC toolchain (`rustup`, `stable-x86_64-pc-windows-msvc`), 1.85 or newer. The code is edition 2024.
+- The MSVC linker: Visual Studio Build Tools with the "Desktop development with C++" workload.
+- Optional: the GitHub CLI (`gh`), to try private repositories without saving a token.
+
+The scripts run in Windows PowerShell 5.1 and in PowerShell 7. If your execution policy blocks them, run them as
+`powershell -NoProfile -ExecutionPolicy Bypass -File scripts\dev.ps1 ...`. The scripts add `%USERPROFILE%\.cargo\bin`
+to the `PATH` when `cargo` is not found.
+
+## The scripts
+
+Start with `scripts\dev.ps1`; it runs the others.
+
+| Command | What it does |
+| --- | --- |
+| `scripts\dev.ps1` or `scripts\dev.ps1 run` | Build (debug) and start the tray app on the sandbox. Options: `-Release`, `-Fresh` (delete the sandbox first), `-Quit`. |
+| `scripts\dev.ps1 build` | Build both exes (release) and print their sizes. `-DebugBuild` for a debug build. |
+| `scripts\dev.ps1 test` | Formatting, clippy and every test. `-Quick` (tests only), `-Filter TEXT`, `-Root FOLDER` (see below). |
+| `scripts\dev.ps1 tss ARGS` | Run `tss` on the sandbox, for example `scripts\dev.ps1 tss check --dry-run`. |
+| `scripts\dev.ps1 dry-run -Repo OWNER/NAME` | Show what a check of that repository would install, in throwaway folders. `-UseToken` for private ones. |
+| `scripts\dev.ps1 bench` | Measure the release app against its budgets (see [Measuring](#measuring)). |
+| `scripts\dev.ps1 clean` | Close the sandbox copy and delete the sandbox, test leftovers in `%TEMP%` and bench results. Keeps `target\`. |
+
+The **sandbox** is `.tss-test\` in the repository (ignored by git): its own settings (`.tss-test\home`) and skills
+folder (`.tss-test\skills`), set through `TSS_HOME` and `TSS_SKILLS_DIR`. A sandbox copy of the tray runs beside a
+real one, with its own icon. The saved GitHub token is the one thing it shares with the real app, so
+`scripts\dev.ps1 tss token set` and `token clear` are refused.
+
+Two small public and private fixture repositories are used for live tries:
+`AngelosP/tiny-skill-sync-fixtures-public` and `AngelosP/tiny-skill-sync-fixtures-private` (the private one needs a
+token with access to it).
+
+## Before a change is done
+
+```powershell
+scripts\dev.ps1 test
+```
+
+This runs `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings` and `cargo test --no-fail-fast`. All three
+must pass. There are 354 tests (223 in the library, 131 integration tests); the whole gate takes about 35 seconds when
+the code is already built.
+
+If the change can affect speed, memory or disk use (startup, verification, the poll, the tray, the settings window),
+also run `scripts\dev.ps1 bench` and check that every row is still within budget.
+
+## Tests
+
+**Every test works in its own throwaway folder** under `%TEMP%` (named `tss-<area>-...`). No test reads or writes the
+real skills folder, the real settings or the saved GitHub token. A failing test can leave its folder behind;
+`scripts\dev.ps1 clean` removes those.
+
+| Where | What |
+| --- | --- |
+| `src\*.rs` (`#[cfg(test)]`) | Unit tests next to the code. The modules that make decisions (`reconcile`, `tree`, `scheduler`, `board`, `app`, `interval`, `pathsafe`) are pure, so every rule is tested without a disk or a network. `apply` and `win::fs` are tested on the real file system. |
+| `tests\engine_sync.rs`, `engine_failures.rs`, `engine_lifecycle.rs` | The engine end to end, on the real file system, with a fake GitHub (`tests\common\mod.rs`: `FakeRemote`, `World`). Failures, crashes in every step of a change, restarts. |
+| `tests\downtime.rs` | Edits made while the app was stopped, and drives that cannot vouch for a file. The evidence for [How edits are found](README.md#how-edits-are-found). |
+| `tests\http.rs` | The real WinHTTP client against a local test server: redirects, timeouts, limits, cancel. |
+| `tests\cli.rs`, `tests\app.rs` | The command line and the tray's logic, with a real engine and a fake GitHub. |
+
+**Another drive.** `scripts\dev.ps1 test -Root FOLDER` sets `TSS_TEST_ROOT`, so the file-system tests make their folders
+there: another drive, a ReFS or Dev Drive volume, or a network share. Run it when you change file-system code. A run on
+an SMB share once found a bug the local NTFS runs could not.
+
+**Live GitHub.** The tests never talk to GitHub. To try the real client, use `scripts\dev.ps1 dry-run -Repo ...` or the
+sandbox (`scripts\dev.ps1 tss add ...` then `tss check`).
+
+### Fixing a bug
+
+1. Write a test that shows the bug, and watch it fail for the right reason.
+2. Fix the code. The test passes, and so does everything else.
+3. Keep the test.
+
+### When a new test passes at once
+
+For code that protects the user's files (`apply`, `reconcile`, `verify`, `win::fs`, the engine), a test that passes on
+its first run is not yet proof that it tests anything. Check it with deliberate bugs ("mutants"):
+
+1. Make one small wrong change in the code the test should guard (flip a condition, skip a step, return early).
+2. Run the tests. At least one must fail. If none does, the tests have a gap: add a test.
+3. Undo the change, and make sure the file is byte for byte as before (compare its hash).
+
+This has been done for `apply`, the engine, the downtime tests, the board, the HTTP layer and the command line.
+
+## Measuring
+
+```powershell
+scripts\dev.ps1 bench
+scripts\dev.ps1 bench -Repo https://github.com/github/awesome-copilot/tree/main/skills -Runs 5
+```
+
+The bench builds the release exes first. It installs real skills from GitHub into a throwaway folder (this needs the
+network), then starts the release tray app many times and reads Windows' own counters: time to the tray icon, the
+start-up check, CPU, memory, disk and network operations while idle, the settings window and an unchanged poll. The app
+writes timing marks only when `TSS_BENCH_REPORT` names a file (`src\win\ui\bench.rs`).
+
+It prints a table, saves it as `bench\out\bench-<time>.md` (ignored by git) and exits with 1 if any row is over budget.
+The settings step briefly shows the app's settings window five times; leave the mouse and keyboard alone while it runs.
+
+The budgets, agreed before the app was written:
+
+| Measure | Budget |
+| --- | --- |
+| Process start to tray icon | median 30 ms, p95 60 ms |
+| Start-up check | 10 ms for an install of 84 files; 75 µs per file at scale |
+| Idle | 0 CPU, 0 disk or network operations, 0 page faults |
+| Idle memory | 12 MiB working set, 2 MiB once trimmed; 4 MiB private |
+| Settings window | open to painted in 50 ms; 20 MiB working set while open; 2 MiB (trimmed) after it closes |
+| Unchanged poll | 50 ms CPU, 0 file reads or writes, 1 request |
+| After a poll | 20 MiB working set, 5 MiB private, 10 threads, 350 handles |
+| Quit | 2 s at most |
+| `tiny-skill-sync.exe` | 1 MiB |
+
+The latest results are in [README.md](README.md#measured-cost).
+
+## Code style
+
+- `cargo fmt` (`rustfmt.toml`: 160 columns) and clippy with no warnings.
+- Comments explain why, not what. Module comments (`//!`) say what a module is for and what it promises.
+- Text the user reads (the tray, the settings window, `tss`) is short, plain English, and says what to do next. `tss`
+  and the scripts print ASCII only, so every console shows it.
+- Windows calls stay in `src\win\`. The rest of the code is plain Rust that tests can drive.
+- Windows are built from the small control helpers in `src\win\ui\mod.rs` (`Form`: `label`, `button`, `check`,
+  `edit`, `combo`, `list`, scaled for the screen's DPI). Add a helper there rather than calling `CreateWindowExW` in a
+  window's code.
+- Dependencies: `windows-sys`, `serde` and `serde_json` only. A new dependency needs a good reason: every one costs
+  build time and start-up time.
+
+## Release build
+
+`Cargo.toml` and `.cargo\config.toml` set the release profile: `opt-level = "s"`, fat LTO, one codegen unit,
+`panic = "abort"`, stripped symbols and a static C runtime (no Visual C++ redistributable needed). `opt-level = "s"`
+keeps the tray exe at 0.86 MiB, under its 1 MiB budget (`opt-level = 3` made it 1.06 MiB). `build.rs` embeds
+`app.manifest` (common controls 6, per-monitor DPI, long paths, UTF-8).
+
+## Spikes
+
+`examples\` and `spikes\` hold the experiments the design was based on. They are not part of the app and are built only
+with `--features spikes`. See [spikes/README.md](spikes/README.md).

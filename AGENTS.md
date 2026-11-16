@@ -1,0 +1,74 @@
+# Rules for agents and contributors
+
+tiny-skill-sync changes files in the user's Copilot skills folder. A mistake can destroy a skill someone wrote by hand.
+These rules keep that from happening. Read [ARCHITECTURE.md](ARCHITECTURE.md) before changing code, and
+[CONTRIBUTING.md](CONTRIBUTING.md) for the commands.
+
+## Never touch real data
+
+- Never read, write or delete anything in the real skills folder (`%USERPROFILE%\.copilot\skills`), the real settings
+  (`%LOCALAPPDATA%\tiny-skill-sync`) or the real work folder (`%USERPROFILE%\.copilot\.tss-work`).
+- Never run `tss token set` or `tss token clear`, and never start the app with the real settings. The saved GitHub token
+  is shared by every copy of the app.
+- Never print, log or save a token.
+- Run the app only through the scripts (`scripts\dev.ps1 run`, `tss`, `dry-run`, `bench`). They set `TSS_HOME` and
+  `TSS_SKILLS_DIR` to the sandbox or to a throwaway folder. If you run an exe directly, set both variables first.
+- Tests make their own folders under `%TEMP%` (or `TSS_TEST_ROOT`). A new test must do the same, through
+  `tests\common\mod.rs` (`World`) or the helpers in the module it tests.
+
+## The safety rules the code keeps
+
+Do not weaken any of these. Each one has tests; if a change makes one of them fail, the change is wrong.
+
+1. **A failure is never a deletion.** Any error from the network, the token or GitHub ends the check of that repository
+   before `reconcile` runs. Only a complete listing (`truncated` false) can remove a skill.
+2. **Only proven copies are deleted.** `apply` deletes or replaces a folder only after a full check proved it equals a
+   version the app installed. Anything else becomes `backup-*`, and backups are never deleted automatically.
+3. **Unmanaged folders are never changed.** A skill folder the record does not own is adopted only when identical to
+   upstream; otherwise it is held.
+4. **Edits hold.** An edited managed skill is never updated or deleted without the user's choice.
+5. **The mass-deletion guard.** A listing with no skills at all deletes nothing unless the user confirmed.
+6. **Destructive steps use the full check.** The quick (fingerprint) check is for status only.
+7. **Links inside the skills folder are never followed** (`win::fs` opens every path with `FILE_FLAG_OPEN_REPARSE_POINT`),
+   and names from GitHub pass `pathsafe` before they reach the disk.
+8. **Downloads are never run.**
+
+All changes to the skills folder go through `apply.rs`. All decisions go through `reconcile.rs`. Do not add a second
+path.
+
+## How to change code
+
+- **Fix bugs test-first.** Write a test that fails because of the bug, see it fail for the right reason, then fix the
+  code. Keep the test.
+- **Check new safety tests with mutants.** If a new test for `apply`, `reconcile`, `verify`, `win::fs` or the engine
+  passes at once, make one deliberate bug at a time in the code it guards and confirm a test fails. Undo each bug and
+  confirm the file is unchanged (compare its hash). See [CONTRIBUTING.md](CONTRIBUTING.md#when-a-new-test-passes-at-once).
+- **Keep decisions pure.** New rules go into the pure modules (`reconcile`, `tree`, `scheduler`, `board`, `app`), so they
+  can be tested without a disk, a network or a clock. Windows calls go into `src\win\`.
+- **Build windows from the control layer.** Use `Form` and the helpers in `src\win\ui\mod.rs`; add a helper there when
+  one is missing, rather than calling `CreateWindowExW` in a window's code. Never hold a `RefCell` borrow across a call
+  that runs a message loop (a question, the tray menu, `DestroyWindow`).
+- **Keep the worker off the UI thread.** Network calls, hashing and file changes run on the worker thread.
+- **Keep it small and quiet.** No new dependency without a measured reason. Nothing may wake up the idle app except its
+  timer, its two folder notifications and the user. An unchanged poll reads and writes no file.
+- **Write plain English** in everything the user reads, and ASCII only in `tss` and script output.
+- **Measure what you change.** For anything on the start-up, idle, poll or settings-window path, run
+  `scripts\dev.ps1 bench` and keep every row within budget. Report measured numbers, not guesses.
+
+## Before you say a change is done
+
+1. `scripts\dev.ps1 test` passes: formatting, clippy with no warnings, every test.
+2. Behaviour you changed has a test that would fail without the change.
+3. If it touches file-system code: the tests also pass on another kind of drive if you have one
+   (`scripts\dev.ps1 test -Root FOLDER`).
+4. If it touches speed, memory or disk use: `scripts\dev.ps1 bench` is within budget.
+5. The docs say what the code does: [README.md](README.md) for users, [ARCHITECTURE.md](ARCHITECTURE.md) for how it
+   works, [CONTRIBUTING.md](CONTRIBUTING.md) for commands.
+6. No leftovers: `scripts\dev.ps1 clean` removes the sandbox and test folders.
+
+## Where the history is
+
+The design plan, with the requirements, every decision, the spike measurements and the implementation log, is kept
+outside this repository by its owner. The measurements that matter are repeated in [README.md](README.md) and
+[spikes/README.md](spikes/README.md). When you find something new (a defect, a measurement, a decision), say so in your
+report so it can be recorded there.

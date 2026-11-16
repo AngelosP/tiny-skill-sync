@@ -1,0 +1,18 @@
+# Build output (also the extra target folders used by the spike build scripts)
+/target/
+/target-*/
+
+# Raw spike and benchmark measurements; the numbers that matter are copied into the plan and the docs
+/spikes/out/
+/bench/out/
+
+# Test artifacts
+/.tss-test/
+*.tmp
+*.log
+*.pdb
+
+# Editors and OS
+.vs/
+.vscode/
+Thumbs.db
