@@ -56,11 +56,15 @@ pub struct ManagedFile {
     pub size: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fp: Option<Fingerprint>,
+    /// What the file is compared by ([`crate::text::canon`]): a hash of the lines that count, or `""` when only the
+    /// exact bytes will do. `None` until the app has read the file once, which records written by older versions lack.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub canon: Option<String>,
 }
 
 impl From<&SkillFile> for ManagedFile {
     fn from(f: &SkillFile) -> Self {
-        ManagedFile { path: f.path.clone(), blob: f.blob.clone(), size: f.size, fp: None }
+        ManagedFile { path: f.path.clone(), blob: f.blob.clone(), size: f.size, fp: None, canon: None }
     }
 }
 
@@ -375,6 +379,7 @@ mod tests {
             blob: crate::hash::blob_hex(path.as_bytes()),
             size: 3,
             fp: with_fp.then_some(Fingerprint { file_id: [u64::MAX, 7], size: 3, write: 133_800_000_000_000_000, change: 133_800_000_000_000_001, usn: 4_096 }),
+            canon: with_fp.then(|| "d".repeat(40)),
         }
     }
 

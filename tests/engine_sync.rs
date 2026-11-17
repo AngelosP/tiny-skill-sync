@@ -345,6 +345,94 @@ fn a_different_folder_with_the_same_name_is_left_alone_and_reported() {
     assert!(s.w.state().repo("fx").unwrap().skill("alpha").is_none());
 }
 
+/// Writes a skill of `STANDARD` as a Windows editor might save it: other line breaks and a blank line more at the end.
+fn write_windows_copy(w: &World, name: &str) {
+    for (path, body) in STANDARD.iter().filter(|(p, _)| p.starts_with(&format!("skills/{name}/"))) {
+        w.write(&path["skills/".len()..], &format!("{}\r\n", body.replace('\n', "\r\n")));
+    }
+}
+
+#[test]
+fn a_folder_that_differs_only_in_line_breaks_is_adopted_after_reading_just_its_text_from_github() {
+    let mut s = Setup::fresh("adopt-text");
+    write_windows_copy(&s.w, "alpha");
+    for name in ["beta", "gamma"] {
+        let (path, body) = STANDARD.iter().find(|(p, _)| *p == format!("skills/{name}/SKILL.md")).unwrap();
+        s.w.write(&path["skills/".len()..], body);
+    }
+    let before = s.w.skills_snapshot();
+
+    let report = s.sync();
+    let repo = only(&report);
+    assert!(matches!(repo.outcome, Outcome::Synced), "{:?}", repo.outcome);
+    for name in ["alpha", "beta", "gamma"] {
+        assert_eq!(skill(repo, name).verdict, Verdict::Adopt, "{name}");
+        assert_eq!(skill(repo, name).result, ApplyResult::Done, "{name}");
+    }
+    assert_eq!(s.remote.calls().file, 3, "only alpha's three files, whose bytes differ, were read");
+    let alpha_bytes: usize = STANDARD.iter().filter(|(p, _)| p.starts_with("skills/alpha/")).map(|(_, body)| body.len()).sum();
+    assert_eq!(repo.downloaded, alpha_bytes as u64, "what was read to compare counts as downloaded");
+    assert_eq!(s.w.skills_snapshot(), before, "not a byte of the skills folder changed");
+
+    s.remote.put(REPO, "skills/alpha/SKILL.md", ALPHA_V2);
+    let report = s.sync();
+    assert_eq!(skill(only(&report), "alpha").verdict, Verdict::Update);
+    assert_eq!(skill(only(&report), "alpha").result, ApplyResult::Done);
+    assert_eq!(s.w.read("alpha/SKILL.md"), ALPHA_V2);
+    assert!(s.w.backups().is_empty(), "the copy it replaced was the same, so there was nothing to keep");
+}
+
+#[test]
+fn a_text_folder_that_really_differs_is_held_and_failing_to_read_github_decides_nothing() {
+    let mut s = Setup::fresh("differs-text");
+    write_windows_copy(&s.w, "alpha");
+    s.w.write("alpha/references/guide.md", "guide, my way\r\n");
+    s.remote.fail_file(REPO, "skills/alpha/SKILL.md", Some(RemoteError::new(FailureKind::Network, "the network is down")));
+    let before = s.w.skills_snapshot();
+
+    let report = s.sync();
+    let repo = only(&report);
+    assert!(matches!(&repo.outcome, Outcome::Failed(f) if f.kind == FailureKind::Network), "{:?}", repo.outcome);
+    assert!(repo.skills.is_empty(), "no decision was made");
+    assert_eq!(s.w.skills_snapshot(), before, "nothing was installed either");
+
+    s.remote.fail_file(REPO, "skills/alpha/SKILL.md", None);
+    let report = s.sync();
+    let repo = only(&report);
+    assert_eq!(skill(repo, "alpha").verdict, Verdict::Held(Hold::UnmanagedDiffers));
+    assert_eq!(s.w.read("alpha/references/guide.md"), "guide, my way\r\n");
+    assert_eq!(skill(repo, "beta").result, ApplyResult::Done);
+    assert!(s.w.state().repo("fx").unwrap().skill("alpha").is_none());
+}
+
+#[test]
+fn reading_files_from_github_to_compare_them_counts_toward_the_download_limit() {
+    let mut s = Setup::fresh("adopt-text-limit");
+    write_windows_copy(&s.w, "alpha");
+    let report = sync_with(&mut s.engine, &s.cfg, SyncOptions { max_download_bytes: 10, ..SyncOptions::default() });
+    assert_eq!(skill(only(&report), "alpha").verdict, Verdict::Held(Hold::UnmanagedDiffers));
+    assert_eq!(s.remote.calls().file, 0);
+
+    let report = s.sync();
+    assert_eq!(skill(only(&report), "alpha").verdict, Verdict::Adopt, "the next check reads them");
+    assert_eq!(skill(only(&report), "alpha").result, ApplyResult::Done);
+}
+
+#[test]
+fn a_managed_skill_saved_with_other_line_breaks_is_not_an_edit_and_follows_upstream() {
+    let mut s = Setup::installed("owned-text");
+    write_windows_copy(&s.w, "alpha");
+    let report = sync_with(&mut s.engine, &s.cfg, SyncOptions { ignore_etag: true, ..SyncOptions::default() });
+    assert_eq!(skill(only(&report), "alpha").verdict, Verdict::InSync);
+
+    s.remote.remove(REPO, "skills/alpha");
+    let report = s.sync();
+    assert_eq!(skill(only(&report), "alpha").verdict, Verdict::Delete);
+    assert_eq!(skill(only(&report), "alpha").result, ApplyResult::Done);
+    assert!(!s.w.exists("alpha"));
+    assert!(s.w.backups().is_empty(), "it was the installed version, so there was nothing to keep");
+}
+
 #[test]
 fn a_folder_the_user_made_is_never_removed_even_when_it_is_not_in_any_repository() {
     let mut s = Setup::installed("unmanaged");

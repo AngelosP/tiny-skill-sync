@@ -84,6 +84,16 @@ public static class TssLive {
         return r.Left + "," + r.Top + "," + r.Right + "," + r.Bottom;
     }
 
+    [DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);
+    [DllImport("user32.dll")] static extern bool GetCursorPos(out POINT point);
+
+    // Where the mouse pointer is on the screen: "x,y".
+    public static string CursorAt() {
+        POINT p;
+        GetCursorPos(out p);
+        return p.X + "," + p.Y;
+    }
+
     [DllImport("user32.dll")] static extern bool GetUpdateRect(IntPtr hwnd, out RECT rect, bool erase);
     [DllImport("user32.dll")] static extern IntPtr WindowFromPoint(POINT point);
     [DllImport("user32.dll")] static extern IntPtr GetAncestor(IntPtr hwnd, uint flags);

@@ -420,7 +420,8 @@ function Test-LocalEdit {
         Check 'resolve replace: ok' ($r.Code -eq 0) ''
         $diff = Compare-Skill $c 'alpha'
         Check 'alpha now equals upstream' ($diff.Count -eq 0) ($diff -join '; ')
-        $saved = @(Get-ChildItem -LiteralPath $c.Root -Recurse -File -Force -ErrorAction SilentlyContinue | Where-Object { $_.FullName -notlike "$($c.Skills)\*" -and $_.FullName -notlike "$($c.Root)\bin\*" -and $_.FullName -notlike "$($c.Root)\out\*" } | Select-String -SimpleMatch 'my own line' -List)
+        # engine.lock is skipped: the app holds it shut while a job runs, such as the look the resolve's change starts.
+        $saved = @(Get-ChildItem -LiteralPath $c.Root -Recurse -File -Force -ErrorAction SilentlyContinue | Where-Object { $_.FullName -notlike "$($c.Skills)\*" -and $_.FullName -notlike "$($c.Root)\bin\*" -and $_.FullName -notlike "$($c.Root)\out\*" -and $_.Name -ne 'engine.lock' } | Select-String -SimpleMatch 'my own line' -List)
         Check 'my replaced edit was saved in a backup' ($saved.Count -ge 1) (($saved | ForEach-Object { $_.Path.Substring($c.Root.Length) }) -join ', ')
 
         [IO.File]::AppendAllText($alphaMd, "`nsecond edit`n")
@@ -790,7 +791,8 @@ function Test-Names {
         }
         $now = [IO.File]::ReadAllText((Join-Path (Join-Path $c.Skills $rloName) 'SKILL.md'))
         Check '"Use the GitHub version" on the override-character skill puts the upstream text back' ($now -notmatch 'my edit' -and $now -match 'right-to-left override') ''
-        $saved = @(Get-ChildItem -LiteralPath $c.Root -Recurse -File -Force -ErrorAction SilentlyContinue | Where-Object { $_.FullName -notlike "$($c.Skills)\*" -and $_.FullName -notlike "$($c.Root)\bin\*" -and $_.FullName -notlike "$($c.Root)\out\*" } | Select-String -SimpleMatch 'my edit' -List)
+        # engine.lock is skipped: the app holds it shut while a job runs, such as the check it makes after start.
+        $saved = @(Get-ChildItem -LiteralPath $c.Root -Recurse -File -Force -ErrorAction SilentlyContinue | Where-Object { $_.FullName -notlike "$($c.Skills)\*" -and $_.FullName -notlike "$($c.Root)\bin\*" -and $_.FullName -notlike "$($c.Root)\out\*" -and $_.Name -ne 'engine.lock' } | Select-String -SimpleMatch 'my edit' -List)
         Check 'and my edit was saved in a backup first' ($saved.Count -ge 1) (($saved | ForEach-Object { Show-Safe $_.Path.Substring($c.Root.Length) }) -join ', ')
         Close-Window $c.Tray
     } finally { Close-Env $c }
@@ -1028,6 +1030,48 @@ function Read-Panel([IntPtr]$Window, [int]$Panel) {
 
 function Show-Nav([IntPtr]$Window) { (@(Read-Nav $Window) | ForEach-Object { "$($_.Label) / $($_.Sub)" }) -join ' ;; ' }
 
+function Get-Width([IntPtr]$Handle) { $b = ([TssLive]::Bounds($Handle)) -split ','; [int]$b[2] - [int]$b[0] }
+
+function Move-Pointer([IntPtr]$Handle) {
+    $b = ([TssLive]::Bounds($Handle)) -split ','
+    [void][TssLive]::SetCursorPos([int](([int]$b[0] + [int]$b[2]) / 2), [int](([int]$b[1] + [int]$b[3]) / 2))
+}
+
+# The list on the left widens when the mouse rests on it and a name in it is cut, taking the room from the page, and
+# narrows when the mouse leaves it. The window asks Windows where the mouse is, so this moves the real mouse pointer,
+# and puts it back afterwards.
+function Test-NavHover($c, [IntPtr]$Window) {
+    $over = [TssLive]::CoveredBy($Window)
+    if ($over -ne '') { Note "the list widening under the mouse was not checked, because a window ($over) is on top of this one"; return }
+    $nav = [TssLive]::GetDlgItem($Window, $UiPanel.Nav)
+    $pane = [TssLive]::GetDlgItem($Window, $UiPanel.Page)
+    $was = ([TssLive]::CursorAt()) -split ','
+    try {
+        # The pointer could be resting on the list already.
+        Move-Pointer $pane
+        Start-Sleep -Milliseconds 300
+        $narrow = Get-Width $nav
+        $both = $narrow + (Get-Width $pane)
+        $half = [int](([TssLive]::Client($Window)) -split ',')[0] / 2
+        $marks = Get-MarkCount $c.Report 'nav'
+        Move-Pointer (Get-Ui $Window $UiPanel.Nav $UiId.NavRepo)
+        Start-Sleep -Milliseconds 100
+        $early = Get-Width $nav
+        $wide = Wait-Maybe { $n = Get-Width $nav; if ($n -gt $narrow) { $n } } 3 25
+        $took = @(Read-Marks $c.Report | Where-Object { $_.Mark -eq 'nav' } | Select-Object -Skip $marks | ForEach-Object { $_.TookMs })
+        $evidence = "list $narrow, then $early after 0.1 s, then $wide px; list and page $both, then $($wide + (Get-Width $pane)) px; half the window $half px; re-laid out in $($took -join ', ') ms"
+        Check 'resting the mouse on a name that is cut widens the list, after a moment, by taking room from the page' ($early -eq $narrow -and $null -ne $wide -and $wide -le $half + 1 -and [math]::Abs($wide + (Get-Width $pane) - $both) -le 1) $evidence
+        $pic = Save-Shot $Window '05b-list-widened'
+        Test-Painted $pic $Window 'the list widened' @(@($UiPanel.Nav, $UiId.NavRepo), @($UiPanel.Page, $UiId.Title))
+        Test-Layout $Window 'the list widened'
+        Move-Pointer $pane
+        $back = Wait-Maybe { if ((Get-Width $nav) -eq $narrow) { $true } } 3 25
+        Check 'moving the mouse onto the page narrows the list again' ($null -ne $back -and (Get-Width $nav) + (Get-Width $pane) -eq $both) ("list $(Get-Width $nav) px, page $(Get-Width $pane) px")
+    } finally {
+        [void][TssLive]::SetCursorPos([int]$was[0], [int]$was[1])
+    }
+}
+
 function Test-Ui {
     Add-Type -AssemblyName System.Windows.Forms
     $c = New-Env 'ui' -NoBranch -WithProxy
@@ -1129,6 +1173,7 @@ function Test-Ui {
         Test-Painted $pic $win 'a repository added' @(@($UiPanel.Hero, $UiId.HeroTitle), @($UiPanel.Hero, $UiId.Sync), @($UiPanel.Nav, $UiId.NavRepo), @($UiPanel.Nav, $UiId.NavSettings), @($UiPanel.Page, $UiId.Title), @($UiPanel.Page, $UiId.Every), @($UiPanel.Page, ($UiId.Skill + 16)))
         Test-Layout $win 'a repository added'
         Test-TabOrder $win 'a repository added'
+        Test-NavHover $c $win
         Click-Ui $win $UiPanel.Nav $UiId.NavActivity
         $notes = Wait-Maybe { $t = Read-Ui $win $UiPanel.Page $UiId.Note; if ($t) { $t } } 5
         Check 'Activity tells what was done' ($notes -match 'alpha' -or $notes -match 'nstalled') (Read-Panel $win $UiPanel.Page)

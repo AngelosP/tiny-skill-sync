@@ -590,6 +590,26 @@ fn a_changed_drive_forgets_the_fingerprints_that_the_check_cannot_renew() {
 }
 
 #[test]
+fn a_record_from_an_older_version_learns_how_to_compare_its_files_at_the_first_start_and_keeps_it() {
+    let s = Setup::installed("learn-canon");
+    let mut state = s.w.state();
+    for skill in state.repos.values_mut().flat_map(|r| r.skills.iter_mut()) {
+        skill.files.iter_mut().for_each(|f| f.canon = None);
+    }
+    state.save(&s.w.state_file()).unwrap();
+
+    let first = s.restarted().startup(&s.cfg).unwrap();
+    assert_eq!(first.verify.stats.hashed, 5, "every file is read once: 3 + 1 + 1");
+    let saved = s.w.state();
+    assert!(saved.repo("fx").unwrap().skills.iter().flat_map(|k| &k.files).all(|f| f.canon.is_some()), "what was learned is saved");
+
+    let next = s.restarted().startup(&s.cfg).unwrap();
+    if next.verify.tracking.journal {
+        assert_eq!(next.verify.stats.hashed, 0, "nothing is read again");
+    }
+}
+
+#[test]
 fn a_machine_without_a_skills_folder_gets_one() {
     let mut s = Setup::fresh("no-folder");
     fs::remove_dir(&s.w.skills).unwrap();
@@ -870,6 +890,23 @@ fn a_check_that_found_nothing_new_is_written_down_at_exit_not_before() {
     assert_eq!(last_check_on_disk(&s.w), Some(T0 + 86_400));
     let mut restarted = s.restarted();
     assert!(sync_which(&mut restarted, &s.cfg, &Which::Due).repos.is_empty(), "a clean exit remembers when the check was made");
+}
+
+#[test]
+fn a_repository_holding_a_skill_is_checked_once_more_after_a_restart_so_the_window_can_show_it() {
+    let mut s = Setup::fresh("held-restart");
+    s.w.write("alpha/SKILL.md", "my own alpha\n");
+    let report = sync_which(&mut s.engine, &s.cfg, &Which::Due);
+    assert_eq!(skill(only(&report), "alpha").verdict, Verdict::Held(Hold::UnmanagedDiffers));
+    assert!(sync_which(&mut s.engine, &s.cfg, &Which::Due).repos.is_empty(), "not again in the same run");
+    s.engine.flush().unwrap();
+
+    // What was held lived only in the memory of the run that ended, so the next start looks again, once.
+    let mut restarted = s.restarted();
+    let report = sync_which(&mut restarted, &s.cfg, &Which::Due);
+    assert_eq!(skill(only(&report), "alpha").verdict, Verdict::Held(Hold::UnmanagedDiffers));
+    assert!(sync_which(&mut restarted, &s.cfg, &Which::Due).repos.is_empty(), "once per start");
+    assert_eq!(s.w.read("alpha/SKILL.md"), "my own alpha\n");
 }
 
 // ---------------------------------------------------------------------------------------------------------------------

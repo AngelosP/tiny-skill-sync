@@ -7,12 +7,17 @@
 //! * A repository that was never checked is due now.
 //! * Otherwise it is due one interval after its last successful check. The interval counts from the check, not
 //!   from the app starting, so closing and opening the app does not cause extra requests.
+//! * One exception: a repository whose last check left something undone (a skill held, a name clash) kept no ETag,
+//!   and what was held was known only to the run that found it. Such a repository is checked once in each run of the
+//!   app, as soon as it is seen without an ETag: straight after the app starts, or straight after a choice made for
+//!   one of its skills (which also drops the ETag) if the run had not checked it yet. So the window can show what
+//!   needs attention. That is at most one request per run for each repository.
 //! * After a failure it is tried again after 5 minutes, then 10, 20, 40 and so on, but never later than its own
 //!   interval. A rate limit waits for the time GitHub named. Nothing here ever runs more often than every 5 minutes.
 //! * A last-check time in the future (the clock was set back) counts as "now", so a wrong clock cannot make the
 //!   app silent for a long time.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::config::{Config, RepoConfig};
 use crate::github::FailureKind;
@@ -38,6 +43,8 @@ pub struct Retry {
 #[derive(Debug, Default)]
 pub struct Schedule {
     retry: HashMap<String, Retry>,
+    /// Repositories checked since the app started, whatever the result.
+    checked: HashSet<String>,
 }
 
 /// One interval after the last check. Never checked means due now.
@@ -68,6 +75,7 @@ impl Schedule {
 
     pub fn on_success(&mut self, repo_id: &str) {
         self.retry.remove(repo_id);
+        self.checked.insert(repo_id.to_string());
     }
 
     /// Records a failed attempt and returns when to try again.
@@ -83,40 +91,38 @@ impl Schedule {
             not_before = not_before.max(at.min(now + LONGEST_WAIT_SECS));
         }
         self.retry.insert(repo_id.to_string(), Retry { failures, not_before });
+        self.checked.insert(repo_id.to_string());
         not_before
     }
 
     pub fn forget(&mut self, repo_id: &str) {
         self.retry.remove(repo_id);
+        self.checked.remove(repo_id);
     }
 
     /// Repositories that are due, in the order they appear in the settings.
     pub fn due_repos(&self, cfg: &Config, state: &State, now: UnixSecs) -> Vec<String> {
-        cfg.repos
-            .iter()
-            .filter(|r| schedulable(cfg, r))
-            .filter(|r| self.due_at(&r.id, r.effective_interval(cfg.default_interval), last_check(state, &r.id), now) <= now)
-            .map(|r| r.id.clone())
-            .collect()
+        cfg.repos.iter().filter(|r| schedulable(cfg, r)).filter(|r| self.due_of(cfg, r, state, now) <= now).map(|r| r.id.clone()).collect()
     }
 
     /// When the app next needs to wake up. `None` means never (nothing is configured): a fully idle process.
     pub fn next_wake(&self, cfg: &Config, state: &State, now: UnixSecs) -> Option<UnixSecs> {
-        cfg.repos
-            .iter()
-            .filter(|r| schedulable(cfg, r))
-            .map(|r| self.due_at(&r.id, r.effective_interval(cfg.default_interval), last_check(state, &r.id), now))
-            .min()
+        cfg.repos.iter().filter(|r| schedulable(cfg, r)).map(|r| self.due_of(cfg, r, state, now)).min()
+    }
+
+    fn due_of(&self, cfg: &Config, repo: &RepoConfig, state: &State, now: UnixSecs) -> UnixSecs {
+        let recorded = state.repo(&repo.id);
+        let unsettled = recorded.is_some_and(|r| r.last_check.is_some() && r.etag.is_none());
+        if unsettled && !self.checked.contains(&repo.id) {
+            return now;
+        }
+        self.due_at(&repo.id, repo.effective_interval(cfg.default_interval), recorded.and_then(|r| r.last_check), now)
     }
 }
 
 /// Paused or misconfigured repositories are shown with their problem but never polled.
 fn schedulable(cfg: &Config, repo: &RepoConfig) -> bool {
     repo.enabled && repo.problems().is_empty() && repo.effective_interval(cfg.default_interval).validate_poll().is_ok()
-}
-
-fn last_check(state: &State, repo_id: &str) -> Option<UnixSecs> {
-    state.repo(repo_id).and_then(|r| r.last_check)
 }
 
 #[cfg(test)]
@@ -142,10 +148,12 @@ mod tests {
         Config { default_interval, repos, ..Config::default() }
     }
 
+    /// Repositories whose last check settled everything (so they kept an ETag).
     fn state_with(checks: &[(&str, UnixSecs)]) -> State {
         let mut s = State::default();
         for (id, at) in checks {
             s.repo_mut(id).last_check = Some(*at);
+            s.repo_mut(id).etag = Some("\"e\"".into());
         }
         s
     }
@@ -296,6 +304,27 @@ mod tests {
         let cfg = config(mins(1), vec![repo("inherits", "o/a"), RepoConfig { interval: Some(hours(1)), ..repo("own", "o/b") }]);
         let state = State::default();
         assert_eq!(Schedule::new().due_repos(&cfg, &state, T0), ["own"]);
+    }
+
+    #[test]
+    fn a_repository_left_unsettled_is_checked_once_after_a_start() {
+        // Its last check held something, so it kept no ETag, and what was held was known only to the run that ended.
+        let cfg = config(hours(24), vec![repo("held", "o/held"), repo("settled", "o/settled")]);
+        let mut state = state_with(&[("held", T0), ("settled", T0)]);
+        state.repo_mut("held").etag = None;
+        let now = T0 + 60;
+        let mut s = Schedule::new();
+        assert_eq!(s.due_repos(&cfg, &state, now), ["held"]);
+        assert_eq!(s.next_wake(&cfg, &state, now), Some(now));
+        s.on_success("held");
+        assert!(s.due_repos(&cfg, &state, now).is_empty(), "once per run");
+        assert_eq!(s.next_wake(&cfg, &state, now), Some(T0 + 24 * 3600));
+
+        let mut s = Schedule::new();
+        s.on_failure("held", FailureKind::Network, None, hours(24), now);
+        assert!(s.due_repos(&cfg, &state, now).is_empty(), "a failure counts as the check");
+        s.forget("held");
+        assert_eq!(s.due_repos(&cfg, &state, now), ["held"]);
     }
 
     #[test]

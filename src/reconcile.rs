@@ -252,7 +252,13 @@ mod tests {
         OwnedSkill {
             name: name.into(),
             commit: "c".repeat(40),
-            files: vec![ManagedFile { path: "SKILL.md".into(), blob: crate::hash::blob_hex(content.as_bytes()), size: content.len() as u64, fp: None }],
+            files: vec![ManagedFile {
+                path: "SKILL.md".into(),
+                blob: crate::hash::blob_hex(content.as_bytes()),
+                size: content.len() as u64,
+                fp: None,
+                canon: None,
+            }],
             pending: None,
         }
     }

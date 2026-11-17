@@ -254,7 +254,7 @@ fn a_file_replaced_by_rename_the_way_editors_save_is_found() {
 }
 
 #[test]
-fn a_longer_or_shorter_file_is_found_without_reading_it() {
+fn a_longer_or_shorter_file_is_found() {
     let (_s, report) = start_after("sizes", |w| {
         fs::write(w.skills.join(GUIDE), "g\n").unwrap();
         let mut beta = OpenOptions::new().append(true).open(w.skills.join("beta/SKILL.md")).unwrap();
@@ -263,8 +263,8 @@ fn a_longer_or_shorter_file_is_found_without_reading_it() {
     assert_eq!(status_of(&report.verify, "alpha"), edited_guide());
     assert_eq!(status_of(&report.verify, "beta"), dirty(&["SKILL.md"], &[], &[]));
     assert_eq!(status_of(&report.verify, "gamma"), clean());
-    // The size alone says so. A full check still reads the files that are the right size: alpha's other two, none of beta's, gamma's one.
-    assert_reads(&report.verify, 0, 3);
+    // Text of another size can still be the same text (other line breaks, blank lines), so the two files are read.
+    assert_reads(&report.verify, 2, FILES);
 }
 
 #[test]

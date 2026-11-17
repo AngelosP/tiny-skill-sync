@@ -37,6 +37,10 @@ Do not weaken any of these. Each one has tests; if a change makes one of them fa
    and names from GitHub pass `pathsafe` before they reach the disk.
 8. **Downloads are never run.**
 
+In rules 2 to 4, "equals", "identical" and "edited" are decided by `text.rs` and nowhere else: two copies of a text file
+are the same when only their line endings, the line break at the end or blank lines differ (the owner chose this).
+Every other difference counts, and a download is still checked byte for byte against its Git blob hash.
+
 All changes to the skills folder go through `apply.rs`. All decisions go through `reconcile.rs`. Do not add a second
 path.
 
@@ -44,9 +48,9 @@ path.
 
 - **Fix bugs test-first.** Write a test that fails because of the bug, see it fail for the right reason, then fix the
   code. Keep the test.
-- **Check new safety tests with mutants.** If a new test for `apply`, `reconcile`, `verify`, `win::fs` or the engine
-  passes at once, make one deliberate bug at a time in the code it guards and confirm a test fails. Undo each bug and
-  confirm the file is unchanged (compare its hash). See [CONTRIBUTING.md](CONTRIBUTING.md#when-a-new-test-passes-at-once).
+- **Check new safety tests with mutants.** If a new test for `apply`, `reconcile`, `verify`, `text`, `win::fs` or the
+  engine passes at once, make one deliberate bug at a time in the code it guards and confirm a test fails. Undo each bug
+  and confirm the file is unchanged (compare its hash). See [CONTRIBUTING.md](CONTRIBUTING.md#when-a-new-test-passes-at-once).
 - **Keep decisions pure.** New rules go into the pure modules (`reconcile`, `tree`, `scheduler`, `board`, `app`), so they
   can be tested without a disk, a network or a clock. Windows calls go into `src\win\`.
 - **Build windows from the control layer.** Describe a page as a `Surface` (in the pure `src\win\ui\page.rs`) and show

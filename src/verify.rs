@@ -1,4 +1,4 @@
-//! Is a skill folder on disk still exactly what this app installed?
+//! Is a skill folder on disk still what this app installed?
 //!
 //! Two strengths:
 //! * `Check::Quick` lets a stored Windows fingerprint (file id, size, times and the file's USN) vouch for a file that
@@ -7,16 +7,19 @@
 //! * `Check::Full` reads and hashes every file. It runs before anything is changed or deleted, because a fingerprint
 //!   alone can miss a write that has not been flushed yet (plan, spike S1b finding 4).
 //!
-//! Either way, a file that does not match its fingerprint is read and compared by hash: a file that was only touched
-//! is clean, and only a real difference counts as an edit. When in doubt a file counts as edited, never as clean.
+//! Either way, a file that does not match its fingerprint is read and compared: a file that was only touched is clean,
+//! and only a real difference counts as an edit. Text is compared as [`crate::text`] says, so a copy saved with other
+//! line breaks or blank lines is clean too. When in doubt a file counts as edited, never as clean.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::io;
 use std::path::Path;
 
 use crate::fsx::join_rel;
 use crate::pathsafe::fold;
-use crate::reconcile::{DirtyInfo, LocalState, UnmanagedState};
+use crate::reconcile::{DirtyInfo, LocalState};
 use crate::state::{Fingerprint, ManagedFile, OwnedSkill, VolumeId};
+use crate::text::{self, TEXT_LIMIT};
 use crate::tree::Skill;
 use crate::win::fs::{FileHasher, Folder, Kind, probe};
 
@@ -57,14 +60,51 @@ impl Stats {
 #[derive(Debug)]
 pub struct Outcome {
     pub local: LocalState,
-    /// Files whose content matched but whose stored fingerprint was missing or out of date, with the one to store.
-    pub refreshed: Vec<(String, Fingerprint)>,
+    /// Files that are the same but whose stored fingerprint, or what they are compared by, is missing or out of date.
+    pub refreshed: Vec<Refresh>,
     pub stats: Stats,
 }
 
-fn dirty(info: DirtyInfo, refreshed: Vec<(String, Fingerprint)>, stats: Stats) -> Outcome {
+/// What to store for one file that was found unchanged.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Refresh {
+    pub path: String,
+    pub fp: Fingerprint,
+    /// Learned from the file, when the record did not have it yet.
+    pub canon: Option<String>,
+}
+
+fn dirty(info: DirtyInfo, refreshed: Vec<Refresh>, stats: Stats) -> Outcome {
     let local = if info.is_empty() { LocalState::Clean } else { LocalState::Dirty(info) };
     Outcome { local, refreshed, stats }
+}
+
+fn is_text(file: &ManagedFile) -> bool {
+    file.canon.as_deref().is_some_and(|c| !c.is_empty())
+}
+
+/// A file of another size can still be the same only when it is text short enough to be compared as text.
+fn size_rules_out(file: &ManagedFile, size: u64) -> bool {
+    size != file.size && !(is_text(file) && size <= TEXT_LIMIT)
+}
+
+/// How a file on disk compares with its record.
+enum Content {
+    Differs,
+    /// The same. Carries what the file is compared by when the record did not have it yet.
+    Same(Option<String>),
+}
+
+fn compare_file(path: &Path, file: &ManagedFile, hasher: &mut FileHasher) -> io::Result<Content> {
+    let keep = if file.canon.as_deref() == Some("") { 0 } else { TEXT_LIMIT };
+    let read = hasher.read(path, keep, u64::MAX)?;
+    if read.blob == file.blob {
+        // The bytes are exactly the recorded ones, so what they are compared by is learned from them.
+        let learned = file.canon.is_none().then(|| read.bytes.as_deref().map(text::canon).unwrap_or_default());
+        return Ok(Content::Same(learned));
+    }
+    let same_text = is_text(file) && read.bytes.as_deref().is_some_and(|bytes| file.canon.as_deref() == Some(text::canon(bytes).as_str()));
+    Ok(if same_text { Content::Same(None) } else { Content::Differs })
 }
 
 /// Compares the folder at `dir` with what was installed (`skill.files`).
@@ -110,29 +150,29 @@ pub fn verify_files(dir: &Path, files: &[ManagedFile], check: Check, hasher: &mu
             info.modified.push(format!("{} (replaced by a folder or link)", file.path));
             continue;
         }
-        if check == Check::Quick && vouches(file.fp, &first.fp) {
+        if check == Check::Quick && file.canon.is_some() && vouches(file.fp, &first.fp) {
             continue;
         }
-        if first.fp.size != file.size {
+        if size_rules_out(file, first.fp.size) {
             info.modified.push(file.path.clone());
             continue;
         }
         stats.hashed += 1;
-        stats.hashed_bytes += file.size;
-        match hasher.blob(&path) {
-            Ok(h) if h == file.blob => {
-                // Hash, then look again: a file that moved while it was being read has no trustworthy fingerprint.
+        stats.hashed_bytes += first.fp.size;
+        match compare_file(&path, file, hasher) {
+            Ok(Content::Same(canon)) => {
+                // Read, then look again: a file that moved while it was being read has no trustworthy fingerprint.
                 stats.probed += 1;
                 match probe(&path) {
                     Ok(Some(second)) if second.kind == Kind::File && second.fp == first.fp => {
-                        if file.fp != Some(first.fp) {
-                            refreshed.push((file.path.clone(), first.fp));
+                        if file.fp != Some(first.fp) || canon.is_some() {
+                            refreshed.push(Refresh { path: file.path.clone(), fp: first.fp, canon });
                         }
                     }
                     _ => info.modified.push(format!("{} (still changing)", file.path)),
                 }
             }
-            Ok(_) => info.modified.push(file.path.clone()),
+            Ok(Content::Differs) => info.modified.push(file.path.clone()),
             Err(_) => info.modified.push(format!("{} (cannot be read)", file.path)),
         }
     }
@@ -150,18 +190,20 @@ pub fn verify_files(dir: &Path, files: &[ManagedFile], check: Check, hasher: &mu
     dirty(info, refreshed, stats)
 }
 
-/// Stores the fingerprint of every file that is on disk, equals its recorded blob and holds still while it is read.
-/// Files that do not qualify get no fingerprint, so the next check reads them.
+/// Stores the fingerprint of every file that is on disk, is the same as its record and holds still while it is read,
+/// and what each file is compared by when the record did not have it yet. Files that do not qualify get no
+/// fingerprint, so the next check reads them.
 pub fn capture(dir: &Path, files: &mut [ManagedFile], hasher: &mut FileHasher) {
     for file in files {
         file.fp = None;
         let path = join_rel(dir, &file.path);
         let Ok(Some(first)) = probe(&path) else { continue };
-        if first.kind != Kind::File || first.fp.size != file.size {
+        if first.kind != Kind::File || size_rules_out(file, first.fp.size) {
             continue;
         }
-        if !matches!(hasher.blob(&path), Ok(h) if h == file.blob) {
-            continue;
+        let Ok(Content::Same(learned)) = compare_file(&path, file, hasher) else { continue };
+        if learned.is_some() {
+            file.canon = learned;
         }
         if let Ok(Some(second)) = probe(&path) {
             if second.kind == Kind::File && second.fp == first.fp {
@@ -171,13 +213,17 @@ pub fn capture(dir: &Path, files: &mut [ManagedFile], hasher: &mut FileHasher) {
     }
 }
 
-/// Copies refreshed fingerprints into the skill record. Returns true when anything changed.
-pub fn apply_refresh(skill: &mut OwnedSkill, refreshed: &[(String, Fingerprint)]) -> bool {
+/// Copies what a check found into the skill record. Returns true when anything changed.
+pub fn apply_refresh(skill: &mut OwnedSkill, refreshed: &[Refresh]) -> bool {
     let mut changed = false;
-    for (path, fp) in refreshed {
-        if let Some(file) = skill.files.iter_mut().find(|f| f.path == *path) {
-            if file.fp != Some(*fp) {
-                file.fp = Some(*fp);
+    for r in refreshed {
+        if let Some(file) = skill.files.iter_mut().find(|f| f.path == r.path) {
+            if file.fp != Some(r.fp) {
+                file.fp = Some(r.fp);
+                changed = true;
+            }
+            if r.canon.is_some() && file.canon != r.canon {
+                file.canon = r.canon.clone();
                 changed = true;
             }
         }
@@ -185,25 +231,49 @@ pub fn apply_refresh(skill: &mut OwnedSkill, refreshed: &[(String, Fingerprint)]
     changed
 }
 
-/// Is an existing folder that nobody owns exactly what upstream has? Only then may it be adopted: the files are
-/// the user's, and adopting changes no byte of them.
-pub fn compare_unmanaged(dir: &Path, skill: &Skill, hasher: &mut FileHasher) -> UnmanagedState {
-    let Ok(Some(folder)) = Folder::open(dir) else { return UnmanagedState::Different };
-    let Ok(found) = folder.list_files() else { return UnmanagedState::Different };
+/// How an existing folder that nobody owns compares with upstream.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Likeness {
+    Same,
+    Different,
+    /// Everything else is the same, but these files (by their path upstream) are text whose bytes differ from the
+    /// copy on GitHub. Whether their lines are the same is known only from that copy.
+    NeedsText(Vec<String>),
+}
+
+/// Is an existing folder that nobody owns the same as upstream? Only then may it be adopted: the files are the user's,
+/// and adopting changes no byte of them. `theirs` holds what the copies on GitHub of some files are compared by
+/// ([`text::canon`]), by path.
+pub fn compare_unmanaged(dir: &Path, skill: &Skill, theirs: &HashMap<String, String>, hasher: &mut FileHasher) -> Likeness {
+    let Ok(Some(folder)) = Folder::open(dir) else { return Likeness::Different };
+    let Ok(found) = folder.list_files() else { return Likeness::Different };
     let wanted: HashSet<String> = skill.files.iter().map(|f| fold(&f.path)).collect();
     if found.len() != skill.files.len() || found.iter().any(|f| f.kind != Kind::File || !wanted.contains(&fold(&f.rel))) {
-        return UnmanagedState::Different;
+        return Likeness::Different;
     }
+    let mut needs = Vec::new();
     for file in &skill.files {
         let path = join_rel(dir, &file.path);
-        if !matches!(probe(&path), Ok(Some(p)) if p.kind == Kind::File && p.fp.size == file.size) {
-            return UnmanagedState::Different;
+        let Ok(Some(p)) = probe(&path) else { return Likeness::Different };
+        let may_be_text = file.size <= TEXT_LIMIT && p.fp.size <= TEXT_LIMIT;
+        if p.kind != Kind::File || (p.fp.size != file.size && !may_be_text) {
+            return Likeness::Different;
         }
-        if !matches!(hasher.blob(&path), Ok(h) if h == file.blob) {
-            return UnmanagedState::Different;
+        let Ok(read) = hasher.read(&path, if may_be_text { TEXT_LIMIT } else { 0 }, u64::MAX) else { return Likeness::Different };
+        if read.blob == file.blob {
+            continue;
+        }
+        let mine = read.bytes.as_deref().map(text::canon).unwrap_or_default();
+        if mine.is_empty() {
+            return Likeness::Different;
+        }
+        match theirs.get(&file.path) {
+            Some(canon) if *canon == mine => {}
+            Some(_) => return Likeness::Different,
+            None => needs.push(file.path.clone()),
         }
     }
-    UnmanagedState::Identical
+    if needs.is_empty() { Likeness::Same } else { Likeness::NeedsText(needs) }
 }
 
 #[cfg(test)]
@@ -233,7 +303,7 @@ mod tests {
         let mut managed = Vec::new();
         for (path, content) in files {
             write(dir, path, content);
-            managed.push(ManagedFile { path: path.to_string(), blob: blob_hex(content.as_bytes()), size: content.len() as u64, fp: None });
+            managed.push(ManagedFile { path: path.to_string(), blob: blob_hex(content.as_bytes()), size: content.len() as u64, fp: None, canon: None });
         }
         capture(dir, &mut managed, &mut FileHasher::default());
         OwnedSkill { name: "alpha".into(), commit: "c".repeat(40), files: managed, pending: None }
@@ -302,7 +372,7 @@ mod tests {
         let o = verify(&dir, &skill, Check::Quick);
         assert_eq!(o.local, LocalState::Clean, "only a real difference in content is an edit");
         assert_eq!(o.stats.hashed, 2, "just the two files whose fingerprint moved are read");
-        let mut paths: Vec<&str> = o.refreshed.iter().map(|(p, _)| p.as_str()).collect();
+        let mut paths: Vec<&str> = o.refreshed.iter().map(|r| r.path.as_str()).collect();
         paths.sort();
         assert_eq!(paths, vec!["refs/a.md", "scripts/run.ps1"]);
 
@@ -346,13 +416,76 @@ mod tests {
     }
 
     #[test]
-    fn a_different_size_is_an_edit_found_without_reading_the_file() {
+    fn a_different_size_is_an_edit_found_without_reading_the_file_unless_it_is_text() {
         let dir = temp("size");
-        let skill = install(&dir, &FILES);
+        let skill = install(&dir, &[("SKILL.md", "# alpha\n"), ("logo.bin", "\0\x01\x02\n")]);
+        write(&dir, "logo.bin", "\0\x01\x02\r\n");
+        let o = verify(&dir, &skill, Check::Full);
+        assert_eq!(info(&o).modified, vec!["logo.bin".to_string()]);
+        assert_eq!(o.stats.hashed, 1, "the resized file that is not text is not read");
+
+        write(&dir, "logo.bin", "\0\x01\x02\n");
         write(&dir, "SKILL.md", "# alpha, much longer now\n");
         let o = verify(&dir, &skill, Check::Full);
         assert_eq!(info(&o).modified, vec!["SKILL.md".to_string()]);
-        assert_eq!(o.stats.hashed, 2, "the two untouched files are read, the resized one is not");
+        assert_eq!(o.stats.hashed, 2, "text of another size may still have the same lines, so it is read");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn line_breaks_and_blank_lines_are_not_edits() {
+        let dir = temp("crlf");
+        let mut skill = install(&dir, &FILES);
+        assert!(skill.files.iter().all(|f| f.canon.as_ref().is_some_and(|c| c.len() == 40)), "the install records how text is compared");
+        write(&dir, "SKILL.md", "\r\n# alpha\r\n\r\n");
+        write(&dir, "refs/a.md", "reference");
+        for check in [Check::Quick, Check::Full] {
+            let o = verify(&dir, &skill, check);
+            assert_eq!(o.local, LocalState::Clean, "{check:?}");
+        }
+        let o = verify(&dir, &skill, Check::Quick);
+        let mut paths: Vec<&str> = o.refreshed.iter().map(|r| r.path.as_str()).collect();
+        paths.sort();
+        assert_eq!(paths, ["SKILL.md", "refs/a.md"], "the new copies are vouched for from now on");
+        assert!(apply_refresh(&mut skill, &o.refreshed));
+        assert_eq!(verify(&dir, &skill, Check::Quick).stats.hashed, 0);
+        assert_eq!(verify(&dir, &skill, Check::Full).local, LocalState::Clean);
+
+        write(&dir, "SKILL.md", "\r\n# alpha, edited\r\n\r\n");
+        for check in [Check::Quick, Check::Full] {
+            assert_eq!(info(&verify(&dir, &skill, check)).modified, vec!["SKILL.md".to_string()], "{check:?}");
+        }
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_record_from_an_older_version_learns_how_its_files_are_compared_once() {
+        let dir = temp("learn");
+        let mut skill = install(&dir, &FILES);
+        let expected: Vec<Option<String>> = skill.files.iter().map(|f| f.canon.clone()).collect();
+        skill.files.iter_mut().for_each(|f| f.canon = None);
+
+        let o = verify(&dir, &skill, Check::Quick);
+        assert_eq!(o.local, LocalState::Clean);
+        assert_eq!(o.stats.hashed, 3, "each file is read once to learn it, fingerprint or not");
+        assert!(apply_refresh(&mut skill, &o.refreshed));
+        assert_eq!(skill.files.iter().map(|f| f.canon.clone()).collect::<Vec<_>>(), expected);
+        assert_eq!(verify(&dir, &skill, Check::Quick).stats.hashed, 0);
+
+        // Until it is learned, nothing but the exact bytes can prove a file untouched.
+        skill.files.iter_mut().for_each(|f| f.canon = None);
+        write(&dir, "SKILL.md", "# alpha\r\n");
+        assert_eq!(info(&verify(&dir, &skill, Check::Full)).modified, vec!["SKILL.md".to_string()]);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_file_that_is_not_text_is_compared_byte_for_byte() {
+        let dir = temp("binary");
+        let skill = install(&dir, &[("SKILL.md", "# alpha\n"), ("data.bin", "a\0\r\nb\r\n")]);
+        assert_eq!(skill.files[1].canon.as_deref(), Some(""));
+        write(&dir, "data.bin", "a\0\nb\n\n");
+        assert_eq!(info(&verify(&dir, &skill, Check::Full)).modified, vec!["data.bin".to_string()]);
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -444,11 +577,8 @@ mod tests {
         let dir = temp("capture");
         write(&dir, "SKILL.md", "actual");
         write(&dir, "b.md", "ok");
-        let mut files = vec![
-            ManagedFile { path: "SKILL.md".into(), blob: blob_hex(b"something else"), size: 6, fp: None },
-            ManagedFile { path: "b.md".into(), blob: blob_hex(b"ok"), size: 2, fp: None },
-            ManagedFile { path: "gone.md".into(), blob: blob_hex(b"x"), size: 1, fp: None },
-        ];
+        let file = |path: &str, content: &[u8], size| ManagedFile { path: path.into(), blob: blob_hex(content), size, fp: None, canon: None };
+        let mut files = vec![file("SKILL.md", b"something else", 6), file("b.md", b"ok", 2), file("gone.md", b"x", 1)];
         capture(&dir, &mut files, &mut FileHasher::default());
         assert!(files[0].fp.is_none() && files[2].fp.is_none());
         assert!(files[1].fp.is_some());
@@ -470,20 +600,40 @@ mod tests {
             write(&dir, p, c);
         }
         let mut h = FileHasher::default();
-        assert_eq!(compare_unmanaged(&dir, &up, &mut h), UnmanagedState::Identical);
+        let none = HashMap::new();
+        assert_eq!(compare_unmanaged(&dir, &up, &none, &mut h), Likeness::Same);
 
         write(&dir, "extra.txt", "x");
-        assert_eq!(compare_unmanaged(&dir, &up, &mut h), UnmanagedState::Different, "an extra file");
+        assert_eq!(compare_unmanaged(&dir, &up, &none, &mut h), Likeness::Different, "an extra file");
         fs::remove_file(dir.join("extra.txt")).unwrap();
 
         write(&dir, "SKILL.md", "# ALPHA\n");
-        assert_eq!(compare_unmanaged(&dir, &up, &mut h), UnmanagedState::Different, "same size, other content");
+        assert_eq!(compare_unmanaged(&dir, &up, &HashMap::from([("SKILL.md".into(), text::canon(b"# alpha\n"))]), &mut h), Likeness::Different);
         write(&dir, "SKILL.md", "# alpha\n");
-        assert_eq!(compare_unmanaged(&dir, &up, &mut h), UnmanagedState::Identical);
+        assert_eq!(compare_unmanaged(&dir, &up, &none, &mut h), Likeness::Same);
 
         fs::remove_file(dir.join("refs").join("a.md")).unwrap();
-        assert_eq!(compare_unmanaged(&dir, &up, &mut h), UnmanagedState::Different, "a missing file");
-        assert_eq!(compare_unmanaged(&dir.join("nope"), &up, &mut h), UnmanagedState::Different, "no folder at all");
+        assert_eq!(compare_unmanaged(&dir, &up, &none, &mut h), Likeness::Different, "a missing file");
+        assert_eq!(compare_unmanaged(&dir.join("nope"), &up, &none, &mut h), Likeness::Different, "no folder at all");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn an_unmanaged_copy_with_other_line_breaks_is_the_same_once_the_copy_on_github_is_known() {
+        let dir = temp("unmanaged-text");
+        let up = upstream(&[("SKILL.md", "# alpha\n\nbody\n"), ("logo.bin", "\0\n"), ("refs/a.md", "reference\n")]);
+        write(&dir, "SKILL.md", "# alpha\r\nbody\r\n\r\n");
+        write(&dir, "logo.bin", "\0\n");
+        write(&dir, "refs/a.md", "reference\n");
+        let mut h = FileHasher::default();
+        assert_eq!(compare_unmanaged(&dir, &up, &HashMap::new(), &mut h), Likeness::NeedsText(vec!["SKILL.md".into()]));
+        let theirs = |content: &[u8]| HashMap::from([("SKILL.md".to_string(), text::canon(content))]);
+        assert_eq!(compare_unmanaged(&dir, &up, &theirs(b"# alpha\n\nbody\n"), &mut h), Likeness::Same);
+        assert_eq!(compare_unmanaged(&dir, &up, &theirs(b"# alpha\n\nother body\n"), &mut h), Likeness::Different);
+        assert_eq!(compare_unmanaged(&dir, &up, &theirs(b"\0"), &mut h), Likeness::Different, "a copy on GitHub that is not text");
+
+        write(&dir, "logo.bin", "\0\r\n");
+        assert_eq!(compare_unmanaged(&dir, &up, &HashMap::new(), &mut h), Likeness::Different, "a file that is not text needs no download to tell");
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -497,7 +647,7 @@ mod tests {
         let link = base.join("alpha");
         let made = std::process::Command::new("cmd").args(["/C", "mklink", "/J"]).arg(&link).arg(&target).output().unwrap().status.success();
         assert!(made);
-        assert_eq!(compare_unmanaged(&link, &upstream(&FILES), &mut FileHasher::default()), UnmanagedState::Different);
+        assert_eq!(compare_unmanaged(&link, &upstream(&FILES), &HashMap::new(), &mut FileHasher::default()), Likeness::Different);
         fs::remove_dir(&link).unwrap();
         fs::remove_dir_all(base).unwrap();
     }

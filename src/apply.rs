@@ -2,7 +2,8 @@
 //!
 //! Every change to a skill the app owns follows one pattern:
 //! 1. Get the new version ready beside the skills folder (`stage-<txn>`), every file proven byte-for-byte right.
-//! 2. Prove again that the folder on disk is still exactly what was installed.
+//! 2. Prove again that the folder on disk is still what was installed (the same as [`crate::text`] says: line endings,
+//!    the line break at the end and blank lines don't count).
 //! 3. Write a note (the pending marker) in the state file saying what is about to happen.
 //! 4. Swap with renames. A rename is atomic, so the skills folder never holds half a skill.
 //! 5. Look at the old folder once more, now that nobody can reach it by its old name. If a late edit slipped in,
@@ -12,9 +13,11 @@
 //! A crash between any two steps is understood by `recover` the next time the app starts: it finishes the change or
 //! undoes it, and never loses a file.
 //!
-//! The rule behind all of it: **a folder is deleted only after it has been proven to be exactly a version the app
-//! installed.** Anything else is kept, as `backup-*` in the work folder, and is never deleted automatically.
+//! The rule behind all of it: **a folder is deleted only after it has been proven to be a version the app installed**,
+//! with only differences that don't count. Anything else is kept, as `backup-*` in the work folder, and is never
+//! deleted automatically.
 
+use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -24,10 +27,10 @@ use crate::fsx::{exists_no_follow, join_rel, remove_dir_all_retry, rename_retry,
 use crate::github::{FailureKind, RemoteError};
 use crate::hash::BlobHasher;
 use crate::pathsafe;
-use crate::reconcile::{DirtyInfo, LocalState, UnmanagedState};
+use crate::reconcile::{DirtyInfo, LocalState};
 use crate::state::{ManagedFile, OwnedSkill, Pending, State};
 use crate::tree::{Skill, SkillFile};
-use crate::verify::{self, Check};
+use crate::verify::{self, Check, Likeness};
 use crate::win::fs::{FileHasher, volume_id};
 
 const EMPTY_BLOB: &str = "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391";
@@ -448,14 +451,15 @@ impl Applier {
         Ok(Applied::Done)
     }
 
-    /// Starts managing a folder that is already identical to upstream. Not one byte of it is written.
-    pub fn adopt(&mut self, state: &mut State, repo_id: &str, skill: &Skill, commit: &str) -> Result<Applied, RemoteError> {
+    /// Starts managing a folder that is already the same as upstream. Not one byte of it is written. `theirs` holds what
+    /// the copies on GitHub of the files whose bytes differ are compared by, by path (see [`verify::compare_unmanaged`]).
+    pub fn adopt(&mut self, state: &mut State, repo_id: &str, skill: &Skill, commit: &str, theirs: &HashMap<String, String>) -> Result<Applied, RemoteError> {
         check_names(skill)?;
         let live = self.live(&skill.name);
-        if verify::compare_unmanaged(&live, skill, &mut self.hasher) != UnmanagedState::Identical {
+        if verify::compare_unmanaged(&live, skill, theirs, &mut self.hasher) != Likeness::Same {
             return Ok(Applied::Held("the existing folder changed while it was being checked; it was left alone".into()));
         }
-        let mut files: Vec<ManagedFile> = skill.files.iter().map(ManagedFile::from).collect();
+        let mut files: Vec<ManagedFile> = skill.files.iter().map(|f| ManagedFile { canon: theirs.get(&f.path).cloned(), ..ManagedFile::from(f) }).collect();
         verify::capture(&live, &mut files, &mut self.hasher);
         if files.iter().any(|f| f.fp.is_none()) {
             return Ok(Applied::Held("the existing folder changed while it was being checked; it was left alone".into()));
@@ -1127,7 +1131,7 @@ mod tests {
         }
         let stamp = |rel: &str| probe(&join_rel(&env.live("alpha"), rel)).unwrap().unwrap().fp;
         let before: Vec<_> = V1.iter().map(|(rel, _)| stamp(rel)).collect();
-        assert_eq!(a.adopt(&mut state, REPO, &skill("alpha", V1), C1).unwrap(), Applied::Done);
+        assert_eq!(a.adopt(&mut state, REPO, &skill("alpha", V1), C1, &HashMap::new()).unwrap(), Applied::Done);
         let after: Vec<_> = V1.iter().map(|(rel, _)| stamp(rel)).collect();
         assert_eq!(before, after, "no file was written, not even its timestamps");
         assert_eq!(local_state(&mut a, &env, &state, "alpha"), LocalState::Clean);
@@ -1140,8 +1144,63 @@ mod tests {
         let (mut a, mut state) = env.restart();
         fs::create_dir_all(env.live("alpha")).unwrap();
         fs::write(env.live("alpha").join("SKILL.md"), EDITED).unwrap();
-        assert!(held_reason(a.adopt(&mut state, REPO, &skill("alpha", V1), C1)).contains("left alone"));
+        assert!(held_reason(a.adopt(&mut state, REPO, &skill("alpha", V1), C1, &HashMap::new())).contains("left alone"));
         assert!(state.repo(REPO).is_none_or(|r| r.skills.is_empty()));
+
+        // Every file of upstream is there as it is, but so is one more.
+        write_files(&env.live("alpha"), &V1.iter().map(|(p, c)| (p.to_string(), c.to_string())).collect::<Vec<_>>());
+        fs::write(env.live("alpha").join("notes.md"), "mine\n").unwrap();
+        assert!(held_reason(a.adopt(&mut state, REPO, &skill("alpha", V1), C1, &HashMap::new())).contains("left alone"));
+        assert!(state.repo(REPO).is_none_or(|r| r.skills.is_empty()));
+        assert_eq!(fs::read_to_string(env.live("alpha").join("notes.md")).unwrap(), "mine\n");
+    }
+
+    /// The files as a Windows editor might save them: other line breaks and a few blank lines more.
+    fn windows_copy(files: Files) -> Vec<(String, String)> {
+        files.iter().map(|(p, c)| (p.to_string(), format!("\r\n{}\r\n", c.replace('\n', "\r\n")))).collect()
+    }
+
+    fn write_files(dir: &Path, files: &[(String, String)]) {
+        for (rel, content) in files {
+            let p = join_rel(dir, rel);
+            fs::create_dir_all(p.parent().unwrap()).unwrap();
+            fs::write(p, content).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_copy_with_other_line_breaks_is_adopted_as_it_is_and_then_updated_like_any_owned_skill() {
+        let env = Env::new("adopt-text");
+        let (mut a, mut state) = env.restart();
+        let copy = windows_copy(V1);
+        write_files(&env.live("alpha"), &copy);
+        assert!(held_reason(a.adopt(&mut state, REPO, &skill("alpha", V1), C1, &HashMap::new())).contains("left alone"), "the copy on GitHub is not known");
+
+        let theirs: HashMap<String, String> = V1.iter().map(|(p, c)| (p.to_string(), crate::text::canon(c.as_bytes()))).collect();
+        assert_eq!(a.adopt(&mut state, REPO, &skill("alpha", V1), C1, &theirs).unwrap(), Applied::Done);
+        assert_eq!(tree_of(&env.live("alpha")), copy.iter().cloned().collect(), "not one byte was written");
+        assert!(record(&state, "alpha").files.iter().all(|f| f.fp.is_some() && f.canon.as_ref().is_some_and(|c| c.len() == 40)));
+        assert_eq!(local_state(&mut a, &env, &state, "alpha"), LocalState::Clean);
+
+        assert_eq!(install(&mut a, &mut state, "alpha", V2, C2, Mode::Normal).unwrap(), Applied::Done);
+        assert_eq!(tree_of(&env.live("alpha")), expected(V2));
+        assert!(env.work_entries().is_empty(), "the old copy was proven the same, so nothing was kept: {:?}", env.work_entries());
+    }
+
+    #[test]
+    fn an_owned_skill_saved_with_other_line_breaks_is_not_an_edit_and_is_removed_without_a_backup() {
+        let env = Env::new("owned-text");
+        let (mut a, mut state) = installed_v1(&env);
+        write_files(&env.live("alpha"), &windows_copy(V1));
+        assert_eq!(local_state(&mut a, &env, &state, "alpha"), LocalState::Clean);
+        assert_eq!(a.delete(&mut state, REPO, "alpha").unwrap(), Applied::Done);
+        assert!(!exists_no_follow(&env.live("alpha")));
+        assert!(env.work_entries().is_empty(), "{:?}", env.work_entries());
+
+        let (mut a, mut state) = installed_v1(&env);
+        write_files(&env.live("alpha"), &[("SKILL.md".to_string(), EDITED.replace('\n', "\r\n"))]);
+        assert!(held_reason(install(&mut a, &mut state, "alpha", V2, C2, Mode::Normal)).contains("edited locally"));
+        assert_eq!(fs::read_to_string(env.live("alpha").join("SKILL.md")).unwrap(), EDITED.replace('\n', "\r\n"), "a real edit still holds");
     }
 
     #[test]

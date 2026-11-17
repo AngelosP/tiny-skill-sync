@@ -22,12 +22,12 @@ use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::HiDpi::{AdjustWindowRectExForDpi, GetDpiForSystem, GetDpiForWindow, GetSystemMetricsForDpi};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetFocus, SetFocus};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    BM_GETCHECK, CreateWindowExW, DefWindowProcW, DestroyIcon, DestroyWindow, GetClientRect, GetDlgCtrlID, HICON, ICON_BIG, ICON_SMALL, IDCANCEL, IsChild,
-    IsIconic, IsWindow, IsWindowVisible, IsZoomed, KillTimer, MINMAXINFO, PostMessageW, SIZE_MINIMIZED, SM_CXICON, SM_CXSMICON, SM_CXVSCROLL, SPI_GETWORKAREA,
-    SW_HIDE, SW_RESTORE, SW_SHOWNORMAL, SWP_NOACTIVATE, SWP_NOZORDER, SWP_SHOWWINDOW, SendMessageW, SetForegroundWindow, SetTimer, SetWindowPos, ShowWindow,
-    SystemParametersInfoW, WA_INACTIVE, WM_ACTIVATE, WM_APP, WM_CLOSE, WM_COMMAND, WM_DPICHANGED, WM_ERASEBKGND, WM_EXITSIZEMOVE, WM_GETMINMAXINFO,
-    WM_NCDESTROY, WM_PAINT, WM_SETICON, WM_SETTINGCHANGE, WM_SIZE, WM_SYSCOLORCHANGE, WM_THEMECHANGED, WM_TIMER, WS_CLIPCHILDREN, WS_EX_CONTROLPARENT,
-    WS_OVERLAPPEDWINDOW,
+    BM_GETCHECK, CreateWindowExW, DefWindowProcW, DestroyIcon, DestroyWindow, GetClientRect, GetCursorPos, GetDlgCtrlID, HICON, ICON_BIG, ICON_SMALL, IDCANCEL,
+    IsChild, IsIconic, IsWindow, IsWindowVisible, IsZoomed, KillTimer, MINMAXINFO, PostMessageW, SIZE_MINIMIZED, SM_CXICON, SM_CXSMICON, SM_CXVSCROLL,
+    SPI_GETWORKAREA, SW_HIDE, SW_RESTORE, SW_SHOWNORMAL, SWP_NOACTIVATE, SWP_NOZORDER, SWP_SHOWWINDOW, SendMessageW, SetForegroundWindow, SetTimer,
+    SetWindowPos, ShowWindow, SystemParametersInfoW, WA_INACTIVE, WM_ACTIVATE, WM_APP, WM_CLOSE, WM_COMMAND, WM_DPICHANGED, WM_ERASEBKGND, WM_EXITSIZEMOVE,
+    WM_GETMINMAXINFO, WM_NCDESTROY, WM_PAINT, WM_SETICON, WM_SETTINGCHANGE, WM_SIZE, WM_SYSCOLORCHANGE, WM_THEMECHANGED, WM_TIMER, WS_CLIPCHILDREN,
+    WS_EX_CONTROLPARENT, WS_OVERLAPPEDWINDOW, WindowFromPoint,
 };
 
 use super::control::{self, BN_CLICKED, CBN_SELENDOK, Surface};
@@ -57,6 +57,9 @@ const WM_REFRESH: u32 = WM_APP + 10;
 /// "5 minutes ago" goes stale; this keeps it roughly right.
 const TIMER_REFRESH: usize = 1;
 const REFRESH_MS: u32 = 60_000;
+/// The list on the left widens once the mouse has rested on it this long, so passing over it does nothing.
+const TIMER_NAV: usize = 2;
+const NAV_REST_MS: u32 = 250;
 /// The panels' ids. Not 1 or 2: Enter and Escape make the dialog manager look for a child with those.
 const HERO: i32 = 101;
 const NAV: i32 = 102;
@@ -111,6 +114,12 @@ thread_local! {
     static REFRESH_POSTED: Cell<bool> = const { Cell::new(false) };
     /// What the window draws behind the panels; kept apart from the state, so painting never needs to borrow it.
     static DIFF_MODE: Cell<bool> = const { Cell::new(false) };
+    /// How wide the list on the left is laid out, in DIPs; also for painting.
+    static NAV_SHOWN: Cell<i32> = const { Cell::new(NAV_W) };
+    /// The mouse is on the list on the left and the rest timer runs.
+    static NAV_RESTING: Cell<bool> = const { Cell::new(false) };
+    /// The mouse rested on the list, so it is as wide as its names need.
+    static NAV_WIDE: Cell<bool> = const { Cell::new(false) };
 }
 
 pub fn window() -> HWND {
@@ -328,7 +337,7 @@ fn update(hwnd: HWND) {
 /// What each panel shows and where, or `None` to hide it.
 type Plan = Vec<(HWND, Option<(Rect, Surface)>)>;
 
-fn lay_out(st: &Win, w: i32, h: i32, bar: i32, fit: Fit) -> Plan {
+fn lay_out(st: &Win, nav_w: i32, w: i32, h: i32, bar: i32, fit: Fit) -> Plan {
     let p = st.p;
     let Some(snap) = &st.snap else { return Vec::new() };
     // Laid out again without the scroll bar's width when it does not fit.
@@ -355,12 +364,21 @@ fn lay_out(st: &Win, w: i32, h: i32, bar: i32, fit: Fit) -> Plan {
     let shown = st.page.as_ref().unwrap_or(&welcome);
     vec![
         (p.hero, Some(([0, 0, w, HERO_H], page::hero(&hero, can_sync, w, fit)))),
-        (p.nav, fitted([0, HERO_H, NAV_W, body], &|w| page::nav(&snap.views, shown, w, body, fit))),
-        (p.page, fitted([NAV_W, HERO_H, (w - NAV_W).max(0), body], &|w| page_of(st, snap, w, fit))),
+        (p.nav, fitted([0, HERO_H, nav_w, body], &|w| page::nav(&snap.views, shown, w, body, fit))),
+        (p.page, fitted([nav_w, HERO_H, (w - nav_w).max(0), body], &|w| page_of(st, snap, w, fit))),
         (p.head, None),
         (p.files, None),
         (p.code, None),
     ]
+}
+
+/// How wide the list on the left is: [`NAV_W`], or as wide as its names need while the mouse rests on it.
+fn nav_width(st: &Win, w: i32, h: i32, bar: i32, fit: Fit) -> i32 {
+    let Some(snap) = st.snap.as_ref().filter(|_| NAV_WIDE.with(Cell::get) && st.diff.is_none()) else { return NAV_W };
+    let body = (h - HERO_H).max(0);
+    let shown = st.page.clone().unwrap_or(Page::Repo(String::new()));
+    let scrolls = page::nav(&snap.views, &shown, NAV_W, body, fit).height > body;
+    page::nav_width(&snap.views, w, if scrolls { bar } else { 0 }, fit)
 }
 
 fn page_of(st: &Win, snap: &Snapshot, w: i32, fit: Fit) -> Surface {
@@ -382,6 +400,12 @@ fn page_of(st: &Win, snap: &Snapshot, w: i32, fit: Fit) -> Surface {
 
 /// Lays everything out again for the window as it is now.
 fn render(hwnd: HWND) {
+    lay_out_again(hwnd, false);
+}
+
+/// Lays everything out again; with `if_nav_moves`, only when the list on the left is to change width.
+fn lay_out_again(hwnd: HWND, if_nav_moves: bool) {
+    let started = Instant::now();
     let dpi = dpi_of(hwnd);
     let (w, h) = client(hwnd);
     if w <= 0 || h <= 0 {
@@ -392,8 +416,14 @@ fn render(hwnd: HWND) {
         let px = unsafe { GetSystemMetricsForDpi(SM_CXVSCROLL, dpi) };
         (px * 96 + dpi as i32 - 1) / dpi as i32
     };
-    let Some((plan, diff, hero)) = with_state(|st| (lay_out(st, w, h, bar, &fit), st.diff.is_some(), st.p.hero)) else { return };
+    let laid = with_state(|st| {
+        let nav_w = nav_width(st, w, h, bar, &fit);
+        let moves = nav_w != NAV_SHOWN.with(Cell::get);
+        (moves || !if_nav_moves).then(|| (lay_out(st, nav_w, w, h, bar, &fit), st.diff.is_some(), st.p.hero, nav_w))
+    });
+    let Some((plan, diff, hero, nav_w)) = laid.flatten() else { return };
     let switched = DIFF_MODE.with(|d| d.replace(diff)) != diff;
+    let widened = NAV_SHOWN.with(|n| n.replace(nav_w)) != nav_w;
     for (panel, part) in plan {
         match part {
             None => unsafe {
@@ -409,8 +439,13 @@ fn render(hwnd: HWND) {
             }
         }
     }
-    if switched {
+    if switched || widened {
         unsafe { RedrawWindow(hwnd, null(), null_mut(), RDW_INVALIDATE | RDW_ALLCHILDREN) };
+    }
+    if if_nav_moves && bench::on() {
+        // As for "settings": paint now, so that the mark includes drawing the panels at their new widths.
+        unsafe { RedrawWindow(hwnd, null(), null_mut(), RDW_UPDATENOW | RDW_ALLCHILDREN) };
+        bench::mark("nav", Some(started.elapsed()));
     }
     let sync = control::child(hero, id::SYNC);
     if !sync.is_null() && with_state(|st| std::mem::replace(&mut st.tipped, sync)).is_some_and(|before| before != sync) {
@@ -425,7 +460,44 @@ fn draw_bg(hwnd: HWND) {
     if DIFF_MODE.with(Cell::get) {
         control::draw(&page::diff_backdrop(&page::diff_layout(w, h), w, h));
     } else {
-        control::draw(&page::backdrop(w, h));
+        control::draw(&page::backdrop(NAV_SHOWN.with(Cell::get), w, h));
+    }
+}
+
+/// Is the mouse on `panel` or one of its controls, with nothing over them?
+fn pointer_on(panel: HWND) -> bool {
+    let mut pt = POINT { x: 0, y: 0 };
+    if unsafe { GetCursorPos(&mut pt) } == 0 {
+        return false;
+    }
+    let under = unsafe { WindowFromPoint(pt) };
+    !under.is_null() && (under == panel || unsafe { IsChild(panel, under) } != 0)
+}
+
+/// The mouse came onto or left a part of the window. The list on the left widens once the mouse has rested on it for
+/// [`NAV_REST_MS`], and narrows as soon as the mouse is anywhere else.
+fn on_hover(hwnd: HWND) {
+    let Some(nav) = with_state(|st| st.p.nav) else { return };
+    if pointer_on(nav) {
+        if !NAV_WIDE.with(Cell::get) && !NAV_RESTING.with(|r| r.replace(true)) {
+            unsafe { SetTimer(hwnd, TIMER_NAV, NAV_REST_MS, None) };
+        }
+        return;
+    }
+    if NAV_RESTING.with(|r| r.replace(false)) {
+        unsafe { KillTimer(hwnd, TIMER_NAV) };
+    }
+    if NAV_WIDE.with(|w| w.replace(false)) {
+        lay_out_again(hwnd, true);
+    }
+}
+
+fn on_rested(hwnd: HWND) {
+    unsafe { KillTimer(hwnd, TIMER_NAV) };
+    NAV_RESTING.with(|r| r.set(false));
+    let Some(nav) = with_state(|st| st.p.nav) else { return };
+    if pointer_on(nav) && !NAV_WIDE.with(|w| w.replace(true)) {
+        lay_out_again(hwnd, true);
     }
 }
 
@@ -925,11 +997,17 @@ fn on_theme(hwnd: HWND) {
 }
 
 fn on_destroyed(hwnd: HWND) {
-    unsafe { KillTimer(hwnd, TIMER_REFRESH) };
+    unsafe {
+        KillTimer(hwnd, TIMER_REFRESH);
+        KillTimer(hwnd, TIMER_NAV);
+    }
     let state = STATE.with(|s| s.try_borrow_mut().ok().and_then(|mut s| s.take()));
     WINDOW.with(|w| w.set(null_mut()));
     REFRESH_POSTED.with(|p| p.set(false));
     DIFF_MODE.with(|d| d.set(false));
+    NAV_SHOWN.with(|n| n.set(NAV_W));
+    NAV_RESTING.with(|r| r.set(false));
+    NAV_WIDE.with(|w| w.set(false));
     if let Some(state) = state {
         for icon in state.icons {
             unsafe { DestroyIcon(icon) };
@@ -949,6 +1027,8 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
         WM_REFRESH => update(hwnd),
         WM_COMMAND => on_command(hwnd, wp, lp),
         WM_TIMER if wp == TIMER_REFRESH => refresh(),
+        WM_TIMER if wp == TIMER_NAV => on_rested(hwnd),
+        control::WM_HOVER => on_hover(hwnd),
         WM_SIZE => {
             if wp as u32 != SIZE_MINIMIZED {
                 render(hwnd);

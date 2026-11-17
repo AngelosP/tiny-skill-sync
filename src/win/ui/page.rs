@@ -389,6 +389,16 @@ pub fn nav(views: &[RepoView], page: &Page, w: i32, h: i32, fit: Fit) -> Surface
     o.done(bottom + 82)
 }
 
+/// How wide the list on the left is while the mouse rests on it: wide enough for the longest name or second line of a
+/// repository, with room for a scroll bar of `bar` DIPs, but never more than half the window `w`. Never narrower than
+/// [`NAV_W`], so names that fit leave it as it is.
+pub fn nav_width(views: &[RepoView], w: i32, bar: i32, fit: Fit) -> i32 {
+    let text = views.iter().map(|v| fit(&printable(&v.label), Font::Body, 0).0.max(fit(&nav_sub(v), Font::Caption, 0).0)).max().unwrap_or(0);
+    // An entry is 8 DIPs in from each side, and draws its lines from 40 DIPs in to 8 before its end; 2 more for rounding.
+    let wanted = text + 16 + 40 + 8 + 2 + bar;
+    wanted.min(w / 2).max(NAV_W)
+}
+
 /// The page when no repository is set up yet.
 pub fn welcome(w: i32, fit: Fit) -> Surface {
     let mut o = Out::new(fit);
@@ -777,10 +787,10 @@ pub fn activity_page(notes: &[Note], when: &dyn Fn(UnixSecs) -> String, w: i32, 
     o.done(y + 16)
 }
 
-/// What the window paints behind the pages: the raised layer under the hero, right of the list. Only its top-left
-/// corner is rounded; the others are past the edges.
-pub fn backdrop(w: i32, h: i32) -> Vec<Deco> {
-    vec![Deco::Fill { at: [NAV_W, HERO_H, w - NAV_W + 20, h - HERO_H + 20], radius: 8, fill: Role::Layer, border: Role::LayerBorder }]
+/// What the window paints behind the pages: the raised layer under the hero, right of a list `nav` DIPs wide. Only its
+/// top-left corner is rounded; the others are past the edges.
+pub fn backdrop(nav: i32, w: i32, h: i32) -> Vec<Deco> {
+    vec![Deco::Fill { at: [nav, HERO_H, w - nav + 20, h - HERO_H + 20], radius: 8, fill: Role::Layer, border: Role::LayerBorder }]
 }
 
 /// Where the parts of the diff view go: the header, then the list of files and the lines of one file, each in a card
@@ -967,10 +977,11 @@ pub fn diff_code(v: &DiffView, w: i32, fit: Fit) -> Surface {
         (Report::Ready(_), Some(change)) => match &change.body {
             Body::NotText => message(&mut o, "This file is not text, so only the fact that it is different is shown."),
             Body::Hidden(why) => message(&mut o, &format!("This file is not shown: {}.", printable(why))),
+            Body::Text(t) if t.only_invisible() && change.presence != Presence::Both => message(&mut o, "This file is empty, or holds only blank lines."),
             Body::Text(t) if t.only_invisible() => message(
                 &mut o,
-                "Every line is the same. Only what can't be seen is different: the line breaks, a mark at the start of the file, \
-                 or the line break at its end.",
+                "Every line is the same. Only a mark that can't be seen at the start of the file (a byte order mark) is \
+                 different. Line breaks and blank lines don't count.",
             ),
             Body::Text(t) => lines(&mut o, t, &v.gaps, w),
         },
@@ -1016,8 +1027,8 @@ fn lines(o: &mut Out, t: &TextDiff, open: &[usize], w: i32) -> i32 {
             Line::Removed { old } => line(o, y, Some(old), None),
             Line::Added { new } => line(o, y, None, Some(new)),
             Line::Folded { old, new, count } if open.contains(&r) => {
-                for i in 0..count.min(MAX_LINES - shown) {
-                    line(o, y, Some(old + i), Some(new + i));
+                for (old, new) in t.folded(old, new, count).take(MAX_LINES - shown) {
+                    line(o, y, Some(old), Some(new));
                     y += LINE_H;
                     shown += 1;
                 }
@@ -1279,6 +1290,32 @@ mod tests {
     }
 
     #[test]
+    fn the_list_widens_just_enough_for_whole_names_and_never_past_half_the_window() {
+        // An entry draws its two lines from 40 DIPs in to 8 DIPs before its right edge.
+        let shows_whole = |s: &Surface, n: i32, text: &str, font: Font| item(s, n).at[2] - 48 >= fit(text, font, 0).0;
+        let short = [view("o/a", vec![ok("x")]), view("o/b", Vec::new())];
+        assert_eq!(nav_width(&short, 980, 0, &fit), NAV_W, "names that fit leave the list as it is");
+
+        let name = "an-owner/a-repository-with-a-long-name@a-branch : a/folder";
+        let long = [view("o/a", vec![ok("x")]), view(name, vec![ok("x")])];
+        let w = nav_width(&long, 1400, 0, &fit);
+        assert!(w > NAV_W && w <= fit(name, Font::Body, 0).0 + 64 + 4, "{w}");
+        let s = nav(&long, &Page::Activity, w, 600, &fit);
+        assert!(shows_whole(&s, id::NAV_REPO + 1, name, Font::Body), "{:?}", item(&s, id::NAV_REPO + 1).at);
+        fits_in(&s, w);
+        assert_eq!(nav_width(&long, 1400, 17, &fit), w + 17, "room is kept for a scroll bar");
+
+        let status = "Can't read the repository because GitHub answered that the token has expired";
+        let busy = [RepoView { status: status.to_string(), ..unreadable("o/a") }];
+        let w = nav_width(&busy, 1400, 0, &fit);
+        assert!(shows_whole(&nav(&busy, &Page::Activity, w, 600, &fit), id::NAV_REPO, status, Font::Caption), "the second line counts too: {w}");
+
+        assert_eq!(nav_width(&long, 640, 0, &fit), 320, "the page keeps at least half the window");
+        assert_eq!(nav_width(&long, 400, 0, &fit), NAV_W, "a window too small to widen the list in");
+        assert_eq!(nav_width(&[], 980, 0, &fit), NAV_W);
+    }
+
+    #[test]
     fn a_repository_says_where_its_skills_come_from_and_how_it_is_read() {
         let r = repo("o/a");
         assert_eq!(repo_sub(&r, &view("o/a", Vec::new()), NOW), "Public · the skills folder on main · checked 2 minutes ago");
@@ -1404,13 +1441,15 @@ mod tests {
         let github = vec![
             ("SKILL.md".to_string(), bytes("a\nb\n")),
             ("gone.md".to_string(), bytes("x\n")),
-            ("crlf.md".to_string(), bytes("l\n")),
+            ("bom.md".to_string(), bytes("l\n")),
+            ("crlf.md".to_string(), bytes("l\n\nm\n")),
             ("logo.png".to_string(), bytes("\0png")),
         ];
         let here = vec![
             ("SKILL.md".to_string(), bytes("a\nc\nd\n")),
             ("new.md".to_string(), bytes("n\n")),
-            ("crlf.md".to_string(), bytes("l\r\n")),
+            ("bom.md".to_string(), bytes("\u{feff}l\r\n")),
+            ("crlf.md".to_string(), bytes("l\r\nm\r\n\r\n")),
             ("logo.png".to_string(), bytes("\0gif")),
         ];
         let summaries: Vec<(String, String)> = compare(github, here).iter().map(|c| (c.path.clone(), file_summary(c).2)).collect();
@@ -1418,7 +1457,8 @@ mod tests {
         assert_eq!(find("SKILL.md"), Some("Changed · 2 added, 1 removed"));
         assert_eq!(find("new.md"), Some("Only on this PC"));
         assert_eq!(find("gone.md"), Some("Only on GitHub"));
-        assert_eq!(find("crlf.md"), Some("Only invisible changes"));
+        assert_eq!(find("bom.md"), Some("Only invisible changes"));
+        assert_eq!(find("crlf.md"), None, "line breaks and blank lines don't count");
         assert_eq!(find("logo.png"), Some("Different (not text)"));
         let hidden = FileChange { path: "big".to_string(), presence: Presence::Both, body: Body::Hidden("it is too big to show".to_string()) };
         assert_eq!(file_summary(&hidden).2, "Not shown");
@@ -1453,6 +1493,34 @@ mod tests {
         let s = diff_code(&v, 500, &fit);
         assert!(shows(&s, "line 2"), "an opened run shows its lines");
         assert_eq!(s.items.iter().filter(|i| matches!(hit(i.id), Hit::Gap(_))).count(), 1);
+    }
+
+    #[test]
+    fn an_opened_run_shows_each_line_with_its_numbers_in_the_files_and_no_blank_lines() {
+        let old: String = (1..=30).map(|n| format!("line {n}\n\n")).collect();
+        let new: String = (1..=30).map(|n| if n == 15 { "line fifteen\n".to_string() } else { format!("line {n}\n") }).collect();
+        let mut v = diff_of(&old, &new);
+        let first = diff_code(&v, 500, &fit).items.iter().find_map(|i| if let Hit::Gap(r) = hit(i.id) { Some(r) } else { None }).unwrap();
+        v.gaps.push(first);
+        let s = diff_code(&v, 500, &fit);
+        let numbers_beside = |text: &str| -> Vec<String> {
+            let y = s.decos.iter().find_map(|d| matches!(d, Deco::Text { text: t, .. } if t == text).then(|| deco_at(d)[1])).unwrap();
+            s.decos.iter().filter(|d| matches!(d, Deco::Text { text: t, .. } if t != text && deco_at(d)[1] == y)).map(deco_text).collect()
+        };
+        assert_eq!(numbers_beside("line 2"), ["3", "2"]);
+        assert_eq!(numbers_beside("line 11"), ["21", "11"]);
+        let texts = s.decos.iter().filter(|d| matches!(d, Deco::Text { font: Font::Mono, .. })).count();
+        assert_eq!(texts, 3 * 17 + 3 * 2, "17 unchanged lines with two numbers each, and the two changed lines with a number and a sign");
+    }
+
+    fn deco_at(d: &Deco) -> Rect {
+        match d {
+            Deco::Fill { at, .. } | Deco::Glyph { at, .. } | Deco::Text { at, .. } => *at,
+        }
+    }
+
+    fn deco_text(d: &Deco) -> String {
+        if let Deco::Text { text, .. } = d { text.clone() } else { String::new() }
     }
 
     #[test]

@@ -1,9 +1,12 @@
 //! What is different between the GitHub copy of a skill and the copy on this PC, for the "Show changes" view. Pure: the
-//! engine reads both sides and hands the bytes in. GitHub is the old side (`-`), this PC the new one (`+`).
+//! engine reads both sides and hands the bytes in. GitHub is the old side (`-`), this PC the new one (`+`). Line breaks
+//! and blank lines do not count here either ([`crate::text`]): files that differ only in them are left out, and blank
+//! lines are not shown.
 
 use std::collections::{BTreeMap, HashMap};
 
 use crate::pathsafe::fold;
+use crate::text;
 
 /// Unchanged lines shown on each side of a change.
 pub const CONTEXT: usize = 3;
@@ -21,22 +24,24 @@ struct Limits {
 
 const LIMITS: Limits = Limits { edits: 1_000, steps: 20_000_000 };
 
-/// One line of the view.
+/// One line of the view. Line numbers count from 1 and are those of the file, blank lines included, though blank lines
+/// are never shown.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Row {
-    /// The same on both sides. Line numbers count from 1.
+    /// The same on both sides.
     Same { old: usize, new: usize },
     /// Only on GitHub.
     Removed { old: usize },
     /// Only on this PC.
     Added { new: usize },
-    /// `count` unchanged lines that are not shown, starting at these line numbers.
+    /// `count` unchanged lines that are not shown, the first of them at these line numbers. [`TextDiff::folded`] gives
+    /// the numbers of them all.
     Folded { old: usize, new: usize, count: usize },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TextDiff {
-    /// The lines on GitHub, without their line breaks.
+    /// The lines on GitHub, without their line breaks: line `n` is at `n - 1`.
     pub old: Vec<String>,
     /// The lines on this PC.
     pub new: Vec<String>,
@@ -48,11 +53,21 @@ pub struct TextDiff {
 }
 
 impl TextDiff {
-    /// The bytes differ but every line is the same: only the line breaks, a byte order mark or the line break at the
-    /// end of the file are different.
+    /// The bytes differ but every line that counts is the same: only a byte order mark is different (files that differ
+    /// only in their line breaks and blank lines are left out).
     pub fn only_invisible(&self) -> bool {
         self.added == 0 && self.removed == 0
     }
+
+    /// The line numbers on each side of the `count` unchanged lines a fold hides, the first of them at `old` and `new`.
+    pub fn folded(&self, old: usize, new: usize, count: usize) -> impl Iterator<Item = (usize, usize)> + '_ {
+        counted_from(&self.old, old).zip(counted_from(&self.new, new)).take(count)
+    }
+}
+
+/// The numbers of the lines that count, from line `from` on.
+fn counted_from(lines: &[String], from: usize) -> impl Iterator<Item = usize> + '_ {
+    (from.max(1)..=lines.len()).filter(move |&n| !text::is_blank(&lines[n - 1]))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -89,16 +104,16 @@ pub struct FileChange {
     pub body: Body,
 }
 
-/// The files that are different, by path. Files are matched as Windows matches names, whatever their case; files with
-/// the same bytes on both sides are left out. A file that was not read on a side is taken to be different: the caller
-/// leaves out the files it knows are the same.
+/// The files that are different, by path. Files are matched as Windows matches names, whatever their case; files that
+/// are the same on both sides ([`text::same`]) are left out. A file that was not read on a side is taken to be
+/// different: the caller leaves out the files it knows are the same.
 pub fn compare(github: Vec<(String, Content)>, here: Vec<(String, Content)>) -> Vec<FileChange> {
     let mut theirs: BTreeMap<String, (String, Content)> = github.into_iter().map(|(path, content)| (fold(&path), (path, content))).collect();
     let mut out = Vec::new();
     let none = Content::Bytes(Vec::new());
     for (path, mine) in here {
         match theirs.remove(&fold(&path)) {
-            Some((_, Content::Bytes(old))) if matches!(&mine, Content::Bytes(new) if *new == old) => {}
+            Some((_, Content::Bytes(old))) if matches!(&mine, Content::Bytes(new) if text::same(&old, new)) => {}
             Some((name, old)) => out.push(FileChange { path: name, presence: Presence::Both, body: body(&old, &mine) }),
             None => out.push(FileChange { path, presence: Presence::OnlyHere, body: body(&none, &mine) }),
         }
@@ -122,21 +137,21 @@ fn body(old: &Content, new: &Content) -> Body {
 
 /// The text of a file, or `None` when it is not text. A byte order mark is not part of the text.
 fn decode(bytes: &[u8]) -> Option<&str> {
-    let text = std::str::from_utf8(bytes).ok().filter(|text| !text.contains('\0'))?;
+    let text = text::decode(bytes)?;
     Some(text.strip_prefix('\u{feff}').unwrap_or(text))
 }
 
-/// The lines of two texts, compared. `\n` and `\r\n` both end a line, and a line break at the very end makes no line.
+/// The lines of two texts, compared. Only the lines that count ([`text::counted_lines`]) are compared and shown.
 pub fn text_diff(old: &str, new: &str) -> TextDiff {
-    let old: Vec<&str> = old.lines().collect();
-    let new: Vec<&str> = new.lines().collect();
-    let ops = script(&old, &new, LIMITS);
+    let (old_counted, old_at): (Vec<&str>, Vec<usize>) = text::counted_lines(old).map(|(n, line)| (line, n)).unzip();
+    let (new_counted, new_at): (Vec<&str>, Vec<usize>) = text::counted_lines(new).map(|(n, line)| (line, n)).unzip();
+    let ops = script(&old_counted, &new_counted, LIMITS);
     let removed = ops.iter().filter(|&&op| op == Op::Del).count();
     let added = ops.iter().filter(|&&op| op == Op::Ins).count();
     TextDiff {
-        rows: rows(&ops, CONTEXT),
-        old: old.into_iter().map(str::to_string).collect(),
-        new: new.into_iter().map(str::to_string).collect(),
+        rows: rows(&ops, &old_at, &new_at, CONTEXT),
+        old: text::numbered_lines(old).map(|(_, line)| line.to_string()).collect(),
+        new: text::numbered_lines(new).map(|(_, line)| line.to_string()).collect(),
         added,
         removed,
     }
@@ -239,20 +254,22 @@ fn walk_back(trace: &[Vec<i32>], n: i32, m: i32, end: i32) -> Vec<Op> {
     ops
 }
 
-/// The rows of the view: every change, `context` unchanged lines around each, and the rest folded.
-fn rows(ops: &[Op], context: usize) -> Vec<Row> {
+/// The rows of the view: every change, `context` unchanged lines around each, and the rest folded. `old_at` and
+/// `new_at` hold the line number in the file of each line the script covers.
+fn rows(ops: &[Op], old_at: &[usize], new_at: &[usize], context: usize) -> Vec<Row> {
     let mut out = Vec::new();
-    let (mut old, mut new) = (1, 1);
+    // Positions in the lines the script covers.
+    let (mut old, mut new) = (0, 0);
     let mut i = 0;
     while i < ops.len() {
         match ops[i] {
             Op::Del => {
-                out.push(Row::Removed { old });
+                out.push(Row::Removed { old: old_at[old] });
                 old += 1;
                 i += 1;
             }
             Op::Ins => {
-                out.push(Row::Added { new });
+                out.push(Row::Added { new: new_at[new] });
                 new += 1;
                 i += 1;
             }
@@ -265,11 +282,11 @@ fn rows(ops: &[Op], context: usize) -> Vec<Row> {
                 // Lines shown after the change before this run, and before the change after it.
                 let lead = if start == 0 { 0 } else { context };
                 let trail = if i == ops.len() { 0 } else { context };
-                let same = |j: usize| Row::Same { old: old + j, new: new + j };
+                let same = |j: usize| Row::Same { old: old_at[old + j], new: new_at[new + j] };
                 if run >= lead + trail + MIN_FOLD {
                     let hidden = run - lead - trail;
                     out.extend((0..lead).map(same));
-                    out.push(Row::Folded { old: old + lead, new: new + lead, count: hidden });
+                    out.push(Row::Folded { old: old_at[old + lead], new: new_at[new + lead], count: hidden });
                     out.extend((lead + hidden..run).map(same));
                 } else {
                     out.extend((0..run).map(same));
@@ -437,13 +454,36 @@ mod tests {
     }
 
     #[test]
-    fn line_breaks_a_byte_order_mark_and_the_last_line_break_are_not_changes() {
-        let unix = "one\ntwo\n";
-        assert!(text_diff(unix, "one\r\ntwo\r\n").only_invisible());
-        assert!(text_diff(unix, "one\ntwo").only_invisible());
+    fn line_breaks_blank_lines_and_the_last_line_break_are_not_changes_and_such_files_are_left_out() {
+        let unix = "one\n\ntwo\n";
+        for copy in ["one\r\n\r\ntwo\r\n", "one\ntwo", "\none\n\n\n  \ntwo\n\n"] {
+            assert!(text_diff(unix, copy).only_invisible(), "{copy:?}");
+        }
+        let files = compare(bytes(&[("a.md", unix.as_bytes()), ("b.md", b"x\n")]), bytes(&[("a.md", b"one\r\ntwo"), ("b.md", b"y\n")]));
+        assert_eq!(files.iter().map(|f| f.path.as_str()).collect::<Vec<_>>(), ["b.md"]);
+
+        // A byte order mark is different, though it can't be seen.
         let files = compare(bytes(&[("a.md", unix.as_bytes())]), bytes(&[("a.md", "\u{feff}one\r\ntwo".as_bytes())]));
         assert!(text_of(&files[0]).only_invisible(), "{files:?}");
-        assert!(!text_diff(unix, "one\n\ntwo\n").only_invisible(), "an empty line is a line");
+    }
+
+    #[test]
+    fn blank_lines_are_not_shown_and_every_line_keeps_its_number_in_the_file() {
+        let diff = text_diff("a\n\nb\nc\n", "a\nb\n\n\nx\n");
+        assert_eq!((diff.added, diff.removed), (1, 1));
+        assert_eq!(diff.rows, [same(1, 1), same(3, 2), Row::Removed { old: 4 }, Row::Added { new: 5 }]);
+        assert_eq!((diff.old[3].as_str(), diff.new[4].as_str()), ("c", "x"));
+
+        // Every other line is blank on GitHub; here the blank lines are gone and line 10 changed.
+        let old: String = numbered(20).iter().map(|line| format!("{line}\n\n")).collect();
+        let mut new = numbered(20);
+        new[9] = "changed".to_string();
+        let diff = text_diff(&old, &joined(&new));
+        assert_eq!((diff.added, diff.removed), (1, 1));
+        assert_eq!(diff.rows[..5], [Row::Folded { old: 1, new: 1, count: 6 }, same(13, 7), same(15, 8), same(17, 9), Row::Removed { old: 19 }]);
+        assert_eq!(diff.folded(1, 1, 6).collect::<Vec<_>>(), [(1, 1), (3, 2), (5, 3), (7, 4), (9, 5), (11, 6)]);
+        assert_eq!(diff.rows[9], Row::Folded { old: 27, new: 14, count: 7 });
+        assert_eq!(diff.folded(27, 14, 7).last(), Some((39, 20)));
     }
 
     #[test]

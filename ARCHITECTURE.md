@@ -42,8 +42,9 @@ case by case. Code that talks to Windows is kept in `src\win\`.
 | `board` | What the tray and the window say: one line per repository and per skill, and the buttons. | yes |
 | `app` | The tray app without its windows: which job runs next and when to wake up. | yes |
 | `diff` | What is different between the GitHub copy of a skill and the copy on disk, line by line ("Show changes"). | yes |
+| `text` | When two copies of a file are the same: line endings, the line break at the end and blank lines don't count. | yes |
 | `state` | `state.json`, the ownership record: what the app installed, file by file. | file I/O |
-| `verify` | Is a skill folder on disk still exactly what was installed? | file I/O |
+| `verify` | Is a skill folder on disk still what was installed? | file I/O |
 | `apply` | The only module that moves or deletes anything in the skills folder. | file I/O |
 | `engine` | Puts it together: lock, load, ask GitHub, reconcile, apply, save. | uses all |
 | `github` | Three kinds of request: list a folder, pin the commit, download a file. | network |
@@ -121,8 +122,10 @@ flowchart TD
   listing. If the branch moved during the download, a hash does not match, nothing is installed, and the check is
   tried again a minute later.
 - **The ETag is kept only when everything settled.** If anything was held, failed or was cancelled, the next check
-  lists again instead of getting a 304, so unfinished work is never forgotten. A 304 says nothing new about the skills,
-  so its report carries over what the record knew: a repository whose last listing had no skills still reports so.
+  lists again instead of getting a 304, so unfinished work is never forgotten. A choice about a skill drops the ETag
+  too. The tray checks such a repository once in each run, as soon as it sees it (see [Scheduling](#scheduling)). A
+  304 says nothing new about the skills, so its report carries over what the record knew: a repository whose last
+  listing had no skills still reports so.
 - **The token is sent only when it is needed** (`engine.rs`, `list`). A repository is listed without a token first, so
   a public one never makes the app look for one. When GitHub answers "not found" (it may be private) or the limit for
   anonymous requests is reached, it is listed once more with the token. A repository found to be private this way is
@@ -155,6 +158,11 @@ owns, and what is on disk. It is a pure function; every row below is a test.
 Extra files in an owned folder count as an edit. If a listing has no skills at all while some are owned, every delete
 is held until you confirm (the **mass-deletion guard**): an empty listing is more often a mistake than a real removal.
 
+"Identical", "same" and "clean" all mean the same as `text.rs` says: two copies of a text file are the same when only
+their line endings, the line break at the end or blank lines differ. That holds for adopting a folder, for finding
+edits, and for the proof `apply.rs` needs before it replaces or deletes a folder. Downloads are still checked byte for
+byte against the Git blob hash.
+
 **A failure never reaches this table.** `github::FailureKind` separates authentication, not found, rate limited, server
 error, redirect, protocol, network, too large, cancelled, changed during download and local errors. Any of them ends
 the check of that repository before anything is decided.
@@ -182,8 +190,9 @@ stateDiagram-v2
   skill, and the renames are atomic.
 - The swap uses renames, so the skills folder never holds half a skill.
 - A delete is the same without the download: Full check, marker, rename to `trash-txn`, audit, remove.
-- **A folder is deleted only after it was proven to equal a version the app installed.** Anything else is kept as
-  `backup-<skill>-<txn>` in the work folder, and backups are never deleted automatically.
+- **A folder is deleted only after it was proven to equal a version the app installed** (equal as `text.rs` says, so a
+  copy that differs only in line endings or blank lines is replaced or deleted like the original). Anything else is
+  kept as `backup-<skill>-<txn>` in the work folder, and backups are never deleted automatically.
 - If the app or the computer stops between two steps, `recover` reads the pending marker at the next start and
   finishes or undoes the change. Tests stop the code at every step to prove it (`engine_lifecycle`, `apply` tests).
 
@@ -198,7 +207,7 @@ flowchart TD
     Can -->|yes| Same{Fingerprint matches?}
     Same -->|yes| Clean[Clean, nothing read]
     Same -->|no| Hash
-    Hash --> Cmp{Same Git hash?}
+    Hash --> Cmp{Same Git hash, or same lines that count?}
     Cmp -->|yes| Learn[Clean: learn the new fingerprint]
     Cmp -->|no| Edited[Edited]
 ```
@@ -213,6 +222,11 @@ flowchart TD
 - The **full check** reads and hashes every file. It runs before any update or delete, because a write through a
   memory-mapped view that was not flushed yet does not move the USN.
 - A file that changes while it is being checked counts as edited. When in doubt, a file is edited, never clean.
+- A file is compared by its Git hash, and a text file also by the hash of its lines that count (`text::canon`, kept in
+  the record as `canon`; empty for a file that is not text or is over 1 MiB, which is compared byte for byte). So
+  another size rules a file out at once only when it is not text. Records written by version 0.2 or older have no
+  `canon`: such a file is compared byte for byte, and is not vouched for by its fingerprint until a check has read it
+  once and learned its `canon` from bytes equal to its Git hash.
 - Each skill folder is opened once without following links, and listed through that same handle
   (`win::fs::Folder`, `GetFileInformationByHandleEx`). The first query restarts the listing, so asking twice gives the
   same answer, and "not found" means an empty folder only on that first query; later it is an error, never a complete
@@ -229,6 +243,10 @@ tests in `tests\downtime.rs`.
 
 - A repository that was never checked is due now; otherwise one interval after its last successful check (so
   restarting the app causes no extra requests).
+- Except: a repository without an ETag (its last check held something, or a choice about one of its skills was made)
+  is checked once in each run of the app, as soon as the app sees it so, usually straight after start. What a check
+  held is known only to the run that found it, so without this the window would show no rows for those skills until
+  the next interval. That is at most one request per run for each such repository (`Schedule::checked`).
 - After a failure: 5 minutes, then 10, 20, 40 and so on, never later than the repository's own interval. A rate limit
   waits for the time GitHub named.
 - Nothing runs more often than every 5 minutes. A month is a calendar month, clamped to the end of a shorter month.
@@ -249,9 +267,9 @@ flowchart TD
 - `config.json` is meant to be read and edited by hand. The tray reloads it when it changes.
 - `state.json` holds, per repository: the ETag of the last fully applied listing, the last check time, whether the last
   listing had no skills in it at all, the "keep mine" list, and per owned skill its commit, its files (path, Git blob
-  hash, size, fingerprint) and an optional pending marker. It is written only when something changed, through a
-  temporary file and a rename. A damaged one is kept as `state.json.damaged-*`; one written by a newer version is not
-  touched.
+  hash, size, fingerprint, and `canon`, the hash of the lines that count) and an optional pending marker. It is written
+  only when something changed, through a temporary file and a rename. A damaged one is kept as `state.json.damaged-*`;
+  one written by a newer version is not touched.
 - `state.json` also names the skills folder its records describe (`skills_dir`). Every call compares it with the folder
   in use before it reads a fingerprint or sorts out an interrupted change (`State::follow_folder`). On a change the
   records are set aside under the old folder's name (`set_aside`, the last four folders), and the new folder's own
@@ -296,6 +314,12 @@ everything they show.
   with `engine::diff`, which only reads, and `diff.rs` lines them up. The window is made when opened and destroyed when
   closed (its fonts and bitmap released, the memory trimmed), so it costs nothing while closed. Its size is saved in
   `window.txt` when you finish resizing it.
+- **The list on the left widens under the mouse** when a repository's name is cut (`page::nav_width`): after the
+  pointer has rested on it for 250 ms, up to half the window, taking the room from the page, whose own width is all
+  that changes. It narrows as soon as the pointer is anywhere else, and never in the diff view. Nothing polls: every
+  control and panel posts `WM_HOVER` to the window when the pointer enters or leaves it (`control::track_hover`), and
+  the window then asks Windows where the pointer is. One gap: leaving from the list's scroll bar straight across the
+  window's border sends no message, so the list stays wide until the next mouse move over the window.
 - **`dialogs.rs`** asks questions in a small modal window drawn the same way, with a native edit box for typing. It is
   not `TaskDialogIndirect`, which lives only in comctl32 version 6; the test executables do not load that, so importing
   it would stop them from starting.
@@ -316,11 +340,11 @@ control or text-direction characters.
 ## Measuring
 
 When `TSS_BENCH_REPORT` names a file, the tray app appends timing marks to it (`src\win\ui\bench.rs`): the tray icon
-shown, each finished job (with how long it took), the window painted, quit and exit. `scripts\bench.ps1` reads
-the marks together with Windows' process counters and compares them with the budgets. Without the variable, nothing is
-written. `scripts\e2e.ps1` and `scripts\soak.ps1` read the same marks to know when a job has finished; the first also
-reads and drives the real windows with Win32 messages and measures whether text fits (`scripts\e2e-lib.ps1`). See
-[CONTRIBUTING.md](CONTRIBUTING.md#live-end-to-end-runs).
+shown, each finished job (with how long it took), the window painted, the list on the left widened or narrowed (`nav`),
+quit and exit. `scripts\bench.ps1` reads the marks together with Windows' process counters and compares them with the
+budgets. Without the variable, nothing is written. `scripts\e2e.ps1` and `scripts\soak.ps1` read the same marks to know
+when a job has finished; the first also reads and drives the real windows with Win32 messages and measures whether
+text fits (`scripts\e2e-lib.ps1`). See [CONTRIBUTING.md](CONTRIBUTING.md#live-end-to-end-runs).
 
 ## Where to change what
 
@@ -333,6 +357,6 @@ reads and drives the real windows with Win32 messages and measures whether text 
 | Requests to GitHub | `github.rs`, `win\http.rs` |
 | When checks happen | `scheduler.rs`, `app.rs` |
 | What the user reads | `board.rs` (tray and window), `win\ui\page.rs` (the window's pages), `cli.rs` (`tss`) |
-| How two copies of a file are compared | `diff.rs` |
+| How two copies of a file are compared | `text.rs` (when they are the same), `diff.rs` (Show changes) |
 | The windows | `win\ui\window.rs`, `win\ui\tray.rs`, `win\ui\dialogs.rs` |
 | How the windows look | `win\ui\control.rs` (controls), `win\ui\paint.rs` (drawing), `win\ui\theme.rs` (colours) |

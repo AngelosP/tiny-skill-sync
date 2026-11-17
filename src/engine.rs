@@ -33,12 +33,13 @@ use crate::github::{FailureKind, Remote, RemoteError, RepoRef, TokenProvider, Tr
 use crate::hash::blob_hex;
 use crate::interval::{UnixSecs, now_secs};
 use crate::pathsafe::{self, fold};
-use crate::reconcile::{self, Decision, DirtyInfo, Input, LocalState, OwnedView, Skip, Verdict};
+use crate::reconcile::{self, Decision, DirtyInfo, Input, LocalState, OwnedView, Skip, UnmanagedState, Verdict};
 use crate::scheduler::Schedule;
 use crate::secret::Secret;
 use crate::state::{Fingerprint, Folder, OwnedSkill, Pending, State, VolumeId};
+use crate::text;
 use crate::tree::{self, Discovery, Rejected, SkillFile};
-use crate::verify::{self, Check, Stats, check_for_volume};
+use crate::verify::{self, Check, Likeness, Stats, check_for_volume};
 use crate::win::fs::{self as winfs, FileHasher, Kind, probe, volume_id};
 
 const LOCK_FILE: &str = "engine.lock";
@@ -553,6 +554,16 @@ struct Ctx<'a> {
     single: bool,
     opts: &'a SyncOptions,
     cancel: &'a AtomicBool,
+    /// What the copies on GitHub of files read to compare a folder nobody owns are compared by: folded skill name,
+    /// then path.
+    theirs: HashMap<String, HashMap<String, String>>,
+}
+
+impl Ctx<'_> {
+    /// Where a skill's file is in the repository's folder.
+    fn rel(&self, skill: &str, path: &str) -> String {
+        if self.single { path.to_string() } else { format!("{skill}/{path}") }
+    }
 }
 
 struct Run {
@@ -993,10 +1004,15 @@ impl Engine {
 
         let single = tree::is_single_skill(&snapshot.entries);
         let discovery = tree::discover(&snapshot.entries, &repo.single_skill_name(), root_len(&s.applier));
-        let decisions = plan_repo(s, repo, &discovery, opts.confirm_mass_delete);
-
-        let cx = Ctx { repo, repo_ref, token, single, opts, cancel };
-        let run = self.apply_all(s, &cx, &discovery, &decisions);
+        let mut cx = Ctx { repo, repo_ref, token, single, opts, cancel, theirs: HashMap::new() };
+        let mut commit = None;
+        let unmanaged = match self.compare_unmanaged(s, &mut cx, &discovery, &mut commit) {
+            Ok(u) => u,
+            Err(e) if e.kind == FailureKind::Cancelled => return RepoReport { outcome: Outcome::Cancelled, ..report },
+            Err(e) => return report.fail(e),
+        };
+        let decisions = plan_repo(s, repo, &discovery, unmanaged, opts.confirm_mass_delete);
+        let run = self.apply_all(s, &cx, &discovery, &decisions, commit);
 
         let mut report = report;
         report.rejected = discovery.rejected.clone();
@@ -1021,9 +1037,54 @@ impl Engine {
         report
     }
 
-    fn apply_all(&self, s: &mut Session, cx: &Ctx, discovery: &Discovery, decisions: &[Decision]) -> Run {
+    /// Compares each folder in the way of a skill that nobody owns with the skill on GitHub, by folded name. A text file
+    /// whose bytes differ is read from GitHub to compare its lines. Failing to read it ends the check, like any failure.
+    fn compare_unmanaged(
+        &self,
+        s: &mut Session,
+        cx: &mut Ctx,
+        discovery: &Discovery,
+        commit: &mut Option<String>,
+    ) -> Result<HashMap<String, UnmanagedState>, RemoteError> {
+        let repo_state = s.state.repo(&cx.repo.id);
+        let owned: HashSet<String> = repo_state.map(|r| r.skills.iter().map(|k| fold(&k.name)).collect()).unwrap_or_default();
+        let ignored: HashSet<String> = repo_state.map(|r| r.ignored.iter().map(|n| fold(n)).collect()).unwrap_or_default();
+        let other_owners = s.state.names_owned_elsewhere(&cx.repo.id);
+        let mut out = HashMap::new();
+        for skill in &discovery.skills {
+            let key = fold(&skill.name);
+            let dir = s.applier.skills_dir.join(&skill.name);
+            if owned.contains(&key) || ignored.contains(&key) || other_owners.contains_key(&key) || !exists_no_follow(&dir) {
+                continue;
+            }
+            let mut likeness = verify::compare_unmanaged(&dir, skill, &HashMap::new(), &mut s.applier.hasher);
+            if let Likeness::NeedsText(paths) = &likeness {
+                let wanted: Vec<&SkillFile> = skill.files.iter().filter(|f| paths.contains(&f.path)).collect();
+                let size: u64 = wanted.iter().map(|f| f.size).sum();
+                likeness = Likeness::Different;
+                if s.downloaded + size <= cx.opts.max_download_bytes {
+                    if commit.is_none() {
+                        *commit = Some(self.remote.commit(&cx.repo_ref, cx.token.as_deref(), cx.cancel)?);
+                    }
+                    let mut theirs = HashMap::new();
+                    for file in wanted {
+                        let rel = cx.rel(&skill.name, &file.path);
+                        let bytes =
+                            download(self.remote.as_ref(), &cx.repo_ref, commit.as_deref().unwrap_or_default(), &rel, file, cx.token.as_deref(), cx.cancel)?;
+                        s.downloaded += file.size;
+                        theirs.insert(file.path.clone(), text::canon(&bytes));
+                    }
+                    likeness = verify::compare_unmanaged(&dir, skill, &theirs, &mut s.applier.hasher);
+                    cx.theirs.insert(key.clone(), theirs);
+                }
+            }
+            out.insert(key, if likeness == Likeness::Same { UnmanagedState::Identical } else { UnmanagedState::Different });
+        }
+        Ok(out)
+    }
+
+    fn apply_all(&self, s: &mut Session, cx: &Ctx, discovery: &Discovery, decisions: &[Decision], mut commit: Option<String>) -> Run {
         let mut run = Run { results: vec![ApplyResult::NotApplicable; decisions.len()], stopped: None, cancelled: false, local_failures: Vec::new() };
-        let mut commit: Option<String> = None;
         for (i, d) in decisions.iter().enumerate() {
             if !d.verdict.is_action() {
                 continue;
@@ -1102,11 +1163,12 @@ impl Engine {
                 }
                 let commit = commit.as_deref().unwrap_or_default();
                 if !downloads {
-                    return Ok(result(s.applier.adopt(&mut s.state, id, skill, commit)?));
+                    let theirs = cx.theirs.get(&fold(&skill.name)).cloned().unwrap_or_default();
+                    return Ok(result(s.applier.adopt(&mut s.state, id, skill, commit, &theirs)?));
                 }
                 let bytes = Cell::new(0u64);
                 let mut fetch = |file: &SkillFile, sink: &mut dyn FnMut(&[u8]) -> bool| -> Result<(), RemoteError> {
-                    let rel = if cx.single { file.path.clone() } else { format!("{}/{}", skill.name, file.path) };
+                    let rel = cx.rel(&skill.name, &file.path);
                     self.remote.file(&cx.repo_ref, commit, &rel, file.size, cx.token.as_deref(), cx.cancel, &mut |chunk: &[u8]| {
                         bytes.set(bytes.get() + chunk.len() as u64);
                         sink(chunk)
@@ -1255,23 +1317,8 @@ impl Engine {
                     commit = Some(self.remote.commit(&repo_ref, token.as_deref(), cancel).map_err(|e| failed(e.message))?);
                 }
                 let rel = if single { file.path.clone() } else { format!("{}/{}", upstream.map_or(skill, |k| k.name.as_str()), file.path) };
-                let mut bytes = Vec::with_capacity(file.size as usize);
-                let mut over = false;
-                let got = self.remote.file(&repo_ref, commit.as_deref().unwrap_or_default(), &rel, file.size, token.as_deref(), cancel, &mut |chunk| {
-                    over |= (bytes.len() + chunk.len()) as u64 > file.size;
-                    if !over {
-                        bytes.extend_from_slice(chunk);
-                    }
-                    !over
-                });
-                let changed = || failed(format!("{} changed on GitHub while it was being read; try again", file.path));
-                if over {
-                    return Err(changed());
-                }
-                got.map_err(|e| failed(e.message))?;
-                if blob_hex(&bytes) != file.blob {
-                    return Err(changed());
-                }
+                let bytes = download(self.remote.as_ref(), &repo_ref, commit.as_deref().unwrap_or_default(), &rel, file, token.as_deref(), cancel)
+                    .map_err(|e| failed(e.message))?;
                 Content::Bytes(bytes)
             };
             theirs.push((file.path.clone(), content));
@@ -1331,8 +1378,15 @@ fn verify_repo(s: &mut Session, repo_id: &str) -> Vec<(String, LocalStatus)> {
     out
 }
 
-/// Turns what is upstream, what is recorded and what is on disk into decisions.
-fn plan_repo(s: &mut Session, repo: &RepoConfig, discovery: &Discovery, confirm_mass_delete: bool) -> Vec<Decision> {
+/// Turns what is upstream, what is recorded and what is on disk into decisions. `unmanaged` says how each folder in
+/// the way of a skill nobody owns compares with it, by folded name.
+fn plan_repo(
+    s: &mut Session,
+    repo: &RepoConfig,
+    discovery: &Discovery,
+    unmanaged: HashMap<String, UnmanagedState>,
+    confirm_mass_delete: bool,
+) -> Vec<Decision> {
     let local: HashMap<String, LocalState> = verify_repo(s, &repo.id)
         .into_iter()
         .filter_map(|(name, status)| match status {
@@ -1345,19 +1399,6 @@ fn plan_repo(s: &mut Session, repo: &RepoConfig, discovery: &Discovery, confirm_
     let ignored: HashSet<String> = repo_state.map(|r| r.ignored.iter().map(|n| fold(n)).collect()).unwrap_or_default();
     let interrupted: Vec<String> = owned.iter().filter(|o| o.pending.is_some()).map(|o| o.name.clone()).collect();
     let other_owners = s.state.names_owned_elsewhere(&repo.id);
-    let owned_keys: HashSet<String> = owned.iter().map(|o| fold(&o.name)).collect();
-
-    let mut unmanaged = HashMap::new();
-    for skill in &discovery.skills {
-        let key = fold(&skill.name);
-        if owned_keys.contains(&key) || ignored.contains(&key) || other_owners.contains_key(&key) {
-            continue;
-        }
-        let dir = s.applier.skills_dir.join(&skill.name);
-        if exists_no_follow(&dir) {
-            unmanaged.insert(key, verify::compare_unmanaged(&dir, skill, &mut s.applier.hasher));
-        }
-    }
 
     let not_checked = || LocalState::Dirty(DirtyInfo { modified: vec!["(not checked)".to_string()], ..DirtyInfo::default() });
     let views: Vec<OwnedView> = owned
@@ -1415,6 +1456,36 @@ fn backups_in(work_dir: &Path) -> Vec<PathBuf> {
     let mut out: Vec<PathBuf> = entries.flatten().filter(|e| e.file_name().to_string_lossy().starts_with("backup-")).map(|e| e.path()).collect();
     out.sort();
     out
+}
+
+/// Downloads one file into memory and proves it is the one that was listed.
+fn download(
+    remote: &dyn Remote,
+    repo_ref: &RepoRef,
+    commit: &str,
+    rel: &str,
+    file: &SkillFile,
+    token: Option<&Secret>,
+    cancel: &AtomicBool,
+) -> Result<Vec<u8>, RemoteError> {
+    let mut bytes = Vec::with_capacity(file.size as usize);
+    let mut over = false;
+    let got = remote.file(repo_ref, commit, rel, file.size, token, cancel, &mut |chunk| {
+        over |= (bytes.len() + chunk.len()) as u64 > file.size;
+        if !over {
+            bytes.extend_from_slice(chunk);
+        }
+        !over
+    });
+    let changed = || RemoteError::new(FailureKind::Changed, format!("{} changed on GitHub while it was being read; try again", file.path));
+    if over {
+        return Err(changed());
+    }
+    got?;
+    if blob_hex(&bytes) != file.blob {
+        return Err(changed());
+    }
+    Ok(bytes)
 }
 
 #[cfg(test)]

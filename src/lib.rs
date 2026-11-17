@@ -19,6 +19,7 @@ pub mod reconcile;
 pub mod scheduler;
 pub mod secret;
 pub mod state;
+pub mod text;
 pub mod tree;
 pub mod verify;
 pub mod win;

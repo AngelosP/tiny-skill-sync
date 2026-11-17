@@ -28,15 +28,16 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     EnableWindow, GetFocus, IsWindowEnabled, ReleaseCapture, SetCapture, SetFocus, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent, VK_RETURN, VK_SPACE,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, BM_CLICK, CREATESTRUCTW, CreatePopupMenu, CreateWindowExW, DLGC_WANTMESSAGE, DefWindowProcW, DestroyMenu, DestroyWindow, GWLP_USERDATA,
-    GetClientRect, GetCursorPos, GetDlgCtrlID, GetDlgItem, GetParent, GetScrollInfo, GetWindowLongPtrW, GetWindowRect, HMENU, HTTRANSPARENT, HWND_TOP, IsChild,
-    IsWindow, MF_CHECKED, MF_SEPARATOR, MF_STRING, MSG, SB_BOTTOM, SB_LINEDOWN, SB_LINEUP, SB_PAGEDOWN, SB_PAGEUP, SB_THUMBTRACK, SB_TOP, SB_VERT, SCROLLINFO,
-    SIF_PAGE, SIF_POS, SIF_RANGE, SIF_TRACKPOS, SPI_GETWHEELSCROLLLINES, SW_INVALIDATE, SW_SCROLLCHILDREN, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOREDRAW,
-    SWP_NOSIZE, SWP_NOZORDER, ScrollWindowEx, SendMessageW, SetWindowLongPtrW, SetWindowPos, SetWindowTextW, SystemParametersInfoW, TPM_RETURNCMD,
-    TPM_RIGHTALIGN, TrackPopupMenuEx, UIS_INITIALIZE, UISF_HIDEACCEL, UISF_HIDEFOCUS, WM_APP, WM_CAPTURECHANGED, WM_CHANGEUISTATE, WM_COMMAND, WM_CTLCOLOREDIT,
-    WM_CTLCOLORSTATIC, WM_ENABLE, WM_ERASEBKGND, WM_GETDLGCODE, WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE,
-    WM_MOUSEWHEEL, WM_NCCREATE, WM_NCDESTROY, WM_NCHITTEST, WM_PAINT, WM_QUERYUISTATE, WM_SETFOCUS, WM_SETTEXT, WM_SIZE, WM_UPDATEUISTATE, WM_VSCROLL,
-    WS_CHILD, WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_DISABLED, WS_EX_CONTROLPARENT, WS_EX_NOPARENTNOTIFY, WS_POPUP, WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
+    AppendMenuW, BM_CLICK, CREATESTRUCTW, CreatePopupMenu, CreateWindowExW, DLGC_WANTMESSAGE, DefWindowProcW, DestroyMenu, DestroyWindow, GA_ROOT,
+    GWLP_USERDATA, GetAncestor, GetClientRect, GetCursorPos, GetDlgCtrlID, GetDlgItem, GetParent, GetScrollInfo, GetWindowLongPtrW, GetWindowRect, HMENU,
+    HTTRANSPARENT, HWND_TOP, IsChild, IsWindow, MF_CHECKED, MF_SEPARATOR, MF_STRING, MSG, PostMessageW, SB_BOTTOM, SB_LINEDOWN, SB_LINEUP, SB_PAGEDOWN,
+    SB_PAGEUP, SB_THUMBTRACK, SB_TOP, SB_VERT, SCROLLINFO, SIF_PAGE, SIF_POS, SIF_RANGE, SIF_TRACKPOS, SPI_GETWHEELSCROLLLINES, SW_INVALIDATE,
+    SW_SCROLLCHILDREN, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOREDRAW, SWP_NOSIZE, SWP_NOZORDER, ScrollWindowEx, SendMessageW, SetWindowLongPtrW, SetWindowPos,
+    SetWindowTextW, SystemParametersInfoW, TPM_RETURNCMD, TPM_RIGHTALIGN, TrackPopupMenuEx, UIS_INITIALIZE, UISF_HIDEACCEL, UISF_HIDEFOCUS, WM_APP,
+    WM_CAPTURECHANGED, WM_CHANGEUISTATE, WM_COMMAND, WM_CTLCOLOREDIT, WM_CTLCOLORSTATIC, WM_ENABLE, WM_ERASEBKGND, WM_GETDLGCODE, WM_KEYDOWN, WM_KILLFOCUS,
+    WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCREATE, WM_NCDESTROY, WM_NCHITTEST, WM_PAINT, WM_QUERYUISTATE,
+    WM_SETFOCUS, WM_SETTEXT, WM_SIZE, WM_UPDATEUISTATE, WM_VSCROLL, WS_CHILD, WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_DISABLED, WS_EX_CONTROLPARENT,
+    WS_EX_NOPARENTNOTIFY, WS_POPUP, WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
 };
 
 use super::paint::{self, Font, Rect, Tone, glyph};
@@ -50,6 +51,9 @@ pub const PANEL_CLASS: &str = "TinySkillSyncPanel";
 pub const WM_PAINTBG: u32 = WM_APP + 5;
 /// From a control that got the focus to its panel, which scrolls it into view.
 const WM_REVEAL: u32 = WM_APP + 6;
+/// Posted to the top-level window when the mouse comes onto or leaves a control or a panel, so that it can follow where
+/// the mouse is without asking all the time.
+pub const WM_HOVER: u32 = WM_APP + 7;
 pub const BN_CLICKED: u32 = 0;
 /// The code a combo sends when an entry was chosen; the combo's text is then the entry.
 pub const CBN_SELENDOK: u32 = 9;
@@ -162,6 +166,8 @@ struct Panel {
     bg: Role,
     scroll: i32,
     dpi: u32,
+    /// The mouse is on the panel itself, not on one of its controls.
+    hover: bool,
 }
 
 fn ctl_of(hwnd: HWND) -> Option<&'static RefCell<Ctl>> {
@@ -221,6 +227,18 @@ pub fn paint_with(hwnd: HWND, draw: &dyn Fn()) {
 fn notify(hwnd: HWND, code: u32) {
     let id = unsafe { GetDlgCtrlID(hwnd) } as u32;
     unsafe { SendMessageW(GetParent(hwnd), WM_COMMAND, ((code << 16) | (id & 0xFFFF)) as usize, hwnd as isize) };
+}
+
+/// The mouse came onto `hwnd`: asks for `WM_MOUSELEAVE` when it goes, and says so to the top-level window.
+fn track_hover(hwnd: HWND) {
+    let mut track = TRACKMOUSEEVENT { cbSize: size_of::<TRACKMOUSEEVENT>() as u32, dwFlags: TME_LEAVE, hwndTrack: hwnd, dwHoverTime: 0 };
+    unsafe { TrackMouseEvent(&mut track) };
+    hovered(hwnd);
+}
+
+/// Posted, not sent: the control that says so may be in the middle of a change.
+fn hovered(hwnd: HWND) {
+    unsafe { PostMessageW(GetAncestor(hwnd, GA_ROOT), WM_HOVER, 0, 0) };
 }
 
 fn invalidate(hwnd: HWND) {
@@ -460,8 +478,7 @@ unsafe extern "system" fn ctl_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
             if let Some(Ok(mut c)) = ctl_of(hwnd).map(RefCell::try_borrow_mut) {
                 if !c.hover {
                     c.hover = true;
-                    let mut track = TRACKMOUSEEVENT { cbSize: size_of::<TRACKMOUSEEVENT>() as u32, dwFlags: TME_LEAVE, hwndTrack: hwnd, dwHoverTime: 0 };
-                    unsafe { TrackMouseEvent(&mut track) };
+                    track_hover(hwnd);
                     invalidate(hwnd);
                 }
             }
@@ -472,6 +489,7 @@ unsafe extern "system" fn ctl_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
                 c.hover = false;
                 invalidate(hwnd);
             }
+            hovered(hwnd);
             return 0;
         }
         WM_LBUTTONDOWN | WM_LBUTTONDBLCLK => {
@@ -554,7 +572,8 @@ unsafe extern "system" fn ctl_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
 
 /// Makes an empty panel. `bg` is its colour; `Role::None` lets its parent draw behind it.
 pub fn panel(parent: HWND, id: i32, bg: Role) -> HWND {
-    let state = Box::into_raw(Box::new(RefCell::new(Panel { surface: Surface::default(), children: Vec::new(), bg, scroll: 0, dpi: dpi_of(parent) })));
+    let state =
+        Box::into_raw(Box::new(RefCell::new(Panel { surface: Surface::default(), children: Vec::new(), bg, scroll: 0, dpi: dpi_of(parent), hover: false })));
     let hwnd = unsafe {
         CreateWindowExW(
             WS_EX_CONTROLPARENT | WS_EX_NOPARENTNOTIFY,
@@ -941,6 +960,21 @@ unsafe extern "system" fn panel_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARA
         }
         WM_REVEAL => {
             reveal(hwnd, wp as HWND);
+            return 0;
+        }
+        WM_MOUSEMOVE => {
+            if let Some(Ok(mut p)) = panel_of(hwnd).map(RefCell::try_borrow_mut) {
+                if !p.hover {
+                    p.hover = true;
+                    track_hover(hwnd);
+                }
+            }
+        }
+        WM_MOUSELEAVE => {
+            if let Some(Ok(mut p)) = panel_of(hwnd).map(RefCell::try_borrow_mut) {
+                p.hover = false;
+            }
+            hovered(hwnd);
             return 0;
         }
         _ => {}

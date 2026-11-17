@@ -46,7 +46,7 @@ scripts\dev.ps1 test
 ```
 
 This runs `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings` and `cargo test --no-fail-fast`. All three
-must pass. There are 442 tests (278 in the library, 164 integration tests); the whole gate takes about 40 seconds when
+must pass. There are 462 tests (292 in the library, 170 integration tests); the whole gate takes about 40 seconds when
 the code is already built.
 
 If the change can affect speed, memory or disk use (startup, verification, the poll, the tray, the window),
@@ -88,7 +88,8 @@ ends up on disk, what the app says and what it leaves alone.
   `tss status` that the app sees only those before it lets the app write anything. A small proxy inside the script makes
   GitHub fail in the ways the `failures` scenario needs.
 - **You will see** one tray icon per running copy of the app (Windows 11 keeps new ones in the overflow flyout), and the
-  `ui` scenario opens, moves and photographs windows and the tray menu. Leave the mouse and keyboard alone while it runs.
+  `ui` scenario opens, moves and photographs windows and the tray menu. It also moves the mouse pointer onto the window
+  for a moment, then puts it back. Leave the mouse and keyboard alone while it runs.
 - **The result** is in `bench\out\e2e-<time>.txt`: every check, PASS or FAIL, with what was seen, plus a table at the
   end. The `ui` screenshots are in `bench\out\shots-<time>\`. The exit code is 1 if a check failed.
 
@@ -107,7 +108,7 @@ ends up on disk, what the app says and what it leaves alone.
 | `failures` | A bad network, bad answers, a bad token: the skills folder must not change. |
 | `stale` | GitHub answering with a listing that is newer than its commit. |
 | `empty` | A repository added as a whole when its skills are in a subfolder. |
-| `ui` | The window, its questions and the tray menu, driven and read from outside: layout, tab order, painting, the text at the top for each kind of failure, a skill row opening, **Show changes** and back, and a new size remembered. It runs in the light or dark mode Windows is in. |
+| `ui` | The window, its questions and the tray menu, driven and read from outside: layout, tab order, painting, the text at the top for each kind of failure, a skill row opening, **Show changes** and back, the list on the left widening under the mouse, and a new size remembered. It runs in the light or dark mode Windows is in. |
 
 Run it when you change the engine's visible behaviour, the tray, the window or anything GitHub-facing, at least
 the scenarios that cover the change (`-Only`). `scripts\dev.ps1 soak` is the long run for leaks and idle cost. The screens
@@ -122,8 +123,8 @@ that is fully painted on screen.
 
 ### When a new test passes at once
 
-For code that protects the user's files (`apply`, `reconcile`, `verify`, `win::fs`, the engine), a test that passes on
-its first run is not yet proof that it tests anything. Check it with deliberate bugs ("mutants"):
+For code that protects the user's files (`apply`, `reconcile`, `verify`, `text`, `win::fs`, the engine), a test that
+passes on its first run is not yet proof that it tests anything. Check it with deliberate bugs ("mutants"):
 
 1. Make one small wrong change in the code the test should guard (flip a condition, skip a step, return early).
 2. Run the tests. At least one must fail. If none does, the tests have a gap: add a test.
@@ -178,9 +179,10 @@ The latest results are in [README.md](README.md#measured-cost).
 
 ## Release build
 
-`Cargo.toml` and `.cargo\config.toml` set the release profile: `opt-level = "s"`, fat LTO, one codegen unit,
-`panic = "abort"`, stripped symbols and a static C runtime (no Visual C++ redistributable needed). `opt-level = "s"`
-keeps the tray exe at 0.86 MiB, under its 1 MiB budget (`opt-level = 3` made it 1.06 MiB). `build.rs` embeds
+`Cargo.toml` and `.cargo\config.toml` set the release profile: `opt-level = "z"`, fat LTO, one codegen unit,
+`panic = "abort"`, stripped symbols and a static C runtime (no Visual C++ redistributable needed). `opt-level = "z"`
+keeps the tray exe at 0.89 MiB, under its 1 MiB budget (`opt-level = "s"` made it 1.01 MiB, `opt-level = 3` larger
+still). It costs about 12% of SHA-1 speed (339 MB/s instead of 384) and nothing the bench can see. `build.rs` embeds
 `app.manifest` (common controls 6, per-monitor DPI, long paths, UTF-8).
 
 ## Releases

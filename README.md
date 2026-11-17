@@ -6,7 +6,7 @@ You tell it which repositories (or which folder of a repository) hold skills. It
 folder, checks GitHub on a schedule, and installs, updates and removes skills as they change upstream. It never
 touches a skill it did not install, and it never overwrites or deletes a skill you edited.
 
-- **Small and quiet.** One exe of just under 1 MiB, no runtime to install. It starts in about 8 ms, uses about 1 MiB of
+- **Small and quiet.** One exe of 0.9 MiB, no runtime to install. It starts in about 8 ms, uses about 1 MiB of
   memory while idle, and does no work at all between checks: no CPU, no disk, no network.
 - **Cheap checks.** An unchanged repository costs one small "has anything changed?" request to GitHub, which reads and
   writes no files.
@@ -26,7 +26,8 @@ These are the rules the app follows. Each one is covered by tests (see [CONTRIBU
    deleted, even if a repository has a skill with the same name. If its content is identical to upstream, the app takes
    it over; if not, it asks you.
 2. **Your edits win.** If you change a skill the app installed and upstream changes too, the app changes nothing and
-   asks you what to do. If you delete one, it does not put it back unless you ask.
+   asks you what to do. If you delete one, it does not put it back unless you ask. Other line endings and added or
+   removed blank lines are not edits (see [What counts as the same](#what-counts-as-the-same)).
 3. **A failure is never a deletion.** No network, a wrong token, a missing repository, a rate limit or a strange answer
    from GitHub only means "could not check". Skills are removed only when GitHub returned a complete listing in which
    they are gone. If a repository suddenly lists no skills at all, nothing is deleted until you confirm.
@@ -106,7 +107,9 @@ checked and when the next check is; after something you asked for, it says what 
 updated", "Checked: nothing new on GitHub"). **Sync now** gets new and updated skills from every repository at once.
 Skills you edited or deleted are never changed by it. Hover over it to read the same.
 
-Down the left are your repositories, each with its state, and **Add repository**, **Activity** and **Settings**.
+Down the left are your repositories, each with its state, and **Add repository**, **Activity** and **Settings**. When a
+name is too long to show whole, rest the mouse on the list for a moment: it widens, up to half the window, taking the
+room from the page beside it, and narrows again when the mouse leaves.
 
 - **A repository:** its name (with a **Private** label when it is read with your token), the folder and branch its
   skills come from, and when it was last checked.
@@ -122,7 +125,8 @@ Down the left are your repositories, each with its state, and **Add repository**
 - **Show changes** turns the window into the differences between the GitHub version of the skill and the copy on this
   PC. Nothing changes until you choose.
   - The files are listed on the left, each marked "Only on GitHub", "Only on this PC", "Changed · 3 added, 1 removed",
-    "Only invisible changes" (line breaks, a byte order mark, the line break at the end) or "Different (not text)".
+    "Only invisible changes" (only a byte order mark is different) or "Different (not text)". Line endings and blank
+    lines don't count here either: a file that differs only in them is not listed, and blank lines are not shown.
   - The chosen file's lines are on the right: `−` on red for a line only on GitHub, `+` on green for a line only on this
     PC, with three lines around each change. Long unchanged stretches are folded.
   - The skill's choices are at the top. **Back** (or Esc) returns.
@@ -268,9 +272,9 @@ Environment variables, mainly for tests and scripts:
 
 ## How edits are found
 
-When the app installs a skill, it records the Git hash of every file and what Windows reports about it: its file id,
-size, times and NTFS change number (USN). The change number moves whenever a file's content changes, even if the size
-and every time stamp are put back.
+When the app installs a skill, it records the Git hash of every file (and for a text file a hash of its lines that
+count, see below) and what Windows reports about it: its file id, size, times and NTFS change number (USN). The change
+number moves whenever a file's content changes, even if the size and every time stamp are put back.
 
 - **On NTFS with a change journal** (the normal case for `C:`), the app compares these facts when it starts, when
   something in the skills folder changes while it runs, and when upstream has changed. An unchanged install is
@@ -283,6 +287,20 @@ and every time stamp are put back.
 Not tested: ReFS, Dev Drive, FAT and exFAT drives. A change made through a memory-mapped view that has not been
 written to disk yet is not visible until it is; the full read before an update or deletion still catches it.
 
+### What counts as the same
+
+Two copies of a text file are the same when they differ only in how lines end (`\r\n` or `\n`), in the line break at
+the end of the file, or in blank lines (lines of nothing but spaces and tabs). A copy saved by an editor that changes
+line endings, or with a blank line added or taken out, is still the same skill. This holds everywhere: finding edits,
+updating and removing a skill, taking over a folder of yours, and **Show changes**.
+
+- Spaces at the end of a line that has text, and a byte order mark, still count.
+- A file that is not text (not UTF-8, or with a NUL character in it), or that is over 1 MiB, is compared byte for byte.
+- In Markdown a blank line can separate two paragraphs; taking it out does not count as an edit either.
+- Skills installed by version 0.2 or older are recorded without the hash of their lines. The app learns it at its first
+  start, from each file that is still exactly as installed. A file already changed in any way by then counts as edited
+  until you choose what to do with it.
+
 ## Measured cost
 
 Measured with `scripts\bench.ps1` on a Ryzen 7 5800X3D with Windows 11, files in the cache, real installs of
@@ -291,20 +309,22 @@ Measured with `scripts\bench.ps1` on a Ryzen 7 5800X3D with Windows 11, files in
 
 | Measure | 442 files | 1,555 files | Budget |
 | --- | --- | --- | --- |
-| Start to tray icon | 9.1 ms | 8.7 ms | 30 ms median |
-| Start-up check of every installed file | 24 ms | 103 ms | 75 µs per file |
+| Start to tray icon | 8.4 ms | 8.6 ms | 30 ms median |
+| Start-up check of every installed file | 24 ms | 105 ms | 75 µs per file |
 | Idle for 10 s: CPU, disk, page faults | 0, 0, 0 | 0, 0, 0 | 0 |
-| Idle memory: trimmed working set / private | 0.9 / 1.8 MiB | 1.2 / 2.6 MiB | 2 / 4 MiB |
-| Window: open to painted (median) | 40 ms | 44 ms | 100 ms |
-| Window open: working set | 13.5 MiB | 14.5 MiB | 40 MiB |
-| Window closed: working set (trimmed) | 1.4 MiB | 1.5 MiB | 2 MiB |
-| Unchanged check: CPU, file reads and writes | 16 ms, 0, 0 | 16 ms, 0, 0 | 50 ms, 0 |
-| Exe size | 0.99 MiB | 0.99 MiB | 1 MiB |
+| Idle memory: trimmed working set / private | 1.0 / 1.8 MiB | 1.2 / 2.6 MiB | 2 / 4 MiB |
+| Window: open to painted (median) | 40 ms | 43 ms | 100 ms |
+| Window open: working set | 13.5 MiB | 14.4 MiB | 40 MiB |
+| Window closed: working set (trimmed) | 1.5 MiB | 1.5 MiB | 2 MiB |
+| Unchanged check: CPU, file reads and writes | 31 ms, 0, 0 | 16 ms, 0, 0 | 50 ms, 0 |
+| Exe size | 0.89 MiB | 0.89 MiB | 1 MiB |
 
 Windows counts a process's CPU time in ticks of 15.6 ms, so an unchanged check shows as one to three ticks (16 to
-47 ms) from run to run. The exe is the row with the least room (about 10 KiB), so check its size after adding code to
-the tray app. A list of 463 skills opens almost as fast as one of 19, because only the rows within about two screens of
-what is shown are made at first; the rest are made as you scroll (with a row made for every skill, it took 120 ms).
+47 ms) from run to run. The exe is built for size: built for speed it would be 1.01 MiB, over its budget, and hash
+files about 13% faster (384 instead of 339 MB/s). A list of 463 skills opens almost as fast as one of 19, because only
+the rows within about two screens of what is shown are made at first; the rest are made as you scroll (with a row made
+for every skill, it took 120 ms). Widening the list of repositories under the mouse takes 18 ms with those 463 skills
+on the page.
 
 Left running for 75 minutes against a test repository with a 5-minute interval and seven upstream changes
 (`scripts\soak.ps1`), the app kept 6 threads and about 340 handles, used 297 ms of CPU in all (0.006 % of one core) and
@@ -322,11 +342,12 @@ ended at 3.2 MiB of private memory. Each change reached the disk within one inte
 - `gh` is found only on the `PATH`; with several `gh` accounts, the active one is used.
 - When Windows long paths are off, a folder you add inside a skill whose path is longer than 260 characters cannot be
   listed, so that skill counts as edited and is left alone.
-- Skills that were refused as unsafe, and folders of yours that were held because they differ from an upstream skill of
-  the same name, are announced by the check that reads the repository's listing (the first check, each time the
-  repository has changed, and `tss check --full-listing`). The app does not remember them: a later check that finds
-  nothing new says "Up to date", and the window forgets a refusal when the app restarts. Nothing is installed
-  or changed in the meantime.
+- Skills that were refused as unsafe are announced by the check that reads the repository's listing (the first check,
+  each time the repository has changed, and `tss check --full-listing`). The app does not remember them: a later check
+  that finds nothing new says "Up to date", and the window forgets a refusal when the app restarts. Nothing is
+  installed or changed in the meantime. Folders of yours that were held because they differ from an upstream skill of
+  the same name are different: until that is settled, the repository is read in full at every check, and once
+  straight after the app starts, so the window always shows them.
 - GitHub's servers can answer for up to a minute with a version of a public repository that is one change old. When
   two of its answers disagree, the check stops with "Changed while checking" and changes nothing; the next check works.
 - One check downloads at most 512 MiB (the rest waits for the next check), and a file over 64 MiB or a skill with more
