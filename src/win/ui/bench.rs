@@ -39,16 +39,20 @@ pub fn mark(label: &str, took: Option<Duration>) {
         GetSystemTimePreciseAsFileTime(&mut now);
     }
     let ticks = |ft: FILETIME| (u64::from(ft.dwHighDateTime) << 32) | u64::from(ft.dwLowDateTime);
-    let ms = |t: u64| t as f64 / 10_000.0;
-    let mut line = format!("mark={label} at_ms={:.2} cpu_ms={:.1}", ms(ticks(now).saturating_sub(ticks(created))), ms(ticks(kernel) + ticks(user)));
+    let mut line = format!("mark={label} at_ms={} cpu_ms={}", ms(ticks(now).saturating_sub(ticks(created))), ms(ticks(kernel) + ticks(user)));
     if let Some(took) = took {
-        line += &format!(" took_ms={:.2}", took.as_secs_f64() * 1000.0);
+        line += &format!(" took_ms={}", ms((took.as_nanos() / 100) as u64));
     }
     line.push_str("\r\n");
     // Measuring must never get in the way: a file that cannot be written loses the mark, nothing else.
     if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(file) {
         let _ = f.write_all(line.as_bytes());
     }
+}
+
+/// Milliseconds with two decimals, from 100-nanosecond ticks. Integers only: formatting a float adds 10 KiB to the exe.
+fn ms(ticks: u64) -> String {
+    format!("{}.{:02}", ticks / 10_000, ticks % 10_000 / 100)
 }
 
 /// A one-word name for a job in a mark.
@@ -61,7 +65,18 @@ pub fn job_label(job: &Job) -> &'static str {
         Job::Resolve { .. } => "job-resolve",
         Job::DeleteGone(_) => "job-delete-gone",
         Job::Remove { .. } => "job-remove",
+        Job::Diff { .. } => "job-diff",
         Job::Flush => "job-flush",
         Job::Plan => "job-plan",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ms;
+
+    #[test]
+    fn milliseconds_keep_two_decimals() {
+        assert_eq!([ms(0), ms(10_500), ms(1_234_567)], ["0.00", "1.05", "123.45"]);
     }
 }

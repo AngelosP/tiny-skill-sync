@@ -14,18 +14,18 @@
   Scenarios (all by default; name some with -Only):
     install       first start: what is installed, how the idle app behaves, how fast it quits
     places        with no TSS_ folders: skills go to %USERPROFILE%\.copilot\skills, beside skills written by hand
-    changes       six kinds of upstream change reach the disk through the tray's "Check now"
+    changes       six kinds of upstream change reach the disk through the tray's "Sync now"
     local-edit    an edit made while the app runs, then an upstream change to the same skill
     edit-stopped  edits made while the app was not running, including ones that keep the file's size and time
     holds         a skill deleted locally, a skill deleted upstream after being edited, every skill deleted upstream
     unmanaged     folders and files that were there before the app: left alone, or adopted only when identical
-    private       a private repository: with the token, without it, and a check that the token never shows
+    private       a private repository: found to need the token, without any sign-in, and the token never shows
     hostile       a branch full of hostile shapes: nothing may be written outside the skills folder
     names         upstream names with control and direction characters are shown escaped
     failures      a bad network, bad answers, a bad token: the skills folder must not change
     stale         GitHub answering with a tree that is newer than its commit
     empty         a repository added as a whole when its skills are in a subfolder
-    ui            screenshots and readings of the settings window and the tray menu
+    ui            the window, its questions and the tray menu, driven and read from outside, with screenshots
 
   A summary table is printed at the end and the whole run is saved in bench\out\e2e-STAMP.txt. The exit code is 1
   when a check failed.
@@ -218,7 +218,7 @@ function Test-Install {
         $diff = Compare-WithUpstream $c.Skills $c.Repo $c.Branch 'skills'
         Check 'the skills folder equals what upstream lists' ($diff.Count -eq 0) (($diff | Select-Object -First 4) -join '; ')
         Check 'alpha, beta and gamma are installed, nothing else' ((Get-SkillNames $c) -join ',' -eq 'alpha,beta,gamma') ((Get-SkillNames $c) -join ',')
-        Check 'no window opened by itself (the settings exist)' ((Find-LiveWindow $c.Tray.Id $SETTINGS_CLASS -Visible) -eq [IntPtr]::Zero)
+        Check 'no window opened by itself (the settings exist)' ((Find-LiveWindow $c.Tray.Id $WINDOW_CLASS -Visible) -eq [IntPtr]::Zero)
 
         $p = $c.Tray
         $p.Refresh()
@@ -400,14 +400,12 @@ function Test-LocalEdit {
         $looks = Get-MarkCount $c.Report 'job-look'
         [IO.File]::AppendAllText($alphaMd, "`nmy own line`n")
         [void](Wait-Live { (Get-MarkCount $c.Report 'job-look') -gt $looks } 'the app to look again after the edit' 20)
-        $win = Open-Settings $c.Tray
-        $list = Get-Control $win 100
-        [TssLive]::Select($list, 0)
-        Start-Sleep -Milliseconds 800
-        $rows = @(Read-UiList $win 110 2)
-        $alphaRow = @($rows | Where-Object { $_[0] -eq 'alpha' }) | Select-Object -First 1
-        Check 'the window, without being asked, shows alpha as edited' ($alphaRow -and $alphaRow[1] -match 'Edited locally') (($rows | ForEach-Object { $_ -join ': ' }) -join ' | ')
-        Close-Settings $c.Tray
+        $win = Open-Window $c.Tray
+        Open-Repo $win 0
+        $alphaRow = Wait-Maybe { $r = @(Read-Skills $win | Where-Object { $_.Name -eq 'alpha' -and $_.Tag -eq 'Edited on this PC' }); if ($r.Count -ge 1) { $r[0] } } 10
+        $rows = @(Read-Skills $win)
+        Check 'the window, without being asked, shows alpha as edited, with what changed' ($null -ne $alphaRow -and $alphaRow.Detail -match 'Edited locally') (($rows | ForEach-Object { "$($_.Name): $($_.Tag)" }) -join ' | ')
+        Close-Window $c.Tray
 
         [void](Push-Upstream $c.Repo $c.Branch @(@{ Path = 'skills/alpha/references/guide.md'; Text = "# Guide`n`nupstream moved on`n" }, @{ Path = 'skills/beta/SKILL.md'; Text = "---`nname: beta`ndescription: beta moved on`n---`n" }) 'live: alpha and beta change')
         $tries = 0
@@ -493,17 +491,16 @@ function Test-EditStopped {
         Note ('start-up job took {0:N0} ms' -f $startup.TookMs)
         Check 'start-up never touched the network or the files it flagged' ((Get-BlobId $alphaGuide) -eq $mineGuide -and (Get-BlobId $betaMd) -eq $mineBeta -and (Read-Skill $c 'gamma\SKILL.md') -notmatch 'while stopped')
 
-        $win = Open-Settings $c.Tray
-        [TssLive]::Select((Get-Control $win 100), 0)
-        Start-Sleep -Milliseconds 800
-        $rows = @(Read-UiList $win 110 2)
+        $win = Open-Window $c.Tray
+        Open-Repo $win 0
+        $rows = @(Read-Skills $win)
         $byName = @{}
-        foreach ($row in $rows) { $byName[$row[0]] = $row[1] }
-        Note ('the tray shows, before any check: ' + (($rows | ForEach-Object { $_ -join ': ' }) -join ' | '))
-        Check 'the tray flags alpha (same-size edit, added file, deleted file) at start-up' ($byName['alpha'] -match 'Edited locally') $byName['alpha']
-        Check 'the tray flags beta (same-size edit) at start-up' ($byName['beta'] -match 'Edited locally') $byName['beta']
-        Check 'the tray does not flag gamma, which nobody touched' ($byName['gamma'] -notmatch 'Edited|held') $byName['gamma']
-        Close-Settings $c.Tray
+        foreach ($row in $rows) { $byName[$row.Name] = "$($row.Tag): $($row.Detail)" }
+        Note ('the window shows, before any check: ' + (($rows | ForEach-Object { "$($_.Name): $($_.Tag)" + $(if ($_.Detail) { " ($($_.Detail))" } else { '' }) }) -join ' | '))
+        Check 'the window flags alpha (same-size edit, added file, deleted file) at start-up' ($byName['alpha'] -match '^Edited on this PC: Edited locally') $byName['alpha']
+        Check 'the window flags beta (same-size edit) at start-up' ($byName['beta'] -match '^Edited on this PC: Edited locally') $byName['beta']
+        Check 'the window does not flag gamma, which nobody touched' ($byName.ContainsKey('gamma') -and $byName['gamma'] -notmatch 'Edited|held') $byName['gamma']
+        Close-Window $c.Tray
         $r = Tss $c @('status')
         Check 'tss status says the same' ($r.Text -match 'alpha: Edited locally' -and $r.Text -match 'beta: Edited locally') ''
 
@@ -622,29 +619,46 @@ function Test-Private {
     $c = $null
     $d = $null
     try {
+        # Added like any repository, without --use-token: the app has to find out by itself that it needs the token.
         $c = New-Env 'private' $PrivateRepo -NoBranch -WithProxy
-        Add-Repo $c
+        Add-Repo $c @('--every', '6h')
         $r = Tss $c @('check')
         $printed.Add($r.Text)
         $diff = Compare-WithUpstream $c.Skills $c.Repo $c.Ref 'skills'
         $have = (Get-SkillNames $c) -join ','
-        Check 'with the token the private repository installs, equal to upstream' ($r.Code -eq 0 -and $diff.Count -eq 0 -and $have -eq 'alpha,beta,gamma') "exit $($r.Code); $have; $($diff.Count) difference(s)"
+        Check 'without being told, the private repository installs with the token, equal to upstream' ($r.Code -eq 0 -and $diff.Count -eq 0 -and $have -eq 'alpha,beta,gamma') "exit $($r.Code); $have; $($diff.Count) difference(s)"
         $log = @($c.Proxy.Entries())
-        $bare = @($log | Where-Object { $_ -notmatch 'auth=yes' })
-        Check 'every request carried the token: the listing, the commit and each download' ($log.Count -gt 0 -and $bare.Count -eq 0) "$($log.Count - $bare.Count) of $($log.Count) requests"
+        $rest = @($log | Select-Object -Skip 1)
+        $first = if ($log.Count) { $log[0] } else { '' }
+        Check 'the first listing went without the token and was not found; every request after it carried the token' ($first -match 'auth=no' -and $first -match '-> 404 ' -and $rest.Count -gt 0 -and @($rest | Where-Object { $_ -notmatch 'auth=yes' }).Count -eq 0) "$($log.Count) request(s); first: $(($first -split '\|')[0].Trim())"
+        $r = Tss $c @('token', 'status')
+        $printed.Add($r.Text)
+        Check 'the app remembers that the repository needs the token' ($r.Text -match "Repositories that send the token: $([regex]::Escape($c.Id))") "exit $($r.Code)"
+        $seen = $log.Count
         $r = Tss $c @('check')
         $printed.Add($r.Text)
-        Check 'a second check finds nothing to do, and GitHub answered "not modified"' ($r.Code -eq 0 -and @($c.Proxy.Entries() | Where-Object { $_ -match '-> 304 ' }).Count -ge 1) "exit $($r.Code)"
+        $again = @($c.Proxy.Entries() | Select-Object -Skip $seen)
+        Check 'a second check sends the token at once, and GitHub answered "not modified"' ($r.Code -eq 0 -and $again.Count -ge 1 -and @($again | Where-Object { $_ -notmatch 'auth=yes' }).Count -eq 0 -and @($again | Where-Object { $_ -match '-> 304 ' }).Count -ge 1) "exit $($r.Code); $($again.Count) request(s)"
 
+        # No sign-in anywhere: the app cannot find gh, whose token lives in the Windows keyring whatever its settings
+        # say. A token saved in Credential Manager is shared by every copy of the app and is never touched, so with one
+        # saved this half cannot run.
         $d = New-Env 'private-anon' $PrivateRepo -NoBranch -WithProxy
+        $noSignIn = @{ PATH = "$env:SystemRoot\System32;$env:SystemRoot"; GH_TOKEN = $null; GITHUB_TOKEN = $null }
         Add-Repo $d @('--every', '6h')
-        $before = Get-DiskStamp $d.Skills
-        $r = Tss $d @('check')
+        $r = Tss $d @('token', 'status') $noSignIn
         $printed.Add($r.Text)
-        Check 'without the token the repository is not found, and the app says it may be private' ($r.Code -ne 0 -and $r.Text -match 'could not find' -and $r.Text -match "private and 'use token' is off") "exit $($r.Code)"
-        Check 'and nothing was installed' ((Get-SkillNames $d).Count -eq 0 -and (Get-DiskStamp $d.Skills) -eq $before)
-        $anon = @($d.Proxy.Entries())
-        Check 'and no request carried a token' ($anon.Count -gt 0 -and @($anon | Where-Object { $_ -match 'auth=yes' }).Count -eq 0) "$($anon.Count) request(s)"
+        if ($r.Text -match 'Saved token: yes') {
+            Note 'skipped the half without any sign-in: a token is saved in Windows Credential Manager, and it is not touched'
+        } else {
+            $before = Get-DiskStamp $d.Skills
+            $r = Tss $d @('check') $noSignIn
+            $printed.Add($r.Text)
+            Check 'without any sign-in the repository is not found, and the app says how to sign in' ($r.Code -ne 0 -and $r.Text -match 'could not find' -and $r.Text -match 'gh auth login') "exit $($r.Code)"
+            Check 'and nothing was installed' ((Get-SkillNames $d).Count -eq 0 -and (Get-DiskStamp $d.Skills) -eq $before)
+            $anon = @($d.Proxy.Entries())
+            Check 'and no request carried a token' ($anon.Count -gt 0 -and @($anon | Where-Object { $_ -match 'auth=yes' }).Count -eq 0) "$($anon.Count) request(s)"
+        }
 
         $leaks = Find-TokenLeaks $token @($c, $d) $printed.ToArray()
         Check 'the token is nowhere: not in the settings, the saved state, the output, the proxy logs or this log' ($leaks.Count -eq 0) ($leaks -join '; ')
@@ -748,36 +762,37 @@ function Test-Names {
 
         [void](Start-Tray $c)
         [void](Wait-Live { (Get-MarkCount $c.Report 'job-startup') -ge 1 } 'the start-up look' 30)
-        $win = Open-Settings $c.Tray
-        [TssLive]::Select((Get-Control $win 100), 0)
-        Start-Sleep -Milliseconds 800
-        $rows = @(Read-UiList $win 110 2)
-        $text = ($rows | ForEach-Object { $_ -join ': ' }) -join "`n"
-        Check 'the settings window lists the skills with the characters written out' ($rows.Count -ge 2 -and $text -match '\\u\{202e\}' -and -not (Has-Danger $text)) (Show-Safe ($text -replace "`n", ' | '))
-        $list = Get-Control $win 110
-        $details = New-Object System.Collections.Generic.List[string]
-        for ($i = 0; $i -lt $rows.Count; $i++) {
-            [TssLive]::Select($list, $i)
-            Start-Sleep -Milliseconds 400
-            $details.Add((Read-UiText $win 111))
+        $win = Open-Window $c.Tray
+        Open-Repo $win 0
+        $rows = @(Read-Skills $win)
+        $text = ($rows | ForEach-Object { "$($_.Name): $($_.Tag)" }) -join "`n"
+        Check 'the window lists the skills with the characters written out' ($rows.Count -ge 2 -and $text -match '\\u\{202e\}' -and -not (Has-Danger $text)) (Show-Safe ($text -replace "`n", ' | '))
+        # A skill that needs the user is open to start with; any other is opened, as a click on its row does.
+        foreach ($row in @($rows | Where-Object { $null -eq $_.Detail })) {
+            Click-Ui $win $UiPanel.Page $row.Id
+            [void](Wait-Maybe { if ($null -ne (Read-Ui $win $UiPanel.Page ($row.Id + 1))) { $true } } 5 100)
         }
+        $rows = @(Read-Skills $win)
+        $details = @($rows | ForEach-Object { [string]$_.Detail })
         $unsafeDetails = @($details | Where-Object { Has-Danger $_ })
-        $mine = @(for ($i = 0; $i -lt $rows.Count; $i++) { if (-not $details[$i].StartsWith("$($rows[$i][0]): ")) { $rows[$i][0] } })
-        Check 'and so does the detail of every skill, selected one by one, each showing its own skill' ($details.Count -eq $rows.Count -and $unsafeDetails.Count -eq 0 -and $mine.Count -eq 0) ("$($details.Count) detail(s); $($unsafeDetails.Count) with a control or direction character; not showing their own skill: " + (Show-Safe ($mine -join ', ')))
-        Note ('the details, one per skill: ' + (Show-Safe (($details | ForEach-Object { $_ -replace "\s+", ' ' }) -join ' || ')))
+        $missing = @($rows | Where-Object { -not $_.Detail } | ForEach-Object { $_.Name })
+        Check 'and so does the detail of every skill, each one opened' ($rows.Count -ge 2 -and $unsafeDetails.Count -eq 0 -and $missing.Count -eq 0) ("$($rows.Count) row(s); $($unsafeDetails.Count) detail(s) with a control or direction character; without a detail: " + (Show-Safe ($missing -join ', ')))
+        Note ('the details, one per skill: ' + (Show-Safe (($rows | ForEach-Object { "$($_.Name): " + ($_.Detail -replace "\s+", ' ') }) -join ' || ')))
 
         # No command is printed for such a name, so this window is the way to settle that skill.
-        $at = @(0..($rows.Count - 1) | Where-Object { $rows[$_][0] -like 'rlo-*' })[0]
+        $rlo = @($rows | Where-Object { $_.Name -like 'rlo-*' })[0]
+        $use = @($rlo.Buttons | Where-Object { $_.Text -eq 'Use the GitHub version' })
+        Check 'the edited skill with the override character offers "Use the GitHub version"' ($use.Count -eq 1) (($rlo.Buttons | ForEach-Object { $_.Text }) -join ' | ')
         $resolved = Get-MarkCount $c.Report 'job-resolve'
-        [TssLive]::Select($list, $at)
-        Start-Sleep -Milliseconds 400
-        Click-Ui $win 112
-        [void](Wait-Live { (Get-MarkCount $c.Report 'job-resolve') -gt $resolved } 'the replace to be done' 30)
+        if ($use.Count -eq 1) {
+            Click-Ui $win $UiPanel.Page $use[0].Id
+            [void](Wait-Live { (Get-MarkCount $c.Report 'job-resolve') -gt $resolved } 'the replace to be done' 30)
+        }
         $now = [IO.File]::ReadAllText((Join-Path (Join-Path $c.Skills $rloName) 'SKILL.md'))
-        Check '"Replace with upstream" on the override-character skill puts the upstream text back' ($now -notmatch 'my edit' -and $now -match 'right-to-left override') ''
+        Check '"Use the GitHub version" on the override-character skill puts the upstream text back' ($now -notmatch 'my edit' -and $now -match 'right-to-left override') ''
         $saved = @(Get-ChildItem -LiteralPath $c.Root -Recurse -File -Force -ErrorAction SilentlyContinue | Where-Object { $_.FullName -notlike "$($c.Skills)\*" -and $_.FullName -notlike "$($c.Root)\bin\*" -and $_.FullName -notlike "$($c.Root)\out\*" } | Select-String -SimpleMatch 'my edit' -List)
         Check 'and my edit was saved in a backup first' ($saved.Count -ge 1) (($saved | ForEach-Object { Show-Safe $_.Path.Substring($c.Root.Length) }) -join ', ')
-        Close-Settings $c.Tray
+        Close-Window $c.Tray
     } finally { Close-Env $c }
 }
 
@@ -878,19 +893,22 @@ function Test-Empty {
 
         [void](Start-Tray $c)
         [void](Wait-Live { (Get-MarkCount $c.Report 'job-startup') -ge 1 } 'the start-up look' 30)
-        $win = Open-Settings $c.Tray
-        $rows = @(Read-UiList $win 100 4)
+        $win = Open-Window $c.Tray
+        $nav = @(Read-Nav $win)
         # The record says the last listing was empty, so this needs no check of its own.
-        Check 'after a restart, before any check, the repository list already says "No skills found"' ($rows.Count -ge 1 -and $rows[0][3] -match 'No skills found') (($rows | ForEach-Object { $_ -join ' | ' }) -join ' ;; ')
+        Check 'after a restart, before any check, the repository list already says "No skills found"' ($nav.Count -ge 1 -and $nav[0].Sub -eq 'No skills found') (($nav | ForEach-Object { "$($_.Label) | $($_.Sub)" }) -join ' ;; ')
         [void](Invoke-TrayCheck $c.Tray $c.Report)
         Start-Sleep -Milliseconds 800
-        $rows = @(Read-UiList $win 100 4)
-        Check 'after "Check now", the repository list says "No skills found"' ($rows.Count -ge 1 -and $rows[0][3] -match 'No skills found') (($rows | ForEach-Object { $_ -join ' | ' }) -join ' ;; ')
-        [TssLive]::Select((Get-Control $win 100), 0)
-        Start-Sleep -Milliseconds 600
-        $detail = Read-UiText $win 111
-        Check 'and its detail tells what to do (the address with the folder)' ($detail -match 'tree/main/skills') ($detail -replace "\s+", ' ')
-        Close-Settings $c.Tray
+        $nav = @(Read-Nav $win)
+        Check 'after "Sync now", the repository list says "No skills found"' ($nav.Count -ge 1 -and $nav[0].Sub -eq 'No skills found') (($nav | ForEach-Object { "$($_.Label) | $($_.Sub)" }) -join ' ;; ')
+        $hero = Read-Hero $win
+        Check 'and the top of the window says the repository needs attention' ($hero.Title -eq '1 repository needs your attention') "$($hero.Title) | $($hero.Sub)"
+        Open-Repo $win 0
+        $lead = Read-Ui $win $UiPanel.Page $UiId.InfoLead
+        $detail = Read-Ui $win $UiPanel.Page $UiId.InfoText
+        Check 'its page says "No skills found." and tells what to do (the address with the folder)' ($lead -eq 'No skills found.' -and $detail -match 'tree/main/skills') ("$lead " + ($detail -replace "\s+", ' '))
+        Check 'with a "Try again" button' ($null -ne (Read-Ui $win $UiPanel.Page $UiId.Retry))
+        Close-Window $c.Tray
     } finally { Close-Env $c }
 }
 
@@ -919,6 +937,10 @@ function Get-Config($c) {
 function Save-Shot([IntPtr]$Window, [string]$Name) {
     New-Item -ItemType Directory -Force $Shots | Out-Null
     $path = Join-Path $Shots "$Name.png"
+    # A picture taken at once can show controls not drawn yet, or a question that just closed still fading out.
+    [void](Wait-Maybe { if (-not [TssLive]::Pending($Window)) { $true } } 3)
+    Start-Sleep -Milliseconds 300
+    [void][TssLive]::DwmFlush()
     $over = [TssLive]::CoveredBy($Window)
     try {
         if ($over -eq '') { [void][TssLive]::CaptureScreen($Window, $path, 0) }
@@ -927,59 +949,84 @@ function Save-Shot([IntPtr]$Window, [string]$Name) {
     [pscustomobject]@{ Path = $path; Screen = ($over -eq '') }
 }
 
-# What the window has drawn: nothing is left waiting to be painted, and in the picture the faces of the Add and Close
-# buttons (at the middle and the bottom of the window) differ from the colour of the window around them. A part that was
-# not drawn would be the colour of the window. A button under the mouse has a bluish face, so the difference in any one
-# colour will do.
-function Test-Painted($Shot, [IntPtr]$Window, [string]$State) {
+# What the window has drawn: nothing is left waiting to be painted, and in the picture each of the given controls (pairs
+# of a panel and an id) is more than one flat colour. A control that was not drawn would be a single colour; one that
+# was has its text, glyph or border in it.
+function Test-Painted($Shot, [IntPtr]$Window, [string]$State, [object[]]$Parts) {
     $quiet = Wait-Maybe { if (-not [TssLive]::Pending($Window)) { $true } } 3
     Check "${State}: nothing is left waiting to be painted" ($null -ne $quiet) ('waiting: ' + [TssLive]::Pending($Window))
     if (-not $Shot) { Check "${State}: a picture of the window was taken" $false; return }
     if (-not $Shot.Screen) { Note "${State}: what the window drew was not checked, because something covered it"; return }
-    $b = ([TssLive]::Bounds($Window)) -split ','
-    $client = ([TssLive]::Client($Window)) -split ','
-    $frame = ([int]$b[2] - [int]$b[0] - [int]$client[0]) / 2
-    $top = ([int]$b[3] - [int]$b[1]) - [int]$client[1] - $frame
-    $layout = @(Get-Layout $Window)
-    $bmp = New-Object System.Drawing.Bitmap $Shot.Path
-    try {
-        $seen = @(foreach ($id in 108, 2) {
-            $item = $layout | Where-Object { $_.Id -eq $id } | Select-Object -First 1
-            $y = [int]($top + $item.Y + $item.H / 2)
-            $face = $bmp.GetPixel([int]($frame + $item.X + 6), $y)
-            $around = $bmp.GetPixel([int]($frame + $item.X - 4), $y)
-            [pscustomobject]@{ Id = $id; Differs = [math]::Max([math]::Abs($face.R - $around.R), [math]::Max([math]::Abs($face.G - $around.G), [math]::Abs($face.B - $around.B))) }
+    $w = ([TssLive]::Bounds($Window)) -split ','
+    $seen = @(foreach ($part in $Parts) {
+            $h = Find-Ui $Window $part[0] $part[1]
+            if ($h -eq [IntPtr]::Zero) { [pscustomobject]@{ Name = "$($part[0])/$($part[1])"; Contrast = -1 }; continue }
+            $b = ([TssLive]::Bounds($h)) -split ','
+            $x = [int]$b[0] - [int]$w[0]; $y = [int]$b[1] - [int]$w[1]
+            [pscustomobject]@{ Name = "$($part[0])/$($part[1])"; Contrast = [TssLive]::Contrast($Shot.Path, $x, $y, [int]$b[2] - [int]$b[0], [int]$b[3] - [int]$b[1]) }
         })
-    } finally { $bmp.Dispose() }
-    $bare = @($seen | Where-Object { $_.Differs -lt 6 })
-    Check "${State}: the picture shows the whole window drawn, down to the Close button" ($bare.Count -eq 0) (($seen | ForEach-Object { "button $($_.Id) differs from the window by $($_.Differs)" }) -join '; ')
+    $bare = @($seen | Where-Object { $_.Contrast -lt 40 })
+    Check "${State}: the picture shows each control looked at drawn" ($bare.Count -eq 0) (($seen | ForEach-Object { "$($_.Name) varies by $($_.Contrast)" }) -join '; ')
 }
 
-# Every control inside the window, and none over another (the combo boxes are made tall for their drop-down lists).
+# Each part of the window shown is inside it and none is over another; inside each part, every control that can be
+# used is inside it from left to right (the pages scroll, so up and down is not checked), and none is over another.
+# Text that is not a control of its own may overlap a row on purpose, so only the controls Tab visits are looked at.
 function Test-Layout([IntPtr]$Window, [string]$State) {
-    $size = ([TssLive]::Client($Window)) -split ','
-    $boxes = @(Get-Layout $Window | Where-Object { $_.Shown -and $_.Class -ne 'ComboBox' })
     $name = { param($b) "$($b.Class)#$($b.Id) at $($b.X),$($b.Y) $($b.W)x$($b.H)" }
-    $outside = @($boxes | Where-Object { $_.X -lt 0 -or $_.Y -lt 0 -or $_.X + $_.W -gt [int]$size[0] -or $_.Y + $_.H -gt [int]$size[1] })
-    Check "${State}: every control is inside the window" ($outside.Count -eq 0) (($outside | ForEach-Object { & $name $_ }) -join '; ')
-    $over = New-Object System.Collections.Generic.List[string]
-    for ($i = 0; $i -lt $boxes.Count; $i++) {
-        for ($j = $i + 1; $j -lt $boxes.Count; $j++) {
-            $a = $boxes[$i]; $b = $boxes[$j]
-            if ($a.X -lt $b.X + $b.W -and $b.X -lt $a.X + $a.W -and $a.Y -lt $b.Y + $b.H -and $b.Y -lt $a.Y + $a.H) { $over.Add((& $name $a) + ' over ' + (& $name $b)) }
+    $overlaps = {
+        param($boxes)
+        for ($i = 0; $i -lt $boxes.Count; $i++) {
+            for ($j = $i + 1; $j -lt $boxes.Count; $j++) {
+                $a = $boxes[$i]; $b = $boxes[$j]
+                if ($a.X -lt $b.X + $b.W -and $b.X -lt $a.X + $a.W -and $a.Y -lt $b.Y + $b.H -and $b.Y -lt $a.Y + $a.H) { (& $name $a) + ' over ' + (& $name $b) }
+            }
         }
     }
+    $size = ([TssLive]::Client($Window)) -split ','
+    $panels = @(Get-Layout $Window | Where-Object { $_.Shown })
+    $outside = New-Object System.Collections.Generic.List[string]
+    foreach ($p in $panels) {
+        if ($p.X -lt 0 -or $p.Y -lt 0 -or $p.X + $p.W -gt [int]$size[0] -or $p.Y + $p.H -gt [int]$size[1]) { $outside.Add('panel ' + (& $name $p)) }
+    }
+    $over = New-Object System.Collections.Generic.List[string]
+    foreach ($o in @(& $overlaps $panels)) { $over.Add('panels: ' + $o) }
+    foreach ($p in $panels) {
+        $width = [int](([TssLive]::Client($p.Handle)) -split ',')[0]
+        $boxes = @(Get-Layout $p.Handle | Where-Object { $_.Shown -and $_.Tab })
+        foreach ($b in $boxes) { if ($b.X -lt 0 -or $b.X + $b.W -gt $width) { $outside.Add("in $($p.Id): " + (& $name $b)) } }
+        foreach ($o in @(& $overlaps $boxes)) { $over.Add("in $($p.Id): " + $o) }
+    }
+    Check "${State}: every part and control is inside the window" ($outside.Count -eq 0) ($outside -join '; ')
     Check "${State}: no control is over another" ($over.Count -eq 0) ($over -join '; ')
 }
 
-# Tab must go down the window, not jump about: each control it visits is no higher than the one before (give or take
-# the height of a row).
+# Tab must go through each part of the window in reading order, not jump about: each control it visits is no higher
+# than the one before (give or take a few pixels), and one beside the one before is to its right.
 function Test-TabOrder([IntPtr]$Window, [string]$State) {
-    $tabs = @(Get-Layout $Window | Where-Object { $_.Tab -and $_.Shown -and $_.On })
-    $back = @(for ($i = 1; $i -lt $tabs.Count; $i++) { if ($tabs[$i].Y + 12 -lt $tabs[$i - 1].Y) { "$($tabs[$i - 1].Id) then $($tabs[$i].Id)" } })
-    $order = ($tabs | ForEach-Object { $_.Id }) -join ' '
-    Check "${State}: Tab visits the controls in reading order" ($back.Count -eq 0) ("order $order" + $(if ($back.Count) { '; goes back at ' + ($back -join ', ') } else { '' }))
+    $back = New-Object System.Collections.Generic.List[string]
+    $order = New-Object System.Collections.Generic.List[string]
+    foreach ($p in @(Get-Layout $Window | Where-Object { $_.Shown })) {
+        $tabs = @(Get-Layout $p.Handle | Where-Object { $_.Tab -and $_.Shown -and $_.On })
+        $order.Add("$($p.Id): " + (($tabs | ForEach-Object { $_.Id }) -join ' '))
+        for ($i = 1; $i -lt $tabs.Count; $i++) {
+            $a = $tabs[$i - 1]; $b = $tabs[$i]
+            $up = $b.Y + 12 -lt $a.Y
+            $left = [math]::Abs($b.Y - $a.Y) -le 12 -and $b.X -lt $a.X
+            if ($up -or $left) { $back.Add("in $($p.Id): $($a.Id) then $($b.Id)") }
+        }
+    }
+    Check "${State}: Tab visits the controls in reading order" ($back.Count -eq 0) (($order -join '; ') + $(if ($back.Count) { '; goes back at ' + ($back -join ', ') } else { '' }))
 }
+
+# The texts of the controls in a part of a window, joined, to read in a report or match.
+function Read-Panel([IntPtr]$Window, [int]$Panel) {
+    $p = [TssLive]::GetDlgItem($Window, $Panel)
+    if ($p -eq [IntPtr]::Zero) { return '' }
+    (@(Get-Layout $p | Where-Object { $_.Shown } | ForEach-Object { [TssLive]::Text($_.Handle) -replace "`n", ' / ' }) | Where-Object { $_ }) -join ' | '
+}
+
+function Show-Nav([IntPtr]$Window) { (@(Read-Nav $Window) | ForEach-Object { "$($_.Label) / $($_.Sub)" }) -join ' ;; ' }
 
 function Test-Ui {
     Add-Type -AssemblyName System.Windows.Forms
@@ -987,244 +1034,299 @@ function Test-Ui {
     try {
         $area = [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea
         $tray = $null
+        $dot = [string][char]0x00B7
 
-        # ---- the first start: nothing is set up, so the window opens by itself
+        # ---- the first start: nothing is set up, so the window opens by itself, on the welcome page
         $clock = [Diagnostics.Stopwatch]::StartNew()
         $tray = Start-Tray $c
-        $win = Wait-Maybe { $w = Find-LiveWindow $tray.Id $SETTINGS_CLASS -Visible; if ($w -ne [IntPtr]::Zero) { $w } } 10 25
+        $win = Wait-Maybe { $w = Find-LiveWindow $tray.Id $WINDOW_CLASS -Visible; if ($w -ne [IntPtr]::Zero) { $w } } 10 25
         $opened = $clock.ElapsedMilliseconds
-        Check 'with nothing set up, the settings window opens by itself' ($null -ne $win) "visible $opened ms after the start"
+        Check 'with nothing set up, the window opens by itself' ($null -ne $win) "visible $opened ms after the start"
         if ($null -eq $win) { return }
         Start-Sleep -Milliseconds 800
         $b = ([TssLive]::Bounds($win)) -split ','
-        Check 'the window is on the screen' ([int]$b[0] -ge $area.Left -and [int]$b[1] -ge $area.Top -and [int]$b[2] -le $area.Right -and [int]$b[3] -le $area.Bottom) ("window $($b -join ',') in the work area $($area.Left),$($area.Top),$($area.Right),$($area.Bottom)")
+        Check 'the window is on the screen' ([int]$b[0] -ge $area.Left - 16 -and [int]$b[1] -ge $area.Top -and [int]$b[2] -le $area.Right + 16 -and [int]$b[3] -le $area.Bottom + 16) ("window $($b -join ',') in the work area $($area.Left),$($area.Top),$($area.Right),$($area.Bottom)")
         $ping = [TssLive]::Ping($win, 2000)
         Check 'the window answers at once' ($ping -ge 0 -and $ping -lt 200) "$ping ms"
+        $hero = Read-Hero $win
+        Check 'the top of the window says what to do' ($hero.Title -eq 'Add a repository to start') "$($hero.Title) / $($hero.Sub)"
+        Check 'the list of repositories is empty, and the page offers Add repository' (@(Read-Nav $win).Count -eq 0 -and $null -ne (Read-Ui $win $UiPanel.Page $UiId.WelcomeAdd)) (Read-Panel $win $UiPanel.Page)
+        Check 'Sync now is greyed out, as there is nothing to sync' (-not [TssLive]::IsWindowEnabled((Get-Ui $win $UiPanel.Hero $UiId.Sync)))
         $pic = Save-Shot $win '01-first-start'
-        Test-Painted $pic $win 'first start'
-        $status = Read-Status $win
-        Check 'the status line says what to do' ($status -eq 'Add a repository to start') $status
-        $rows = @(Read-UiList $win 100 4)
-        Check 'the list of repositories is empty' ($rows.Count -eq 0) "$($rows.Count) row(s)"
-        $grey = @(Get-Layout $win | Where-Object { $_.Shown -and -not $_.On } | ForEach-Object { $_.Id })
-        Check 'what is done to a repository is greyed out: every, token, enabled, check now, remove' (@(101, 102, 103, 104, 105 | Where-Object { $grey -notcontains $_ }).Count -eq 0) ('greyed: ' + (($grey | Sort-Object) -join ' '))
-        $label = Get-Layout $win | Where-Object { $_.Class -eq 'Static' -and [TssLive]::Text($_.Handle) -like 'GitHub token:*' } | Select-Object -First 1
-        $token = $(if ($label) { [TssLive]::Text($label.Handle) } else { '' })
-        Check 'no token is saved, the window says so, and Clear is greyed out' ($token -eq 'GitHub token: not saved' -and $grey -contains 122) $token
-        $folder = Read-UiText $win 123
-        Check 'the skills folder shown is the one the app was given' ($folder -eq $c.Skills) $folder
-        $default = Read-UiText $win 120
-        Check 'the default check interval is 1 day' ($default -eq '1 day') $default
+        Test-Painted $pic $win 'first start' @(@($UiPanel.Hero, $UiId.HeroTitle), @($UiPanel.Nav, $UiId.NavAdd), @($UiPanel.Nav, $UiId.NavSettings), @($UiPanel.Page, $UiId.WelcomeAdd))
         Test-Layout $win 'first start'
         Test-TabOrder $win 'first start'
 
-        # ---- add a repository through the window, the answers slowed down so that the check can be watched
+        # ---- Settings
+        Click-Ui $win $UiPanel.Nav $UiId.NavSettings
+        $folder = Wait-Maybe { Read-Ui $win $UiPanel.Page $UiId.SkillsDir } 5
+        Check 'Settings shows the skills folder the app was given' ($folder -eq $c.Skills) $folder
+        $default = Read-Ui $win $UiPanel.Page $UiId.DefaultEvery
+        Check 'the default check interval is 1 day' ($default -eq '1 day') $default
+        # The saved token is shared by every copy of the app, so either way is right; what is shown must agree with it.
+        $token = Read-Ui $win $UiPanel.Page $UiId.TokenText
+        $save = Read-Ui $win $UiPanel.Page 323
+        $delete = Read-Ui $win $UiPanel.Page 324
+        $agrees = ($token -match 'No token is saved, so your GitHub CLI sign-in is used' -and $save -like 'Save a token*' -and $null -eq $delete) -or ($token -match 'Your token is saved' -and $save -like 'Replace token*' -and $delete -eq 'Delete token')
+        Check 'it says the token is used by itself, and offers to save, replace or delete one as fits' $agrees "$token / $save / $delete"
+        $pic = Save-Shot $win '02-settings'
+        Test-Painted $pic $win 'Settings' @(@($UiPanel.Page, $UiId.DefaultEvery), @($UiPanel.Page, $UiId.SkillsDir), @($UiPanel.Page, 323))
+        Test-Layout $win 'Settings'
+        Test-TabOrder $win 'Settings'
+
+        # ---- add a repository through its question, the answers slowed down so that the check can be watched
+        Click-Ui $win $UiPanel.Nav $UiId.NavAdd
+        $ask = Wait-Maybe { $d = Find-Ask $tray; if ($d -ne [IntPtr]::Zero) { $d } } 8
+        Check 'Add repository asks for the repository' ($null -ne $ask)
+        if ($null -eq $ask) { return }
+        Start-Sleep -Milliseconds 400
+        $said = Read-Panel $ask $AskPanel
+        Note "the question: $said"
+        $note = Read-Ui $ask $AskPanel $AskId.Note
+        Check 'it has no box for a token; a note says private repositories work by themselves' ($note -like 'Private repositories work automatically*' -and $said -notmatch 'Use my token|Private repository$') $note
+        Check 'it offers how often to check, starting at the default' ((Read-Ui $ask $AskPanel $AskId.Combo) -eq 'Default (1 day)') (Read-Ui $ask $AskPanel $AskId.Combo)
+        Set-UiText (Get-Ui $ask $AskPanel $AskId.Edit) (Get-Address $c)
+        $hint = Wait-Maybe { $t = Read-Ui $ask $AskPanel $AskId.Hint; if ($t -match [regex]::Escape($c.Repo) -and $t -match 'skills folder on') { $t } } 5
+        Check 'as the address is typed, the question says what it reads it as' ($null -ne $hint) (Read-Ui $ask $AskPanel $AskId.Hint)
+        $pic = Save-Shot $ask '03-add'
+        Test-Painted $pic $ask 'the Add question' @(@($AskPanel, $AskId.Heading), @($AskPanel, $AskId.Edit), @($AskPanel, $AskId.Ok), @($AskPanel, $AskId.Cancel))
+        Test-Layout $ask 'the Add question'
+        Test-TabOrder $ask 'the Add question'
         $c.Proxy.SetMode('api', 'slow:2500')
-        Set-UiText $win 106 (Get-Address $c)
-        Click-Control $win 107
-        Check 'the Private box ticks when it is clicked' (Get-Ticked $win 107)
-        Click-Control $win 108
+        Click-Ui $ask $AskPanel $AskId.Ok
         $seen = New-Object System.Collections.Generic.List[string]
         $worst = 0
         $watch = [Diagnostics.Stopwatch]::StartNew()
         $done = $false
         $pic = $null
         while ($watch.Elapsed.TotalSeconds -lt 40 -and -not $done) {
-            $t = Read-Status $win
+            $t = Read-Ui $win $UiPanel.Hero $UiId.HeroSub
             if ($t -and -not $seen.Contains($t)) { $seen.Add($t) }
-            if ($t -like 'Checking for updates*' -and -not $pic) { $pic = Save-Shot $win '02-checking' }
+            if ($t -match 'Checking for updates' -and -not $pic) { $pic = Save-Shot $win '04-checking' }
             $answer = [TssLive]::Ping($win, 3000)
             $worst = [math]::Max($worst, $(if ($answer -lt 0) { 3000 } else { $answer }))
-            $now = @(Read-UiList $win 100 4)
-            if ($now.Count -ge 1 -and $now[0][3] -eq 'Up to date') { $done = $true }
+            $nav = @(Read-Nav $win)
+            if ($nav.Count -ge 1 -and $nav[0].Sub -match 'up to date$') { $done = $true }
             Start-Sleep -Milliseconds 100
         }
         $c.Proxy.SetMode('api', 'pass')
-        Check 'while it checked, the status line said "Checking for updates"' (@($seen | Where-Object { $_ -like 'Checking for updates*' }).Count -ge 1) ($seen -join ' / ')
+        Check 'the question closed once Add was clicked' ((Find-Ask $tray) -eq [IntPtr]::Zero)
+        Check 'while it checked, the top of the window said "Checking for updates"' (@($seen | Where-Object { $_ -match 'Checking for updates' }).Count -ge 1) ($seen -join ' / ')
         Check 'the window kept answering while it checked' ($worst -lt 500) "slowest answer $worst ms over $([int]$watch.Elapsed.TotalSeconds) s"
-        Check 'the check ends with the repository saying Up to date' $done "after $([int]$watch.Elapsed.TotalSeconds) s"
-        $rows = @(Read-UiList $win 100 4)
-        Note ('the repository row: ' + (($rows | ForEach-Object { $_ -join ' | ' }) -join ' ;; '))
-        Check 'the row names the repository, the default interval, and when it was checked' ($rows.Count -eq 1 -and $rows[0][0] -match [regex]::Escape($c.Repo) -and $rows[0][1] -eq '1 day (default)' -and $rows[0][2] -match 'now|ago') (($rows | ForEach-Object { $_ -join ' | ' }) -join ' ;; ')
-        $names = @(Read-UiList $win 110 2 | ForEach-Object { $_[0] })
-        Check 'the skills list shows alpha, beta and gamma' (($names -join ',') -eq 'alpha,beta,gamma') ($names -join ',')
+        Check 'the check ends with the list saying "3 skills, up to date"' ($done -and @(Read-Nav $win)[0].Sub -eq "3 skills $dot up to date") (Show-Nav $win)
+        $title = Read-Ui $win $UiPanel.Page $UiId.Title
+        $sub = Read-Ui $win $UiPanel.Page $UiId.Sub
+        Note "the page: $title / $sub"
+        Check 'the page of the new repository is shown: its name, public, its folder and branch, when it was checked' ($title -eq $c.Repo -and $sub -match '^Public' -and $sub -match 'the skills folder on main' -and $sub -match 'checked') "$title / $sub"
+        $skills = @(Read-Skills $win)
+        Note ('the skills: ' + (($skills | ForEach-Object { "$($_.Name) / $($_.Tag)" }) -join ' ;; '))
+        Check 'the skills listed are alpha, beta and gamma, each installed and closed' ((($skills | ForEach-Object { $_.Name }) -join ',') -eq 'alpha,beta,gamma' -and @($skills | Where-Object { $_.Tag -notmatch '^(Installed|Up to date)$' -or $null -ne $_.Detail }).Count -eq 0)
         Check 'the skills are on disk, equal to upstream' ((Compare-WithUpstream $c.Skills $c.Repo $c.Ref 'skills').Count -eq 0)
-        Check 'the add box is empty again and Private is unticked' ((Read-UiText $win 106) -eq '' -and -not (Get-Ticked $win 107))
-        $on = @(Get-Layout $win | Where-Object { $_.Shown -and $_.On } | ForEach-Object { $_.Id })
-        Check 'the new repository is selected: every, token, enabled, check now and remove are on' (@(101, 102, 103, 104, 105 | Where-Object { $on -notcontains $_ }).Count -eq 0) ('on: ' + (($on | Sort-Object) -join ' '))
-        Check 'Use my token and Enabled are ticked (Private was ticked)' ((Get-Ticked $win 102) -and (Get-Ticked $win 103))
-        $said = Wait-Maybe { $s = Read-Status $win; if ($s -like 'Checked*') { $s } } 8
-        Check 'when the check is over, the status line says what it did' ($said -eq 'Checked: skills were updated') $said
-        $pic = Save-Shot $win '03-installed'
-        Test-Painted $pic $win 'a repository added'
+        Check 'Check every shows the default, and Keep in sync is on' ((Read-Ui $win $UiPanel.Page $UiId.Every) -eq 'Default (1 day)' -and (Get-Checked $win $UiPanel.Page $UiId.Enabled)) (Read-Ui $win $UiPanel.Page $UiId.Every)
+        $hero = Wait-Maybe { $h = Read-Hero $win; if ($h.Title -eq 'All skills are up to date') { $h } } 8
+        Check 'the top of the window says all skills are up to date, and how the check the user asked for ended' ($null -ne $hero -and $hero.Sub -like 'Checked: skills were updated*') $(if ($hero) { "$($hero.Title) / $($hero.Sub)" } else { (Read-Hero $win).Title })
+        $pic = Save-Shot $win '05-installed'
+        Test-Painted $pic $win 'a repository added' @(@($UiPanel.Hero, $UiId.HeroTitle), @($UiPanel.Hero, $UiId.Sync), @($UiPanel.Nav, $UiId.NavRepo), @($UiPanel.Nav, $UiId.NavSettings), @($UiPanel.Page, $UiId.Title), @($UiPanel.Page, $UiId.Every), @($UiPanel.Page, ($UiId.Skill + 16)))
         Test-Layout $win 'a repository added'
         Test-TabOrder $win 'a repository added'
+        Click-Ui $win $UiPanel.Nav $UiId.NavActivity
+        $notes = Wait-Maybe { $t = Read-Ui $win $UiPanel.Page $UiId.Note; if ($t) { $t } } 5
+        Check 'Activity tells what was done' ($notes -match 'alpha' -or $notes -match 'nstalled') (Read-Panel $win $UiPanel.Page)
+        [void](Save-Shot $win '06-activity')
 
-        # ---- the two interval boxes
-        Choose-Item $win 101 4
-        $row = Wait-Maybe { $r = @(Read-UiList $win 100 4); if ($r.Count -ge 1 -and $r[0][1] -eq '12 hours') { $r[0] } } 8
+        # ---- Check every, of the repository and the default
+        Open-Repo $win 0
+        Choose-Ui $win $UiPanel.Page $UiId.Every '12 hours'
         $cfg = Wait-Maybe { $x = Get-Config $c; if ($x -and $x.repos[0].interval -eq '12h') { $x } } 8
-        Check 'choosing 12 hours in "Check every" is shown in the list and saved for that repository' ($null -ne $row -and $null -ne $cfg) (($row -join ' | ') + '; saved: ' + $(if ($cfg) { $cfg.repos[0].interval } else { '-' }))
-        $next = Wait-Maybe { $s = Read-Status $win; if ($s -like 'Next check in*') { $s } } 8
-        Check 'once a setting is changed, the status line says when the next check is' ($null -ne $next) (Read-Status $win)
-        Choose-Item $win 120 2
+        Check 'choosing 12 hours in "Check every" is saved for that repository, and shown' ($null -ne $cfg -and (Read-Ui $win $UiPanel.Page $UiId.Every) -eq '12 hours') (Read-Ui $win $UiPanel.Page $UiId.Every)
+        $hero = Wait-Maybe { $h = Read-Hero $win; if ($h.Sub -like "3 skills from 1 repository $dot checked * $dot next check in *") { $h } } 5
+        Check 'once the user does something else, the top of the window sums up: the skills, when they were checked, the next check' ($null -ne $hero) ((Read-Hero $win).Sub)
+        Click-Ui $win $UiPanel.Nav $UiId.NavSettings
+        [void](Wait-Maybe { Read-Ui $win $UiPanel.Page $UiId.DefaultEvery } 5)
+        Choose-Ui $win $UiPanel.Page $UiId.DefaultEvery '6 hours'
         $cfg = Wait-Maybe { $x = Get-Config $c; if ($x -and $x.default_interval -eq '6h') { $x } } 8
-        Check 'choosing 6 hours as the default interval is saved, and the repository keeps its own' ($null -ne $cfg -and $cfg.repos[0].interval -eq '12h') ('default ' + $(if ($cfg) { $cfg.default_interval } else { '-' }))
-        Choose-Item $win 101 0
-        $row = Wait-Maybe { $r = @(Read-UiList $win 100 4); if ($r.Count -ge 1 -and $r[0][1] -eq '6 hours (default)') { $r[0] } } 8
-        $cfg = Get-Config $c
-        Check 'choosing Default for the repository makes it follow the default interval' ($null -ne $row -and -not $cfg.repos[0].interval) (($row -join ' | '))
+        Check 'choosing 6 hours as the default in Settings is saved, and the repository keeps its own' ($null -ne $cfg -and $cfg.repos[0].interval -eq '12h') ('default ' + $(if ($cfg) { $cfg.default_interval } else { '-' }))
+        Open-Repo $win 0
+        Choose-Ui $win $UiPanel.Page $UiId.Every 'Default (6 hours)'
+        $cfg = Wait-Maybe { $x = Get-Config $c; if ($x -and -not $x.repos[0].interval) { $x } } 8
+        Check 'choosing "Default (6 hours)" makes the repository follow the default' ($null -ne $cfg -and (Read-Ui $win $UiPanel.Page $UiId.Every) -eq 'Default (6 hours)') (Read-Ui $win $UiPanel.Page $UiId.Every)
 
-        # ---- Enabled
+        # ---- Keep in sync
         $checks = Get-MarkCount $c.Report 'job-check'
-        Click-Control $win 103
-        $off = Wait-Maybe { $l = @(Get-Layout $win | Where-Object { $_.Id -eq 104 }); if ($l.Count -ge 1 -and -not $l[0].On) { $true } } 8
+        Click-Ui $win $UiPanel.Page $UiId.Enabled
+        $paused = Wait-Maybe { $n = @(Read-Nav $win); if ($n.Count -ge 1 -and $n[0].Sub -eq 'Paused') { $true } } 8
         $cfg = Get-Config $c
-        Check 'unticking Enabled greys out Check now and is saved' ($off -and $cfg.repos[0].enabled -eq $false)
-        Note ('with the only repository paused, the row says: ' + ((@(Read-UiList $win 100 4) | ForEach-Object { $_ -join ' | ' }) -join ' ;; ') + '; the status line says: ' + (Read-Status $win))
-        Click-Control $win 103
-        $back = Wait-Maybe { $l = @(Get-Layout $win | Where-Object { $_.Id -eq 104 }); if ($l.Count -ge 1 -and $l[0].On) { $true } } 8
+        Check 'turning Keep in sync off is saved, and the list says Paused' ($paused -and $cfg.repos[0].enabled -eq $false) (Show-Nav $win)
+        $hero = Read-Hero $win
+        Check 'the top of the window says every repository is paused, and Sync now is greyed out' ($hero.Title -eq 'Every repository is paused' -and -not [TssLive]::IsWindowEnabled((Get-Ui $win $UiPanel.Hero $UiId.Sync))) "$($hero.Title) / $($hero.Sub)"
+        [void](Save-Shot $win '07-paused')
+        Click-Ui $win $UiPanel.Page $UiId.Enabled
         $again = Wait-Maybe { if ((Get-MarkCount $c.Report 'job-check') -gt $checks) { $true } } 30
-        Check 'ticking Enabled again turns Check now back on and checks the repository at once' ($back -and $again)
-        [void](Wait-Maybe { $r = @(Read-UiList $win 100 4); if ($r.Count -ge 1 -and $r[0][3] -eq 'Up to date') { $true } } 20)
+        Check 'turning it on again checks the repository at once' ($again -and (Get-Checked $win $UiPanel.Page $UiId.Enabled))
+        [void](Wait-Maybe { $n = @(Read-Nav $win); if ($n.Count -ge 1 -and $n[0].Sub -match 'up to date$') { $true } } 20)
         Wait-Settled $c
 
-        # ---- a local edit appears by itself
+        # ---- a local edit appears by itself, with what can be done about it
         [IO.File]::AppendAllText((Join-Path $c.Skills 'alpha\SKILL.md'), "`nmy own words`n")
-        $edited = Wait-Maybe { $r = @(Read-UiList $win 110 2 | Where-Object { $_[0] -eq 'alpha' -and $_[1] -match 'Edited locally' }); if ($r.Count -ge 1) { $r[0] } } 40
-        Check 'an edit made to a skill shows in the list as "Edited locally" without anyone asking' ($null -ne $edited) ($edited -join ' | ')
-        $row = Wait-Maybe { $r = @(Read-UiList $win 100 4); if ($r.Count -ge 1 -and $r[0][3] -match 'Needs attention') { $r[0] } } 10
-        Check 'and the repository says it needs attention' ($null -ne $row) ($row -join ' | ')
-        $index = [array]::IndexOf(@(Read-UiList $win 110 2 | ForEach-Object { $_[0] }), 'alpha')
-        [TssLive]::Select((Get-Control $win 110), $index)
-        $detail = Wait-Maybe { $t = Read-UiText $win 111; if ($t -like 'alpha:*') { $t } } 8
-        Note ('the detail of the edited skill: ' + $detail)
-        $one = Read-UiText $win 112
-        $two = Read-UiText $win 113
-        $shown = @(Get-Layout $win | Where-Object { $_.Shown -and ($_.Id -eq 112 -or $_.Id -eq 113) })
-        Check 'selecting it offers two buttons: Replace with upstream, Keep mine' ($shown.Count -eq 2 -and $one -eq 'Replace with upstream' -and $two -eq 'Keep mine') "$one | $two"
-        $fit = Get-EditFit $win 111
-        Check 'the detail of the skill is shown in full' ($fit.Lines -le $fit.Visible) "$($fit.Lines) line(s), room for $($fit.Visible)"
-        Check 'the detail box can be reached with Tab (so it can be read and scrolled from the keyboard)' $fit.Tab
-        $pic = Save-Shot $win '04-skill-edited'
-        Test-Painted $pic $win 'a skill selected'
-        Test-Layout $win 'a skill selected'
-        Test-TabOrder $win 'a skill selected'
+        $edited = Wait-Maybe { $r = @(Read-Skills $win | Where-Object { $_.Name -eq 'alpha' -and $_.Tag -eq 'Edited on this PC' }); if ($r.Count -ge 1) { $r[0] } } 40
+        Check 'an edit made to a skill shows as "Edited on this PC" without anyone asking' ($null -ne $edited) ((@(Read-Skills $win) | ForEach-Object { "$($_.Name) / $($_.Tag)" }) -join ' ;; ')
+        $nav = Wait-Maybe { $n = @(Read-Nav $win); if ($n.Count -ge 1 -and $n[0].Sub -eq "3 skills $dot 1 needs you") { $n[0] } } 10
+        $hero = Read-Hero $win
+        Check 'the list says the repository needs you, and the top of the window says a skill does' ($null -ne $nav -and $hero.Title -eq '1 skill needs your attention') ((Show-Nav $win) + " / $($hero.Title)")
+        if ($null -eq $edited) { return }
+        $texts = @($edited.Buttons | ForEach-Object { $_.Text })
+        Check 'its row opens by itself, says what changed, and offers Show changes, Use the GitHub version and Keep my version' ($edited.Detail -match '^Edited locally' -and $texts -contains 'Show changes' -and $texts -contains 'Use the GitHub version' -and $texts -contains 'Keep my version') ("$($edited.Detail) / " + ($texts -join ', '))
+        $pic = Save-Shot $win '08-skill-edited'
+        Test-Painted $pic $win 'an edited skill' @(@($UiPanel.Hero, $UiId.HeroTitle), @($UiPanel.Page, $edited.Id), @($UiPanel.Page, ($edited.Id + 1)), @($UiPanel.Page, ($edited.Id + 2)))
+        Test-Layout $win 'an edited skill'
+        Test-TabOrder $win 'an edited skill'
 
-        # ---- Remove asks first
-        Click-Control $win 105
-        $ask = Wait-Maybe { $d = Find-LiveWindow $tray.Id $ASK_CLASS -Visible; if ($d -ne [IntPtr]::Zero) { $d } } 8
-        Check 'Remove... asks before it does anything' ($null -ne $ask)
-        if ($null -ne $ask) {
-            Start-Sleep -Milliseconds 500
-            [void](Save-Shot $ask '05-remove-asks')
-            $kids = @(Get-Layout $ask)
-            Note ('the question: ' + (($kids | ForEach-Object { "#$($_.Id) $($_.Class) '" + [TssLive]::Text($_.Handle) + "'" }) -join ' | '))
-            $radios = @($kids | Where-Object { $_.Class -eq 'Button' -and ((($_.Style -band 0xF) -eq 4) -or (($_.Style -band 0xF) -eq 9)) })
-            $ticks = @($radios | ForEach-Object { [TssLive]::SendMessageW($_.Handle, 0xF0, [IntPtr]::Zero, [IntPtr]::Zero).ToInt64() })
-            Check 'it offers two choices, and the one that keeps the skills installed is chosen to start with' ($radios.Count -eq 2 -and $ticks[0] -eq 1 -and $ticks[1] -eq 0 -and [TssLive]::Text($radios[0].Handle) -like 'Leave*') ('ticks ' + ($ticks -join ','))
-            $target = [TssLive]::GetDlgItem($ask, 2)
-            if ($target -eq [IntPtr]::Zero) { $target = $kids[0].Handle }
-            Send-Key $target $VK_ESCAPE
-            $gone = Wait-Maybe { if ((Find-LiveWindow $tray.Id $ASK_CLASS -Visible) -eq [IntPtr]::Zero) { $true } } 5
-            Check 'Esc cancels the question; the repository and its skills are still there' ($gone -and @(Read-UiList $win 100 4).Count -eq 1 -and (Test-Path -LiteralPath (Join-Path $c.Skills 'alpha\SKILL.md')))
+        # ---- Show changes, and back
+        Click-Ui $win $UiPanel.Page ($edited.Id + 2)
+        $file = Wait-Maybe { $t = Read-Ui $win $UiPanel.Files $UiId.File; if ($t) { $t } } 15
+        $inPlace = [TssLive]::Shown([TssLive]::GetDlgItem($win, $UiPanel.Head)) -and -not [TssLive]::Shown([TssLive]::GetDlgItem($win, $UiPanel.Page)) -and -not [TssLive]::Shown([TssLive]::GetDlgItem($win, $UiPanel.Nav))
+        Check 'Show changes shows the differences in place of the pages' $inPlace
+        Check 'the file that differs is listed: SKILL.md, changed' ($file -match "^SKILL\.md`nChanged $dot \d+ added, \d+ removed$") ($file -replace "`n", ' / ')
+        $head = Read-Panel $win $UiPanel.Head
+        Check 'it names the skill, says nothing changes until a choice is made, and offers the choices' ((Read-Ui $win $UiPanel.Head $UiId.Title) -eq 'alpha' -and $head -match 'Nothing changes until you choose' -and $head -match 'Use the GitHub version' -and $head -match 'Keep my version') $head
+        $pic = Save-Shot $win '09-changes'
+        Test-Painted $pic $win 'the changes of a skill' @(@($UiPanel.Head, $UiId.Back), @($UiPanel.Head, $UiId.Title), @($UiPanel.Head, $UiId.DiffAction), @($UiPanel.Files, $UiId.File))
+        Test-Layout $win 'the changes of a skill'
+        Send-Key (Get-Ui $win $UiPanel.Head $UiId.Back) $VK_ESCAPE
+        $back = Wait-Maybe { if ([TssLive]::Shown([TssLive]::GetDlgItem($win, $UiPanel.Page)) -and -not [TssLive]::Shown([TssLive]::GetDlgItem($win, $UiPanel.Head))) { $true } } 5
+        Check 'Esc goes back to the page of the repository, and nothing changed' ($back -and (Read-Skill $c 'alpha\SKILL.md') -match 'my own words')
+
+        # ---- More, then Remove repository: it asks first
+        Click-Ui $win $UiPanel.Page $UiId.More
+        $menu = Wait-Menu $tray
+        Check 'More opens a menu' ($menu -ne [IntPtr]::Zero)
+        if ($menu -ne [IntPtr]::Zero) {
+            $items = @([TssLive]::MenuItems($menu))
+            Check 'it offers Sync this repository, Open on GitHub, Open skills folder and Remove repository' (($items -join ' | ') -like 'Sync this repository | Open on GitHub | Open skills folder | - | Remove repository*') ($items -join ' | ')
+            New-Item -ItemType Directory -Force $Shots | Out-Null
+            [void][TssLive]::CaptureScreen($menu, (Join-Path $Shots '10-more-menu.png'), 24)
+            Choose-MenuItem $menu ([array]::IndexOf($items, @($items | Where-Object { $_ -like 'Remove repository*' })[0]))
+            $ask = Wait-Maybe { $d = Find-Ask $tray; if ($d -ne [IntPtr]::Zero) { $d } } 8
+            Check 'Remove repository asks before it does anything' ($null -ne $ask)
+            if ($null -ne $ask) {
+                Start-Sleep -Milliseconds 400
+                [void](Save-Shot $ask '11-remove-asks')
+                Note ('the question: ' + (Read-Panel $ask $AskPanel))
+                $one = Read-Ui $ask $AskPanel $AskId.Choice
+                $two = Read-Ui $ask $AskPanel ($AskId.Choice + 1)
+                Check 'it offers two choices, and the one that keeps the skills installed is chosen to start with' ($one -like 'Leave its skills installed*' -and $two -like 'Delete its skills too*' -and (Get-Checked $ask $AskPanel $AskId.Choice) -and -not (Get-Checked $ask $AskPanel ($AskId.Choice + 1))) "$one / $two"
+                Send-Key (Get-Ui $ask $AskPanel $AskId.Cancel) $VK_ESCAPE
+                $gone = Wait-Maybe { if ((Find-Ask $tray) -eq [IntPtr]::Zero) { $true } } 5
+                Check 'Esc cancels the question; the repository and its skills are still there' ($gone -and @(Read-Nav $win).Count -eq 1 -and (Test-Path -LiteralPath (Join-Path $c.Skills 'alpha\SKILL.md')))
+            } else { Send-Key $menu $VK_ESCAPE }
         }
 
-        # ---- failed checks: what the window says about each. No skill is selected, so that the repository's own text shows.
-        [TssLive]::Deselect((Get-Control $win 110), [array]::IndexOf(@(Read-UiList $win 110 2 | ForEach-Object { $_[0] }), 'alpha'))
-        $none = Wait-Maybe { if ((Read-UiText $win 111) -notlike 'alpha:*') { $true } } 5
-        Check 'a skill that is deselected no longer shows its details' ($null -ne $none) (Read-UiText $win 111)
+        # ---- failed checks: what the window says about each
         $c.Proxy.SetMode('api', 'close')
-        Click-Control $win 104
-        $row = Wait-Maybe { $r = @(Read-UiList $win 100 4); if ($r.Count -ge 1 -and $r[0][3] -eq 'No connection') { $r[0] } } 30
-        Check 'with the network down, Check now ends with the repository saying "No connection"' ($null -ne $row) ($row -join ' | ')
-        $said = Read-Status $win
-        $reason = $said -replace ' \(.*\)$', ''
-        $room = Get-StatusFit $win $reason
-        Check 'the status line gives the reason first, and the reason has room to be read' ($said -like 'The connection was lost*' -and $room.Needed -le $room.Available) "$said ($($room.Needed) of $($room.Available) px)"
-        $why = Wait-Maybe { $t = Read-UiText $win 111; if ($t -match 'connection') { $t } } 8
-        Check 'with no skill selected, the detail box explains what went wrong' ($null -ne $why) $why
-        $fit = Get-EditFit $win 111
-        Check 'and shows it in full' ($fit.Lines -le $fit.Visible) "$($fit.Lines) line(s), room for $($fit.Visible)"
-        Note ('the Messages box holds: ' + ((Read-UiText $win 126) -replace '\s+', ' '))
-        Check 'the skills are still listed and on disk' (@(Read-UiList $win 110 2).Count -eq 3 -and @(Get-SkillNames $c).Count -eq 3)
-        $pic = Save-Shot $win '06-no-connection'
-        Test-Painted $pic $win 'a failed check'
+        Click-Ui $win $UiPanel.Hero $UiId.Sync
+        $nav = Wait-Maybe { $n = @(Read-Nav $win); if ($n.Count -ge 1 -and $n[0].Sub -eq 'No connection') { $n[0] } } 30
+        Check 'with the network down, Sync now ends with the list saying "No connection"' ($null -ne $nav) (Show-Nav $win)
+        $hero = Read-Hero $win
+        Check 'the top of the window says the repository can not be read, and why' ($hero.Title -match '^1 repository can.t be read$' -and $hero.Sub -match 'connection') "$($hero.Title) / $($hero.Sub)"
+        $lead = Read-Ui $win $UiPanel.Page $UiId.InfoLead
+        $why = Read-Ui $win $UiPanel.Page $UiId.InfoText
+        Check 'its page says it can not be read and why, with Open Settings and Try again' ($lead -match '^Can.t read this repository\.$' -and $why -match 'connection' -and $null -ne (Read-Ui $win $UiPanel.Page $UiId.Retry) -and $null -ne (Read-Ui $win $UiPanel.Page $UiId.OpenSettings)) "$lead $why"
+        Check 'the skills are still listed and on disk' (@(Read-Skills $win).Count -eq 3 -and @(Get-SkillNames $c).Count -eq 3)
+        $pic = Save-Shot $win '12-no-connection'
+        Test-Painted $pic $win 'a failed check' @(@($UiPanel.Hero, $UiId.HeroTitle), @($UiPanel.Page, $UiId.InfoLead), @($UiPanel.Page, $UiId.InfoText), @($UiPanel.Page, $UiId.Retry))
         Test-Layout $win 'a failed check'
+        Test-TabOrder $win 'a failed check'
         foreach ($case in @(@('404', 'Not found'), @('redirect', 'Repository moved'))) {
             $c.Proxy.SetMode('api', $case[0])
-            Click-Control $win 104
             $status = $case[1]
-            $row = Wait-Maybe { $r = @(Read-UiList $win 100 4); if ($r.Count -ge 1 -and $r[0][3] -eq $status) { $r[0] } } 30
-            Check "when GitHub answers $($case[0]), the repository says `"$status`"" ($null -ne $row) ($row -join ' | ')
+            Click-Ui $win $UiPanel.Page $UiId.Retry
+            $nav = Wait-Maybe { $n = @(Read-Nav $win); if ($n.Count -ge 1 -and $n[0].Sub -eq $status) { $n[0] } } 30
+            Check "when GitHub answers $($case[0]), Try again ends with the list saying `"$status`"" ($null -ne $nav) (Show-Nav $win)
             Start-Sleep -Milliseconds 400
-            $fit = Get-EditFit $win 111
-            Note ("the detail ($status): " + (Read-UiText $win 111))
-            Check "its explanation is shown in full ($status)" ($fit.Lines -le $fit.Visible) "$($fit.Lines) line(s), room for $($fit.Visible)"
-            $said = Read-Status $win
-            $room = Get-StatusFit $win ($said -replace ' \([^()]*\)$', '')
-            Note ("the status line ($status): $said ($($room.Needed) of $($room.Available) px; cut at its end when longer, the box above has the whole text)")
+            Note ("the page ($status): " + (Read-Ui $win $UiPanel.Page $UiId.InfoLead) + ' ' + ((Read-Ui $win $UiPanel.Page $UiId.InfoText) -replace '\s+', ' '))
         }
         $c.Proxy.SetMode('api', 'pass')
-        Click-Control $win 104
-        # Alpha is still edited, so a repository that is well again needs attention for that; "Checking" would not do.
-        $healed = Wait-Maybe { $r = @(Read-UiList $win 100 4); if ($r.Count -ge 1 -and $r[0][3] -match '^Needs attention') { $r[0] } } 30
-        Check 'when GitHub answers again, the next Check now clears the failure, and the edited skill is what the repository needs attention for' ($null -ne $healed) $(if ($healed) { $healed -join ' | ' } else { @(Read-UiList $win 100 4)[0] -join ' | ' })
+        Click-Ui $win $UiPanel.Page $UiId.Retry
+        # Alpha is still edited, so a repository that is well again needs the user for that.
+        $healed = Wait-Maybe { $n = @(Read-Nav $win); if ($n.Count -ge 1 -and $n[0].Sub -eq "3 skills $dot 1 needs you") { $n[0] } } 30
+        Check 'when GitHub answers again, Try again clears the failure, and the edited skill is what the repository needs you for' ($null -ne $healed -and $null -eq (Read-Ui $win $UiPanel.Page $UiId.InfoLead)) (Show-Nav $win)
 
         # ---- the tray menu
         $menu = Show-TrayMenu $tray
         Check 'the tray menu opens' ($menu -ne [IntPtr]::Zero)
         if ($menu -ne [IntPtr]::Zero) {
             $items = @([TssLive]::MenuItems($menu))
-            Check 'the menu offers Open settings (the default), Check now, and Quit after a separator' (($items -join ' | ') -eq 'Open settings (default) | Check now | - | Quit') ($items -join ' | ')
+            Check 'the menu offers Open Tiny Skill Sync (the default), Sync now, and Quit after a separator' (($items -join ' | ') -eq 'Open Tiny Skill Sync (default) | Sync now | - | Quit') ($items -join ' | ')
             New-Item -ItemType Directory -Force $Shots | Out-Null
-            [void][TssLive]::CaptureScreen($menu, (Join-Path $Shots '07-tray-menu.png'), 24)
+            [void][TssLive]::CaptureScreen($menu, (Join-Path $Shots '13-tray-menu.png'), 24)
             Hide-TrayMenu $tray
             $closed = Wait-Maybe { if ((Find-LiveWindow $tray.Id $MENU_CLASS -Visible) -eq [IntPtr]::Zero) { $true } } 4
             Check 'the menu goes away when it is dismissed' $closed
         }
 
+        # ---- the window keeps the size it is given
+        $dpi = [int][TssLive]::GetDpiForWindow($win)
+        [void][TssLive]::SetWindowPos($win, [IntPtr]::Zero, 0, 0, [int](860 * $dpi / 96), [int](600 * $dpi / 96), 0x16)
+        [void][TssLive]::PostMessageW($win, $WM_EXITSIZEMOVE, [IntPtr]::Zero, [IntPtr]::Zero)
+        $client = ([TssLive]::Client($win)) -split ','
+        $want = '{0} {1}' -f [math]::Floor([int]$client[0] * 96 / $dpi), [math]::Floor([int]$client[1] * 96 / $dpi)
+        $sizeFile = Join-Path $c.Home 'window.txt'
+        $saved = Wait-Maybe { $t = $(try { [IO.File]::ReadAllText($sizeFile).Trim() } catch { '' }); if ($t -eq $want) { $t } } 5
+        Check 'a window given a new size remembers it' ($null -ne $saved) ("window.txt: " + $(try { [IO.File]::ReadAllText($sizeFile).Trim() } catch { '-' }) + "; wanted $want at $dpi dpi")
+        $pic = Save-Shot $win '14-smaller'
+        Test-Painted $pic $win 'a smaller window' @(@($UiPanel.Hero, $UiId.Sync), @($UiPanel.Nav, $UiId.NavSettings), @($UiPanel.Page, $UiId.More))
+        Test-Layout $win 'a smaller window'
+        Test-TabOrder $win 'a smaller window'
+
         # ---- closing, and starting the app a second time
-        Send-Key (Get-Control $win 106) $VK_ESCAPE
-        $closed = Wait-Maybe { if ((Find-LiveWindow $tray.Id $SETTINGS_CLASS -Visible) -eq [IntPtr]::Zero) { $true } } 5
-        Check 'Esc closes the settings window, and the app keeps running' ($closed -and -not $tray.HasExited)
+        Send-Key (Get-Ui $win $UiPanel.Nav $UiId.NavAdd) $VK_ESCAPE
+        $closed = Wait-Maybe { if ((Find-LiveWindow $tray.Id $WINDOW_CLASS) -eq [IntPtr]::Zero) { $true } } 5
+        Check 'Esc closes the window, and the app keeps running' ($closed -and -not $tray.HasExited)
         $second = Start-LiveTray $c.Root @() (Get-EnvOf $c @{ TSS_BENCH_REPORT = $c.Report })
         $ended = $second.WaitForExit(8000)
         if (-not $ended) { Stop-Process -Id $second.Id -Force }
-        $win = Wait-Maybe { $w = Find-LiveWindow $tray.Id $SETTINGS_CLASS -Visible; if ($w -ne [IntPtr]::Zero) { $w } } 8
-        Check 'starting the app a second time ends the new copy and opens the settings window of the running one' ($ended -and $null -ne $win) "the second copy ended: $ended"
+        $win = Wait-Maybe { $w = Find-LiveWindow $tray.Id $WINDOW_CLASS -Visible; if ($w -ne [IntPtr]::Zero) { $w } } 8
+        Check 'starting the app a second time ends the new copy and opens the window of the running one' ($ended -and $null -ne $win) "the second copy ended: $ended"
         if ($null -ne $win) {
             Start-Sleep -Milliseconds 500
-            Check 'the reopened window still has the repository' (@(Read-UiList $win 100 4).Count -eq 1)
+            $client = ([TssLive]::Client($win)) -split ','
+            $dpi = [int][TssLive]::GetDpiForWindow($win)
+            $now = @([math]::Floor([int]$client[0] * 96 / $dpi), [math]::Floor([int]$client[1] * 96 / $dpi))
+            $was = @($want -split ' ' | ForEach-Object { [int]$_ })
+            Check 'it opens at the size it was given, with the repository still there' ([math]::Abs($now[0] - $was[0]) -le 1 -and [math]::Abs($now[1] - $was[1]) -le 1 -and @(Read-Nav $win).Count -eq 1) ("$($now -join ' ') for $want; " + (Show-Nav $win))
 
-            # ---- bad input in the add box
-            Set-UiText $win 106 'not a repo'
-            Click-Control $win 108
-            # The click is posted, so the line still shows the last check's "Checked: ..." until the window has answered.
-            $says = Wait-Maybe { $s = Read-Status $win; if ($s -like 'Enter a repository*') { $s } } 5
-            Check 'an address that is not a repository is refused, with a sentence on the status line' ($null -ne $says -and @(Read-UiList $win 100 4).Count -eq 1) $(if ($says) { $says } else { Read-Status $win })
-            Check 'and what was typed stays in the box to be corrected' ((Read-UiText $win 106) -eq 'not a repo')
-            Set-UiText $win 106 (Get-Address $c)
-            Click-Control $win 108
-            $says = Wait-Maybe { $s = Read-Status $win; if ($s -match 'already') { $s } } 5
-            Check 'adding the same repository twice is refused, and says so' ($null -ne $says -and @(Read-UiList $win 100 4).Count -eq 1) $says
-            [void](Save-Shot $win '08-refused')
+            # ---- bad input in the Add question
+            Click-Ui $win $UiPanel.Nav $UiId.NavAdd
+            $ask = Wait-Maybe { $d = Find-Ask $tray; if ($d -ne [IntPtr]::Zero) { $d } } 8
+            Check 'Add repository asks again' ($null -ne $ask)
+            if ($null -ne $ask) {
+                $edit = Get-Ui $ask $AskPanel $AskId.Edit
+                Set-UiText $edit 'not a repo'
+                $hint = Wait-Maybe { $t = Read-Ui $ask $AskPanel $AskId.Hint; if ($t -and $t -notlike 'owner/name*') { $t } } 5
+                Click-Ui $ask $AskPanel $AskId.Ok
+                Start-Sleep -Milliseconds 600
+                Check 'an address that is not a repository is refused: the question stays, says why, and keeps what was typed' ($null -ne $hint -and (Find-Ask $tray) -ne [IntPtr]::Zero -and [TssLive]::Text($edit) -eq 'not a repo' -and @(Read-Nav $win).Count -eq 1) $hint
+                Set-UiText $edit (Get-Address $c)
+                $hint = Wait-Maybe { $t = Read-Ui $ask $AskPanel $AskId.Hint; if ($t -match 'already set up') { $t } } 5
+                Click-Ui $ask $AskPanel $AskId.Ok
+                Start-Sleep -Milliseconds 600
+                Check 'adding the same repository twice is refused, and says so' ($null -ne $hint -and (Find-Ask $tray) -ne [IntPtr]::Zero -and @(Read-Nav $win).Count -eq 1) $hint
+                [void](Save-Shot $ask '15-refused')
 
-            # ---- a repository with no skills at its top: what the window says
-            Set-UiText $win 106 "https://github.com/$($c.Repo)"
-            Click-Control $win 107
-            Click-Control $win 108
-            $row = Wait-Maybe { $r = @(Read-UiList $win 100 4); if ($r.Count -eq 2 -and $r[1][3] -match 'No skills found') { $r[1] } } 40
-            Check 'a repository with no skills at its top says "No skills found"' ($null -ne $row) ($row -join ' | ')
-            $says = Wait-Maybe { $s = Read-Status $win; if ($s -match 'no skills found') { $s } } 5
-            Check 'and the status line says so too, not "up to date"' ($null -ne $says) $(if ($says) { $says } else { Read-Status $win })
-            $detail = Wait-Maybe { $t = Read-UiText $win 111; if ($t -match 'No skills were found') { $t } } 8
-            Note ('the detail: ' + $detail)
-            $fit = Get-EditFit $win 111
-            Check 'its explanation, which ends with what to do about it, is shown in full' ($fit.Lines -le $fit.Visible) "$($fit.Lines) line(s), room for $($fit.Visible)"
-            $pic = Save-Shot $win '09-no-skills-found'
-            Test-Painted $pic $win 'a repository without skills'
-            Test-Layout $win 'a repository without skills'
+                # ---- a repository with no skills at its top: what the window says
+                Set-UiText $edit "https://github.com/$($c.Repo)"
+                [void](Wait-Maybe { $t = Read-Ui $ask $AskPanel $AskId.Hint; if ($t -match 'top of the repository') { $t } } 5)
+                Click-Ui $ask $AskPanel $AskId.Ok
+                $nav = Wait-Maybe { $n = @(Read-Nav $win); if ($n.Count -eq 2 -and $n[1].Sub -eq 'No skills found') { $n[1] } } 40
+                Check 'a repository with no skills at its top says "No skills found" in the list' ($null -ne $nav) (Show-Nav $win)
+                $lead = Read-Ui $win $UiPanel.Page $UiId.InfoLead
+                $why = Read-Ui $win $UiPanel.Page $UiId.InfoText
+                Note "its page: $lead $($why -replace '\s+', ' ')"
+                Check 'its page says so, and what to do about it, with Try again' ($lead -eq 'No skills found.' -and $why -match 'No skills were found' -and $null -ne (Read-Ui $win $UiPanel.Page $UiId.Retry)) "$lead $why"
+                $pic = Save-Shot $win '16-no-skills-found'
+                Test-Painted $pic $win 'a repository without skills' @(@($UiPanel.Page, $UiId.InfoLead), @($UiPanel.Page, $UiId.InfoText), @($UiPanel.Nav, ($UiId.NavRepo + 1)))
+                Test-Layout $win 'a repository without skills'
+            }
         }
 
         $box = Find-LiveWindow $tray.Id '#32770'

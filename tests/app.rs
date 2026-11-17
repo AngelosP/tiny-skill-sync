@@ -32,7 +32,10 @@ fn last(mut settled: Vec<(Job, Settled)>) -> Settled {
 /// Answers the next job without an engine, as an engine that fails would.
 fn answer(app: &mut App, result: Result<Answer, EngineError>, next_wake: Option<i64>, now: i64) -> Settled {
     let order = app.next_order().expect("a job is waiting");
-    app.finish(Done { job: order.job, result, next_wake, last_checks: Vec::new(), kept: Vec::new(), lists_nothing: Vec::new(), stamp: None }, now)
+    app.finish(
+        Done { job: order.job, result, next_wake, last_checks: Vec::new(), kept: Vec::new(), lists_nothing: Vec::new(), private: Vec::new(), stamp: None },
+        now,
+    )
 }
 
 fn broken() -> Result<Answer, EngineError> {
@@ -98,6 +101,26 @@ fn the_first_start_looks_then_checks_then_sleeps_until_the_next_check_is_due() {
 }
 
 #[test]
+fn a_repository_found_to_be_private_is_shown_as_private_and_still_is_after_a_restart() {
+    let mut s = Setup::fresh("app-private");
+    s.tokens = FakeTokens::some("tok");
+    s.engine = s.restarted();
+    s.remote.make_private(REPO, "tok");
+    let mut app = started(&mut s);
+    assert!(!app.board.views(app.cfg(), T0)[0].private, "nothing was asked yet");
+
+    app.want(Job::Check(None));
+    run(&mut app, &mut s.engine, T0);
+    assert_eq!(s.w.skill_names(), ["alpha", "beta", "gamma"]);
+    assert!(app.board.views(app.cfg(), T0)[0].private);
+
+    let mut engine = s.restarted();
+    let mut again = app_for(&s);
+    run(&mut again, &mut engine, T0);
+    assert!(again.board.views(again.cfg(), T0)[0].private, "remembered");
+}
+
+#[test]
 fn a_job_that_is_already_waiting_covers_a_smaller_one() {
     let mut app = bare();
     assert!(!app.want(Job::Look), "starting up looks at the disk anyway");
@@ -143,6 +166,7 @@ fn quitting_drops_what_is_waiting_and_saves_last() {
         last_checks: Vec::new(),
         kept: Vec::new(),
         lists_nothing: Vec::new(),
+        private: Vec::new(),
         stamp: None,
     };
     app.finish(done, T0);
@@ -186,7 +210,7 @@ fn an_engine_that_cannot_work_is_an_error_and_is_tried_less_often_until_it_works
     let mut s = Setup::fresh("app-broken");
     let mut app = started(&mut s);
     app.on_timer(T0);
-    assert_eq!(answer(&mut app, broken(), Some(T0), T0), Settled::default());
+    assert_eq!(answer(&mut app, broken(), Some(T0), T0), Settled { stale_feedback: true, ..Settled::default() });
     assert_eq!(app.health(), Health::Error);
     assert_eq!(app.tooltip(), "Tiny Skill Sync: cannot read state.json");
     assert_eq!(app.arm(T0), Some(T0 + FAILURE_BACKOFF), "still due, but not in a loop");
@@ -309,6 +333,40 @@ fn a_conflict_is_shown_and_settled_as_the_user_chose() {
 }
 
 #[test]
+fn a_check_that_finds_nothing_new_does_not_say_all_is_well_while_a_skill_still_needs_the_user() {
+    let mut s = Setup::installed("app-nothing-new");
+    let mut app = started(&mut s);
+    app.want(Job::Check(None));
+    let told = last(run(&mut app, &mut s.engine, T0));
+    assert_eq!(told.feedback.as_deref(), Some("Checked: everything is up to date"));
+
+    s.w.write("alpha/SKILL.md", "my alpha\n");
+    app.want(Job::Check(None));
+    let told = last(run(&mut app, &mut s.engine, T0));
+    assert_eq!(app.health(), Health::Attention);
+    assert_eq!(told.feedback.as_deref(), Some("Checked: nothing new on GitHub"), "the edit still needs the user");
+}
+
+#[test]
+fn what_the_user_was_told_is_dropped_once_the_state_changes_without_them() {
+    let mut s = Setup::installed("app-told");
+    let mut app = started(&mut s);
+    app.want(Job::Check(None));
+    let told = last(run(&mut app, &mut s.engine, T0));
+    assert!(told.feedback.is_some());
+    assert!(!told.stale_feedback);
+
+    app.want(Job::Look);
+    assert!(!last(run(&mut app, &mut s.engine, T0)).stale_feedback, "nothing changed, so it still holds");
+
+    s.w.write("alpha/SKILL.md", "my alpha\n");
+    app.want(Job::Look);
+    let looked = last(run(&mut app, &mut s.engine, T0));
+    assert_eq!(app.health(), Health::Attention);
+    assert_eq!((looked.feedback, looked.stale_feedback), (None, true));
+}
+
+#[test]
 fn skills_gone_upstream_all_at_once_are_deleted_only_when_the_user_says_so() {
     let mut s = Setup::installed("app-gone");
     let mut app = started(&mut s);
@@ -327,6 +385,13 @@ fn skills_gone_upstream_all_at_once_are_deleted_only_when_the_user_says_so() {
     assert_eq!(told.feedback.as_deref(), Some("Checked: skills were updated"));
     // Nothing is left to settle, but a repository that lists no skills is not "up to date" either.
     assert_eq!(app.health(), Health::Attention);
+    assert_eq!(app.board.views(app.cfg(), T0)[0].status, "No skills found");
+
+    // GitHub now answers "not modified": the listing it stands for is still empty, and the user is told so again.
+    app.want(Job::Check(Some(fx())));
+    let told = last(run(&mut app, &mut s.engine, T0));
+    let label = app.cfg().repos[0].label();
+    assert_eq!(told.feedback, Some(format!("Checked: no skills found ({label})")));
     assert_eq!(app.board.views(app.cfg(), T0)[0].status, "No skills found");
 }
 
@@ -422,4 +487,38 @@ fn another_skills_folder_in_the_settings_is_taken_in_at_once_the_way_the_app_sta
     assert_eq!(answer(&mut app, Err(EngineError::Busy), None, T0), Settled::default());
     app.on_timer(T0 + BUSY_RETRY);
     assert_eq!(app.queued(), &[Job::Startup], "tried again while tss works, like the first start");
+}
+
+#[test]
+fn what_is_different_is_answered_to_the_window_and_is_neither_news_nor_a_failure_of_the_app() {
+    let mut s = Setup::installed("app-diff");
+    let mut app = started(&mut s);
+    s.w.write("alpha/SKILL.md", "my alpha\n");
+    let news = app.board.messages().count();
+    let alpha = || Job::Diff { repo: fx(), skill: "alpha".to_string() };
+
+    assert!(app.want(alpha()));
+    let order = app.next_order().unwrap();
+    assert_ne!(app.health(), Health::Working, "the window shows that it is reading, not the tray");
+    let settled = app.finish(app::perform(&mut s.engine, &order, &cancel_flag()), T0);
+    assert_eq!(settled.feedback, None);
+    let shown = settled.diff.expect("an answer for the window");
+    assert_eq!((shown.repo.as_str(), shown.skill.as_str()), ("fx", "alpha"));
+    assert_eq!(shown.result.unwrap().files.len(), 1);
+    assert_eq!(s.w.read("alpha/SKILL.md"), "my alpha\n");
+
+    app.want(alpha());
+    let shown = answer(&mut app, Err(EngineError::Busy), None, T0).diff.unwrap();
+    assert_eq!(shown.result, Err("Another check is running right now; try again in a moment".to_string()));
+    app.want(alpha());
+    let settled = answer(&mut app, Err(EngineError::Failed("the connection dropped".to_string())), Some(T0), T0);
+    assert_eq!((settled.feedback, settled.diff.unwrap().result), (None, Err("The connection dropped".to_string())));
+    assert_eq!(app.board.messages().count(), news, "looking is not news");
+    assert_eq!((app.health(), app.arm(T0)), (Health::Ok, Some(T0)), "nor a reason to wait before the next check");
+
+    app.on_timer(T0);
+    answer(&mut app, broken(), Some(T0), T0);
+    app.want(alpha());
+    answer(&mut app, Ok(Answer::Diffed(engine::DiffReport { on_github: true, here: true, files: Vec::new() })), Some(T0), T0);
+    assert_eq!((app.health(), app.arm(T0)), (Health::Error, Some(T0 + FAILURE_BACKOFF)), "nor proof that checks work again");
 }

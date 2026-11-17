@@ -49,14 +49,15 @@ path.
   confirm the file is unchanged (compare its hash). See [CONTRIBUTING.md](CONTRIBUTING.md#when-a-new-test-passes-at-once).
 - **Keep decisions pure.** New rules go into the pure modules (`reconcile`, `tree`, `scheduler`, `board`, `app`), so they
   can be tested without a disk, a network or a clock. Windows calls go into `src\win\`.
-- **Build windows from the control layer.** Use `Form` and the helpers in `src\win\ui\mod.rs`; add a helper there when
-  one is missing, rather than calling `CreateWindowExW` in a window's code. Never hold a `RefCell` borrow across a call
+- **Build windows from the control layer.** Describe a page as a `Surface` (in the pure `src\win\ui\page.rs`) and show
+  it with `control::set` (`src\win\ui\control.rs`); add a `Kind` or `Look` there when one is missing, rather than
+  calling `CreateWindowExW` in a window's code. Never hold a `RefCell` borrow across a call
   that runs a message loop (a question, the tray menu, `DestroyWindow`).
 - **Keep the worker off the UI thread.** Network calls, hashing and file changes run on the worker thread.
 - **Keep it small and quiet.** No new dependency without a measured reason. Nothing may wake up the idle app except its
   timer, its two folder notifications and the user. An unchanged poll reads and writes no file.
 - **Write plain English** in everything the user reads, and ASCII only in `tss` and script output.
-- **Measure what you change.** For anything on the start-up, idle, poll or settings-window path, run
+- **Measure what you change.** For anything on the start-up, idle, poll or window path, run
   `scripts\dev.ps1 bench` and keep every row within budget. Report measured numbers, not guesses.
 
 ## Before you say a change is done
@@ -66,7 +67,7 @@ path.
 3. If it touches file-system code: the tests also pass on another kind of drive if you have one
    (`scripts\dev.ps1 test -Root FOLDER`).
 4. If it touches speed, memory or disk use: `scripts\dev.ps1 bench` is within budget.
-5. If it changes what the app shows or does while it runs (the tray, the settings window, the visible result of a
+5. If it changes what the app shows or does while it runs (the tray, the window, the visible result of a
    check): the matching scenarios of `scripts\dev.ps1 e2e -Only ...` pass, and for a window you have looked at the
    screenshots they save.
 6. The docs say what the code does: [README.md](README.md) for users, [ARCHITECTURE.md](ARCHITECTURE.md) for how it

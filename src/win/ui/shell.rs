@@ -35,14 +35,14 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     WS_EX_TOOLWINDOW, WS_POPUP,
 };
 
-use super::{bench, dialogs, local_time, register_class, sentence, settings, tray, trim_memory};
-use crate::app::{App, Done, Job, Order, perform};
-use crate::board::{APP_NAME, Board, Level, RepoView, span};
+use super::page::{self, Note};
+use super::{bench, dialogs, register_class, sentence, tray, trim_memory, window};
+use crate::app::{App, Done, Job, Order, Shown, perform};
+use crate::board::{APP_NAME, Level, RepoView, span};
 use crate::cli::{Host, SystemHost};
 use crate::config::{CONFIG_FILE, Config, Paths};
 use crate::engine::{Engine, EngineError, Stamp, stamp_of};
 use crate::interval::{UnixSecs, now_secs};
-use crate::pathsafe::{printable, printable_lines};
 use crate::win::{wide, wide_os};
 
 /// Tray menu and remote-control commands, sent as `WM_COMMAND`.
@@ -51,7 +51,7 @@ pub const CMD_CHECK: usize = 1002;
 pub const CMD_QUIT: usize = 1003;
 /// The worker finished an order.
 const WM_WORKER: u32 = WM_APP + 2;
-/// Something changed: start the next job, set the timer, update the icon and the settings window.
+/// Something changed: start the next job, set the timer, update the icon and the window.
 const WM_KICK: u32 = WM_APP + 3;
 const TIMER_LOOK: usize = 1;
 /// A look at the skills folder waits until it has been quiet this long.
@@ -106,6 +106,8 @@ struct Shell {
     feedback: Option<String>,
     /// When the worker was handed the job it runs.
     sent_at: Option<Instant>,
+    /// The differences of a skill the worker read, until the window takes them.
+    diff: Option<Shown>,
 }
 
 thread_local! {
@@ -224,6 +226,7 @@ pub fn run() -> i32 {
         cfg_error: cfg_error.is_some(),
         feedback: None,
         sent_at: None,
+        diff: None,
         home,
     };
     SHELL.with(|s| *s.borrow_mut() = Some(shell));
@@ -231,7 +234,7 @@ pub fn run() -> i32 {
     bench::mark("tray", None);
     on_kick();
     if first_run || cfg_error.is_some() {
-        settings::open();
+        window::open();
     }
 
     let code = pump(None);
@@ -254,7 +257,7 @@ fn find_other(title: &str) -> HWND {
     unsafe { FindWindowW(wide(CLASS).as_ptr(), wide(title).as_ptr()) }
 }
 
-/// Another copy is running: open its settings window instead.
+/// Another copy is running: open its window instead.
 fn wake_other(title: &str) -> i32 {
     // It may still be starting.
     for _ in 0..20 {
@@ -330,6 +333,7 @@ impl Shell {
                         last_checks: Vec::new(),
                         kept: Vec::new(),
                         lists_nothing: Vec::new(),
+                        private: Vec::new(),
                         stamp: None,
                     };
                     self.on_done(failed);
@@ -360,6 +364,11 @@ impl Shell {
         }
         if settled.feedback.is_some() {
             self.feedback = settled.feedback;
+        } else if settled.stale_feedback {
+            self.feedback = None;
+        }
+        if settled.diff.is_some() {
+            self.diff = settled.diff;
         }
         // The job's own changes signalled the watch; a new one starts clean. Edits made while it ran show at the next look.
         if !matches!(job, Job::Look | Job::Plan | Job::Flush) {
@@ -371,7 +380,7 @@ impl Shell {
         if self.home_watch.is_none() {
             self.home_watch = Watch::open(&self.home, false, HOME_CHANGES);
         }
-        if matches!(job, Job::Startup | Job::Poll) && self.app.is_idle() && !settings::is_open() {
+        if matches!(job, Job::Startup | Job::Poll) && self.app.is_idle() && !window::is_open() {
             trim_memory();
         }
     }
@@ -460,7 +469,7 @@ impl Shell {
             return feedback.clone();
         }
         if self.cfg_error {
-            return "config.json cannot be read; see the messages below".to_string();
+            return CFG_UNREADABLE.to_string();
         }
         if !self.app.cfg().repos.iter().any(|r| r.enabled) {
             return "Add a repository to start".to_string();
@@ -472,45 +481,33 @@ impl Shell {
         }
     }
 
-    fn notes(&self) -> String {
-        notes_of(&self.app.board)
+    /// What stops everything, if anything does.
+    fn problem(&self) -> Option<String> {
+        if self.cfg_error {
+            return Some(CFG_UNREADABLE.to_string());
+        }
+        self.app.board.problem().or(self.app.board.failure()).map(str::to_string)
+    }
+
+    /// Something is happening, or just happened, that the status line says.
+    fn news(&self) -> bool {
+        self.app.busy().is_some_and(Job::shows_work) || self.feedback.is_some()
     }
 }
 
-/// The messages the settings window shows. Text that came from a repository is escaped (see `printable_lines`), so a
-/// skill or file name cannot reorder or hide what is shown.
-fn notes_of(board: &Board) -> String {
-    let mut lines = Vec::new();
-    for problem in board.problem().into_iter().chain(board.failure()) {
-        lines.push(format!("Problem: {}", printable(problem)));
-    }
-    if !board.orphans().is_empty() {
-        lines.push(format!(
-            "Skills recorded for repositories that are no longer in the settings are left alone: {}. To stop tracking them, run: tss remove ID",
-            printable(&board.orphans().join(", "))
-        ));
-    }
-    let messages: Vec<_> = board.messages().collect();
-    for message in messages.iter().rev() {
-        let level = match message.level {
-            Level::Error => "Error: ",
-            Level::Attention => "Attention: ",
-            Level::Ok => "",
-        };
-        lines.push(format!("{}  {level}{}", local_time(message.at), printable_lines(&message.text).replace('\n', "\r\n")));
-    }
-    lines.join("\r\n")
-}
+const CFG_UNREADABLE: &str = "config.json can’t be read; see Activity";
 
-/// What the settings window shows.
+/// What the main window shows.
 pub struct Snapshot {
     pub now: UnixSecs,
     pub cfg: Config,
     pub views: Vec<RepoView>,
     pub skills_dir: PathBuf,
     pub work_dir: PathBuf,
-    pub notes: String,
+    pub notes: Vec<Note>,
     pub status: String,
+    pub problem: Option<String>,
+    pub news: bool,
 }
 
 pub fn snapshot() -> Option<Snapshot> {
@@ -522,10 +519,17 @@ pub fn snapshot() -> Option<Snapshot> {
             views: s.app.board.views(s.app.cfg(), now),
             skills_dir: s.app.skills_dir().clone(),
             work_dir: s.paths().work_dir(),
-            notes: s.notes(),
+            notes: page::activity_of(&s.app.board),
             status: s.status(now),
+            problem: s.problem(),
+            news: s.news(),
         }
     })
+}
+
+/// The differences of a skill the worker read since this was last asked.
+pub fn take_diff() -> Option<Shown> {
+    with_shell(|s| s.diff.take()).flatten()
 }
 
 /// The user asked for a job. Whatever they were told about the last one gives way to it.
@@ -589,7 +593,7 @@ fn on_kick() {
         return;
     };
     tray::show(health, &tip);
-    settings::refresh();
+    window::refresh();
 }
 
 /// The handles the UI thread waits on. The folders are not watched while a job runs: the job changes them itself.
@@ -635,7 +639,7 @@ fn on_signal(handle: HANDLE) {
 
 /// Feeds a window's keyboard messages to the dialog manager: Tab, Enter and Escape work as in a dialog box.
 fn is_dialog_message(msg: &MSG) -> bool {
-    [dialogs::active(), settings::window()]
+    [dialogs::active(), window::window()]
         .into_iter()
         .filter(|w| !w.is_null())
         .any(|w| (msg.hwnd == w || unsafe { IsChild(w, msg.hwnd) } != 0) && unsafe { IsDialogMessageW(w, msg) } != 0)
@@ -684,14 +688,14 @@ pub fn pump(done: Option<&dyn Fn() -> bool>) -> i32 {
     }
 }
 
-/// Quitting: the settings window closes, the job that runs gets two seconds, what waits to be saved is saved, and
+/// Quitting: the main window closes, the job that runs gets two seconds, what waits to be saved is saved, and
 /// the icon goes. Safe to call more than once.
 fn shutdown() {
     if SHUT_DOWN.with(|s| s.replace(true)) {
         return;
     }
     bench::mark("quit", None);
-    settings::close();
+    window::close();
     with_shell(|s| {
         s.cancel.store(true, Ordering::Relaxed);
         s.app.quit();
@@ -716,8 +720,8 @@ fn shutdown() {
 fn show_menu(hwnd: HWND, x: i32, y: i32) {
     unsafe {
         let menu = CreatePopupMenu();
-        AppendMenuW(menu, MF_STRING, CMD_SETTINGS, wide("Open settings").as_ptr());
-        AppendMenuW(menu, MF_STRING, CMD_CHECK, wide("Check now").as_ptr());
+        AppendMenuW(menu, MF_STRING, CMD_SETTINGS, wide("Open Tiny Skill Sync").as_ptr());
+        AppendMenuW(menu, MF_STRING, CMD_CHECK, wide("Sync now").as_ptr());
         AppendMenuW(menu, MF_SEPARATOR, 0, null());
         AppendMenuW(menu, MF_STRING, CMD_QUIT, wide("Quit").as_ptr());
         SetMenuDefaultItem(menu, CMD_SETTINGS as u32, 0);
@@ -742,7 +746,7 @@ fn on_tray(hwnd: HWND, wp: WPARAM, lp: LPARAM) {
         let y = i32::from(((wp >> 16) & 0xFFFF) as u16 as i16);
         show_menu(hwnd, x, y);
     } else {
-        settings::open();
+        window::open();
     }
 }
 
@@ -752,7 +756,7 @@ fn on_command(hwnd: HWND, id: usize) {
         CMD_SETTINGS if !ask.is_null() => unsafe {
             SetForegroundWindow(ask);
         },
-        CMD_SETTINGS => settings::open(),
+        CMD_SETTINGS => window::open(),
         CMD_CHECK => {
             want(Job::Check(None));
         }
@@ -829,18 +833,5 @@ mod tests {
         assert_eq!(tag, instance_tag(Path::new(r"c:\users\someone\appdata\local\TINY-SKILL-SYNC")));
         assert_ne!(tag, instance_tag(Path::new(r"C:\Temp\tss-home")));
         assert_eq!(tag.len(), 16);
-    }
-
-    #[test]
-    fn the_messages_never_show_a_control_character_from_a_repository() {
-        let mut board = Board::new();
-        board.say(1_700_000_000, Level::Attention, "fx: a\u{1b}[2K\rb\u{202e}exe.pdf\nsecond line".to_string());
-        board.say(1_700_000_001, Level::Ok, "fx: plain".to_string());
-        let notes = notes_of(&board);
-        assert!(notes.contains("a\\u{1b}[2K\\u{d}b\\u{202e}exe.pdf\r\nsecond line"), "{notes:?}");
-        assert!(notes.contains("fx: plain"), "{notes:?}");
-        // What is left is the line break the edit box needs, written out as CR LF, and nothing else.
-        assert!(notes.chars().all(|c| matches!(c, '\r' | '\n') || !c.is_control()), "{notes:?}");
-        assert!(!notes.contains('\u{202e}'));
     }
 }

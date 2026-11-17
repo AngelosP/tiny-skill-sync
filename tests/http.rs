@@ -469,8 +469,8 @@ fn a_redirect_is_reported_and_never_followed() {
 const ERROR_ANSWERS: &[(u16, &str, bool, FailureKind, &str)] = &[
     (401, r#"{"message":"Bad credentials"}"#, true, FailureKind::Auth, "GitHub said: Bad credentials"),
     (403, r#"{"message":"Resource not accessible by personal access token"}"#, true, FailureKind::Auth, "Resource not accessible"),
-    (404, r#"{"message":"Not Found"}"#, false, FailureKind::NotFound, "'use token' is off"),
-    (404, r#"{"message":"Not Found"}"#, true, FailureKind::NotFound, "the token cannot see it"),
+    (404, r#"{"message":"Not Found"}"#, false, FailureKind::NotFound, "or it is private"),
+    (404, r#"{"message":"Not Found"}"#, true, FailureKind::NotFound, "your GitHub sign-in cannot see it"),
     (500, "", false, FailureKind::Server, "HTTP 500"),
     (503, "<html>unavailable</html>", false, FailureKind::Server, "HTTP 503"),
     (418, r#"{"message":"I'm a teapot"}"#, false, FailureKind::Protocol, "unexpected status (418) (GitHub said: I'm a teapot)"),
@@ -502,7 +502,7 @@ fn rate_limits_over_the_wire_carry_githubs_waiting_time() {
     let remote = server.remote();
     let e = tree_error(remote.tree(&at("", "primary"), None, None, &go()));
     assert_eq!((e.kind, e.retry_at), (FailureKind::RateLimited, Some(now + 600)), "{e}");
-    assert!(e.message.contains("'use token'"), "without a token the message says how to raise the limit: {e}");
+    assert!(e.message.contains("gh auth login"), "without a token the message says how to raise the limit: {e}");
     let e = tree_error(remote.tree(&at("", "secondary"), None, None, &go()));
     assert_eq!(e.kind, FailureKind::RateLimited, "{e}");
     let wait = e.retry_at.expect("a time to wait until") - now;

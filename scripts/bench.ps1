@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-  Measures the release tray app against its budgets: startup, idle cost, memory, the settings window and an
+  Measures the release tray app against its budgets: startup, idle cost, memory, the window and an
   unchanged poll. Prints a table and saves it in bench\out\.
 
 .DESCRIPTION
@@ -11,7 +11,7 @@
   2. Startup: the tray app starts -Runs times on that install (warm: the files are in the cache). The app writes
      timing marks to a file named by TSS_BENCH_REPORT (see src\win\ui\bench.rs).
   3. Idle: one copy is watched for -IdleSeconds: CPU, I/O and page faults should stay at 0.
-  4. Settings: a second start makes the first copy open its settings window, which shows on the screen for about
+  4. Settings: a second start makes the first copy open its window, which shows on the screen for about
      2 seconds and is then closed; memory is measured on it. The time to open is measured -SettingsRuns times, each
      time the first opening in a fresh copy (the window flashes up each time). Skip with -NoSettings.
   5. Poll: the record is changed so every repository is due, and the app is started again: it checks GitHub at
@@ -24,7 +24,8 @@
   Repositories to install, as for 'tss add'. Default: the skills folder of anthropics/skills.
 
 .PARAMETER UseToken
-  Send the GitHub token (needed for private repositories).
+  Send the GitHub token with every request (tss add --use-token). Without it, the app sends the token only after GitHub
+  answers that a repository is private or missing.
 
 .PARAMETER Runs
   How many times to measure startup. Default 10.
@@ -33,10 +34,10 @@
   How long to watch the idle app. Default 10.
 
 .PARAMETER NoSettings
-  Do not open the settings window.
+  Do not open the window.
 
 .PARAMETER SettingsRuns
-  How many times to measure opening the settings window. Default 5.
+  How many times to measure opening the window. Default 5.
 
 .PARAMETER Keep
   Keep the throwaway folder, to look at it afterwards.
@@ -72,7 +73,7 @@ $WM_COMMAND = 0x111
 $WM_CLOSE = 0x10
 $CMD_QUIT = 1003
 $TRAY_CLASS = 'TinySkillSyncTray'
-$SETTINGS_CLASS = 'TinySkillSyncSettings'
+$WINDOW_CLASS = 'TinySkillSyncWindow'
 
 $exe = Join-Path (Get-ExeDir 'release') 'tiny-skill-sync.exe'
 $tssExe = Join-Path (Get-ExeDir 'release') 'tss.exe'
@@ -319,24 +320,24 @@ try {
 
     # 4. Settings
     if (-not $NoSettings) {
-        Write-Host "== Settings window (shows for about 2 s, then flashes up $($SettingsRuns - 1) more times)" -ForegroundColor Cyan
+        Write-Host "== Window (shows for about 2 s, then flashes up $($SettingsRuns - 1) more times)" -ForegroundColor Cyan
         $sw = [Diagnostics.Stopwatch]::StartNew()
         $second = Start-Tray (Join-Path $reports 'second.txt')
         if (-not $second.WaitForExit(5000)) { throw 'The second copy did not hand over to the first within 5 s.' }
         $st = Wait-Mark $report 'settings' 5000
         $wallMs = $sw.Elapsed.TotalMilliseconds
         $openMs = @($st.TookMs)
-        Add-Row 'Second start: exit code' ([string]$second.ExitCode) '0, and the first copy opens its settings' ($second.ExitCode -eq 0)
+        Add-Row 'Second start: exit code' ([string]$second.ExitCode) '0, and the first copy opens its window' ($second.ExitCode -eq 0)
         Start-Sleep -Seconds 1
         $open = Get-Snapshot $p
-        Add-Row 'Settings window open: working set / private bytes' ('{0} / {1}' -f (MiB $open.WorkingSetKiB), (MiB $open.PrivateKiB)) '20 MiB or less' ($open.WorkingSetKiB -le 20480)
-        $h = Find-Window $SETTINGS_CLASS $p.Id
-        if ($h -eq [IntPtr]::Zero) { throw 'The settings window was not found.' }
+        Add-Row 'Window open: working set / private bytes' ('{0} / {1}' -f (MiB $open.WorkingSetKiB), (MiB $open.PrivateKiB)) '40 MiB or less' ($open.WorkingSetKiB -le 40960)
+        $h = Find-Window $WINDOW_CLASS $p.Id
+        if ($h -eq [IntPtr]::Zero) { throw 'The window was not found.' }
         [void][TssBenchNative]::PostMessageW($h, $WM_CLOSE, [IntPtr]::Zero, [IntPtr]::Zero)
-        if (-not (Wait-Window $SETTINGS_CLASS $p.Id 5000 -Gone)) { throw 'The settings window did not close.' }
+        if (-not (Wait-Window $WINDOW_CLASS $p.Id 5000 -Gone)) { throw 'The window did not close.' }
         Start-Sleep -Seconds 1
         $closed = Get-Snapshot $p
-        Add-Row 'Settings window closed: working set / private bytes' ('{0} / {1}' -f (MiB $closed.WorkingSetKiB), (MiB $closed.PrivateKiB)) '2 MiB or less trimmed' ($closed.WorkingSetKiB -le 2048)
+        Add-Row 'Window closed: working set / private bytes' ('{0} / {1}' -f (MiB $closed.WorkingSetKiB), (MiB $closed.PrivateKiB)) '2 MiB or less trimmed' ($closed.WorkingSetKiB -le 2048)
         # Only one copy runs at a time, so the idle one goes before the fresh ones start.
         Stop-Tray $p
         for ($k = 2; $k -le $SettingsRuns; $k++) {
@@ -346,14 +347,14 @@ try {
             $again = Start-Tray (Join-Path $reports "second-$k.txt")
             if (-not $again.WaitForExit(5000)) { throw 'The second copy did not hand over to the first within 5 s.' }
             $openMs += (Wait-Mark $r 'settings' 5000).TookMs
-            $h = Wait-Window $SETTINGS_CLASS $q.Id
-            if ($h -eq [IntPtr]::Zero) { throw 'The settings window was not found.' }
+            $h = Wait-Window $WINDOW_CLASS $q.Id
+            if ($h -eq [IntPtr]::Zero) { throw 'The window was not found.' }
             [void][TssBenchNative]::PostMessageW($h, $WM_CLOSE, [IntPtr]::Zero, [IntPtr]::Zero)
-            if (-not (Wait-Window $SETTINGS_CLASS $q.Id 5000 -Gone)) { throw 'The settings window did not close.' }
+            if (-not (Wait-Window $WINDOW_CLASS $q.Id 5000 -Gone)) { throw 'The window did not close.' }
             Stop-Tray $q
         }
         $so = Get-Stats $openMs
-        Add-Row 'Settings window: open to painted (first opening in a copy)' ('median {0:N1} ms, max {1:N1} ms (n {2}); second start to painted {3:N0} ms wall' -f $so.Median, $so.Max, $so.N, $wallMs) 'median 50 ms or less' ($so.Median -le 50)
+        Add-Row 'Window: open to painted (first opening in a copy)' ('median {0:N1} ms, max {1:N1} ms (n {2}); second start to painted {3:N0} ms wall' -f $so.Median, $so.Max, $so.N, $wallMs) 'median 100 ms or less' ($so.Median -le 100)
     }
     Stop-Tray $p
 

@@ -184,7 +184,7 @@ pub fn failure(resp: &Response, what: &str, authenticated: bool, now: i64) -> Re
             (None, Some(at)) if at > now => at,
             _ => now + DEFAULT_RATE_LIMIT_WAIT_SECS,
         };
-        let hint = if authenticated { "" } else { " Turning on 'use token' for the repository raises the limit." };
+        let hint = if authenticated { "" } else { " Signing in with the GitHub CLI (gh auth login) or saving a token in Settings raises the limit." };
         return RemoteError {
             kind: FailureKind::RateLimited,
             message: format!("GitHub's request limit has been reached; waiting before trying {what} again.{hint}"),
@@ -196,7 +196,7 @@ pub fn failure(resp: &Response, what: &str, authenticated: bool, now: i64) -> Re
         401 => RemoteError::new(FailureKind::Auth, format!("GitHub did not accept the token for {what}; it may have expired or been revoked{detail}")),
         403 => RemoteError::new(FailureKind::Auth, format!("GitHub refused access to {what}{detail}")),
         404 => {
-            let why = if authenticated { "or the token cannot see it" } else { "or it is private and 'use token' is off" };
+            let why = if authenticated { "or your GitHub sign-in cannot see it" } else { "or it is private" };
             RemoteError::new(FailureKind::NotFound, format!("GitHub could not find {what}: it may not exist, the branch or folder may be wrong, {why}"))
         }
         300..=399 => RemoteError::new(
@@ -339,8 +339,8 @@ mod tests {
         assert_eq!((by_message.kind, by_message.retry_at), (FailureKind::RateLimited, Some(1060)));
         let stale_reset = failure(&resp(403, &[("x-ratelimit-remaining", "0"), ("x-ratelimit-reset", "900")], "{}"), "r", true, now);
         assert_eq!(stale_reset.retry_at, Some(1060), "a reset time in the past still waits a little");
-        assert!(by_remaining.message.contains("use token"), "anonymous users are told how to get more room");
-        assert!(!by_429.message.contains("use token"));
+        assert!(by_remaining.message.contains("gh auth login"), "anonymous users are told how to get more room");
+        assert!(!by_429.message.contains("gh auth login"));
     }
 
     #[test]
@@ -367,7 +367,7 @@ mod tests {
             assert!(!e.message.is_empty());
         }
         assert!(failure(&resp(404, &[], ""), "r", false, now).message.contains("private"));
-        assert!(failure(&resp(404, &[], ""), "r", true, now).message.contains("token cannot see it"));
+        assert!(failure(&resp(404, &[], ""), "r", true, now).message.contains("sign-in cannot see it"));
         assert!(failure(&resp(403, &[], r#"{"message":"Resource not accessible"}"#), "r", true, now).message.contains("Resource not accessible"));
     }
 

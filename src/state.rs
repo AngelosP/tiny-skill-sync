@@ -94,6 +94,10 @@ pub struct RepoState {
     /// The last listing that was read had no skills in it at all, not even ones refused as unsafe.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub lists_nothing: bool,
+    /// GitHub showed the repository only to the user's GitHub sign-in: it is private, so the token is used from the
+    /// start. Learned by the app; the user never sets it.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub needs_token: bool,
 }
 
 impl RepoState {

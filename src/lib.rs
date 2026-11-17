@@ -8,6 +8,7 @@ pub mod apply;
 pub mod board;
 pub mod cli;
 pub mod config;
+pub mod diff;
 pub mod engine;
 pub mod fsx;
 pub mod github;

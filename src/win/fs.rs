@@ -6,11 +6,11 @@
 //! while a writer holds a file open, so every managed file is asked through its own handle.
 
 use std::ffi::OsString;
-use std::fs::OpenOptions;
+use std::fs::{File, OpenOptions};
 use std::io::{self, Read};
 use std::mem::offset_of;
 use std::os::windows::ffi::OsStringExt;
-use std::os::windows::fs::OpenOptionsExt;
+use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::ptr::{null, null_mut};
 
@@ -156,11 +156,41 @@ impl Default for FileHasher {
     }
 }
 
+/// A file read by [`FileHasher::read`].
+#[derive(Debug, PartialEq, Eq)]
+pub struct FileRead {
+    pub blob: String,
+    pub len: u64,
+    /// The file's bytes, when there were few enough to keep.
+    pub bytes: Option<Vec<u8>>,
+}
+
 impl FileHasher {
     /// Git blob SHA-1 of the file as it is now. Fails with `InvalidData` if the file changes size while being read.
     pub fn blob(&mut self, path: &Path) -> io::Result<String> {
         let mut file = OpenOptions::new().read(true).custom_flags(FILE_FLAG_SEQUENTIAL_SCAN).open(path)?;
         let len = file.metadata()?.len();
+        self.hash(&mut file, len, None)
+    }
+
+    /// Reads a plain file without following a link: its Git blob hash, and its bytes when there are at most `keep`.
+    /// A file longer than `limit` is not read (`FileTooLarge`); a link or a folder is not read either (`InvalidInput`).
+    pub fn read(&mut self, path: &Path, keep: u64, limit: u64) -> io::Result<FileRead> {
+        let mut file = OpenOptions::new().read(true).custom_flags(NO_FOLLOW | FILE_FLAG_SEQUENTIAL_SCAN).open(path)?;
+        let meta = file.metadata()?;
+        if kind_of(meta.file_attributes()) != Kind::File {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "it is a link or a folder"));
+        }
+        let len = meta.len();
+        if len > limit {
+            return Err(io::ErrorKind::FileTooLarge.into());
+        }
+        let mut bytes = (len <= keep).then(|| Vec::with_capacity(len as usize));
+        let blob = self.hash(&mut file, len, bytes.as_mut())?;
+        Ok(FileRead { blob, len, bytes })
+    }
+
+    fn hash(&mut self, file: &mut File, len: u64, mut keep: Option<&mut Vec<u8>>) -> io::Result<String> {
         let mut hasher = BlobHasher::new(len);
         let mut total = 0u64;
         loop {
@@ -173,6 +203,9 @@ impl FileHasher {
                 break;
             }
             hasher.update(&self.buf[..n]);
+            if let Some(bytes) = keep.as_mut() {
+                bytes.extend_from_slice(&self.buf[..n]);
+            }
         }
         if total != len {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "the file changed while it was being read"));
@@ -460,6 +493,29 @@ mod tests {
 
         fs::remove_dir(&junction).unwrap();
         assert!(outside.join("secret.txt").exists());
+        fs::remove_dir_all(dir).unwrap();
+        fs::remove_dir_all(outside).unwrap();
+    }
+
+    #[test]
+    fn a_file_is_read_with_its_hash_and_kept_only_when_small_and_a_link_is_never_read() {
+        let dir = temp("read");
+        fs::write(dir.join("f.txt"), b"hello\n").unwrap();
+        let outside = temp("read-outside");
+        fs::write(outside.join("secret.txt"), b"s").unwrap();
+        let junction = dir.join("junction");
+        let made = std::process::Command::new("cmd").args(["/C", "mklink", "/J"]).arg(&junction).arg(&outside).output().unwrap().status.success();
+        assert!(made, "creating a junction needs no privileges");
+        let mut hasher = FileHasher::default();
+        let blob = crate::hash::blob_hex(b"hello\n");
+        let read = |hasher: &mut FileHasher, keep, limit| hasher.read(&dir.join("f.txt"), keep, limit);
+
+        assert_eq!(read(&mut hasher, 6, 6).unwrap(), FileRead { blob: blob.clone(), len: 6, bytes: Some(b"hello\n".to_vec()) });
+        assert_eq!(read(&mut hasher, 5, 6).unwrap(), FileRead { blob, len: 6, bytes: None }, "hashed, but not kept");
+        assert_eq!(read(&mut hasher, 6, 5).unwrap_err().kind(), io::ErrorKind::FileTooLarge);
+        assert_eq!(hasher.read(&junction, 100, 100).unwrap_err().kind(), io::ErrorKind::InvalidInput, "the link is looked at, not followed");
+
+        fs::remove_dir(&junction).unwrap();
         fs::remove_dir_all(dir).unwrap();
         fs::remove_dir_all(outside).unwrap();
     }

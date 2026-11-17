@@ -15,7 +15,7 @@ it is called, does one piece of work, and returns a report.
 
 ```mermaid
 flowchart TD
-    You((You)) -->|click| Tray[Tray icon and settings window]
+    You((You)) -->|click| Tray[Tray icon and window]
     You -->|type| Tss[tss]
     Tray -->|orders| App[App: what runs next]
     App -->|one job at a time| Worker[Worker thread]
@@ -39,8 +39,9 @@ case by case. Code that talks to Windows is kept in `src\win\`.
 | `reconcile` | The decision table: given upstream, the record and the disk, what may be done to each skill? | yes |
 | `scheduler` | When is each repository due; how long to wait after a failure. | yes |
 | `interval` | `30m`, `6h`, `1d`, `2w`, `1mo` and calendar-month arithmetic. | yes |
-| `board` | What the tray and the settings window say: one line per repository and per skill, and the buttons. | yes |
+| `board` | What the tray and the window say: one line per repository and per skill, and the buttons. | yes |
 | `app` | The tray app without its windows: which job runs next and when to wake up. | yes |
+| `diff` | What is different between the GitHub copy of a skill and the copy on disk, line by line ("Show changes"). | yes |
 | `state` | `state.json`, the ownership record: what the app installed, file by file. | file I/O |
 | `verify` | Is a skill folder on disk still exactly what was installed? | file I/O |
 | `apply` | The only module that moves or deletes anything in the skills folder. | file I/O |
@@ -51,13 +52,13 @@ case by case. Code that talks to Windows is kept in `src\win\`.
 | `win::fs` | File facts `std` does not give: file id, USN, volume, links; one-handle folder listing. | Windows |
 | `win::http` | A small blocking HTTP client on WinHTTP. The only networking code. | Windows |
 | `win::cred`, `win::proc` | The token from Credential Manager, or from `gh auth token`. | Windows |
-| `win::ui` | The tray icon, the settings window, questions, and the small control layer they are built from. | Windows |
+| `win::ui` | The tray icon, the window, questions, and the controls they are drawn with (see [below](#the-tray-and-the-window)). | Windows |
 
 ## Threads and waking up
 
 The tray app has two threads.
 
-- The **UI thread** owns the hidden main window, the tray icon, the settings window and the message loop. It sleeps in
+- The **UI thread** owns the hidden main window, the tray icon, the window you open and the message loop. It sleeps in
   `MsgWaitForMultipleObjectsEx` on window messages and three handles: a waitable timer set to the next check, a change
   notification on the app's folder (`config.json`, `state.json`), and one on the skills folder. Nothing polls.
 - The **worker thread** owns the engine and runs one job at a time: the start-up look, a check, a resolution. Network
@@ -76,22 +77,22 @@ sequenceDiagram
     W-->>UI: done
     UI->>UI: update the icon, trim memory, set the timer
     Note over UI: asleep: 0 CPU, 0 I/O
-    UI->>W: Check job (timer fired, or "Check now")
+    UI->>W: Check job (timer fired, or "Sync now")
     W->>E: sync
     E-->>W: report
     W-->>UI: done
 ```
 
 Timed checks run in Windows' background mode (low I/O and CPU priority); the start-up look and checks you ask for run
-at normal priority. After the start-up job, after a timed check and when the settings window closes, the app trims its
+at normal priority. After the start-up job, after a timed check and when the window closes, the app trims its
 working set so it holds about 1 MiB while idle.
 
 `app.rs` guards against busy loops whatever the engine answers: a job that could not run at all is retried after
 5 minutes, doubling up to an hour; a job that found `tss` working is retried after a minute; two timed checks are at
 least 30 seconds apart; and after the computer wakes from sleep, the app waits 30 seconds for the network.
 
-A change in the skills folder only leads to a read-only look, two seconds after the last change, so the settings
-window shows an edit without waiting for the next check. Safety never depends on it: every change starts by comparing
+A change in the skills folder only leads to a read-only look, two seconds after the last change, so the window shows
+an edit without waiting for the next check. Safety never depends on it: every change starts by comparing
 the disk with the record. Settings that name another skills folder lead to a start-up job instead, retried like the
 first one, so the change of folder is recorded and reported at once (see [Files on disk](#files-on-disk)).
 
@@ -120,7 +121,14 @@ flowchart TD
   listing. If the branch moved during the download, a hash does not match, nothing is installed, and the check is
   tried again a minute later.
 - **The ETag is kept only when everything settled.** If anything was held, failed or was cancelled, the next check
-  lists again instead of getting a 304, so unfinished work is never forgotten.
+  lists again instead of getting a 304, so unfinished work is never forgotten. A 304 says nothing new about the skills,
+  so its report carries over what the record knew: a repository whose last listing had no skills still reports so.
+- **The token is sent only when it is needed** (`engine.rs`, `list`). A repository is listed without a token first, so
+  a public one never makes the app look for one. When GitHub answers "not found" (it may be private) or the limit for
+  anonymous requests is reached, it is listed once more with the token. A repository found to be private this way is
+  remembered in the record (`needs_token`), so later checks send the token at once, until it can be read without one
+  again. `use_token` in the settings sends it from the first request. Without a token, the failure is reported with
+  what to do; as with every failure, nothing is decided from it.
 - **`gh` is only a token source.** All requests are made by the app's own WinHTTP client.
 
 ## Deciding: the reconcile table
@@ -255,7 +263,7 @@ flowchart TD
 - `engine.lock` stops the tray and `tss` from working at the same time; the loser is told to try again.
 - The app keeps nothing inside the skills folder, so Copilot only ever sees skill folders.
 
-## The tray and the settings window
+## The tray and the window
 
 `board.rs` turns the engine's reports into what you see: a level per skill (fine, needs attention, error), a line of
 text, and the buttons that make sense. It is pure, so every sentence and button is tested. The newest news about a
@@ -263,29 +271,52 @@ skill wins; a failed check or a 304 says nothing new about the skills, so the la
 last listing had no skills in it says "No skills found". That comes from the record, not from an empty list of rows,
 because after a restart a repository whose skills were all held or skipped has no rows either.
 
-The windows (`src\win\ui\`) are plain Win32 controls (common controls 6, through the manifest), with no dialog templates
-and no COM. They are built from a small reusable control layer in `src\win\ui\mod.rs` (`Form` and helpers for labels,
-buttons, check boxes, edit boxes, combo boxes and list views, scaled for the screen's DPI). The settings window is
-created when opened and destroyed when closed, so it costs nothing while closed. A list keeps its rows when their
-number is unchanged, and only the cells that changed are set, so the selection and the scroll position stay. When the
-number changes, `lv_fill` refills it with drawing turned off and room for every row made at once, then paints it once:
-463 skills open in about 45 ms, where filling row by row took 68 ms.
+The windows (`src\win\ui\`) are Win32 windows with no dialog templates, no COM and no UI library: the app draws
+everything they show.
+
+- **`control.rs`** has one window class for every kind of control (button, skill row, switch, choice, list, entry in the
+  repository list, label) and one for a panel, which holds controls, scrolls them and draws what is behind them (cards,
+  dividers, icons, plain text). A page is a `Surface`: its items, each a real child window with an id and the text it
+  shows (so the tests find them), and its decorations. `set` matches a new surface with the controls already there by
+  id, so the focus, the hover and the scroll position survive a refresh. A window costs about 0.15 ms to make, so only
+  the controls within about two screens of what is shown are made (`NEAR`); the others are made as the page scrolls to
+  them, or when the window asks for one by id (`child`). 463 skills open in about 43 ms; with a control made for every
+  row it took 125 ms.
+- **`paint.rs`** draws each paint into one off-screen bitmap and copies it to the screen at once, so nothing flickers.
+  Rounded boxes are anti-aliased by hand (GDI cannot); text is drawn by GDI with ClearType. Positions are in DIPs and
+  become pixels at the window's DPI. A control has no background of its own: it asks its parent to draw what is under
+  it into the same bitmap (`WM_PAINTBG`), so its corners blend with the card beneath.
+- **`theme.rs`** holds the Windows 11 light and dark colours and the high contrast colours. It follows the app mode the
+  user chose in Windows (`AppsUseLightTheme`); `TSS_THEME=dark` or `light` overrides it, for screenshots. The title bar
+  and menus are asked to match through DWM and uxtheme, both loaded only when a window opens.
+- **`page.rs`** builds every page as a `Surface` from what the app knows. It calls no Windows function (text is
+  measured through a `Fit` the window passes in), so every layout and sentence is tested without a screen.
+- **`window.rs`** is the main window: the band at the top, the repositories down the left, the page on the right.
+  "Show changes" turns the whole window into the differences of one skill until Back (or Esc); the worker reads them
+  with `engine::diff`, which only reads, and `diff.rs` lines them up. The window is made when opened and destroyed when
+  closed (its fonts and bitmap released, the memory trimmed), so it costs nothing while closed. Its size is saved in
+  `window.txt` when you finish resizing it.
+- **`dialogs.rs`** asks questions in a small modal window drawn the same way, with a native edit box for typing. It is
+  not `TaskDialogIndirect`, which lives only in comctl32 version 6; the test executables do not load that, so importing
+  it would stop them from starting.
 
 A window procedure can be entered again while it runs (a control notifies its parent from inside the call that changed
 it). So the UI state lives in thread-local `RefCell`s borrowed only with `try_borrow_mut`, and no borrow is held across a
 call that runs a message loop (a question, the tray menu, `DestroyWindow`).
 
-The settings window explains things in two places. The status line at the bottom is one line and is cut at its end with
-an ellipsis, so a failed check puts the reason first and the repository last (`app.rs`, `summary`). When a listing was
-empty and nothing was left to do about it, the line says "no skills found", as the row does. The box under the
-skills list shows the whole text: the selected skill's, or the repository's when no skill is selected (`Row.detail`,
-`board.rs`). It has room for about three lines and a scroll bar, and Tab reaches it. Text that came from a repository
-passes through `printable` before it is shown, so a name cannot carry control or text-direction characters.
+The band at the top says how everything is in one title, the worst first: a problem of the app, repositories that
+can't be read, skills that need you, repositories that need you, the first check still to come, or all up to date. The
+line under it says where, when the last check was, and when the next one is (`page::hero_of`). While the app works, or
+just after it told you something, that line says so instead. After a check you asked for, it is `summary` in `app.rs`:
+a failed check puts the reason first, and a check that found nothing new says "Checked: nothing new on GitHub" unless
+all is well. A skill row opens to show its whole text (`Row.detail`, `board.rs`) and its buttons; a skill that needs
+you starts open. Text that came from a repository passes through `printable` before it is shown, so a name cannot carry
+control or text-direction characters.
 
 ## Measuring
 
 When `TSS_BENCH_REPORT` names a file, the tray app appends timing marks to it (`src\win\ui\bench.rs`): the tray icon
-shown, each finished job (with how long it took), the settings window painted, quit and exit. `scripts\bench.ps1` reads
+shown, each finished job (with how long it took), the window painted, quit and exit. `scripts\bench.ps1` reads
 the marks together with Windows' process counters and compares them with the budgets. Without the variable, nothing is
 written. `scripts\e2e.ps1` and `scripts\soak.ps1` read the same marks to know when a job has finished; the first also
 reads and drives the real windows with Win32 messages and measures whether text fits (`scripts\e2e-lib.ps1`). See
@@ -301,5 +332,7 @@ reads and drives the real windows with Win32 messages and measures whether text 
 | How edits are found | `verify.rs`, `win\fs.rs` |
 | Requests to GitHub | `github.rs`, `win\http.rs` |
 | When checks happen | `scheduler.rs`, `app.rs` |
-| What the user reads | `board.rs` (tray and settings), `cli.rs` (`tss`) |
-| The windows | `win\ui\settings.rs`, `win\ui\tray.rs`, `win\ui\dialogs.rs`, controls in `win\ui\mod.rs` |
+| What the user reads | `board.rs` (tray and window), `win\ui\page.rs` (the window's pages), `cli.rs` (`tss`) |
+| How two copies of a file are compared | `diff.rs` |
+| The windows | `win\ui\window.rs`, `win\ui\tray.rs`, `win\ui\dialogs.rs` |
+| How the windows look | `win\ui\control.rs` (controls), `win\ui\paint.rs` (drawing), `win\ui\theme.rs` (colours) |

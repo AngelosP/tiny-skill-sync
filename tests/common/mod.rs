@@ -242,6 +242,9 @@ struct FakeRepo {
     commits: Vec<String>,
     history: BTreeMap<String, BTreeMap<String, Vec<u8>>>,
     private_token: Option<String>,
+    /// Answers a listing without a token with this error, as GitHub does once its limit for anonymous requests is
+    /// reached.
+    anonymous_error: Option<RemoteError>,
     tree_error: Option<RemoteError>,
     commit_error: Option<RemoteError>,
     file_errors: BTreeMap<String, RemoteError>,
@@ -382,6 +385,15 @@ impl FakeRemote {
         self.with(repo, |r| r.private_token = Some(token.to_string()));
     }
 
+    pub fn make_public(&self, repo: &str) {
+        self.with(repo, |r| r.private_token = None);
+    }
+
+    /// Fails only the listings asked for without a token.
+    pub fn fail_anonymous(&self, repo: &str, error: Option<RemoteError>) {
+        self.with(repo, |r| r.anonymous_error = error);
+    }
+
     pub fn fail_tree(&self, repo: &str, error: Option<RemoteError>) {
         self.with(repo, |r| r.tree_error = error);
     }
@@ -489,6 +501,9 @@ impl Remote for Client {
         let g = fake.inner.lock().unwrap();
         let r = g.repos.get(&key(repo)).ok_or_else(|| not_found(&repo.label()))?;
         check_access(r, token, &repo.label())?;
+        if let Some(e) = r.anonymous_error.as_ref().filter(|_| token.is_none()) {
+            return Err(e.clone());
+        }
         if let Some(e) = &r.tree_error {
             return Err(e.clone());
         }

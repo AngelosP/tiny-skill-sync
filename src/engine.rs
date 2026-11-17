@@ -27,22 +27,32 @@ use std::time::{Duration, Instant};
 
 use crate::apply::{self, Applied, Applier, Mode, Note, Step};
 use crate::config::{Config, Paths, RepoConfig};
-use crate::fsx::exists_no_follow;
+use crate::diff::{self, Content, FileChange};
+use crate::fsx::{exists_no_follow, join_rel};
 use crate::github::{FailureKind, Remote, RemoteError, RepoRef, TokenProvider, TreeReply};
+use crate::hash::blob_hex;
 use crate::interval::{UnixSecs, now_secs};
-use crate::pathsafe::fold;
+use crate::pathsafe::{self, fold};
 use crate::reconcile::{self, Decision, DirtyInfo, Input, LocalState, OwnedView, Skip, Verdict};
 use crate::scheduler::Schedule;
 use crate::secret::Secret;
 use crate::state::{Fingerprint, Folder, OwnedSkill, Pending, State, VolumeId};
 use crate::tree::{self, Discovery, Rejected, SkillFile};
 use crate::verify::{self, Check, Stats, check_for_volume};
-use crate::win::fs::{Kind, probe, volume_id};
+use crate::win::fs::{self as winfs, FileHasher, Kind, probe, volume_id};
 
 const LOCK_FILE: &str = "engine.lock";
 const DEFAULT_LOCK_WAIT: Duration = Duration::from_secs(3);
 /// The most one check downloads. A skill that would go past it waits for the next check.
 pub const DEFAULT_MAX_DOWNLOAD: u64 = 512 * 1024 * 1024;
+/// Added to 'not found' when there is no token to try: the repository may be private.
+const SIGN_IN: &str = "To read a private repository, sign in with the GitHub CLI (gh auth login) or save a token in Settings";
+/// "Show changes" reads and downloads files of at most this size, and at most `DIFF_TOTAL_BYTES` from each side; it
+/// names the others without showing them.
+pub const DIFF_FILE_BYTES: u64 = 1 << 20;
+const DIFF_TOTAL_BYTES: u64 = 4 << 20;
+const TOO_BIG: &str = "it is too big to show";
+const TOO_MUCH: &str = "the other files that are different are already as much as can be shown";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Access {
@@ -269,6 +279,17 @@ pub struct RemoveReport {
     pub kept: Vec<(String, String)>,
 }
 
+/// What "Show changes" found for one skill.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DiffReport {
+    /// GitHub lists the skill. When it does not, every file on this PC shows as only here.
+    pub on_github: bool,
+    /// The skill's folder is on this PC.
+    pub here: bool,
+    /// The files that are different. Empty when the two copies are the same.
+    pub files: Vec<FileChange>,
+}
+
 type StepHook = Box<dyn FnMut(Step) -> Result<(), RemoteError> + Send>;
 
 /// Tells which drive a folder is on and whether that drive keeps a change journal.
@@ -407,15 +428,9 @@ impl Session {
         }
     }
 
-    fn token_for(&mut self, tokens: &dyn TokenProvider, repo: &RepoConfig) -> Result<Option<Arc<Secret>>, Failure> {
-        if !repo.use_token {
-            return Ok(None);
-        }
-        let resolved = self.token.get_or_insert_with(|| tokens.token().map(Arc::new));
-        match resolved {
-            Ok(t) => Ok(Some(Arc::clone(t))),
-            Err(why) => Err(Failure { kind: FailureKind::Auth, message: why.clone(), retry_at: None }),
-        }
+    /// The user's token, looked up at most once per session and only when a repository needs it.
+    fn token(&mut self, tokens: &dyn TokenProvider) -> Result<Arc<Secret>, String> {
+        self.token.get_or_insert_with(|| tokens.token().map(Arc::new)).clone()
     }
 
     fn ensure_preflight(&mut self) -> Result<(), RemoteError> {
@@ -476,6 +491,57 @@ fn root_len(applier: &Applier) -> usize {
     let skills = applier.skills_dir.to_string_lossy().chars().count();
     let work = applier.work_dir.to_string_lossy().chars().count() + 30;
     skills.max(work)
+}
+
+/// The files of a skill's folder on this PC, without following any link, or `None` when the folder is not there.
+fn files_here(dir: &Path) -> Result<Option<Vec<winfs::Found>>, EngineError> {
+    let cannot = |e: io::Error| failed(format!("{} cannot be read: {e}", dir.display()));
+    match winfs::Folder::open(dir).map_err(cannot)? {
+        None => Ok(None),
+        Some(folder) if folder.kind == Kind::Dir => folder.list_files().map(Some).map_err(cannot),
+        Some(_) => Err(failed(format!("{} is not a plain folder (a link is never followed)", dir.display()))),
+    }
+}
+
+/// The files on this PC that are different from GitHub, and the folded paths of the ones that are the same.
+type ReadHere = (Vec<(String, Content)>, HashSet<String>);
+
+/// Reads the files on this PC for "Show changes", comparing each with its copy on GitHub (`theirs`, by folded path).
+/// Bytes are kept only while there is room.
+fn read_here(dir: &Path, found: Vec<winfs::Found>, theirs: &HashMap<String, &SkillFile>, cancel: &AtomicBool) -> Result<ReadHere, EngineError> {
+    let mut hasher = FileHasher::default();
+    let mut budget = DIFF_TOTAL_BYTES;
+    let mut different = Vec::new();
+    let mut same = HashSet::new();
+    for file in found {
+        if cancel.load(Ordering::Relaxed) {
+            return Err(failed("showing the changes was stopped"));
+        }
+        if file.kind != Kind::File {
+            different.push((file.rel, Content::Hidden("it is a link, which is never followed".into())));
+            continue;
+        }
+        let key = fold(&file.rel);
+        let upstream = theirs.get(&key);
+        // A file too big to show that is larger than its copy on GitHub is different whatever it holds; it is not read.
+        let limit = upstream.map_or(0, |t| t.size).max(DIFF_FILE_BYTES);
+        let content = match hasher.read(&join_rel(dir, &file.rel), DIFF_FILE_BYTES.min(budget), limit) {
+            Ok(read) if upstream.is_some_and(|t| t.blob == read.blob) => {
+                same.insert(key);
+                continue;
+            }
+            Ok(winfs::FileRead { bytes: Some(bytes), len, .. }) => {
+                budget -= len;
+                Content::Bytes(bytes)
+            }
+            Ok(read) if read.len > DIFF_FILE_BYTES => Content::Hidden(TOO_BIG.into()),
+            Ok(_) => Content::Hidden(TOO_MUCH.into()),
+            Err(e) if e.kind() == io::ErrorKind::FileTooLarge => Content::Hidden(TOO_BIG.into()),
+            Err(e) => Content::Hidden(format!("it could not be read: {e}")),
+        };
+        different.push((file.rel, content));
+    }
+    Ok((different, same))
 }
 
 /// What one repository's check needs besides the session.
@@ -543,6 +609,11 @@ impl Engine {
     /// Whether the last listing read for a repository had no skills in it at all, as of the last call.
     pub fn lists_nothing(&self, repo_id: &str) -> bool {
         self.cache.state.repo(repo_id).is_some_and(|r| r.lists_nothing)
+    }
+
+    /// Whether a repository was found to be readable only with the user's GitHub sign-in, as of the last call.
+    pub fn needs_token(&self, repo_id: &str) -> bool {
+        self.cache.state.repo(repo_id).is_some_and(|r| r.needs_token)
     }
 
     /// The stamp of `state.json` as the last call left it, or `None` when it is not known. A different stamp on disk
@@ -833,6 +904,56 @@ impl Engine {
         Ok(reports)
     }
 
+    /// Lists a repository the way it can be read, and says which token (if any) did it. A repository the user marked
+    /// with `use_token` is read with the token only. Any other is read without one first, so a public repository never
+    /// makes the app look for the token. When GitHub then says 'not found' (it may be private) or that the limit for
+    /// anonymous requests is reached, it is read once more with the token. A repository found to be private this way
+    /// is remembered when `learn` is set, so later checks use the token straight away, and forgotten again once it can
+    /// be read without one. Whatever fails, the error is returned and nothing is decided from it.
+    fn list(
+        &self,
+        s: &mut Session,
+        repo: &RepoConfig,
+        repo_ref: &RepoRef,
+        etag: Option<&str>,
+        learn: bool,
+        cancel: &AtomicBool,
+    ) -> Result<(TreeReply, Option<Arc<Secret>>), Failure> {
+        let tree = |token: Option<&Arc<Secret>>| self.remote.tree(repo_ref, etag, token.map(Arc::as_ref), cancel);
+        if repo.use_token {
+            let token = s.token(self.tokens.as_ref()).map_err(|why| Failure { kind: FailureKind::Auth, message: why, retry_at: None })?;
+            return Ok((tree(Some(&token))?, Some(token)));
+        }
+        let remembered = s.state.repo(&repo.id).is_some_and(|r| r.needs_token);
+        if remembered {
+            if let Ok(token) = s.token(self.tokens.as_ref()) {
+                return Ok((tree(Some(&token))?, Some(token)));
+            }
+        }
+        match tree(None) {
+            Ok(reply) => {
+                if remembered && learn {
+                    s.state.repo_mut(&repo.id).needs_token = false;
+                    s.must_save = true;
+                }
+                Ok((reply, None))
+            }
+            Err(e) if matches!(e.kind, FailureKind::NotFound | FailureKind::RateLimited) => match s.token(self.tokens.as_ref()) {
+                Ok(token) => {
+                    let reply = tree(Some(&token))?;
+                    if e.kind == FailureKind::NotFound && !remembered && learn {
+                        s.state.repo_mut(&repo.id).needs_token = true;
+                        s.must_save = true;
+                    }
+                    Ok((reply, Some(token)))
+                }
+                Err(_) if e.kind == FailureKind::NotFound => Err(Failure { message: format!("{}. {SIGN_IN}", e.message), ..e.into() }),
+                Err(_) => Err(e.into()),
+            },
+            Err(e) => Err(e.into()),
+        }
+    }
+
     fn sync_repo(&self, s: &mut Session, repo: &RepoConfig, opts: &SyncOptions, cancel: &AtomicBool) -> RepoReport {
         let report = RepoReport::new(repo);
         let problems = repo.problems();
@@ -843,17 +964,12 @@ impl Engine {
             Ok(r) => r,
             Err(why) => return report.fail(Failure { kind: FailureKind::Local, message: why, retry_at: None }),
         };
-        let token = match s.token_for(self.tokens.as_ref(), repo) {
-            Ok(t) => t,
-            Err(f) => return report.fail(f),
-        };
-
         let stored_etag = if opts.ignore_etag { None } else { s.state.repo(&repo.id).and_then(|r| r.etag.clone()) };
-        let reply = match self.remote.tree(&repo_ref, stored_etag.as_deref(), token.as_deref(), cancel) {
+        let (reply, token) = match self.list(s, repo, &repo_ref, stored_etag.as_deref(), !opts.dry_run, cancel) {
             Ok(r) => r,
             // Whatever went wrong, it ends here: no decision is ever made from an error.
-            Err(e) if e.kind == FailureKind::Cancelled => return RepoReport { outcome: Outcome::Cancelled, ..report },
-            Err(e) => return report.fail(e),
+            Err(f) if f.kind == FailureKind::Cancelled => return RepoReport { outcome: Outcome::Cancelled, ..report },
+            Err(f) => return report.fail(f),
         };
         let (new_etag, snapshot) = match reply {
             TreeReply::NotModified if stored_etag.is_some() => {
@@ -862,6 +978,8 @@ impl Engine {
                     s.touch_check(&repo.id, self.now());
                 }
                 report.outcome = Outcome::Unchanged;
+                // The listing that "not modified" stands for is the one remembered.
+                report.lists_nothing = s.state.repo(&repo.id).is_some_and(|r| r.lists_nothing);
                 return report;
             }
             TreeReply::NotModified => {
@@ -1042,11 +1160,10 @@ impl Engine {
                     return Err(failed(problems.join("; ")));
                 }
                 let repo_ref = RepoRef::of(repo).map_err(failed)?;
-                let token = s.token_for(self.tokens.as_ref(), repo).map_err(|f| failed(f.message))?;
-                let snapshot = match self.remote.tree(&repo_ref, None, token.as_deref(), cancel) {
-                    Ok(TreeReply::Snapshot { snapshot, .. }) => snapshot,
-                    Ok(TreeReply::NotModified) => return Err(failed("GitHub answered 'not modified' to a request that had no ETag")),
-                    Err(e) => return Err(failed(e.message)),
+                let (reply, token) = self.list(s, repo, &repo_ref, None, true, cancel).map_err(|f| failed(f.message))?;
+                let snapshot = match reply {
+                    TreeReply::Snapshot { snapshot, .. } => snapshot,
+                    TreeReply::NotModified => return Err(failed("GitHub answered 'not modified' to a request that had no ETag")),
                 };
                 if snapshot.truncated {
                     return Err(failed("GitHub cut the listing short because the folder is too big"));
@@ -1083,6 +1200,83 @@ impl Engine {
                 }
             }
         }
+    }
+
+    /// What is different between a skill on GitHub and the copy on this PC. Changes nothing and remembers nothing (only
+    /// a check learns that a repository is private), and downloads only the files whose hash is not the same.
+    pub fn diff(&mut self, cfg: &Config, repo_id: &str, skill: &str, cancel: &AtomicBool) -> Result<DiffReport, EngineError> {
+        let repo = cfg.find(repo_id).ok_or_else(|| failed(format!("no repository '{repo_id}' is set up")))?;
+        pathsafe::check_component(skill).map_err(|e| failed(format!("'{skill}' is not a skill name ({e})")))?;
+        let mut s = self.begin(Access::ReadOnly)?;
+        let result = self.diff_in(&mut s, repo, skill, cancel);
+        self.finish(s);
+        result
+    }
+
+    fn diff_in(&self, s: &mut Session, repo: &RepoConfig, skill: &str, cancel: &AtomicBool) -> Result<DiffReport, EngineError> {
+        let problems = repo.problems();
+        if !problems.is_empty() {
+            return Err(failed(problems.join("; ")));
+        }
+        let repo_ref = RepoRef::of(repo).map_err(failed)?;
+        let dir = s.applier.skills_dir.join(skill);
+        let found = files_here(&dir)?;
+        let (reply, token) = self.list(s, repo, &repo_ref, None, false, cancel).map_err(|f| failed(f.message))?;
+        let snapshot = match reply {
+            TreeReply::Snapshot { snapshot, .. } => snapshot,
+            TreeReply::NotModified => return Err(failed("GitHub answered 'not modified' to a request that had no ETag")),
+        };
+        if snapshot.truncated {
+            return Err(failed("GitHub cut the listing short because the folder is too big"));
+        }
+        let single = tree::is_single_skill(&snapshot.entries);
+        let discovery = tree::discover(&snapshot.entries, &repo.single_skill_name(), root_len(&s.applier));
+        let key = fold(skill);
+        let upstream = discovery.skills.iter().find(|k| fold(&k.name) == key);
+        let files = upstream.map_or(&[][..], |k| k.files.as_slice());
+        let by_name: HashMap<String, &SkillFile> = files.iter().map(|f| (fold(&f.path), f)).collect();
+
+        let here = found.is_some();
+        let (ours, same) = match found {
+            Some(found) => read_here(&dir, found, &by_name, cancel)?,
+            None => Default::default(),
+        };
+        let mut theirs = Vec::new();
+        let mut commit: Option<String> = None;
+        let mut budget = DIFF_TOTAL_BYTES;
+        for file in files.iter().filter(|f| !same.contains(&fold(&f.path))) {
+            let content = if file.size > DIFF_FILE_BYTES {
+                Content::Hidden(TOO_BIG.into())
+            } else if file.size > budget {
+                Content::Hidden(TOO_MUCH.into())
+            } else {
+                budget -= file.size;
+                if commit.is_none() {
+                    commit = Some(self.remote.commit(&repo_ref, token.as_deref(), cancel).map_err(|e| failed(e.message))?);
+                }
+                let rel = if single { file.path.clone() } else { format!("{}/{}", upstream.map_or(skill, |k| k.name.as_str()), file.path) };
+                let mut bytes = Vec::with_capacity(file.size as usize);
+                let mut over = false;
+                let got = self.remote.file(&repo_ref, commit.as_deref().unwrap_or_default(), &rel, file.size, token.as_deref(), cancel, &mut |chunk| {
+                    over |= (bytes.len() + chunk.len()) as u64 > file.size;
+                    if !over {
+                        bytes.extend_from_slice(chunk);
+                    }
+                    !over
+                });
+                let changed = || failed(format!("{} changed on GitHub while it was being read; try again", file.path));
+                if over {
+                    return Err(changed());
+                }
+                got.map_err(|e| failed(e.message))?;
+                if blob_hex(&bytes) != file.blob {
+                    return Err(changed());
+                }
+                Content::Bytes(bytes)
+            };
+            theirs.push((file.path.clone(), content));
+        }
+        Ok(DiffReport { on_github: upstream.is_some(), here, files: diff::compare(theirs, ours) })
     }
 
     /// Stops managing a repository's skills. The caller removes the repository from the settings afterwards.

@@ -1,4 +1,4 @@
-//! What the tray and the settings window show: one honest line per repository and per skill.
+//! What the tray and the window show: one honest line per repository and per skill.
 //!
 //! This is a pure model, so every sentence and every button can be tested. The engine reports what it found
 //! (`StartupReport`, `VerifyReport`, `SyncReport`); the board remembers the newest word about each skill and turns it
@@ -25,6 +25,11 @@ pub const APP_NAME: &str = "Tiny Skill Sync";
 /// A tray tooltip holds 127 UTF-16 units (128 with the closing zero).
 pub const TOOLTIP_UNITS: usize = 127;
 const MAX_MESSAGES: usize = 30;
+
+/// "owner/repo" from a label such as "owner/repo@main : skills"; neither part of a repository name has '@' or a space.
+pub fn repo_name(label: &str) -> &str {
+    label.split(['@', ' ']).next().unwrap_or(label)
+}
 
 /// How serious something is. The worst one wins when levels are rolled up.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -65,9 +70,9 @@ pub enum Action {
 impl Action {
     pub fn label(self) -> &'static str {
         match self {
-            Action::Overwrite => "Replace with upstream",
+            Action::Overwrite => "Use the GitHub version",
             Action::Restore => "Restore",
-            Action::KeepMine => "Keep mine",
+            Action::KeepMine => "Keep my version",
             Action::LeaveRemoved => "Leave it deleted",
             Action::ManageAgain => "Manage again",
             Action::RemoveThem => "Delete them",
@@ -88,7 +93,10 @@ impl Action {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Row {
     pub name: String,
+    /// The whole sentence: what is the matter and what the app will do.
     pub text: String,
+    /// A few words for a label next to the name: "Up to date", "Edited on this PC".
+    pub tag: &'static str,
     pub level: Level,
     pub actions: Vec<Action>,
 }
@@ -105,6 +113,8 @@ pub struct RepoView {
     pub level: Level,
     /// The last check that got a real answer from GitHub.
     pub last_check: Option<UnixSecs>,
+    /// Read with the GitHub token: the user said so, or GitHub could not find it without one.
+    pub private: bool,
     /// What needs the user first, then by name.
     pub skills: Vec<Row>,
 }
@@ -185,7 +195,7 @@ impl SkillBoard {
 
     fn row(&self) -> Row {
         let shown = present(self.local.as_ref(), self.fact.as_ref());
-        Row { name: self.name.clone(), text: shown.text, level: shown.level, actions: shown.actions }
+        Row { name: self.name.clone(), text: shown.text, tag: shown.tag, level: shown.level, actions: shown.actions }
     }
 }
 
@@ -225,22 +235,55 @@ fn hint_of(verdict: &Verdict) -> Option<LocalStatus> {
 
 struct Shown {
     text: String,
+    tag: &'static str,
     level: Level,
     actions: Vec<Action>,
 }
 
-fn shown(text: impl Into<String>, level: Level, actions: &[Action]) -> Shown {
-    Shown { text: text.into(), level, actions: actions.to_vec() }
+fn shown(text: impl Into<String>, tag: &'static str, level: Level, actions: &[Action]) -> Shown {
+    Shown { text: text.into(), tag, level, actions: actions.to_vec() }
 }
 
 const EDITED: [Action; 2] = [Action::Overwrite, Action::KeepMine];
 const DELETED: [Action; 2] = [Action::Restore, Action::LeaveRemoved];
+pub const UP_TO_DATE_TAG: &str = "Up to date";
+pub const INSTALLED_TAG: &str = "Installed";
+pub const EDITED_TAG: &str = "Edited on this PC";
+pub const DELETED_TAG: &str = "Deleted on this PC";
+const UPDATE_TAG: &str = "Update available";
+const REMOVED_TAG: &str = "Removed on GitHub";
+const NEW_TAG: &str = "New";
+const DIFFERENT_TAG: &str = "Different copy here";
+const LISTS_NOTHING_TAG: &str = "GitHub lists nothing";
+const KEPT_TAG: &str = "Kept as yours";
+const CLASH_TAG: &str = "Name clash";
+const NOT_SAFE_TAG: &str = "Not safe";
+const NOT_CHANGED_TAG: &str = "Not changed";
+const FAILED_TAG: &str = "Failed";
+const INTERRUPTED_TAG: &str = "Interrupted";
+
+impl Row {
+    /// "Show changes" has something to show: a copy here that may differ from GitHub's, under a name that is safe to
+    /// look up and in a folder this repository owns.
+    pub fn can_compare(&self) -> bool {
+        matches!(
+            self.tag,
+            EDITED_TAG | UPDATE_TAG | REMOVED_TAG | DIFFERENT_TAG | LISTS_NOTHING_TAG | KEPT_TAG | NOT_CHANGED_TAG | FAILED_TAG | INTERRUPTED_TAG
+        )
+    }
+
+    /// There may be a folder to open.
+    pub fn has_folder(&self) -> bool {
+        !matches!(self.tag, DELETED_TAG | NEW_TAG | NOT_SAFE_TAG)
+    }
+}
 
 /// Puts what is known about the disk and about upstream together. An edit or a deletion is the user's doing and is
 /// shown the same way whatever upstream says; the choices differ only where upstream has no version to offer.
 fn present(local: Option<&LocalStatus>, fact: Option<&Fact>) -> Shown {
+    use Level::{Attention, Ok};
     if let Some(LocalStatus::Interrupted) = local {
-        return shown(Verdict::Held(Hold::Interrupted).message(), Level::Attention, &[]);
+        return shown(Verdict::Held(Hold::Interrupted).message(), INTERRUPTED_TAG, Attention, &[]);
     }
     let state = match local {
         Some(LocalStatus::Checked(state)) => Some(state),
@@ -248,31 +291,31 @@ fn present(local: Option<&LocalStatus>, fact: Option<&Fact>) -> Shown {
     };
     match fact {
         None | Some(Fact::InSync) => match state {
-            Some(LocalState::Dirty(info)) => shown(Verdict::ModifiedLocally(info.clone()).message(), Level::Attention, &EDITED),
-            Some(LocalState::FolderMissing) => shown(Verdict::MissingLocally.message(), Level::Attention, &DELETED),
-            _ if fact.is_some() => shown(Verdict::InSync.message(), Level::Ok, &[]),
-            _ => shown("Installed", Level::Ok, &[]),
+            Some(LocalState::Dirty(info)) => shown(Verdict::ModifiedLocally(info.clone()).message(), EDITED_TAG, Attention, &EDITED),
+            Some(LocalState::FolderMissing) => shown(Verdict::MissingLocally.message(), DELETED_TAG, Attention, &DELETED),
+            _ if fact.is_some() => shown(Verdict::InSync.message(), UP_TO_DATE_TAG, Ok, &[]),
+            _ => shown("Installed", INSTALLED_TAG, Ok, &[]),
         },
         Some(Fact::Newer) => match state {
-            Some(LocalState::Dirty(info)) => shown(Verdict::Held(Hold::UpdateBlocked(info.clone())).message(), Level::Attention, &EDITED),
-            Some(LocalState::FolderMissing) => shown(Verdict::Held(Hold::UpdateBlockedMissing).message(), Level::Attention, &DELETED),
-            _ => shown("Update available: will be installed at the next check", Level::Ok, &[]),
+            Some(LocalState::Dirty(info)) => shown(Verdict::Held(Hold::UpdateBlocked(info.clone())).message(), EDITED_TAG, Attention, &EDITED),
+            Some(LocalState::FolderMissing) => shown(Verdict::Held(Hold::UpdateBlockedMissing).message(), DELETED_TAG, Attention, &DELETED),
+            _ => shown("Update available: will be installed at the next check", UPDATE_TAG, Ok, &[]),
         },
         Some(Fact::Removed) => match state {
-            Some(LocalState::Dirty(info)) => shown(Verdict::Held(Hold::DeleteBlocked(info.clone())).message(), Level::Attention, &[Action::KeepMine]),
-            Some(LocalState::FolderMissing) => shown(Verdict::Forget.message(), Level::Ok, &[]),
-            _ => shown(Verdict::Delete.message(), Level::Ok, &[]),
+            Some(LocalState::Dirty(info)) => shown(Verdict::Held(Hold::DeleteBlocked(info.clone())).message(), EDITED_TAG, Attention, &[Action::KeepMine]),
+            Some(LocalState::FolderMissing) => shown(Verdict::Forget.message(), REMOVED_TAG, Ok, &[]),
+            _ => shown(Verdict::Delete.message(), REMOVED_TAG, Ok, &[]),
         },
-        Some(Fact::New) => shown(Verdict::Install.message(), Level::Ok, &[]),
-        Some(Fact::Adopting) => shown("Already installed and identical: will be managed at the next check", Level::Ok, &[]),
-        Some(Fact::NameTaken) => shown(Verdict::Held(Hold::UnmanagedDiffers).message(), Level::Attention, &EDITED),
-        Some(Fact::EmptyListing) => shown(Verdict::Held(Hold::MassDeletion).message(), Level::Attention, &[Action::RemoveThem, Action::KeepMine]),
-        Some(Fact::Kept) => shown(Verdict::Skipped(Skip::Ignored).message(), Level::Ok, &[Action::ManageAgain]),
-        Some(Fact::Waiting) => shown("Managed again: the next check will handle it", Level::Ok, &[]),
-        Some(Fact::Clash(owner)) => shown(Verdict::Skipped(Skip::Collision { owner: owner.clone() }).message(), Level::Attention, &[]),
-        Some(Fact::NotSafe(reason)) => shown(Verdict::Skipped(Skip::Rejected { reason: reason.clone() }).message(), Level::Attention, &[]),
-        Some(Fact::Stopped(why)) => shown(format!("Not changed: {why}"), Level::Attention, &[]),
-        Some(Fact::Failed(why)) => shown(format!("Failed: {why}"), Level::Error, &[]),
+        Some(Fact::New) => shown(Verdict::Install.message(), NEW_TAG, Ok, &[]),
+        Some(Fact::Adopting) => shown("Already installed and identical: will be managed at the next check", "Will be managed", Ok, &[]),
+        Some(Fact::NameTaken) => shown(Verdict::Held(Hold::UnmanagedDiffers).message(), DIFFERENT_TAG, Attention, &EDITED),
+        Some(Fact::EmptyListing) => shown(Verdict::Held(Hold::MassDeletion).message(), LISTS_NOTHING_TAG, Attention, &[Action::RemoveThem, Action::KeepMine]),
+        Some(Fact::Kept) => shown(Verdict::Skipped(Skip::Ignored).message(), KEPT_TAG, Ok, &[Action::ManageAgain]),
+        Some(Fact::Waiting) => shown("Managed again: the next check will handle it", "Managed again", Ok, &[]),
+        Some(Fact::Clash(owner)) => shown(Verdict::Skipped(Skip::Collision { owner: owner.clone() }).message(), CLASH_TAG, Attention, &[]),
+        Some(Fact::NotSafe(reason)) => shown(Verdict::Skipped(Skip::Rejected { reason: reason.clone() }).message(), NOT_SAFE_TAG, Attention, &[]),
+        Some(Fact::Stopped(why)) => shown(format!("Not changed: {why}"), NOT_CHANGED_TAG, Attention, &[]),
+        Some(Fact::Failed(why)) => shown(format!("Failed: {why}"), FAILED_TAG, Level::Error, &[]),
     }
 }
 
@@ -285,6 +328,8 @@ struct RepoBoard {
     last_check: Option<UnixSecs>,
     /// The last listing had no skills in it at all.
     lists_nothing: bool,
+    /// GitHub could not find the repository without the token.
+    needs_token: bool,
 }
 
 impl RepoBoard {
@@ -370,7 +415,33 @@ impl Board {
             }
             repo.check = Some(repo_report.outcome.clone());
         }
+        for repo_report in &report.repos {
+            self.tell_changes(now, repo_report);
+        }
         self.tell(now, &report.notes, &report.warnings);
+    }
+
+    /// One message for each kind of change a check made on this PC. Up to three skills are named, more are counted.
+    fn tell_changes(&mut self, now: UnixSecs, report: &RepoReport) {
+        let from = repo_name(&report.label);
+        for verdict in [Verdict::Install, Verdict::Update, Verdict::Delete, Verdict::Adopt] {
+            let names: Vec<&str> = report.skills.iter().filter(|s| s.result == ApplyResult::Done && s.verdict == verdict).map(|s| s.name.as_str()).collect();
+            let what = match names.as_slice() {
+                [] => continue,
+                [one] => one.to_string(),
+                [a, b] => format!("{a} and {b}"),
+                [a, b, c] => format!("{a}, {b} and {c}"),
+                many => format!("{} skills", many.len()),
+            };
+            let (them, they) = if names.len() == 1 { ("it", "it is") } else { ("them", "they are") };
+            let text = match verdict {
+                Verdict::Install => format!("Installed {what} from {from}"),
+                Verdict::Update => format!("Updated {what} from {from}"),
+                Verdict::Delete => format!("Deleted {what}: {from} no longer has {them}"),
+                _ => format!("{what} on this PC matched {from}, so {they} now kept in sync"),
+            };
+            self.say(now, Level::Ok, text);
+        }
     }
 
     /// The user settled one skill, so the screen can say so before the next check.
@@ -395,6 +466,13 @@ impl Board {
     pub fn note_lists_nothing(&mut self, repo_id: &str, nothing: bool) {
         if nothing || self.repos.contains_key(repo_id) {
             self.repos.entry(repo_id.to_string()).or_default().lists_nothing = nothing;
+        }
+    }
+
+    /// Whether the engine found that the repository can only be read with the token, from what it remembers.
+    pub fn note_private(&mut self, repo_id: &str, needs_token: bool) {
+        if needs_token || self.repos.contains_key(repo_id) {
+            self.repos.entry(repo_id.to_string()).or_default().needs_token = needs_token;
         }
     }
 
@@ -513,6 +591,7 @@ impl Board {
             detail,
             level,
             last_check: board.and_then(|b| b.last_check),
+            private: repo.use_token || board.is_some_and(|b| b.needs_token),
             skills,
         }
     }
@@ -526,7 +605,7 @@ impl Board {
         }
     }
 
-    /// Adds a message to the log the settings window shows.
+    /// Adds a message to the log the window's Activity page shows.
     pub fn say(&mut self, at: UnixSecs, level: Level, text: String) {
         // The same message again is the same message: only when it was last seen changes.
         self.messages.retain(|m| !(m.level == level && m.text == text));
@@ -789,45 +868,78 @@ mod tests {
         let na = ApplyResult::NotApplicable;
         let held = || ApplyResult::Held("busy".to_string());
         let broke = || ApplyResult::Failed("disk full".to_string());
-        let cases: Vec<(Verdict, ApplyResult, Level, Vec<Action>, &str)> = vec![
-            (Verdict::InSync, na.clone(), Level::Ok, vec![], "In sync"),
-            (Verdict::Install, ApplyResult::Done, Level::Ok, vec![], "In sync"),
-            (Verdict::Install, ApplyResult::DryRun, Level::Ok, vec![], "will be installed"),
-            (Verdict::Install, ApplyResult::NotTried, Level::Ok, vec![], "will be installed"),
-            (Verdict::Install, held(), Level::Attention, vec![], "Not changed: busy"),
-            (Verdict::Install, broke(), Level::Error, vec![], "Failed: disk full"),
-            (Verdict::Update, ApplyResult::Done, Level::Ok, vec![], "In sync"),
-            (Verdict::Update, ApplyResult::DryRun, Level::Ok, vec![], "Update available"),
-            (Verdict::Update, ApplyResult::NotTried, Level::Ok, vec![], "Update available"),
-            (Verdict::Update, held(), Level::Attention, vec![], "Not changed: busy"),
-            (Verdict::Update, broke(), Level::Error, vec![], "Failed: disk full"),
-            (Verdict::Adopt, ApplyResult::Done, Level::Ok, vec![], "In sync"),
-            (Verdict::Adopt, ApplyResult::DryRun, Level::Ok, vec![], "will be managed"),
-            (Verdict::Adopt, held(), Level::Attention, vec![], "Not changed"),
-            (Verdict::Delete, ApplyResult::DryRun, Level::Ok, vec![], "will be deleted"),
-            (Verdict::Delete, ApplyResult::NotTried, Level::Ok, vec![], "will be deleted"),
-            (Verdict::Delete, held(), Level::Attention, vec![], "Not changed"),
-            (Verdict::Delete, broke(), Level::Error, vec![], "Failed"),
-            (Verdict::Forget, ApplyResult::DryRun, Level::Ok, vec![], "Removed upstream and locally"),
-            (Verdict::ModifiedLocally(info("a.md")), na.clone(), Level::Attention, vec![Overwrite, KeepMine], "Edited locally (changed: a.md)"),
-            (Verdict::MissingLocally, na.clone(), Level::Attention, vec![Restore, LeaveRemoved], "Deleted locally"),
-            (Verdict::Held(Hold::UpdateBlocked(info("a.md"))), na.clone(), Level::Attention, vec![Overwrite, KeepMine], "Update held"),
-            (Verdict::Held(Hold::UpdateBlockedMissing), na.clone(), Level::Attention, vec![Restore, LeaveRemoved], "Update held"),
-            (Verdict::Held(Hold::DeleteBlocked(info("a.md"))), na.clone(), Level::Attention, vec![KeepMine], "Removal held"),
-            (Verdict::Held(Hold::UnmanagedDiffers), na.clone(), Level::Attention, vec![Overwrite, KeepMine], "already exists"),
-            (Verdict::Held(Hold::MassDeletion), na.clone(), Level::Attention, vec![RemoveThem, KeepMine], "no skills at all"),
-            (Verdict::Held(Hold::Interrupted), na.clone(), Level::Attention, vec![], "interrupted"),
-            (Verdict::Skipped(Skip::Ignored), na.clone(), Level::Ok, vec![ManageAgain], "Kept as yours"),
-            (Verdict::Skipped(Skip::Collision { owner: "o/b".to_string() }), na.clone(), Level::Attention, vec![], "o/b"),
-            (Verdict::Skipped(Skip::Rejected { reason: "too deep".to_string() }), na, Level::Attention, vec![], "too deep"),
+        type Case = (Verdict, ApplyResult, Level, Vec<Action>, &'static str, &'static str);
+        let cases: Vec<Case> = vec![
+            (Verdict::InSync, na.clone(), Level::Ok, vec![], "In sync", "Up to date"),
+            (Verdict::Install, ApplyResult::Done, Level::Ok, vec![], "In sync", "Up to date"),
+            (Verdict::Install, ApplyResult::DryRun, Level::Ok, vec![], "will be installed", "New"),
+            (Verdict::Install, ApplyResult::NotTried, Level::Ok, vec![], "will be installed", "New"),
+            (Verdict::Install, held(), Level::Attention, vec![], "Not changed: busy", "Not changed"),
+            (Verdict::Install, broke(), Level::Error, vec![], "Failed: disk full", "Failed"),
+            (Verdict::Update, ApplyResult::Done, Level::Ok, vec![], "In sync", "Up to date"),
+            (Verdict::Update, ApplyResult::DryRun, Level::Ok, vec![], "Update available", "Update available"),
+            (Verdict::Update, ApplyResult::NotTried, Level::Ok, vec![], "Update available", "Update available"),
+            (Verdict::Update, held(), Level::Attention, vec![], "Not changed: busy", "Not changed"),
+            (Verdict::Update, broke(), Level::Error, vec![], "Failed: disk full", "Failed"),
+            (Verdict::Adopt, ApplyResult::Done, Level::Ok, vec![], "In sync", "Up to date"),
+            (Verdict::Adopt, ApplyResult::DryRun, Level::Ok, vec![], "will be managed", "Will be managed"),
+            (Verdict::Adopt, held(), Level::Attention, vec![], "Not changed", "Not changed"),
+            (Verdict::Delete, ApplyResult::DryRun, Level::Ok, vec![], "will be deleted", "Removed on GitHub"),
+            (Verdict::Delete, ApplyResult::NotTried, Level::Ok, vec![], "will be deleted", "Removed on GitHub"),
+            (Verdict::Delete, held(), Level::Attention, vec![], "Not changed", "Not changed"),
+            (Verdict::Delete, broke(), Level::Error, vec![], "Failed", "Failed"),
+            (Verdict::Forget, ApplyResult::DryRun, Level::Ok, vec![], "Removed upstream and locally", "Removed on GitHub"),
+            (
+                Verdict::ModifiedLocally(info("a.md")),
+                na.clone(),
+                Level::Attention,
+                vec![Overwrite, KeepMine],
+                "Edited locally (changed: a.md)",
+                "Edited on this PC",
+            ),
+            (Verdict::MissingLocally, na.clone(), Level::Attention, vec![Restore, LeaveRemoved], "Deleted locally", "Deleted on this PC"),
+            (Verdict::Held(Hold::UpdateBlocked(info("a.md"))), na.clone(), Level::Attention, vec![Overwrite, KeepMine], "Update held", "Edited on this PC"),
+            (Verdict::Held(Hold::UpdateBlockedMissing), na.clone(), Level::Attention, vec![Restore, LeaveRemoved], "Update held", "Deleted on this PC"),
+            (Verdict::Held(Hold::DeleteBlocked(info("a.md"))), na.clone(), Level::Attention, vec![KeepMine], "Removal held", "Edited on this PC"),
+            (Verdict::Held(Hold::UnmanagedDiffers), na.clone(), Level::Attention, vec![Overwrite, KeepMine], "already exists", "Different copy here"),
+            (Verdict::Held(Hold::MassDeletion), na.clone(), Level::Attention, vec![RemoveThem, KeepMine], "no skills at all", "GitHub lists nothing"),
+            (Verdict::Held(Hold::Interrupted), na.clone(), Level::Attention, vec![], "interrupted", "Interrupted"),
+            (Verdict::Skipped(Skip::Ignored), na.clone(), Level::Ok, vec![ManageAgain], "Kept as yours", "Kept as yours"),
+            (Verdict::Skipped(Skip::Collision { owner: "o/b".to_string() }), na.clone(), Level::Attention, vec![], "o/b", "Name clash"),
+            (Verdict::Skipped(Skip::Rejected { reason: "too deep".to_string() }), na, Level::Attention, vec![], "too deep", "Not safe"),
         ];
-        for (verdict, result, level, actions, text) in cases {
+        for (verdict, result, level, actions, text, tag) in cases {
             let board = after(Outcome::Unchanged, vec![skill("s", verdict.clone(), result.clone())]);
             let got = row(&board, "s");
             let what = format!("{verdict:?} / {result:?}");
             assert_eq!(got.level, level, "level for {what}");
             assert_eq!(got.actions, actions, "buttons for {what}");
             assert!(got.text.contains(text), "text for {what} was '{}', which should contain '{text}'", got.text);
+            assert_eq!(got.tag, tag, "tag for {what}");
+        }
+    }
+
+    #[test]
+    fn show_changes_is_offered_for_a_copy_here_that_may_differ_and_open_folder_where_one_may_be() {
+        let na = || ApplyResult::NotApplicable;
+        let cases = [
+            (Verdict::InSync, na(), false, true),
+            (Verdict::Install, ApplyResult::DryRun, false, false),
+            (Verdict::Update, ApplyResult::DryRun, true, true),
+            (Verdict::Delete, ApplyResult::DryRun, true, true),
+            (Verdict::Install, ApplyResult::Failed("disk full".to_string()), true, true),
+            (Verdict::ModifiedLocally(info("a.md")), na(), true, true),
+            (Verdict::MissingLocally, na(), false, false),
+            (Verdict::Held(Hold::UnmanagedDiffers), na(), true, true),
+            (Verdict::Held(Hold::MassDeletion), na(), true, true),
+            (Verdict::Skipped(Skip::Ignored), na(), true, true),
+            (Verdict::Skipped(Skip::Collision { owner: "o/b".to_string() }), na(), false, true),
+            (Verdict::Skipped(Skip::Rejected { reason: "too deep".to_string() }), na(), false, false),
+        ];
+        for (verdict, result, compare, folder) in cases {
+            let board = after(Outcome::Unchanged, vec![skill("s", verdict.clone(), result.clone())]);
+            let got = row(&board, "s");
+            assert_eq!((got.can_compare(), got.has_folder()), (compare, folder), "{verdict:?} / {result:?} ({})", got.tag);
         }
     }
 
@@ -935,7 +1047,7 @@ mod tests {
     fn a_look_at_the_disk_alone_says_installed_and_nothing_about_upstream() {
         let mut board = Board::new();
         board.note_verify(&verified(vec![("a", "s", clean()), ("a", "t", edited("x.md")), ("a", "u", missing())]), NOW);
-        assert_eq!((row(&board, "s").text.as_str(), row(&board, "s").level), ("Installed", Level::Ok));
+        assert_eq!((row(&board, "s").text.as_str(), row(&board, "s").level, row(&board, "s").tag), ("Installed", Level::Ok, "Installed"));
         assert_eq!(row(&board, "t").actions, [Action::Overwrite, Action::KeepMine]);
         assert_eq!(row(&board, "u").actions, [Action::Restore, Action::LeaveRemoved]);
     }
@@ -974,7 +1086,7 @@ mod tests {
         let mut board = after(Outcome::Unchanged, vec![skill("s", Verdict::Update, ApplyResult::DryRun)]);
         board.note_verify(&verified(vec![("a", "s", LocalStatus::Interrupted)]), NOW);
         let got = row(&board, "s");
-        assert_eq!((got.level, got.actions.is_empty()), (Level::Attention, true));
+        assert_eq!((got.level, got.actions.is_empty(), got.tag), (Level::Attention, true, "Interrupted"));
         assert!(got.text.contains("interrupted"), "{}", got.text);
 
         let from_check = after(Outcome::NeedsAttention, vec![skill("s", Verdict::Held(Hold::Interrupted), ApplyResult::NotApplicable)]);
@@ -996,6 +1108,7 @@ mod tests {
         board.note_resolved("a", "Mixed-Case", Resolution::ManageAgain);
         let got = row(&board, "Mixed-Case");
         assert!(got.text.contains("next check") && got.actions.is_empty() && got.level == Level::Ok, "{got:?}");
+        assert_eq!(got.tag, "Managed again");
         assert_eq!(names(&board), ["Mixed-Case"], "the skill stays one row, under the name it already had");
     }
 
@@ -1283,6 +1396,23 @@ mod tests {
     }
 
     #[test]
+    fn a_repository_is_private_when_it_is_marked_so_or_found_to_be() {
+        let mut board = Board::new();
+        assert!(!view(&board).private);
+        board.note_private("a", true);
+        assert!(view(&board).private, "found to need the token");
+        board.note_private("a", false);
+        assert!(!view(&board).private, "read without the token again");
+
+        let marked = Config { repos: vec![RepoConfig { use_token: true, ..repo("a", true) }], ..Config::default() };
+        assert!(Board::new().views(&marked, NOW)[0].private, "marked to send the token");
+
+        let mut untouched = Board::new();
+        untouched.note_private("a", false);
+        assert!(untouched.repos.is_empty(), "a public repository adds nothing to the board");
+    }
+
+    #[test]
     fn what_to_do_about_no_skills_depends_on_where_the_repository_was_looked_at() {
         let said = |branch: &str, path: &str| {
             let config = Config { repos: vec![RepoConfig { branch: branch.to_string(), path: path.to_string(), ..repo("a", true) }], ..Config::default() };
@@ -1384,6 +1514,50 @@ mod tests {
         assert_eq!(texts.len(), MAX_MESSAGES);
         assert_eq!(texts.last(), Some(&"problem 39"), "the newest is kept");
         assert!(!texts.contains(&"problem 0"), "the oldest goes first");
+    }
+
+    #[test]
+    fn what_a_check_changed_on_this_pc_is_told_in_the_activity() {
+        let changed = vec![
+            skill("new", Verdict::Install, ApplyResult::Done),
+            skill("old", Verdict::Update, ApplyResult::Done),
+            skill("gone", Verdict::Delete, ApplyResult::Done),
+            skill("same", Verdict::Adopt, ApplyResult::Done),
+            skill("record", Verdict::Forget, ApplyResult::Done),
+            skill("held", Verdict::Update, ApplyResult::Held("edited".to_string())),
+            skill("trial", Verdict::Install, ApplyResult::DryRun),
+            skill("broken", Verdict::Install, ApplyResult::Failed("disk full".to_string())),
+            in_sync("quiet"),
+        ];
+        let mut board = Board::new();
+        board.note_sync(&sync_of(vec![RepoReport { label: "owner/a@main : skills".to_string(), ..report("a", Outcome::Synced, changed) }]), NOW);
+        let got: Vec<(Level, &str)> = board.messages().map(|m| (m.level, m.text.as_str())).collect();
+        assert_eq!(
+            got,
+            [
+                (Level::Ok, "Installed new from owner/a"),
+                (Level::Ok, "Updated old from owner/a"),
+                (Level::Ok, "Deleted gone: owner/a no longer has it"),
+                (Level::Ok, "same on this PC matched owner/a, so it is now kept in sync"),
+            ]
+        );
+
+        // Many at once are counted, so they never push everything else out of the log.
+        let done = |names: &[&str], verdict: Verdict| names.iter().map(|n| skill(n, verdict.clone(), ApplyResult::Done)).collect::<Vec<_>>();
+        let mut many = done(&["a", "b", "c", "d"], Verdict::Install);
+        many.extend(done(&["e", "f"], Verdict::Delete));
+        many.extend(done(&["g", "h", "i"], Verdict::Adopt));
+        let mut board = Board::new();
+        board.note_sync(&sync_of(vec![report("b", Outcome::Synced, many)]), NOW);
+        let got: Vec<&str> = board.messages().map(|m| m.text.as_str()).collect();
+        assert_eq!(
+            got,
+            [
+                "Installed 4 skills from owner/b",
+                "Deleted e and f: owner/b no longer has them",
+                "g, h and i on this PC matched owner/b, so they are now kept in sync"
+            ]
+        );
     }
 
     #[test]

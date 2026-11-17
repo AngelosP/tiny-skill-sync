@@ -6,13 +6,15 @@ You tell it which repositories (or which folder of a repository) hold skills. It
 folder, checks GitHub on a schedule, and installs, updates and removes skills as they change upstream. It never
 touches a skill it did not install, and it never overwrites or deletes a skill you edited.
 
-- **Small and quiet.** One 0.86 MiB exe, no runtime to install. It starts in about 8 ms, uses about 1 MiB of memory
-  while idle, and does no work at all between checks: no CPU, no disk, no network.
+- **Small and quiet.** One exe of just under 1 MiB, no runtime to install. It starts in about 8 ms, uses about 1 MiB of
+  memory while idle, and does no work at all between checks: no CPU, no disk, no network.
 - **Cheap checks.** An unchanged repository costs one small "has anything changed?" request to GitHub, which reads and
   writes no files.
-- **Public and private repositories.** Public ones need nothing. Private ones use a GitHub token saved in Windows
-  Credential Manager, or the token of the GitHub CLI (`gh auth login`).
-- **A tray icon and a settings window**, plus a command line (`tss`) that does the same work one command at a time.
+- **Public and private repositories.** Public ones need nothing. Private ones are read with the GitHub CLI's sign-in
+  (`gh auth login`) or a token saved in Windows Credential Manager, without any setting to turn on.
+- **A tray icon and a window** that shows every repository and skill, says in plain words what needs you, and shows
+  line by line what is different between GitHub and your copy of a skill. It follows the Windows light or dark mode.
+- **A command line** (`tss`) that does the same work one command at a time.
 
 Windows 10 and 11, x64. Version 0.1: there is no installer yet, and the exe is not signed.
 
@@ -47,8 +49,8 @@ These are the rules the app follows. Each one is covered by tests (see [CONTRIBU
    notification area. The first start of a new exe can take up to a second while Microsoft Defender scans it. The exes
    are not signed, so if a browser downloaded them, Windows may ask before the first start (**More info**, **Run
    anyway**).
-3. Click the icon to open the settings window. Paste the address of a GitHub folder that holds skills into the box at
-   the bottom of the repositories list, and click **Add**. For example:
+3. Click the icon to open the window. Click **Add repository**, paste the address of a GitHub folder that holds skills,
+   and click **Add**. For example:
 
    ```text
    https://github.com/anthropics/skills/tree/main/skills
@@ -74,12 +76,12 @@ Folders whose name starts with a dot, loose files and folders without a `SKILL.m
 
 > **Add the folder that holds the skills.** Many repositories keep their skills in a `skills` folder. If you add only
 > `owner/name` for such a repository, the app finds no skills in the root and installs nothing. The repository then
-> shows "No skills found", and the settings window and `tss status` say what to do: add the folder's address instead,
+> shows "No skills found", and the window and `tss status` say what to do: add the folder's address instead,
 > `https://github.com/OWNER/NAME/tree/BRANCH/skills`.
 
 A skill whose files include something unsafe on Windows (a link, a submodule, a reserved name such as `CON`, two names
 that differ only in case, an over-long path) is not installed, and a version already installed is left as it is. The
-reason is shown in the settings window and by `tss check` whenever a check reads the repository's listing: the first
+reason is shown in the window and by `tss check` whenever a check reads the repository's listing: the first
 check, each time the repository has changed, and `tss check --full-listing` (see [Limitations](#limitations)).
 
 ## The tray icon
@@ -90,50 +92,86 @@ check, each time the repository has changed, and `tss check --full-listing` (see
 | Blue ring | Checking for updates. |
 | Grey ring | No repositories are set up. |
 | Amber disc with `!` | A skill needs you (see below). |
-| Red disc with `x` | A check failed. The tooltip and the settings window say why. |
+| Red disc with `x` | A check failed. The tooltip and the window say why. |
 
-The tooltip says what the state is. Right-click for **Open settings**, **Check now** and **Quit**. Starting
-`tiny-skill-sync.exe` again opens the settings window of the copy that already runs; `tiny-skill-sync.exe --quit` closes
-it.
+The tooltip says what the state is. Click the icon to open the window, or right-click for **Open Tiny Skill Sync**,
+**Sync now** and **Quit**. Starting `tiny-skill-sync.exe` again opens the window of the copy that already runs;
+`tiny-skill-sync.exe --quit` closes it.
 
-## The settings window
+## The window
 
-- **Repositories:** each repository, its state and when it was last checked. For the selected one: how often to check
-  it, **Use my token**, **Enabled**, **Check now** and **Remove…**. Removing asks whether to keep its skills (they become
-  yours) or delete the ones you did not edit.
-- **Add:** `owner/name` or the address of a GitHub folder. Tick **Private** to send your token.
-- **Skills:** the skills of the selected repository and the state of each, with buttons for the choices that make sense.
-  The box under the list explains the selected skill or, when none is selected, what went wrong with the repository
-  (Tab moves to it, so a long text can be scrolled).
-- **Default check interval**, the GitHub token (**Set…**, **Clear**) and the skills folder (**Open**, **Backups**).
-- **Messages:** what changed recently, and what went wrong.
+The band across the top says how everything is in one sentence ("All skills are up to date", "1 skill needs your
+attention", "1 repository can't be read"). The line under it counts the skills and repositories and says when they were
+checked and when the next check is; after something you asked for, it says what came of it ("Checked: skills were
+updated", "Checked: nothing new on GitHub"). **Sync now** gets new and updated skills from every repository at once.
+Skills you edited or deleted are never changed by it. Hover over it to read the same.
+
+Down the left are your repositories, each with its state, and **Add repository**, **Activity** and **Settings**.
+
+- **A repository:** its name (with a **Private** label when it is read with your token), the folder and branch its
+  skills come from, and when it was last checked.
+  - When it can't be read, a box says why, with **Try again** and **Open Settings** (where the GitHub sign-in is).
+  - **Check every** sets how often it is checked: **Default** (the interval in Settings), a common interval, or
+    **Custom…**.
+  - **Keep in sync** off pauses it: it is not checked, and nothing in its skills is changed.
+  - The **More** button holds **Sync this repository**, **Open on GitHub**, **Open skills folder** and **Remove
+    repository…**. Removing asks whether to leave its skills installed (they become yours) or to delete them too
+    (skills you edited are kept).
+- **Its skills,** each with its state. A skill that needs you is open already; click any other to open it. An open
+  skill says what is going on, and offers the choices that make sense (see below), **Show changes** and **Open folder**.
+- **Show changes** turns the window into the differences between the GitHub version of the skill and the copy on this
+  PC. Nothing changes until you choose.
+  - The files are listed on the left, each marked "Only on GitHub", "Only on this PC", "Changed · 3 added, 1 removed",
+    "Only invisible changes" (line breaks, a byte order mark, the line break at the end) or "Different (not text)".
+  - The chosen file's lines are on the right: `−` on red for a line only on GitHub, `+` on green for a line only on this
+    PC, with three lines around each change. Long unchanged stretches are folded.
+  - The skill's choices are at the top. **Back** (or Esc) returns.
+  - Only the files whose hash differs are read or downloaded, and nothing is written. A file over 1 MiB, files beyond
+    4 MiB from either side, and links (never followed) are named but not shown.
+- **Activity:** what the app did recently, newest first, and what went wrong.
+- **Settings:**
+  - **Check for updates every**: the default interval, for every repository set to **Default** (1 day at first).
+  - **Skills folder** and **Backups**, each with **Open**.
+  - **GitHub sign-in for private repositories**: **Save a token…**, and once one is saved, **Replace token…** and
+    **Delete token**.
+  - **About**.
 
 Every change is saved at once; there is no OK button. Intervals are a number and a unit: `30m`, `6h`, `1d`, `2w` or
-`1mo` (a calendar month), at least 5 minutes. A repository without its own interval uses the default (1 day).
+`1mo` (a calendar month), at least 5 minutes. **Custom…** also takes words, such as `45 minutes` or `3 days`.
+
+The window follows the Windows light or dark mode, and high contrast. It can be resized and remembers its size
+(`window.txt` in the app's folder). Esc closes it; the app keeps running in the tray. The window is created when it
+opens and destroyed when it closes, so it costs nothing while closed.
 
 ### When a skill needs you
 
 | Choice | What it does |
 | --- | --- |
-| Replace with upstream | Install upstream's version. What is in the folder now is kept as a backup. |
+| Use the GitHub version | Install upstream's version. What is in the folder now is kept as a backup. |
 | Restore | Bring back a skill you deleted. |
-| Keep mine | The folder is yours: the app never changes or removes it again. |
+| Keep my version | The folder is yours: the app never changes or removes it again. |
 | Leave it deleted | A skill you deleted stays deleted. |
-| Manage again | Undo **Keep mine**. |
+| Manage again | Undo **Keep my version**. |
 | Delete them | Upstream now lists no skills at all: remove the ones the app installed. |
 
-Backups are folders named `backup-<skill>-<number>` in the work folder (the **Backups** button opens it). The app never
+Backups are folders named `backup-<skill>-<number>` in the work folder (**Backups** in Settings opens it). The app never
 deletes them; delete them yourself when you no longer need them.
 
 ## Private repositories
 
-Tick **Private** (or **Use my token**) for the repository, and give the app a token in one of two ways:
+There is nothing to turn on. A repository is read without a token first, so a public one never makes the app look for
+a token. When GitHub answers "not found" (the repository may be private) or the limit for requests without a token is
+reached, the app reads it again with your token, and remembers that the repository needs it. Give the app a token in
+one of two ways:
 
-- Save a token in the settings window (**Set…**) or with `tss token set`. It is kept in Windows Credential Manager, for
-  your user on this computer only. A fine-grained token with read-only **Contents** access to the repositories is
-  enough.
-- Or sign in to the GitHub CLI (`gh auth login`). When no token is saved, the app asks `gh auth token` for one. `gh` must
+- Sign in to the GitHub CLI (`gh auth login`). When no token is saved, the app asks `gh auth token` for one. `gh` must
   be on the `PATH`. The app uses only the token; `gh` makes no requests for it.
+- Or save a token in Settings (**Save a token…**) or with `tss token set`. It is kept in Windows Credential Manager,
+  for your user on this computer only. A fine-grained token with read-only **Contents** access to the repositories is
+  enough. A saved token is used before the GitHub CLI's.
+
+Without either, a private repository shows "Can't read this repository" with what to do. To send the token with every
+request to a repository, even the first, add it with `tss add --use-token` (or set `use_token` in `config.json`).
 
 The token is read when a check needs it. It is never written to the settings, the state or any message. Sending a token
 also raises GitHub's rate limit: without one, every program on your network shares 60 requests an hour.
@@ -159,7 +197,7 @@ Names and messages that come from a repository are shown with control and text-d
 (`\u{202e}`), in the window and in `tss`, so a name cannot hide part of a line or change how it reads. `tss` prints a
 ready-to-paste `tss resolve` command only for a skill whose name is plain (letters, digits, spaces and a few marks such
 as `-` and `_`), because Windows allows `$`, `;`, `%` and quotes in a folder name; for any other name it points to the
-settings window.
+app's window.
 
 Ctrl+C during `tss check` stops at once without a message. That is safe: the next start finishes or undoes a change that
 was interrupted.
@@ -170,6 +208,7 @@ was interrupted.
 | --- | --- |
 | Settings | `%LOCALAPPDATA%\tiny-skill-sync\config.json` |
 | What the app installed (the ownership record) | `%LOCALAPPDATA%\tiny-skill-sync\state.json` |
+| The window's size | `%LOCALAPPDATA%\tiny-skill-sync\window.txt` |
 | Skills | `%USERPROFILE%\.copilot\skills`, unless `skills_dir` is set in `config.json` |
 | Work folder: downloads in progress and backups | `.tss-work` beside the skills folder (`%USERPROFILE%\.copilot\.tss-work`) |
 
@@ -213,9 +252,10 @@ is refused with a request to check first.
 }
 ```
 
-An empty `branch` means the default branch, and an empty `path` the repository root. Never change an `id`: the
-installed skills are recorded under it. When the app or `tss` saves the settings, it writes only the fields above, so
-anything else you added by hand is dropped.
+An empty `branch` means the default branch, and an empty `path` the repository root. `use_token` sends the token with
+every request to that repository; without it, a private repository is still read with the token (see
+[Private repositories](#private-repositories)). Never change an `id`: the installed skills are recorded under it. When
+the app or `tss` saves the settings, it writes only the fields above, so anything else you added by hand is dropped.
 
 Environment variables, mainly for tests and scripts:
 
@@ -251,20 +291,20 @@ Measured with `scripts\bench.ps1` on a Ryzen 7 5800X3D with Windows 11, files in
 
 | Measure | 442 files | 1,555 files | Budget |
 | --- | --- | --- | --- |
-| Start to tray icon | 8.0 ms | 8.3 ms | 30 ms median |
-| Start-up check of every installed file | 23 ms | 100 ms | 75 µs per file |
+| Start to tray icon | 9.1 ms | 8.7 ms | 30 ms median |
+| Start-up check of every installed file | 24 ms | 103 ms | 75 µs per file |
 | Idle for 10 s: CPU, disk, page faults | 0, 0, 0 | 0, 0, 0 | 0 |
-| Idle memory: trimmed working set / private | 0.9 / 1.8 MiB | 1.2 / 2.5 MiB | 2 / 4 MiB |
-| Settings window: open to painted (median) | 47 ms | 45 ms | 50 ms |
-| Settings window open: working set | 11.5 MiB | 12.3 MiB | 20 MiB |
-| Unchanged check: CPU, file reads and writes | 16 ms, 0, 0 | 31 ms, 0, 0 | 50 ms, 0 |
-| Exe size | 0.87 MiB | 0.87 MiB | 1 MiB |
+| Idle memory: trimmed working set / private | 0.9 / 1.8 MiB | 1.2 / 2.6 MiB | 2 / 4 MiB |
+| Window: open to painted (median) | 40 ms | 44 ms | 100 ms |
+| Window open: working set | 13.5 MiB | 14.5 MiB | 40 MiB |
+| Window closed: working set (trimmed) | 1.4 MiB | 1.5 MiB | 2 MiB |
+| Unchanged check: CPU, file reads and writes | 16 ms, 0, 0 | 16 ms, 0, 0 | 50 ms, 0 |
+| Exe size | 0.99 MiB | 0.99 MiB | 1 MiB |
 
 Windows counts a process's CPU time in ticks of 15.6 ms, so an unchanged check shows as one to three ticks (16 to
-47 ms) from run to run. The settings window is the row with the least room (the budget is 50 ms, and the same build
-varies by a few milliseconds from one day to the next), so run the bench again after any change to it. A list of 463
-skills opens as fast as one of 19, because the list is filled with drawing turned off and painted once (filled row by
-row, it took 68 ms).
+47 ms) from run to run. The exe is the row with the least room (about 10 KiB), so check its size after adding code to
+the tray app. A list of 463 skills opens almost as fast as one of 19, because only the rows within about two screens of
+what is shown are made at first; the rest are made as you scroll (with a row made for every skill, it took 120 ms).
 
 Left running for 75 minutes against a test repository with a 5-minute interval and seven upstream changes
 (`scripts\soak.ps1`), the app kept 6 threads and about 340 handles, used 297 ms of CPU in all (0.006 % of one core) and
@@ -276,7 +316,7 @@ ended at 3.2 MiB of private memory. Each change reached the disk within one inte
 - No installer, no automatic start at sign-in, no signed exe, no automatic updates of the app itself.
 - It is not checked yet whether a running Copilot session notices new or changed skills without a restart.
 - A repository that is renamed or moved on GitHub is reported as a failure; update its address yourself.
-- No dark mode, no icon in the exe file, and the tray icon is drawn for the screen scale at start.
+- No icon in the exe file, and the tray icon is drawn for the screen scale at start.
 - It uses the Windows proxy settings (WinHTTP's automatic proxy), but it has not been tested behind a proxy.
 - A short network failure turns the icon red until the next successful check.
 - `gh` is found only on the `PATH`; with several `gh` accounts, the active one is used.
@@ -285,14 +325,16 @@ ended at 3.2 MiB of private memory. Each change reached the disk within one inte
 - Skills that were refused as unsafe, and folders of yours that were held because they differ from an upstream skill of
   the same name, are announced by the check that reads the repository's listing (the first check, each time the
   repository has changed, and `tss check --full-listing`). The app does not remember them: a later check that finds
-  nothing new says "Up to date", and the settings window forgets a refusal when the app restarts. Nothing is installed
+  nothing new says "Up to date", and the window forgets a refusal when the app restarts. Nothing is installed
   or changed in the meantime.
 - GitHub's servers can answer for up to a minute with a version of a public repository that is one change old. When
   two of its answers disagree, the check stops with "Changed while checking" and changes nothing; the next check works.
 - One check downloads at most 512 MiB (the rest waits for the next check), and a file over 64 MiB or a skill with more
   than 10,000 files is refused. There is no limit on what all the installed skills add up to.
-- The settings window is 616 by 619 pixels at 100% scale and does not shrink. It has been tried only at 100%; on a small
-  screen with a high scale (for example 1366 by 768 at 125%) part of it is off the screen.
+- The window opens at 980 by 680 at 100% scale (smaller if the screen has less room) and can be made as small as 640
+  by 480. It has been tried only at 100% scale.
+- The window's controls are drawn by the app. Each is a real window with its text, and Tab, Enter, Space and Esc work,
+  but they do not tell a screen reader what kind of control they are.
 - Changing the skills folder does not move installed skills (see [Files](#files)). Once more than four other folders
   have been used, the oldest record is forgotten; going back to that folder then works like a damaged `state.json`.
   Two names for one folder that only the disk could tell apart (a short 8.3 name, a mapped drive, a link) count as two

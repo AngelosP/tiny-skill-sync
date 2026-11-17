@@ -88,7 +88,7 @@ impl Interval {
         }
     }
 
-    /// Plain English for the settings window, for example "6 hours".
+    /// Plain English for the window, for example "6 hours".
     pub fn describe(self) -> String {
         let word = match self.unit {
             Unit::Minute => "minute",
@@ -177,7 +177,7 @@ pub fn add_months(secs: UnixSecs, months: i64) -> UnixSecs {
     days_from_civil(ny, nm, d.min(days_in_month(ny, nm))) * 86_400 + time_of_day
 }
 
-/// `2026-11-15T10:30:00Z`, for logs and the settings window.
+/// `2026-11-15T10:30:00Z`, for logs and the window.
 pub fn format_utc(secs: UnixSecs) -> String {
     let (y, m, d) = civil_from_days(secs.div_euclid(86_400));
     let t = secs.rem_euclid(86_400);

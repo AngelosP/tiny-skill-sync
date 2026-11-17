@@ -181,8 +181,9 @@ fn losing_access_to_a_private_repository_removes_nothing() {
     assert_eq!(failure(only(&report)).kind, FailureKind::Auth);
     assert_eq!(w.snapshot(), before);
 
-    // Without a token GitHub answers 'not found' for a private repository.
+    // Without any token GitHub answers 'not found' for a private repository.
     cfg.repos[0].use_token = false;
+    let mut engine = w.engine_with(&remote, &FakeTokens::none());
     let report = sync_all(&mut engine, &cfg);
     assert_eq!(failure(only(&report)).kind, FailureKind::NotFound);
     assert_eq!(w.snapshot(), before);
@@ -341,6 +342,172 @@ fn the_token_never_reaches_a_file_or_a_report() {
         assert!(!String::from_utf8_lossy(&bytes).contains(SECRET), "the token was written to {path}");
     }
     assert!(!format!("{first:?}{second:?}").contains(SECRET));
+}
+
+fn tree_without_token() -> (String, Option<String>) {
+    ("tree".to_string(), None)
+}
+
+fn with_token(kind: &str, token: &str) -> (String, Option<String>) {
+    (kind.to_string(), Some(token.to_string()))
+}
+
+#[test]
+fn a_private_repository_is_read_with_the_token_without_being_told_and_that_is_remembered() {
+    let w = World::new("auto-token");
+    let remote = FakeRemote::new();
+    remote.seed_standard(REPO);
+    remote.make_private(REPO, "tok");
+    let tokens = FakeTokens::some("tok");
+    let cfg = standard_config();
+    let mut engine = w.engine_with(&remote, &tokens);
+
+    let report = sync_all(&mut engine, &cfg);
+
+    assert!(matches!(only(&report).outcome, Outcome::Synced), "{:?}", only(&report).outcome);
+    assert_eq!(w.skill_names(), ["alpha", "beta", "gamma"]);
+    let seen = remote.tokens_seen();
+    assert_eq!(seen[0], tree_without_token(), "the first try is without the token");
+    assert_eq!(seen[1], with_token("tree", "tok"), "GitHub said 'not found', so the token is tried");
+    assert!(seen[2..].iter().all(|(_, t)| t.as_deref() == Some("tok")), "the downloads use it too: {seen:?}");
+    assert!(w.state().repo("fx").unwrap().needs_token, "remembered on disk");
+    assert!(engine.needs_token("fx"));
+
+    // The next check, even after a restart, goes straight to the token: one request, not two.
+    remote.reset();
+    let mut engine = w.engine_with(&remote, &tokens);
+    let report = sync_all(&mut engine, &cfg);
+    assert!(matches!(only(&report).outcome, Outcome::Unchanged), "{:?}", only(&report).outcome);
+    assert_eq!(remote.tokens_seen(), [with_token("tree", "tok")]);
+}
+
+#[test]
+fn a_public_repository_never_looks_for_the_token() {
+    let w = World::new("public-no-token");
+    let remote = FakeRemote::new();
+    remote.seed_standard(REPO);
+    let tokens = FakeTokens::some("tok");
+    let mut engine = w.engine_with(&remote, &tokens);
+
+    let report = sync_all(&mut engine, &standard_config());
+
+    assert!(matches!(only(&report).outcome, Outcome::Synced), "{:?}", only(&report).outcome);
+    assert_eq!(tokens.asked(), 0, "not looked up, so the GitHub CLI is not started");
+    assert!(remote.tokens_seen().iter().all(|(_, t)| t.is_none()));
+    assert!(!w.state().repo("fx").unwrap().needs_token);
+
+    // Only 'not found' and the limit for anonymous requests are worth trying with the token; any other error is not.
+    remote.fail_tree(REPO, Some(error(FailureKind::Server)));
+    remote.reset();
+    let report = sync_all(&mut engine, &standard_config());
+    assert_eq!(failure(only(&report)).kind, FailureKind::Server);
+    assert_eq!(remote.tokens_seen(), [tree_without_token()]);
+    assert_eq!(tokens.asked(), 0);
+}
+
+#[test]
+fn a_private_repository_without_any_sign_in_says_how_to_sign_in_and_changes_nothing() {
+    let w = World::new("auto-no-token");
+    let remote = FakeRemote::new();
+    remote.seed_standard(REPO);
+    remote.make_private(REPO, "tok");
+    let tokens = FakeTokens::none();
+    let mut engine = w.engine_with(&remote, &tokens);
+
+    let report = sync_all(&mut engine, &standard_config());
+
+    let f = failure(only(&report));
+    assert_eq!(f.kind, FailureKind::NotFound, "still 'not found': the app cannot tell a private repository from a missing one");
+    assert!(f.message.contains("gh auth login") && f.message.contains("save a token in Settings"), "{}", f.message);
+    assert_eq!(remote.tokens_seen(), [tree_without_token()]);
+    assert_eq!(tokens.asked(), 1);
+    assert!(w.skill_names().is_empty());
+    assert!(!engine.needs_token("fx"));
+}
+
+#[test]
+fn a_limit_on_anonymous_requests_is_got_round_with_the_token_but_does_not_make_the_repository_private() {
+    let w = World::new("auto-limit");
+    let remote = FakeRemote::new();
+    remote.seed_standard(REPO);
+    remote.fail_anonymous(REPO, Some(error(FailureKind::RateLimited)));
+    let tokens = FakeTokens::some("tok");
+    let mut engine = w.engine_with(&remote, &tokens);
+
+    let report = sync_all(&mut engine, &standard_config());
+
+    assert!(matches!(only(&report).outcome, Outcome::Synced), "{:?}", only(&report).outcome);
+    assert_eq!(&remote.tokens_seen()[..2], [tree_without_token(), with_token("tree", "tok")]);
+    assert!(!w.state().repo("fx").unwrap().needs_token, "a public repository is not remembered as private");
+
+    // Without a token the limit is waited out as before.
+    let mut engine = w.engine_with(&remote, &FakeTokens::none());
+    let report = sync_with(&mut engine, &standard_config(), SyncOptions { ignore_etag: true, ..SyncOptions::default() });
+    assert_eq!(failure(only(&report)).kind, FailureKind::RateLimited);
+}
+
+#[test]
+fn a_remembered_private_repository_is_tried_without_the_token_once_there_is_none() {
+    let w = World::new("auto-forget");
+    let remote = FakeRemote::new();
+    remote.seed_standard(REPO);
+    remote.make_private(REPO, "tok");
+    let cfg = standard_config();
+    sync_all(&mut w.engine_with(&remote, &FakeTokens::some("tok")), &cfg);
+    assert!(w.state().repo("fx").unwrap().needs_token);
+    let before = w.snapshot();
+
+    // The user signed out while it is still private: the check fails and says how to sign in, and changes nothing.
+    let tokens = FakeTokens::none();
+    let mut engine = w.engine_with(&remote, &tokens);
+    let f = failure(only(&sync_with(&mut engine, &cfg, SyncOptions { ignore_etag: true, ..SyncOptions::default() }))).clone();
+    assert_eq!(f.kind, FailureKind::NotFound);
+    assert!(f.message.contains("gh auth login"), "{}", f.message);
+    assert_eq!(w.snapshot(), before, "nothing changed, and it is still remembered as private");
+
+    // It was made public: read without a token, and no longer remembered as private.
+    remote.make_public(REPO);
+    remote.reset();
+    let report = sync_all(&mut engine, &cfg);
+    assert!(matches!(only(&report).outcome, Outcome::Unchanged), "{:?}", only(&report).outcome);
+    assert!(remote.tokens_seen().iter().all(|(_, t)| t.is_none()));
+    assert!(!w.state().repo("fx").unwrap().needs_token);
+    assert_eq!(w.skill_names(), ["alpha", "beta", "gamma"]);
+}
+
+#[test]
+fn replacing_an_edited_skill_of_a_private_repository_uses_the_token() {
+    let w = World::new("auto-overwrite");
+    let remote = FakeRemote::new();
+    remote.seed_standard(REPO);
+    remote.make_private(REPO, "tok");
+    let cfg = standard_config();
+    let mut engine = w.engine_with(&remote, &FakeTokens::some("tok"));
+    sync_all(&mut engine, &cfg);
+    w.write("alpha/SKILL.md", "my own words\n");
+    remote.reset();
+
+    let report = engine.resolve(&cfg, "fx", "alpha", Resolution::Overwrite, &cancel_flag()).expect("replaced");
+
+    assert!(report.message.contains("now matches"), "{}", report.message);
+    assert_eq!(w.read("alpha/SKILL.md"), ALPHA_V1);
+    assert!(remote.tokens_seen().iter().all(|(_, t)| t.as_deref() == Some("tok")), "{:?}", remote.tokens_seen());
+}
+
+#[test]
+fn a_dry_run_reads_a_private_repository_with_the_token_but_remembers_nothing() {
+    let w = World::new("auto-dry");
+    let remote = FakeRemote::new();
+    remote.seed_standard(REPO);
+    remote.make_private(REPO, "tok");
+    let mut engine = w.engine_with(&remote, &FakeTokens::some("tok"));
+    let before = w.snapshot();
+
+    let report = sync_with(&mut engine, &standard_config(), SyncOptions { dry_run: true, ..SyncOptions::default() });
+
+    assert!(matches!(only(&report).outcome, Outcome::WouldChange), "{:?}", only(&report).outcome);
+    assert_eq!(w.snapshot(), before);
+    assert!(!engine.needs_token("fx"), "not even in memory");
 }
 
 // ---------------------------------------------------------------------------------------------------------------------

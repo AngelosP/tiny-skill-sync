@@ -17,7 +17,8 @@ use std::sync::atomic::AtomicBool;
 use crate::board::{Board, Health, Level, capitalized};
 use crate::config::Config;
 use crate::engine::{
-    Access, Engine, EngineError, Outcome, RemoveReport, Resolution, ResolveReport, Stamp, StartupReport, SyncOptions, SyncReport, VerifyReport, Which,
+    Access, DiffReport, Engine, EngineError, Outcome, RemoveReport, Resolution, ResolveReport, Stamp, StartupReport, SyncOptions, SyncReport, VerifyReport,
+    Which,
 };
 use crate::interval::UnixSecs;
 
@@ -56,6 +57,11 @@ pub enum Job {
         repo: String,
         delete_skills: bool,
     },
+    /// "Show changes": what is different between a skill on GitHub and the copy on this PC. Changes nothing.
+    Diff {
+        repo: String,
+        skill: String,
+    },
     /// Quitting: save what is waiting to be saved.
     Flush,
     /// The settings changed: work out when to wake up next. Reads nothing.
@@ -63,9 +69,9 @@ pub enum Job {
 }
 
 impl Job {
-    /// The tray shows "checking for updates…" while it runs.
+    /// The tray shows "checking for updates…" while it runs. The window shows its own progress for "Show changes".
     pub fn shows_work(&self) -> bool {
-        !matches!(self, Job::Look | Job::Flush | Job::Plan)
+        !matches!(self, Job::Look | Job::Flush | Job::Plan | Job::Diff { .. })
     }
 
     /// The user asked for it, so they are told how it went.
@@ -90,6 +96,7 @@ pub enum Answer {
     Checked { verified: Option<VerifyReport>, sync: SyncReport },
     Resolved(ResolveReport),
     Removed(RemoveReport),
+    Diffed(DiffReport),
     Flushed,
     Planned,
 }
@@ -104,6 +111,8 @@ pub struct Done {
     pub kept: Vec<(String, Vec<String>)>,
     /// Whether the last listing of each repository had no skills in it at all.
     pub lists_nothing: Vec<(String, bool)>,
+    /// Whether each repository was found to need the token.
+    pub private: Vec<(String, bool)>,
     /// The stamp of `state.json` as this job left it.
     pub stamp: Option<Stamp>,
 }
@@ -129,6 +138,7 @@ pub fn perform(engine: &mut Engine, order: &Order, cancel: &AtomicBool) -> Done 
             engine.sync(cfg, &Which::One(id.clone()), &opts, cancel).map(|sync| Answer::Checked { verified: None, sync })
         }
         Job::Remove { repo, delete_skills } => engine.remove_repo(repo, *delete_skills).map(Answer::Removed),
+        Job::Diff { repo, skill } => engine.diff(cfg, repo, skill, cancel).map(Answer::Diffed),
         Job::Flush => engine.flush().map(|()| Answer::Flushed),
         Job::Plan => Ok(Answer::Planned),
     };
@@ -139,6 +149,7 @@ pub fn perform(engine: &mut Engine, order: &Order, cancel: &AtomicBool) -> Done 
         last_checks: cfg.repos.iter().filter_map(|r| engine.last_check(&r.id).map(|at| (r.id.clone(), at))).collect(),
         kept: cfg.repos.iter().map(|r| (r.id.clone(), engine.kept(&r.id))).collect(),
         lists_nothing: cfg.repos.iter().map(|r| (r.id.clone(), engine.lists_nothing(&r.id))).collect(),
+        private: cfg.repos.iter().map(|r| (r.id.clone(), engine.needs_token(&r.id))).collect(),
         stamp: engine.state_stamp(),
     }
 }
@@ -150,6 +161,18 @@ pub struct Settled {
     pub removed: Option<String>,
     /// How a job the user asked for went, for the status line.
     pub feedback: Option<String>,
+    /// The state changed without the user, so what they were last told no longer holds.
+    pub stale_feedback: bool,
+    /// "Show changes" finished.
+    pub diff: Option<Shown>,
+}
+
+/// What "Show changes" found for a skill, or why it could not be shown.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Shown {
+    pub repo: String,
+    pub skill: String,
+    pub result: Result<DiffReport, String>,
 }
 
 /// The state the UI thread keeps.
@@ -290,11 +313,14 @@ impl App {
     pub fn finish(&mut self, done: Done, now: UnixSecs) -> Settled {
         self.busy = None;
         self.board.set_working(false);
+        let before = self.health();
         let mut settled = Settled::default();
         let job = done.job;
         let by_user = job.by_user();
+        let mut checked = None;
 
         match done.result {
+            Err(e) if matches!(job, Job::Diff { .. }) => settled.diff = shown(&job, Err(capitalized(&e.to_string()))),
             Err(EngineError::Busy) => match job {
                 Job::Startup | Job::Poll => self.hold(now + BUSY_RETRY),
                 _ if by_user => settled.feedback = Some(capitalized(&EngineError::Busy.to_string())),
@@ -311,7 +337,7 @@ impl App {
                 }
             }
             Ok(answer) => {
-                if !matches!(answer, Answer::Flushed | Answer::Planned) {
+                if !matches!(answer, Answer::Flushed | Answer::Planned | Answer::Diffed(_)) {
                     self.failures = 0;
                     self.board.note_failure(now, None);
                 }
@@ -327,7 +353,7 @@ impl App {
                         }
                         self.board.note_sync(&sync, now);
                         if by_user {
-                            settled.feedback = Some(summary(&sync));
+                            checked = Some(sync);
                         }
                     }
                     Answer::Resolved(report) => {
@@ -350,6 +376,7 @@ impl App {
                             settled.removed = Some(repo.clone());
                         }
                     }
+                    Answer::Diffed(report) => settled.diff = shown(&job, Ok(report)),
                     Answer::Flushed | Answer::Planned => {}
                 }
             }
@@ -365,10 +392,18 @@ impl App {
         for (id, nothing) in &done.lists_nothing {
             self.board.note_lists_nothing(id, *nothing);
         }
+        for (id, needs_token) in &done.private {
+            self.board.note_private(id, *needs_token);
+        }
         self.state_stamp = done.stamp;
         if job == Job::Poll {
             self.hold(now + MIN_POLL_GAP);
         }
+        // Told once the board knows all the job brought back, so that it never says all is well when it is not.
+        if let Some(sync) = checked {
+            settled.feedback = Some(summary(&sync, self.health() == Health::Ok));
+        }
+        settled.stale_feedback = settled.feedback.is_none() && self.health() != before;
         settled
     }
 
@@ -440,9 +475,17 @@ fn backoff(failures: u32) -> UnixSecs {
     (FAILURE_BACKOFF << doublings).min(MAX_FAILURE_BACKOFF)
 }
 
+fn shown(job: &Job, result: Result<DiffReport, String>) -> Option<Shown> {
+    match job {
+        Job::Diff { repo, skill } => Some(Shown { repo: repo.clone(), skill: skill.clone(), result }),
+        _ => None,
+    }
+}
+
 /// One line about a check the user asked for. The rows say the details. The line is cut at its end when it is too long,
-/// so the reason comes first and the repository after it.
-fn summary(report: &SyncReport) -> String {
+/// so the reason comes first and the repository after it. `all_well` is whether nothing needs the user once the check is
+/// taken in: a check that found nothing new does not mean an edit made earlier is settled.
+fn summary(report: &SyncReport, all_well: bool) -> String {
     let failed: Vec<_> = report.repos.iter().filter_map(|r| if let Outcome::Failed(f) = &r.outcome { Some((r, f)) } else { None }).collect();
     // As the row's "No skills found": the listing was empty and nothing was left to do about it.
     let empty: Vec<_> = report.repos.iter().filter(|r| r.lists_nothing && r.skills.is_empty()).collect();
@@ -456,7 +499,8 @@ fn summary(report: &SyncReport) -> String {
         [] if empty.len() == 1 => format!("Checked: no skills found ({})", empty[0].label),
         [] if !empty.is_empty() => format!("Checked: no skills found in {} repositories", empty.len()),
         [] if any(|o| matches!(o, Outcome::Synced)) => "Checked: skills were updated".to_string(),
-        [] => "Checked: everything is up to date".to_string(),
+        [] if all_well => "Checked: everything is up to date".to_string(),
+        [] => "Checked: nothing new on GitHub".to_string(),
     }
 }
 
@@ -492,20 +536,20 @@ mod tests {
     #[test]
     fn a_failed_check_says_why_first_because_the_status_line_cuts_the_end() {
         let lost = failed_check("owner/repo@main : skills", "the connection was lost");
-        assert_eq!(summary(&lost), "The connection was lost (owner/repo@main : skills)");
+        assert_eq!(summary(&lost, false), "The connection was lost (owner/repo@main : skills)");
         let refused = failed_check("owner/repo@main : skills", "GitHub refused access to owner/repo");
-        assert_eq!(summary(&refused), "GitHub refused access to owner/repo (owner/repo@main : skills)");
+        assert_eq!(summary(&refused, false), "GitHub refused access to owner/repo (owner/repo@main : skills)");
     }
 
     #[test]
     fn a_check_that_found_no_skills_does_not_say_everything_is_up_to_date() {
         let empty = |label| RepoReport { lists_nothing: true, ..repo_report(label, Outcome::Unchanged) };
-        assert_eq!(summary(&checked(vec![empty("o/a"), repo_report("o/b", Outcome::Synced)])), "Checked: no skills found (o/a)");
-        assert_eq!(summary(&checked(vec![empty("o/a"), empty("o/b")])), "Checked: no skills found in 2 repositories");
+        assert_eq!(summary(&checked(vec![empty("o/a"), repo_report("o/b", Outcome::Synced)]), false), "Checked: no skills found (o/a)");
+        assert_eq!(summary(&checked(vec![empty("o/a"), empty("o/b")]), false), "Checked: no skills found in 2 repositories");
         // Skills that need the user come first.
         let attention = checked(vec![empty("o/a"), repo_report("o/b", Outcome::NeedsAttention)]);
-        assert_eq!(summary(&attention), "Checked: some skills need your attention");
-        assert_eq!(summary(&checked(vec![repo_report("o/b", Outcome::Unchanged)])), "Checked: everything is up to date");
+        assert_eq!(summary(&attention, false), "Checked: some skills need your attention");
+        assert_eq!(summary(&checked(vec![repo_report("o/b", Outcome::Unchanged)]), true), "Checked: everything is up to date");
     }
 
     #[test]

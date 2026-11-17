@@ -46,10 +46,10 @@ scripts\dev.ps1 test
 ```
 
 This runs `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings` and `cargo test --no-fail-fast`. All three
-must pass. There are 378 tests (241 in the library, 137 integration tests); the whole gate takes about 40 seconds when
+must pass. There are 442 tests (278 in the library, 164 integration tests); the whole gate takes about 40 seconds when
 the code is already built.
 
-If the change can affect speed, memory or disk use (startup, verification, the poll, the tray, the settings window),
+If the change can affect speed, memory or disk use (startup, verification, the poll, the tray, the window),
 also run `scripts\dev.ps1 bench` and check that every row is still within budget.
 
 ## Tests
@@ -60,7 +60,7 @@ real skills folder, the real settings or the saved GitHub token. A failing test 
 
 | Where | What |
 | --- | --- |
-| `src\*.rs` (`#[cfg(test)]`) | Unit tests next to the code. The modules that make decisions (`reconcile`, `tree`, `scheduler`, `board`, `app`, `interval`, `pathsafe`) are pure, so every rule is tested without a disk or a network. `apply` and `win::fs` are tested on the real file system. |
+| `src\*.rs` (`#[cfg(test)]`) | Unit tests next to the code. The modules that make decisions (`reconcile`, `tree`, `scheduler`, `board`, `app`, `interval`, `pathsafe`) are pure, so every rule is tested without a disk or a network; so are the comparison behind **Show changes** (`diff`) and the window's pages (`win::ui::page`). `apply` and `win::fs` are tested on the real file system. |
 | `tests\engine_sync.rs`, `engine_failures.rs`, `engine_lifecycle.rs` | The engine end to end, on the real file system, with a fake GitHub (`tests\common\mod.rs`: `FakeRemote`, `World`). Failures, crashes in every step of a change, restarts. |
 | `tests\downtime.rs` | Edits made while the app was stopped, and drives that cannot vouch for a file. The evidence for [How edits are found](README.md#how-edits-are-found). |
 | `tests\http.rs` | The real WinHTTP client against a local test server: redirects, timeouts, limits, cancel. |
@@ -76,7 +76,7 @@ sandbox (`scripts\dev.ps1 tss add ...` then `tss check`), and for everything the
 ### Live end-to-end runs
 
 The tests use a fake GitHub and no windows. `scripts\dev.ps1 e2e` is the other half: it starts the real release exes on
-throwaway folders against real GitHub, drives the tray and the settings window the way a person would, and checks what
+throwaway folders against real GitHub, drives the tray and the window the way a person would, and checks what
 ends up on disk, what the app says and what it leaves alone.
 
 - **It needs** the network, a signed-in GitHub CLI (`gh auth login`) that may push to the two fixture repositories, and a
@@ -96,7 +96,7 @@ ends up on disk, what the app says and what it leaves alone.
 | --- | --- |
 | `install` | First start: what is installed, how the idle app behaves, how fast it quits. |
 | `places` | With `TSS_HOME` and `TSS_SKILLS_DIR` unset and the profile folders pointed at `%TEMP%`: skills go to `%USERPROFILE%\.copilot\skills` beside a skill written by hand, the settings to `%LOCALAPPDATA%\tiny-skill-sync`, nothing anywhere else. Then `skills_dir` set in `config.json`: the new folder gets its own copies and the old one is left as it is; taken out again while the tray runs, the first folder is managed as before, with an edit made there meanwhile kept and shown. |
-| `changes` | Six kinds of upstream change reach the disk through the tray's **Check now**. |
+| `changes` | Six kinds of upstream change reach the disk through the tray's **Sync now**. |
 | `local-edit` | An edit made while the app runs, then an upstream change to the same skill. |
 | `edit-stopped` | Edits made while the app was not running, including ones that keep a file's size and time. |
 | `holds` | A skill deleted locally; a skill deleted upstream after being edited; every skill deleted upstream. |
@@ -107,9 +107,9 @@ ends up on disk, what the app says and what it leaves alone.
 | `failures` | A bad network, bad answers, a bad token: the skills folder must not change. |
 | `stale` | GitHub answering with a listing that is newer than its commit. |
 | `empty` | A repository added as a whole when its skills are in a subfolder. |
-| `ui` | Layout, tab order, painting and the text of the settings window and the tray menu, including each kind of failure. |
+| `ui` | The window, its questions and the tray menu, driven and read from outside: layout, tab order, painting, the text at the top for each kind of failure, a skill row opening, **Show changes** and back, and a new size remembered. It runs in the light or dark mode Windows is in. |
 
-Run it when you change the engine's visible behaviour, the tray, the settings window or anything GitHub-facing, at least
+Run it when you change the engine's visible behaviour, the tray, the window or anything GitHub-facing, at least
 the scenarios that cover the change (`-Only`). `scripts\dev.ps1 soak` is the long run for leaks and idle cost. The screens
 are checked on real screen copies, not on `PrintWindow`, which sometimes returns an unpainted bottom band for a window
 that is fully painted on screen.
@@ -141,11 +141,11 @@ scripts\dev.ps1 bench -Repo https://github.com/github/awesome-copilot/tree/main/
 
 The bench builds the release exes first. It installs real skills from GitHub into a throwaway folder (this needs the
 network), then starts the release tray app many times and reads Windows' own counters: time to the tray icon, the
-start-up check, CPU, memory, disk and network operations while idle, the settings window and an unchanged poll. The app
+start-up check, CPU, memory, disk and network operations while idle, the window and an unchanged poll. The app
 writes timing marks only when `TSS_BENCH_REPORT` names a file (`src\win\ui\bench.rs`).
 
 It prints a table, saves it as `bench\out\bench-<time>.md` (ignored by git) and exits with 1 if any row is over budget.
-The settings step briefly shows the app's settings window five times; leave the mouse and keyboard alone while it runs.
+The window step briefly shows the app's window five times; leave the mouse and keyboard alone while it runs.
 
 The budgets, agreed before the app was written:
 
@@ -155,7 +155,7 @@ The budgets, agreed before the app was written:
 | Start-up check | 10 ms for an install of 84 files; 75 µs per file at scale |
 | Idle | 0 CPU, 0 disk or network operations, 0 page faults |
 | Idle memory | 12 MiB working set, 2 MiB once trimmed; 4 MiB private |
-| Settings window | open to painted in 50 ms; 20 MiB working set while open; 2 MiB (trimmed) after it closes |
+| Window | open to painted in 100 ms; 40 MiB working set while open; 2 MiB (trimmed) after it closes |
 | Unchanged poll | 50 ms CPU, 0 file reads or writes, 1 request |
 | After a poll | 20 MiB working set, 5 MiB private, 10 threads, 350 handles |
 | Quit | 2 s at most |
@@ -167,12 +167,12 @@ The latest results are in [README.md](README.md#measured-cost).
 
 - `cargo fmt` (`rustfmt.toml`: 160 columns) and clippy with no warnings.
 - Comments explain why, not what. Module comments (`//!`) say what a module is for and what it promises.
-- Text the user reads (the tray, the settings window, `tss`) is short, plain English, and says what to do next. `tss`
+- Text the user reads (the tray, the window, `tss`) is short, plain English, and says what to do next. `tss`
   and the scripts print ASCII only, so every console shows it.
 - Windows calls stay in `src\win\`. The rest of the code is plain Rust that tests can drive.
-- Windows are built from the small control helpers in `src\win\ui\mod.rs` (`Form`: `label`, `button`, `check`,
-  `edit`, `combo`, `list`, scaled for the screen's DPI). Add a helper there rather than calling `CreateWindowExW` in a
-  window's code.
+- A page is a `Surface` built by the pure `src\win\ui\page.rs` and shown with `control::set`
+  (`src\win\ui\control.rs`), which makes, updates and scrolls its controls. When a kind of control is missing, add a
+  `Kind` or `Look` there rather than calling `CreateWindowExW` in a window's code.
 - Dependencies: `windows-sys`, `serde` and `serde_json` only. A new dependency needs a good reason: every one costs
   build time and start-up time.
 

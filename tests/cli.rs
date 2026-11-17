@@ -140,7 +140,7 @@ fn a_check_installs_and_status_looks_only_at_the_disk() {
     expect(
         &ran,
         1,
-        &["Needs attention (1)", "  ! alpha: Edited locally", "tss resolve fx alpha replace", "(Replace with upstream)", "tss resolve fx alpha keep"],
+        &["Needs attention (1)", "  ! alpha: Edited locally", "tss resolve fx alpha replace", "(Use the GitHub version)", "tss resolve fx alpha keep"],
     );
     assert!(host.remote.log().is_empty(), "status asked GitHub: {:?}", host.remote.log());
 }
@@ -237,7 +237,7 @@ fn a_skill_name_a_shell_could_run_gets_no_command_to_paste() {
 
     host.world.write("a$(b)/SKILL.md", "mine\n");
     let ran = tss(&host, "status");
-    expect(&ran, 1, &["! a$(b): Edited locally", "Use the settings window: Replace with upstream / Keep mine"]);
+    expect(&ran, 1, &["! a$(b): Edited locally", "Open Tiny Skill Sync and choose: Use the GitHub version / Keep my version"]);
     assert!(!ran.out.contains("tss resolve fx a$(b)") && !ran.out.contains("\"a$(b)\""), "{ran:?}");
 }
 
@@ -411,6 +411,19 @@ fn the_token_is_saved_shown_and_cleared() {
 
     expect(&tss(&host, "token clear"), 0, &["The saved token was removed."]);
     expect(&tss(&host, "token clear"), 0, &["No token was saved."]);
+}
+
+#[test]
+fn a_repository_found_to_be_private_is_shown_as_sending_the_token() {
+    let host = TestHost { tokens: FakeTokens::some("tok"), gh: Ok(()), ..TestHost::new("cli-auto-token") };
+    host.remote.make_private(REPO, "tok");
+
+    expect(&tss(&host, "check"), 0, &[]);
+
+    assert_eq!(host.world.skill_names(), ["alpha", "beta", "gamma"], "read with the token without being told");
+    assert!(!host.config().repos[0].use_token, "the settings are not changed");
+    expect(&tss(&host, "token status"), 0, &["Repositories that send the token: fx"]);
+    expect(&tss(&host, "status"), 0, &["sends the GitHub token"]);
 }
 
 #[test]

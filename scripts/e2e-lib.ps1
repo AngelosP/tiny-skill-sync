@@ -88,15 +88,45 @@ public static class TssLive {
     [DllImport("user32.dll")] static extern IntPtr WindowFromPoint(POINT point);
     [DllImport("user32.dll")] static extern IntPtr GetAncestor(IntPtr hwnd, uint flags);
 
-    // What the window still has to paint: "window" if the window itself has, and the id of each control that has.
+    // What the window still has to paint: "window" if the window itself has, and the id of each shown panel or control
+    // inside it, at any depth, that has.
     public static string Pending(IntPtr parent) {
         StringBuilder sb = new StringBuilder();
         RECT r;
         if (GetUpdateRect(parent, out r, false)) sb.Append("window ");
-        for (IntPtr h = GetWindow(parent, 5); h != IntPtr.Zero; h = GetWindow(h, 2)) {
-            if (GetUpdateRect(h, out r, false)) sb.Append(GetDlgCtrlID(h) + " ");
-        }
+        PendingIn(parent, sb);
         return sb.ToString().Trim();
+    }
+
+    static void PendingIn(IntPtr parent, StringBuilder sb) {
+        RECT r;
+        for (IntPtr h = GetWindow(parent, 5); h != IntPtr.Zero; h = GetWindow(h, 2)) {
+            if (!IsWindowVisible(h)) continue;
+            if (GetUpdateRect(h, out r, false)) sb.Append(GetDlgCtrlID(h) + " ");
+            PendingIn(h, sb);
+        }
+    }
+
+    public static bool Shown(IntPtr hwnd) { return IsWindowVisible(hwnd); }
+
+    // Waits until the desktop has been composed again, so that what was just painted is on the screen.
+    [DllImport("dwmapi.dll")] public static extern int DwmFlush();
+
+    // How much a part of a picture varies: the largest difference in any one colour between two of its pixels. A part
+    // that was drawn has text, a glyph or a border in it; one that was not is a single flat colour.
+    public static int Contrast(string path, int x, int y, int w, int h) {
+        using (Bitmap bmp = new Bitmap(path)) {
+            int[] lo = new int[] { 255, 255, 255 };
+            int[] hi = new int[] { 0, 0, 0 };
+            for (int j = Math.Max(0, y); j < Math.Min(bmp.Height, y + h); j++) {
+                for (int i = Math.Max(0, x); i < Math.Min(bmp.Width, x + w); i++) {
+                    Color c = bmp.GetPixel(i, j);
+                    int[] v = new int[] { c.R, c.G, c.B };
+                    for (int k = 0; k < 3; k++) { lo[k] = Math.Min(lo[k], v[k]); hi[k] = Math.Max(hi[k], v[k]); }
+                }
+            }
+            return Math.Max(0, Math.Max(hi[0] - lo[0], Math.Max(hi[1] - lo[1], hi[2] - lo[2])));
+        }
     }
 
     // Whether another window is on top of this one: the process and class of what is on top at the corners and the
@@ -126,9 +156,8 @@ public static class TssLive {
     [DllImport("user32.dll")] static extern IntPtr GetWindow(IntPtr hwnd, uint cmd);
     [DllImport("user32.dll")] static extern int GetWindowLongW(IntPtr hwnd, int index);
     [DllImport("user32.dll")] static extern int GetDlgCtrlID(IntPtr hwnd);
-    [DllImport("user32.dll")] static extern bool IsWindowEnabled(IntPtr hwnd);
+    [DllImport("user32.dll")] public static extern bool IsWindowEnabled(IntPtr hwnd);
     [DllImport("user32.dll")] static extern bool ClientToScreen(IntPtr hwnd, ref POINT point);
-    [DllImport("user32.dll")] static extern void keybd_event(byte vk, byte scan, uint flags, UIntPtr extra);
     [StructLayout(LayoutKind.Sequential)] struct POINT { public int X, Y; }
 
     // The direct children of a window in z-order, which is the order Tab visits them in, each as
@@ -151,38 +180,7 @@ public static class TssLive {
         return list.ToArray();
     }
 
-    // A key pressed and let go, for the keyboard, but only while a window of this process has the keyboard: whatever
-    // else has it must not get the key. Says whether it was pressed.
-    public static bool KeyToProcess(uint pid, byte vk) {
-        uint owner;
-        GetWindowThreadProcessId(GetForegroundWindow(), out owner);
-        if (owner != pid) return false;
-        keybd_event(vk, 0, 0, UIntPtr.Zero);
-        keybd_event(vk, 0, 2, UIntPtr.Zero);
-        return true;
-    }
-
-    // The first child of this class whose top-left corner is at x,y (in 96 DPI pixels, give or take 2) in the parent's
-    // client area: a label has no id to ask for.
-    public static IntPtr ChildAt(IntPtr parent, string cls, int x, int y) {
-        int dpi = (int)GetDpiForWindow(parent);
-        if (dpi <= 0) dpi = 96;
-        x = (x * dpi + 48) / 96;
-        y = (y * dpi + 48) / 96;
-        POINT origin = new POINT();
-        ClientToScreen(parent, ref origin);
-        for (IntPtr h = GetWindow(parent, 5); h != IntPtr.Zero; h = GetWindow(h, 2)) {
-            StringBuilder sb = new StringBuilder(64);
-            GetClassNameW(h, sb, 64);
-            RECT r;
-            GetWindowRect(h, out r);
-            if (string.Equals(sb.ToString(), cls, StringComparison.OrdinalIgnoreCase) && Math.Abs(r.Left - origin.X - x) <= 2 && Math.Abs(r.Top - origin.Y - y) <= 2) return h;
-        }
-        return IntPtr.Zero;
-    }
-
     [DllImport("user32.dll")] static extern bool GetClientRect(IntPtr hwnd, out RECT rect);
-    [DllImport("user32.dll")] static extern IntPtr GetForegroundWindow();
     [DllImport("user32.dll")] static extern IntPtr SendMessageTimeoutW(IntPtr hwnd, uint msg, IntPtr wp, IntPtr lp, uint flags, uint timeout, out IntPtr result);
     [DllImport("user32.dll")] static extern int GetMenuItemCount(IntPtr menu);
     [DllImport("user32.dll")] static extern uint GetMenuState(IntPtr menu, uint pos, uint flags);
@@ -239,137 +237,15 @@ public static class TssLive {
         return new int[] { r.Left, r.Top, r.Right, r.Bottom };
     }
 
-    // A part of the screen as a PNG, each pixel made zoom times as large so that a small icon can be seen.
-    public static string CaptureArea(int left, int top, int width, int height, int zoom, string path) {
-        using (Bitmap raw = new Bitmap(width, height))
-        using (Graphics g = Graphics.FromImage(raw)) {
-            g.CopyFromScreen(left, top, 0, 0, new Size(width, height));
-            using (Bitmap big = new Bitmap(width * zoom, height * zoom))
-            using (Graphics gb = Graphics.FromImage(big)) {
-                gb.InterpolationMode = System.Drawing.Drawing2D.InterpolationMode.NearestNeighbor;
-                gb.PixelOffsetMode = System.Drawing.Drawing2D.PixelOffsetMode.Half;
-                gb.DrawImage(raw, new Rectangle(0, 0, width * zoom, height * zoom), new Rectangle(0, 0, width, height), GraphicsUnit.Pixel);
-                big.Save(path, ImageFormat.Png);
-            }
-        }
-        return width + "x" + height;
-    }
-
     [DllImport("user32.dll")] public static extern IntPtr GetDlgItem(IntPtr parent, int id);
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern IntPtr SendMessageW(IntPtr hwnd, uint msg, IntPtr wp, StringBuilder lp);
-    [DllImport("kernel32.dll")] static extern IntPtr OpenProcess(uint access, bool inherit, uint pid);
-    [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr handle);
-    [DllImport("kernel32.dll")] static extern IntPtr VirtualAllocEx(IntPtr process, IntPtr address, UIntPtr size, uint type, uint protect);
-    [DllImport("kernel32.dll")] static extern bool VirtualFreeEx(IntPtr process, IntPtr address, UIntPtr size, uint type);
-    [DllImport("kernel32.dll")] static extern bool WriteProcessMemory(IntPtr process, IntPtr address, byte[] buffer, UIntPtr size, out UIntPtr written);
-    [DllImport("kernel32.dll")] static extern bool ReadProcessMemory(IntPtr process, IntPtr address, byte[] buffer, UIntPtr size, out UIntPtr read);
 
-    [StructLayout(LayoutKind.Sequential)]
-    struct LVITEM {
-        public uint mask; public int iItem; public int iSubItem; public uint state; public uint stateMask;
-        public IntPtr pszText; public int cchTextMax; public int iImage; public IntPtr lParam;
-        public int iIndent; public int iGroupId; public uint cColumns; public IntPtr puColumns; public IntPtr piColFmt; public int iGroup;
-    }
-
-    // The text of a control of any kind (button, edit, static, combo box).
+    // The text of a window or control of any kind.
     public static string Text(IntPtr hwnd) {
         int n = (int)SendMessageW(hwnd, 0x000E, IntPtr.Zero, IntPtr.Zero);
         StringBuilder sb = new StringBuilder(n + 2);
         SendMessageW(hwnd, 0x000D, (IntPtr)(n + 1), sb);
         return sb.ToString();
-    }
-
-    public static int ListCount(IntPtr list) { return (int)SendMessageW(list, 0x1004, IntPtr.Zero, IntPtr.Zero); }
-
-    // A list view lives in another process, so the item and its text are exchanged through memory in that process.
-    static object Remote(IntPtr list, Func<IntPtr, IntPtr, object> body) {
-        uint pid;
-        GetWindowThreadProcessId(list, out pid);
-        IntPtr proc = OpenProcess(0x0008 | 0x0010 | 0x0020 | 0x0400, false, pid);
-        if (proc == IntPtr.Zero) throw new Exception("cannot open the process of the list");
-        IntPtr mem = VirtualAllocEx(proc, IntPtr.Zero, (UIntPtr)4096, 0x3000, 0x04);
-        try { return body(proc, mem); }
-        finally { VirtualFreeEx(proc, mem, UIntPtr.Zero, 0x8000); CloseHandle(proc); }
-    }
-
-    static void Put(IntPtr proc, IntPtr at, byte[] bytes) {
-        UIntPtr done;
-        if (!WriteProcessMemory(proc, at, bytes, (UIntPtr)bytes.Length, out done)) throw new Exception("WriteProcessMemory failed");
-    }
-
-    static byte[] Get(IntPtr proc, IntPtr at, int size) {
-        byte[] bytes = new byte[size];
-        UIntPtr done;
-        if (!ReadProcessMemory(proc, at, bytes, (UIntPtr)size, out done)) throw new Exception("ReadProcessMemory failed");
-        return bytes;
-    }
-
-    static byte[] Bytes(LVITEM item) {
-        int size = Marshal.SizeOf(typeof(LVITEM));
-        byte[] bytes = new byte[size];
-        IntPtr p = Marshal.AllocHGlobal(size);
-        try { Marshal.StructureToPtr(item, p, false); Marshal.Copy(p, bytes, 0, size); } finally { Marshal.FreeHGlobal(p); }
-        return bytes;
-    }
-
-    // The text in one cell of a list view in report mode.
-    public static string Cell(IntPtr list, int row, int column) {
-        return (string)Remote(list, delegate (IntPtr proc, IntPtr mem) {
-            IntPtr text = (IntPtr)(mem.ToInt64() + 256);
-            LVITEM item = new LVITEM();
-            item.iItem = row; item.iSubItem = column; item.pszText = text; item.cchTextMax = 400;
-            Put(proc, mem, Bytes(item));
-            int n = (int)SendMessageW(list, 0x1073, (IntPtr)row, mem);
-            byte[] raw = Get(proc, text, Math.Max(0, Math.Min(n, 399)) * 2);
-            return Encoding.Unicode.GetString(raw);
-        });
-    }
-
-    // Selects a row the way a click would (the window is told, so it reacts as it does to a person).
-    public static void Select(IntPtr list, int row) {
-        Remote(list, delegate (IntPtr proc, IntPtr mem) {
-            LVITEM item = new LVITEM();
-            item.stateMask = 3; item.state = 3;
-            Put(proc, mem, Bytes(item));
-            SendMessageW(list, 0x102B, (IntPtr)row, mem);
-            return null;
-        });
-    }
-
-    // Deselects a row the way Ctrl+click on the selected row does.
-    public static void Deselect(IntPtr list, int row) {
-        Remote(list, delegate (IntPtr proc, IntPtr mem) {
-            LVITEM item = new LVITEM();
-            item.stateMask = 3; item.state = 0;
-            Put(proc, mem, Bytes(item));
-            SendMessageW(list, 0x102B, (IntPtr)row, mem);
-            return null;
-        });
-    }
-
-    [DllImport("user32.dll")] static extern IntPtr GetDC(IntPtr hwnd);
-    [DllImport("user32.dll")] static extern int ReleaseDC(IntPtr hwnd, IntPtr dc);
-    [DllImport("gdi32.dll")] static extern IntPtr SelectObject(IntPtr dc, IntPtr obj);
-    [DllImport("gdi32.dll", CharSet = CharSet.Unicode)] static extern bool GetTextExtentPoint32W(IntPtr dc, string text, int count, out SIZE size);
-    [StructLayout(LayoutKind.Sequential)] struct SIZE { public int cx, cy; }
-
-    // How wide the control's text is when written on one line in the control's own font, and how wide the control is:
-    // "needed,available" in pixels. A label whose text needs more than it has ends in "...".
-    public static string OneLine(IntPtr hwnd) { return OneLine(hwnd, Text(hwnd)); }
-
-    // The same for a text that is to be shown in the control.
-    public static string OneLine(IntPtr hwnd, string text) {
-        IntPtr font = SendMessageW(hwnd, 0x0031, IntPtr.Zero, IntPtr.Zero);
-        IntPtr dc = GetDC(hwnd);
-        try {
-            IntPtr old = SelectObject(dc, font);
-            SIZE size;
-            GetTextExtentPoint32W(dc, text, text.Length, out size);
-            SelectObject(dc, old);
-            RECT r;
-            GetClientRect(hwnd, out r);
-            return size.cx + "," + (r.Right - r.Left);
-        } finally { ReleaseDC(hwnd, dc); }
     }
 }
 '@
@@ -378,20 +254,45 @@ public static class TssLive {
 
 $WM_COMMAND = 0x111
 $WM_CLOSE = 0x10
+$WM_SETTEXT = 0xC
 $WM_KEYDOWN = 0x100
 $WM_CANCELMODE = 0x1F
+$WM_EXITSIZEMOVE = 0x232
 $BM_CLICK = 0xF5
+$BM_GETCHECK = 0xF0
+$MN_SELECTITEM = 0x1E5
+$CBN_SELENDOK = 9
 $VK_ESCAPE = 0x1B
+$VK_RETURN = 0x0D
 $CMD_SETTINGS = 1001
 $CMD_CHECK = 1002
 $CMD_QUIT = 1003
 $TRAY_CLASS = 'TinySkillSyncTray'
-$SETTINGS_CLASS = 'TinySkillSyncSettings'
+$WINDOW_CLASS = 'TinySkillSyncWindow'
 $ASK_CLASS = 'TinySkillSyncAsk'
 $MENU_CLASS = '#32768'
 $TRAY_ICON_ID = 1
 $TRAY_CALLBACK = 0x8001
 $WM_CONTEXTMENU = 0x7B
+
+# The panels of the window, each a child of it, and the ids of the controls on them (src\win\ui\page.rs, mod id).
+# Head, Files and Code show only while the window shows what differs in a skill; the others are hidden then.
+$UiPanel = @{ Hero = 101; Nav = 102; Page = 103; Head = 104; Files = 105; Code = 106 }
+# Save token and Delete token are left out on purpose: the saved token is shared by every copy of the app.
+$UiId = @{
+    Sync = 200; HeroTitle = 201; HeroSub = 202
+    NavAdd = 300; NavActivity = 301; NavSettings = 302; NavHead = 303; NavRepo = 1000
+    WelcomeAdd = 305; More = 310; Every = 311; Enabled = 312; Retry = 313; OpenSettings = 314
+    DefaultEvery = 320; OpenSkills = 321; OpenBackups = 322
+    Title = 400; Private = 401; Sub = 402; InfoLead = 403; InfoText = 404; SkillsDir = 410; TokenText = 411; Empty = 412
+    Back = 330; DiffAction = 333; Note = 100000; File = 200000; Gap = 300000
+    # Plus 8 per skill, plus the part: 0 the row ("name`ntag"), 1 its details, 2 Show changes, 3 Open folder, 4 and on
+    # its actions.
+    Skill = 1000000
+}
+# A question (src\win\ui\page.rs, mod ask_id): its controls are on one panel.
+$AskPanel = 100
+$AskId = @{ Ok = 1; Cancel = 2; Edit = 10; Heading = 11; Text = 12; Label = 13; Hint = 14; ComboLabel = 15; Combo = 16; Note = 17; Choice = 20 }
 
 # ---------------------------------------------------------------- a throwaway install
 
@@ -701,7 +602,7 @@ function Get-MarkCount([string]$Path, [string]$Mark) {
     @(Read-Marks $Path | Where-Object { $_.Mark -eq $Mark }).Count
 }
 
-# The tray app's "Check now": asks for it the way the menu does and waits until that job has finished. Returns how
+# The tray app's "Sync now": asks for it the way the menu does and waits until that job has finished. Returns how
 # long the app says the job took, in milliseconds.
 function Invoke-TrayCheck([Diagnostics.Process]$P, [string]$Report, [int]$TimeoutSec = 120) {
     $before = Get-MarkCount $Report 'job-check'
@@ -726,53 +627,112 @@ function Wait-Quiet([string]$Report, [int]$QuietSec = 4, [int]$TimeoutSec = 90) 
     $false
 }
 
-# ---------------------------------------------------------------- the settings window, read from outside
+# ---------------------------------------------------------------- the window, read and driven from outside
 
-function Open-Settings([Diagnostics.Process]$P) {
-    $h = Find-LiveWindow $P.Id $SETTINGS_CLASS -Visible
+# Opens the window the way the tray menu does (or finds it open), and returns it once it shows.
+function Open-Window([Diagnostics.Process]$P) {
+    $h = Find-LiveWindow $P.Id $WINDOW_CLASS -Visible
     if ($h -eq [IntPtr]::Zero) { Send-LiveCommand $P $CMD_SETTINGS }
-    Wait-Live { $w = Find-LiveWindow $P.Id $SETTINGS_CLASS -Visible; if ($w -ne [IntPtr]::Zero) { $w } } 'the settings window' 15 100
+    Wait-Live { $w = Find-LiveWindow $P.Id $WINDOW_CLASS -Visible; if ($w -ne [IntPtr]::Zero) { $w } } 'the window' 15 100
 }
 
-function Close-Settings([Diagnostics.Process]$P) {
-    $h = Find-LiveWindow $P.Id $SETTINGS_CLASS
+function Close-Window([Diagnostics.Process]$P) {
+    $h = Find-LiveWindow $P.Id $WINDOW_CLASS
     if ($h -ne [IntPtr]::Zero) { [void][TssLive]::PostMessageW($h, $WM_CLOSE, [IntPtr]::Zero, [IntPtr]::Zero) }
 }
 
-function Get-Control([IntPtr]$Window, [int]$Id) {
-    $h = [TssLive]::GetDlgItem($Window, $Id)
-    if ($h -eq [IntPtr]::Zero) { throw "The window has no control $Id." }
+# A control on a panel of the window (or of a question), or zero when it is not there. The window destroys the controls
+# it no longer shows, so one that is there is shown whenever its panel is. A long page makes its controls only within
+# about two screens of what is shown (control.rs, NEAR), so a control further down is zero until the page scrolls to
+# it; the fixtures' pages are short enough that every control is made.
+function Find-Ui([IntPtr]$Window, [int]$Panel, [int]$Id) {
+    $p = [TssLive]::GetDlgItem($Window, $Panel)
+    if ($p -eq [IntPtr]::Zero) { return [IntPtr]::Zero }
+    [TssLive]::GetDlgItem($p, $Id)
+}
+
+function Get-Ui([IntPtr]$Window, [int]$Panel, [int]$Id) {
+    $h = Find-Ui $Window $Panel $Id
+    if ($h -eq [IntPtr]::Zero) { throw "The window has no control $Id on panel $Panel." }
     $h
 }
 
-# The rows of a list in the window, each an array of the texts of its columns. Wrap the call in @( ) .
-function Read-UiList([IntPtr]$Window, [int]$Id, [int]$Columns) {
-    $list = Get-Control $Window $Id
-    $n = [TssLive]::ListCount($list)
-    for ($i = 0; $i -lt $n; $i++) {
-        $row = New-Object string[] $Columns
-        for ($col = 0; $col -lt $Columns; $col++) { $row[$col] = [TssLive]::Cell($list, $i, $col) }
-        , $row
+# The text of a control (every label and paragraph is a control too), or $null when it is not there.
+function Read-Ui([IntPtr]$Window, [int]$Panel, [int]$Id) {
+    $h = Find-Ui $Window $Panel $Id
+    if ($h -eq [IntPtr]::Zero) { return $null }
+    [TssLive]::Text($h)
+}
+
+# Clicks a button, a row, a toggle or a choice as a person would: the control changes its own look, then tells the
+# window. Never a list: a click opens its menu, which waits for a person (use Choose-Ui).
+function Click-Ui([IntPtr]$Window, [int]$Panel, [int]$Id) {
+    [void][TssLive]::PostMessageW((Get-Ui $Window $Panel $Id), $BM_CLICK, [IntPtr]::Zero, [IntPtr]::Zero)
+}
+
+# Whether a toggle or a choice is on.
+function Get-Checked([IntPtr]$Window, [int]$Panel, [int]$Id) {
+    ([TssLive]::SendMessageW((Get-Ui $Window $Panel $Id), $BM_GETCHECK, [IntPtr]::Zero, [IntPtr]::Zero).ToInt64()) -eq 1
+}
+
+# Gives a control a text through its own message. A text box takes it as typing, and tells its question.
+function Set-UiText([IntPtr]$Control, [string]$Text) {
+    $p = [Runtime.InteropServices.Marshal]::StringToHGlobalUni($Text)
+    try { [void][TssLive]::SendMessageW($Control, $WM_SETTEXT, [IntPtr]::Zero, $p) } finally { [Runtime.InteropServices.Marshal]::FreeHGlobal($p) }
+}
+
+# Picks an entry of a list as its menu does: the list shows the entry, then tells the window, through its panel, that
+# the choice is made.
+function Choose-Ui([IntPtr]$Window, [int]$Panel, [int]$Id, [string]$Entry) {
+    $list = Get-Ui $Window $Panel $Id
+    Set-UiText $list $Entry
+    [void][TssLive]::PostMessageW([TssLive]::GetDlgItem($Window, $Panel), $WM_COMMAND, [IntPtr](($CBN_SELENDOK -shl 16) -bor $Id), $list)
+}
+
+# The big line at the top of the window and the one under it.
+function Read-Hero([IntPtr]$Window) {
+    [pscustomobject]@{ Title = (Read-Ui $Window $UiPanel.Hero $UiId.HeroTitle); Sub = (Read-Ui $Window $UiPanel.Hero $UiId.HeroSub) }
+}
+
+# The repositories in the list at the left, top to bottom: the label and the line under it. Wrap the call in @( ).
+function Read-Nav([IntPtr]$Window) {
+    for ($i = 0; ; $i++) {
+        $t = Read-Ui $Window $UiPanel.Nav ($UiId.NavRepo + $i)
+        if ($null -eq $t) { break }
+        $two = $t -split "`n", 2
+        [pscustomobject]@{ Index = $i; Label = $two[0]; Sub = $(if ($two.Count -gt 1) { $two[1] } else { '' }) }
     }
 }
 
-function Read-UiText([IntPtr]$Window, [int]$Id) {
-    [TssLive]::Text((Get-Control $Window $Id))
+# The skills on a repository's page, top to bottom: the name and the tag on the row and, when the row is open, the
+# details and buttons under it ($null and none when it is closed). Wrap the call in @( ).
+function Read-Skills([IntPtr]$Window) {
+    for ($j = 0; ; $j++) {
+        $base = $UiId.Skill + 8 * $j
+        $row = Read-Ui $Window $UiPanel.Page $base
+        if ($null -eq $row) { break }
+        $two = $row -split "`n", 2
+        $buttons = @(foreach ($k in 2..7) {
+                $t = Read-Ui $Window $UiPanel.Page ($base + $k)
+                if ($null -ne $t) { [pscustomobject]@{ Id = $base + $k; Text = $t } }
+            })
+        [pscustomobject]@{
+            Index = $j; Id = $base; Name = $two[0]; Tag = $(if ($two.Count -gt 1) { $two[1] } else { '' })
+            Detail = (Read-Ui $Window $UiPanel.Page ($base + 1)); Buttons = $buttons
+        }
+    }
 }
 
-# Types into a text box the way a person would (the window gets the text through its own message).
-function Set-UiText([IntPtr]$Window, [int]$Id, [string]$Text) {
-    $p = [Runtime.InteropServices.Marshal]::StringToHGlobalUni($Text)
-    try { [void][TssLive]::SendMessageW((Get-Control $Window $Id), 0x000C, [IntPtr]::Zero, $p) } finally { [Runtime.InteropServices.Marshal]::FreeHGlobal($p) }
+# Shows the page of the repository at this place in the list, and waits until it shows.
+function Open-Repo([IntPtr]$Window, [int]$Index = 0) {
+    Click-Ui $Window $UiPanel.Nav ($UiId.NavRepo + $Index)
+    Wait-Live { if ((Find-Ui $Window $UiPanel.Page $UiId.Title) -ne [IntPtr]::Zero) { $true } } 'the page of the repository' 10 100
+    Start-Sleep -Milliseconds 300
 }
 
-function Click-Ui([IntPtr]$Window, [int]$Id) {
-    [void][TssLive]::PostMessageW($Window, $WM_COMMAND, [IntPtr]$Id, [TssLive]::GetDlgItem($Window, $Id))
-}
-
-# Clicks a button or ticks a check box as a person would: the control changes its own look and then tells the window.
-function Click-Control([IntPtr]$Window, [int]$Id) {
-    [void][TssLive]::PostMessageW((Get-Control $Window $Id), $BM_CLICK, [IntPtr]::Zero, [IntPtr]::Zero)
+# A question the app shows (adding or removing a repository, for example), or zero.
+function Find-Ask([Diagnostics.Process]$P) {
+    Find-LiveWindow $P.Id $ASK_CLASS -Visible
 }
 
 # A key sent to one control of a window, through its message queue (the keyboard itself is not used, so it does not
@@ -781,7 +741,8 @@ function Send-Key([IntPtr]$Control, [int]$Key) {
     [void][TssLive]::PostMessageW($Control, $WM_KEYDOWN, [IntPtr]$Key, [IntPtr]::Zero)
 }
 
-# The controls of a window in tab order, each with where it is (client pixels) and how it is.
+# The children of a window or panel in tab order (the window keeps the z-order in the order it lays them out), each
+# with where it is (client pixels) and how it is.
 function Get-Layout([IntPtr]$Window) {
     foreach ($line in [TssLive]::Children($Window)) {
         $part = $line -split '\|'
@@ -794,54 +755,25 @@ function Get-Layout([IntPtr]$Window) {
     }
 }
 
-# Whether a button or check box is ticked.
-function Get-Ticked([IntPtr]$Window, [int]$Id) {
-    ([TssLive]::SendMessageW((Get-Control $Window $Id), 0xF0, [IntPtr]::Zero, [IntPtr]::Zero).ToInt64()) -eq 1
-}
-
-# Picks an item of a combo box as a person does: the box shows it, then tells the window that the choice is made.
-function Choose-Item([IntPtr]$Window, [int]$Id, [int]$Index) {
-    $combo = Get-Control $Window $Id
-    [void][TssLive]::SendMessageW($combo, 0x14E, [IntPtr]$Index, [IntPtr]::Zero)
-    [void][TssLive]::PostMessageW($Window, $WM_COMMAND, [IntPtr]((9 -shl 16) -bor $Id), $combo)
-}
-
-# The status line at the bottom of the settings window: a label has no id to ask for.
-function Read-Status([IntPtr]$Window) {
-    $h = [TssLive]::ChildAt($Window, 'Static', 12, 551)
-    if ($h -eq [IntPtr]::Zero) { return $null }
-    [TssLive]::Text($h)
-}
-
-# How much room a text needs on one line in the status line of the settings window (its own text by default), and how
-# much room the line has, in pixels; the line ends in "..." when the text needs more.
-function Get-StatusFit([IntPtr]$Window, [string]$Text = $null) {
-    $h = [TssLive]::ChildAt($Window, 'Static', 12, 551)
-    if ($h -eq [IntPtr]::Zero) { return $null }
-    $part = $(if ($null -eq $Text) { [TssLive]::OneLine($h) } else { [TssLive]::OneLine($h, $Text) }) -split ','
-    [pscustomobject]@{ Needed = [int]$part[0]; Available = [int]$part[1] }
-}
-
-# How much of a multi-line edit box's text can be seen without scrolling: how many lines the text takes, how many
-# fit in the box, and whether the box has a scroll bar for the rest.
-function Get-EditFit([IntPtr]$Window, [int]$Id) {
-    $edit = Get-Control $Window $Id
-    $ask = { param([int]$Message, [int]$Wp) [TssLive]::SendMessageW($edit, $Message, [IntPtr]$Wp, [IntPtr]::Zero).ToInt64() }
-    $lines = [int](& $ask 0xBA 0)
-    $top = {
-        param([int]$Line)
-        $at = [int](& $ask 0xBB $Line)
-        $y = ((& $ask 0xD6 $at) -shr 16) -band 0xFFFF
-        if ($y -ge 0x8000) { $y - 0x10000 } else { $y }
+# A pop-up menu of the app that is showing, once it has been put in its place on screen; zero when none shows in time.
+function Wait-Menu([Diagnostics.Process]$P, [int]$TimeoutSec = 5) {
+    # The window is made before the menu is put in its place, and is 100 by 100 at the corner of the screen until then.
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    while ($sw.Elapsed.TotalSeconds -lt $TimeoutSec) {
+        $m = Find-LiveWindow $P.Id $MENU_CLASS -Visible
+        if ($m -ne [IntPtr]::Zero) {
+            $b = [TssLive]::Bounds($m)
+            if ($b -ne '0,0,100,100') { Start-Sleep -Milliseconds 400; return $m }
+        }
+        Start-Sleep -Milliseconds 100
     }
-    $height = [int](([TssLive]::Client($edit)) -split ',')[1]
-    $visible = $lines
-    if ($lines -ge 2) {
-        $step = (& $top 1) - (& $top 0)
-        if ($step -gt 0) { $visible = [int][math]::Floor($height / $step) }
-    }
-    $item = Get-Layout $Window | Where-Object { $_.Id -eq $Id } | Select-Object -First 1
-    [pscustomobject]@{ Lines = $lines; Visible = $visible; Scrolls = (($item.Style -band 0x200000) -ne 0); Tab = $item.Tab }
+    [IntPtr]::Zero
+}
+
+# Chooses an item of a pop-up menu that is showing, as the keyboard does: the item is selected, then Enter is pressed.
+function Choose-MenuItem([IntPtr]$Menu, [int]$Index) {
+    [void][TssLive]::SendMessageW($Menu, $MN_SELECTITEM, [IntPtr]$Index, [IntPtr]::Zero)
+    [void][TssLive]::PostMessageW($Menu, $WM_KEYDOWN, [IntPtr]$VK_RETURN, [IntPtr]::Zero)
 }
 
 # The pop-up menu of the tray icon, shown the way a right click on the icon shows it (the icon sits in the overflow
@@ -853,17 +785,7 @@ function Show-TrayMenu([Diagnostics.Process]$P) {
     $x = 1000; $y = 1000
     if ($r) { $x = [int](($r[0] + $r[2]) / 2); $y = [int](($r[1] + $r[3]) / 2) }
     [void][TssLive]::PostMessageW($tray, $TRAY_CALLBACK, [IntPtr](($y -shl 16) -bor ($x -band 0xFFFF)), [IntPtr]$WM_CONTEXTMENU)
-    # The window is made before the menu is put in its place, and is 100 by 100 at the corner of the screen until then.
-    $sw = [Diagnostics.Stopwatch]::StartNew()
-    while ($sw.Elapsed.TotalSeconds -lt 5) {
-        $m = Find-LiveWindow $P.Id $MENU_CLASS -Visible
-        if ($m -ne [IntPtr]::Zero) {
-            $b = [TssLive]::Bounds($m)
-            if ($b -ne '0,0,100,100') { Start-Sleep -Milliseconds 400; return $m }
-        }
-        Start-Sleep -Milliseconds 100
-    }
-    [IntPtr]::Zero
+    Wait-Menu $P
 }
 
 # Closes a pop-up menu that is showing, as clicking elsewhere does.

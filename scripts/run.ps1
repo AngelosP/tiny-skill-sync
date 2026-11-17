@@ -4,8 +4,8 @@
 
 .DESCRIPTION
   Builds first (a debug build unless -Release). One copy of the app runs per settings folder, so the sandbox copy
-  runs beside the real one, if any, with its own tray icon. The first start opens the settings window. Running this
-  script again while the sandbox copy runs opens its settings window.
+  runs beside the real one, if any, with its own tray icon. The first start opens the window. Running this
+  script again while the sandbox copy runs opens its window.
 
   The saved GitHub token is shared with the real app: do not use Set or Clear in the sandbox unless you mean it.
 

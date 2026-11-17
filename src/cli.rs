@@ -49,8 +49,8 @@ Usage:
         manage    undo keep
   tss add OWNER/NAME [--every INTERVAL] [--use-token]
   tss add https://github.com/OWNER/NAME/tree/BRANCH/FOLDER [...]
-      Follow a repository, or one folder of it. --use-token sends the GitHub token
-      (needed for private repositories).
+      Follow a repository, or one folder of it. A private repository is read with
+      the GitHub token by itself; --use-token sends it for every request.
   tss remove REPO [--delete-skills]
       Stop following a repository. Its skills stay installed and become yours,
       unless --delete-skills is given (edited skills are kept even then).
@@ -451,7 +451,7 @@ fn exit_code(level: Level) -> i32 {
 /// double quotes PowerShell still runs `$(...)`, treats a backtick as an escape and ends the string at a curly double
 /// quote, and cmd expands `%NAME%`; single quotes are no safer, because curly single quotes close them too. So a word is
 /// only written out when it is made of letters, digits, spaces and a few plain marks, and the user is pointed to the
-/// settings window for any other.
+/// app's window for any other.
 fn quote(word: &str) -> Option<String> {
     let plain = |c: char| c.is_ascii_alphanumeric() || "-_./:".contains(c);
     if word.is_empty() || !word.chars().all(|c| plain(c) || c.is_alphanumeric() || c == ' ' || c == '+') {
@@ -514,7 +514,7 @@ fn rows(out: &mut String, repo_id: &str, rows: &[Row], all: bool) {
             say!(out, "      {cmd:<width$}   ({label})");
         }
         if !untyped.is_empty() {
-            say!(out, "      No command is shown because the name is not safe to paste. Use the settings window: {}", untyped.join(" / "));
+            say!(out, "      No command is shown because the name is not safe to paste. Open Tiny Skill Sync and choose: {}", untyped.join(" / "));
         }
     }
 }
@@ -531,13 +531,13 @@ fn messages(out: &mut String, board: &Board) {
     }
 }
 
-fn schedule_text(cfg: &Config, repo: &RepoConfig) -> String {
+fn schedule_text(cfg: &Config, repo: &RepoConfig, sends_token: bool) -> String {
     let mut text = match (repo.enabled, repo.interval) {
         (false, _) => "Disabled: checked only when asked".to_string(),
         (true, Some(every)) => format!("Checked every {}", every.describe()),
         (true, None) => format!("Checked every {} (the default)", cfg.default_interval.describe()),
     };
-    if repo.use_token {
+    if sends_token {
         text.push_str("; sends the GitHub token");
     }
     text.push('.');
@@ -584,7 +584,7 @@ fn status(host: &dyn Host, out: &mut String) -> Result<i32, Fail> {
     for (view, repo) in board.views(&all_enabled(&cfg), now).iter().zip(&cfg.repos) {
         gap(out);
         header(out, view, repo);
-        say!(out, "  Last check: {}. {}", view.last_check_text(now), schedule_text(&cfg, repo));
+        say!(out, "  Last check: {}. {}", view.last_check_text(now), schedule_text(&cfg, repo, repo.use_token || engine.needs_token(&repo.id)));
         if view.skills.is_empty() {
             say!(out, "  No skills from it are installed.");
         }
@@ -767,7 +767,7 @@ fn add(host: &dyn Host, out: &mut String, spec: &str, every: Option<Interval>, u
     }
     let added = cfg.add_repo(&spec, every, use_token).clone();
     cfg.save(&file).map_err(Fail::Failed)?;
-    say!(out, "Added {} as '{}'. {}", added.label(), added.id, schedule_text(&cfg, &added));
+    say!(out, "Added {} as '{}'. {}", added.label(), added.id, schedule_text(&cfg, &added, added.use_token));
     say!(out, "Install its skills now with: {}", command_line("check", &[&added.id], &[]).unwrap_or_else(|| "tss check".to_string()));
     Ok(EXIT_OK)
 }
@@ -852,13 +852,17 @@ fn token(host: &dyn Host, out: &mut String, action: TokenAction) -> Result<i32, 
                     }
                 }
             };
-            let users: Vec<&str> = cfg.repos.iter().filter(|r| r.use_token).map(|r| r.id.as_str()).collect();
+            // The repositories the user marked, and those found to be private. A state that cannot be read only hides
+            // the second kind, so it is not a failure here.
+            let state = load_state(host, &cfg).unwrap_or_default();
+            let sends = |r: &RepoConfig| r.use_token || state.repo(&r.id).is_some_and(|s| s.needs_token);
+            let users: Vec<&str> = cfg.repos.iter().filter(|r| sends(r)).map(|r| r.id.as_str()).collect();
             if users.is_empty() {
-                say!(out, "No repository sends the token.");
+                say!(out, "No repository sends the token. It is tried by itself when GitHub cannot find a repository without it.");
             } else {
                 say!(out, "Repositories that send the token: {}", users.join(", "));
             }
-            if !available && cfg.repos.iter().any(|r| r.use_token && r.enabled) {
+            if !available && cfg.repos.iter().any(|r| sends(r) && r.enabled) {
                 say!(out, "They cannot be checked until a token is saved (tss token set) or the GitHub CLI is signed in (gh auth login).");
                 return Ok(EXIT_ATTENTION);
             }
@@ -1033,10 +1037,11 @@ mod tests {
     }
 
     #[test]
-    fn a_row_whose_name_is_not_safe_to_paste_points_to_the_settings_window() {
+    fn a_row_whose_name_is_not_safe_to_paste_points_to_the_app_window() {
         let row = |name: &str, actions: &[Action]| Row {
             name: name.into(),
             text: "Edited locally (changed: SKILL.md)".into(),
+            tag: "Edited on this PC",
             level: Level::Attention,
             actions: actions.to_vec(),
         };
@@ -1045,17 +1050,17 @@ mod tests {
         rows(&mut out, "fx", &[row("a$(b)", &[Action::Overwrite, Action::KeepMine])], true);
         assert!(!out.contains("tss resolve"), "{out}");
         assert!(out.contains("! a$(b): Edited locally"), "the name is still shown:\n{out}");
-        assert!(out.contains("Use the settings window: Replace with upstream / Keep mine"), "{out}");
+        assert!(out.contains("Open Tiny Skill Sync and choose: Use the GitHub version / Keep my version"), "{out}");
 
         // A command that does not name the skill can still be typed; the one that does cannot.
         let mut out = String::new();
         rows(&mut out, "fx", &[row("a$(b)", &[Action::RemoveThem, Action::KeepMine])], true);
         assert!(out.contains("tss check fx --delete-all   (Delete them)"), "{out}");
-        assert!(!out.contains("tss resolve") && out.contains("Use the settings window: Keep mine"), "{out}");
+        assert!(!out.contains("tss resolve") && out.contains("Open Tiny Skill Sync and choose: Keep my version"), "{out}");
 
         let mut out = String::new();
         rows(&mut out, "fx", &[row("alpha", &[Action::Overwrite, Action::KeepMine])], true);
-        assert!(out.contains("tss resolve fx alpha replace") && out.contains("tss resolve fx alpha keep") && !out.contains("settings window"), "{out}");
+        assert!(out.contains("tss resolve fx alpha replace") && out.contains("tss resolve fx alpha keep") && !out.contains("Open Tiny Skill Sync"), "{out}");
     }
 
     #[test]

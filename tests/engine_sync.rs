@@ -5,7 +5,9 @@ mod common;
 use std::fs;
 
 use common::*;
-use tiny_skill_sync::engine::{ApplyResult, Outcome, Resolution, SyncOptions, SyncReport};
+use tiny_skill_sync::diff::{Body, FileChange, Presence};
+use tiny_skill_sync::engine::{ApplyResult, DIFF_FILE_BYTES, DiffReport, Outcome, Resolution, SyncOptions, SyncReport};
+use tiny_skill_sync::github::{FailureKind, RemoteError};
 use tiny_skill_sync::reconcile::{Hold, Skip, Verdict};
 
 fn names(map: &std::collections::BTreeMap<String, String>) -> Vec<&str> {
@@ -448,4 +450,192 @@ fn a_skill_that_is_not_safe_to_install_is_rejected_whole_and_the_rest_still_inst
     assert_eq!(repo.rejected.len(), 1, "{:?}", repo.rejected);
     assert_eq!(repo.rejected[0].name, "bad");
     assert_eq!(skill(repo, "ok").result, ApplyResult::Done);
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Show changes
+// ---------------------------------------------------------------------------------------------------------------------
+
+fn diff(s: &mut Setup, skill: &str) -> DiffReport {
+    s.engine.diff(&s.cfg, "fx", skill, &cancel_flag()).expect("the changes could be shown")
+}
+
+fn shown(report: &DiffReport) -> Vec<(&str, Presence)> {
+    report.files.iter().map(|f| (f.path.as_str(), f.presence)).collect()
+}
+
+fn lines(change: &FileChange) -> (usize, usize) {
+    match &change.body {
+        Body::Text(text) => (text.removed, text.added),
+        other => panic!("{} is not shown as text: {other:?}", change.path),
+    }
+}
+
+#[test]
+fn show_changes_downloads_only_the_files_that_differ_and_changes_nothing() {
+    let mut s = Setup::installed("diff");
+    s.w.write("alpha/SKILL.md", &ALPHA_V1.replace("v1", "mine"));
+    s.w.write("alpha/notes.md", "my notes\n");
+    s.w.remove("alpha/scripts/hello.ps1");
+    let before = s.w.snapshot();
+
+    let report = diff(&mut s, "alpha");
+
+    assert!(report.on_github && report.here);
+    assert_eq!(shown(&report), [("notes.md", Presence::OnlyHere), ("scripts/hello.ps1", Presence::OnlyOnGitHub), ("SKILL.md", Presence::Both)]);
+    let changed = ALPHA_V1.lines().filter(|l| l.contains("v1")).count();
+    assert_eq!(lines(&report.files[2]), (changed, changed));
+    assert_eq!(lines(&report.files[0]), (0, 1));
+    assert_eq!(lines(&report.files[1]), (1, 0));
+    // The guide is the same on both sides, so it is not downloaded.
+    assert_eq!(s.remote.calls(), Calls { tree: 1, conditional: 0, commit: 1, file: 2 });
+    assert!(!s.remote.log().iter().any(|l| l.contains("guide.md")), "{:?}", s.remote.log());
+    assert_eq!(s.w.snapshot(), before, "showing changes writes nothing, not even state.json");
+}
+
+#[test]
+fn show_changes_of_a_skill_deleted_here_or_gone_from_github() {
+    let mut s = Setup::installed("diff-gone");
+    fs::remove_dir_all(s.w.skills.join("beta")).unwrap();
+    let report = diff(&mut s, "Beta");
+    assert!(report.on_github && !report.here, "the name is matched whatever its case");
+    assert_eq!(shown(&report), [("SKILL.md", Presence::OnlyOnGitHub)]);
+
+    s.remote.remove(REPO, "skills/gamma");
+    s.remote.reset();
+    let report = diff(&mut s, "Gamma");
+    assert!(!report.on_github && report.here);
+    assert_eq!(shown(&report), [("SKILL.md", Presence::OnlyHere)]);
+    assert_eq!(s.remote.calls(), Calls { tree: 1, conditional: 0, commit: 0, file: 0 }, "nothing to download");
+
+    s.remote.reset();
+    assert!(diff(&mut s, "alpha").files.is_empty(), "a skill that is the same on both sides has nothing to show");
+    assert_eq!(s.remote.calls(), Calls { tree: 1, conditional: 0, commit: 0, file: 0 });
+}
+
+#[test]
+fn show_changes_of_a_private_repository_sends_the_token_without_remembering_that_it_is_private() {
+    let mut s = Setup::installed("diff-private");
+    s.remote.make_private(REPO, "secret");
+    s.tokens = FakeTokens::some("secret");
+    s.engine = s.restarted();
+    s.w.write("beta/SKILL.md", "mine\n");
+    let state = fs::read(s.w.state_file()).unwrap();
+
+    let report = diff(&mut s, "beta");
+
+    assert_eq!(shown(&report), [("SKILL.md", Presence::Both)]);
+    let seen = s.remote.tokens_seen();
+    let seen: Vec<(&str, bool)> = seen.iter().map(|(kind, token)| (kind.as_str(), token.is_some())).collect();
+    assert_eq!(seen, [("tree", false), ("tree", true), ("commit", true), ("file", true)]);
+    assert!(!s.engine.needs_token("fx"), "only a check learns that a repository is private");
+    assert_eq!(fs::read(s.w.state_file()).unwrap(), state);
+}
+
+#[test]
+fn show_changes_fails_as_a_whole_and_changes_nothing_when_github_fails() {
+    let mut s = Setup::installed("diff-fail");
+    s.w.write("alpha/SKILL.md", "mine\n");
+    let before = s.w.snapshot();
+
+    s.remote.fail_file(REPO, "skills/alpha/SKILL.md", Some(RemoteError::new(FailureKind::Network, "the connection dropped")));
+    let err = s.engine.diff(&s.cfg, "fx", "alpha", &cancel_flag()).unwrap_err();
+    assert!(err.to_string().contains("the connection dropped"), "{err}");
+
+    s.remote.fail_file(REPO, "skills/alpha/SKILL.md", None);
+    s.remote.lie_about(REPO, "skills/alpha/SKILL.md", "pushed meanwhile\n");
+    let err = s.engine.diff(&s.cfg, "fx", "alpha", &cancel_flag()).unwrap_err();
+    assert!(err.to_string().contains("changed on GitHub"), "a download that does not match the listing is not shown: {err}");
+    s.remote.lie_about(REPO, "skills/alpha/SKILL.md", &ALPHA_V1.repeat(2));
+    let err = s.engine.diff(&s.cfg, "fx", "alpha", &cancel_flag()).unwrap_err();
+    assert!(err.to_string().contains("changed on GitHub"), "nor one longer than listed: {err}");
+
+    s.remote.make_private(REPO, "secret");
+    let err = s.engine.diff(&s.cfg, "fx", "alpha", &cancel_flag()).unwrap_err();
+    assert!(err.to_string().contains("gh auth login"), "{err}");
+
+    assert!(s.engine.diff(&s.cfg, "nope", "alpha", &cancel_flag()).is_err());
+    let err = s.engine.diff(&s.cfg, "fx", "..", &cancel_flag()).unwrap_err();
+    assert!(err.to_string().contains("not a skill name"), "only a skill name is accepted: {err}");
+    assert_eq!(s.w.snapshot(), before);
+}
+
+#[test]
+fn show_changes_names_what_it_does_not_read_and_never_follows_a_link() {
+    let mut s = Setup::fresh("diff-big");
+    let big = vec![b'x'; DIFF_FILE_BYTES as usize + 1];
+    s.remote.put_bytes(REPO, "skills/alpha/same.bin", &big);
+    s.remote.put_bytes(REPO, "skills/alpha/changed.bin", &big);
+    s.sync();
+    let mut mine = big.clone();
+    mine[0] = b'y';
+    fs::write(s.w.skills.join("alpha").join("changed.bin"), &mine).unwrap();
+    let outside = s.w.root.join("outside");
+    fs::create_dir_all(&outside).unwrap();
+    fs::write(outside.join("SKILL.md"), "not in the skill\n").unwrap();
+    let link = s.w.skills.join("alpha").join("linked");
+    let made = std::process::Command::new("cmd").args(["/C", "mklink", "/J"]).arg(&link).arg(&outside).output().unwrap().status.success();
+    assert!(made, "creating a junction needs no privileges");
+    s.remote.reset();
+
+    let report = diff(&mut s, "alpha");
+
+    let bodies: Vec<(&str, &Body)> = report.files.iter().map(|f| (f.path.as_str(), &f.body)).collect();
+    assert_eq!(bodies.len(), 2, "the big file that is the same is left out: {bodies:?}");
+    assert_eq!(bodies[0].0, "changed.bin");
+    assert!(matches!(bodies[0].1, Body::Hidden(why) if why.contains("too big")), "{bodies:?}");
+    assert_eq!(bodies[1].0, "linked");
+    assert!(matches!(bodies[1].1, Body::Hidden(why) if why.contains("never followed")), "{bodies:?}");
+    assert_eq!(s.remote.calls().file, 0, "a file too big to show is not downloaded");
+    fs::remove_dir(&link).unwrap();
+
+    let skill = s.w.skills.join("alpha");
+    fs::remove_dir_all(&skill).unwrap();
+    let made = std::process::Command::new("cmd").args(["/C", "mklink", "/J"]).arg(&skill).arg(&outside).output().unwrap().status.success();
+    assert!(made);
+    let err = s.engine.diff(&s.cfg, "fx", "alpha", &cancel_flag()).unwrap_err();
+    assert!(err.to_string().contains("link"), "{err}");
+    fs::remove_dir(&skill).unwrap();
+}
+
+#[test]
+fn show_changes_of_a_folder_that_is_itself_one_skill() {
+    let w = World::new("diff-single");
+    let remote = FakeRemote::new();
+    remote.seed("o/tools", &[("tools/helper/SKILL.md", "helper\n"), ("tools/helper/refs/a.md", "a\n")]);
+    let cfg = config(vec![repo("t", "o/tools", "tools/helper")]);
+    let mut engine = w.engine(&remote);
+    sync_all(&mut engine, &cfg);
+    w.write("helper/refs/a.md", "mine\n");
+
+    let report = engine.diff(&cfg, "t", "helper", &cancel_flag()).unwrap();
+
+    assert_eq!(shown(&report), [("refs/a.md", Presence::Both)]);
+    assert!(remote.log().contains(&"file o/tools tools/helper/refs/a.md".to_string()), "{:?}", remote.log());
+}
+
+#[test]
+fn show_changes_reads_at_most_a_few_megabytes_from_each_side_not_counting_files_that_are_the_same() {
+    let mut s = Setup::fresh("diff-budget");
+    let mib = vec![0u8; DIFF_FILE_BYTES as usize];
+    for i in 1..=5 {
+        s.remote.put_bytes(REPO, &format!("skills/alpha/a-same-{i}.bin"), &mib);
+        s.remote.put_bytes(REPO, &format!("skills/alpha/up-{i}.bin"), &mib);
+    }
+    s.sync();
+    let alpha = s.w.skills.join("alpha");
+    for i in 1..=5 {
+        fs::remove_file(alpha.join(format!("up-{i}.bin"))).unwrap();
+        fs::write(alpha.join(format!("here-{i}.bin")), &mib).unwrap();
+    }
+    s.remote.reset();
+
+    let report = diff(&mut s, "alpha");
+
+    let hidden: Vec<&str> =
+        report.files.iter().filter(|f| matches!(&f.body, Body::Hidden(why) if why.contains("as much as can be shown"))).map(|f| f.path.as_str()).collect();
+    assert_eq!(report.files.len(), 10, "{:?}", shown(&report));
+    assert_eq!(hidden.len(), 2, "four files from each side are shown and the fifth is only named: {hidden:?}");
+    assert!(hidden.iter().any(|p| p.starts_with("up-")) && hidden.iter().any(|p| p.starts_with("here-")), "{hidden:?}");
+    assert_eq!(s.remote.calls().file, 4);
 }
