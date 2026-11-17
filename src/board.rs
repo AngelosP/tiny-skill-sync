@@ -283,6 +283,8 @@ struct RepoBoard {
     /// How the latest check ended.
     check: Option<Outcome>,
     last_check: Option<UnixSecs>,
+    /// The last listing had no skills in it at all.
+    lists_nothing: bool,
 }
 
 impl RepoBoard {
@@ -357,9 +359,11 @@ impl Board {
     pub fn note_sync(&mut self, report: &SyncReport, now: UnixSecs) {
         for repo_report in &report.repos {
             let repo = self.repos.entry(repo_report.repo_id.clone()).or_default();
-            // Nothing listed means the check did not get as far as a listing, or upstream was not modified: keep the rows.
-            if !repo_report.skills.is_empty() || !repo_report.rejected.is_empty() {
+            // A listing replaces the rows, even one with nothing in it. No listing at all means the check did not get
+            // as far, or upstream was not modified: keep the rows.
+            if repo_report.lists_nothing || !repo_report.skills.is_empty() || !repo_report.rejected.is_empty() {
                 repo.replace_skills(repo_report);
+                repo.lists_nothing = repo_report.lists_nothing;
             }
             if matches!(repo_report.outcome, Outcome::Unchanged | Outcome::Synced | Outcome::NeedsAttention) {
                 repo.last_check = Some(repo_report.finished_at);
@@ -385,6 +389,13 @@ impl Board {
     /// Seeds the time of the last check from what the engine remembers.
     pub fn note_last_check(&mut self, repo_id: &str, at: UnixSecs) {
         self.repos.entry(repo_id.to_string()).or_default().last_check = Some(at);
+    }
+
+    /// Seeds whether the last listing of a repository had no skills in it, from what the engine remembers.
+    pub fn note_lists_nothing(&mut self, repo_id: &str, nothing: bool) {
+        if nothing || self.repos.contains_key(repo_id) {
+            self.repos.entry(repo_id.to_string()).or_default().lists_nothing = nothing;
+        }
     }
 
     /// The skills the user keeps as their own, as recorded. A look at the disk only covers the skills the app manages,
@@ -469,9 +480,13 @@ impl Board {
             Health::Ok => "all skills are up to date".to_string(),
             Health::Attention => {
                 let count: usize = enabled().map(|view| view.skills.iter().filter(|row| row.level >= Level::Attention).count()).sum();
-                match count {
-                    1 => "1 skill needs attention".to_string(),
-                    n => format!("{n} skills need attention"),
+                // A repository that needs attention without a single skill to blame is one that lists none.
+                let empty: Vec<&RepoView> = enabled().filter(|view| view.level >= Level::Attention && view.skills.is_empty()).collect();
+                match (count, empty.as_slice()) {
+                    (0, [one]) => format!("{}: {}", one.label, one.status),
+                    (0, many) if !many.is_empty() => format!("{} repositories have no skills", many.len()),
+                    (1, _) => "1 skill needs attention".to_string(),
+                    (n, _) => format!("{n} skills need attention"),
                 }
             }
             Health::Error => {
@@ -489,7 +504,7 @@ impl Board {
     fn view_of(&self, repo: &RepoConfig, now: UnixSecs) -> RepoView {
         let board = self.repos.get(&repo.id);
         let skills = board.map(RepoBoard::rows).unwrap_or_default();
-        let (level, status, detail) = judge(repo.enabled, board, &skills, now);
+        let (level, status, detail) = judge(repo, board, &skills, now);
         RepoView {
             id: repo.id.clone(),
             label: repo.label(),
@@ -524,8 +539,8 @@ impl Board {
 
 /// The level, the short status and the long explanation of one repository. A disabled repository is the user's
 /// choice and counts for nothing; a failed check is an error until a later check gets an answer.
-fn judge(enabled: bool, board: Option<&RepoBoard>, rows: &[Row], now: UnixSecs) -> (Level, String, Option<String>) {
-    if !enabled {
+fn judge(repo: &RepoConfig, board: Option<&RepoBoard>, rows: &[Row], now: UnixSecs) -> (Level, String, Option<String>) {
+    if !repo.enabled {
         return (Level::Ok, "Disabled".to_string(), None);
     }
     let outcome = board.and_then(|b| b.check.as_ref());
@@ -535,6 +550,13 @@ fn judge(enabled: bool, board: Option<&RepoBoard>, rows: &[Row], now: UnixSecs) 
     let level = rows.iter().map(|row| row.level).max().unwrap_or(Level::Ok);
     let attention = rows.iter().filter(|row| row.level >= Level::Attention).count();
     let never_checked = board.is_none_or(|b| b.last_check.is_none());
+    // A listing with nothing in it is not "up to date": it is usually a repository added as a whole when its skills
+    // are in a subfolder, and without this it would sit there looking fine while nothing was ever installed. Only the
+    // listing tells: a repository whose skills were all held or skipped has no rows after a restart either.
+    let lists_nothing = board.is_some_and(|b| b.lists_nothing);
+    if lists_nothing && rows.is_empty() && matches!(outcome, None | Some(Outcome::Unchanged | Outcome::Synced)) {
+        return (Level::Attention, NO_SKILLS.to_string(), Some(no_skills_advice(repo)));
+    }
     let status = match outcome {
         _ if attention > 0 => format!("Needs attention ({attention})"),
         Some(Outcome::Cancelled) => "Check cancelled".to_string(),
@@ -543,6 +565,23 @@ fn judge(enabled: bool, board: Option<&RepoBoard>, rows: &[Row], now: UnixSecs) 
         _ => "Up to date".to_string(),
     };
     (level, status, None)
+}
+
+const NO_SKILLS: &str = "No skills found";
+
+/// What to do when a repository has no skills where the app looked. A skill is a folder with a SKILL.md in it.
+fn no_skills_advice(repo: &RepoConfig) -> String {
+    let name = &repo.repo;
+    let skill = "A skill is a folder with a SKILL.md file in it.";
+    if repo.path.is_empty() {
+        let branch = if repo.branch.is_empty() { "main" } else { &repo.branch };
+        format!(
+            "No skills were found at the top of {name}. {skill} If yours are in a subfolder, remove this repository and add the address of that folder, \
+             for example https://github.com/{name}/tree/{branch}/skills"
+        )
+    } else {
+        format!("No skills were found in the folder '{}' of {name}. {skill} Check that the folder and the branch are right.", repo.path)
+    }
 }
 
 fn short(kind: FailureKind) -> &'static str {
@@ -561,10 +600,17 @@ fn short(kind: FailureKind) -> &'static str {
     }
 }
 
+/// The first letter in upper case, so a message from deeper down reads as a sentence.
+pub fn capitalized(text: &str) -> String {
+    let mut chars = text.chars();
+    chars.next().map(|first| first.to_uppercase().chain(chars).collect()).unwrap_or_default()
+}
+
 fn explain(failure: &Failure, now: UnixSecs) -> String {
+    let message = capitalized(&failure.message);
     match failure.retry_at.filter(|&at| at > now) {
-        Some(at) => format!("{} Next try in {}.", failure.message, span(at - now)),
-        None => failure.message.clone(),
+        Some(at) => format!("{message} Next try in {}.", span(at - now)),
+        None => message,
     }
 }
 
@@ -662,7 +708,13 @@ mod tests {
             stats: Stats::default(),
             downloaded: 0,
             finished_at: CHECKED,
+            lists_nothing: false,
         }
+    }
+
+    /// A check that read a listing with no skills in it at all.
+    fn nothing_listed(id: &str, outcome: Outcome, skills: Vec<SkillReport>) -> RepoReport {
+        RepoReport { lists_nothing: true, ..report(id, outcome, skills) }
     }
 
     fn sync_of(repos: Vec<RepoReport>) -> SyncReport {
@@ -681,6 +733,13 @@ mod tests {
     fn after(outcome: Outcome, skills: Vec<SkillReport>) -> Board {
         let mut board = Board::new();
         board.note_sync(&sync_of(vec![report("a", outcome, skills)]), NOW);
+        board
+    }
+
+    /// A board that has just seen one check of repository `a`, whose listing had no skills in it.
+    fn after_nothing(outcome: Outcome, skills: Vec<SkillReport>) -> Board {
+        let mut board = Board::new();
+        board.note_sync(&sync_of(vec![nothing_listed("a", outcome, skills)]), NOW);
         board
     }
 
@@ -818,7 +877,7 @@ mod tests {
 
         let now = view(&board);
         assert_eq!(now.skills, before, "an error says nothing about the skills");
-        assert_eq!((now.level, now.status.as_str(), now.detail.as_deref()), (Level::Error, "No connection", Some("it went wrong")));
+        assert_eq!((now.level, now.status.as_str(), now.detail.as_deref()), (Level::Error, "No connection", Some("It went wrong")));
         assert_eq!(now.last_check, Some(CHECKED), "a failed check is not a check");
     }
 
@@ -967,7 +1026,7 @@ mod tests {
         assert_eq!(busy.health(&one()), Health::Error);
 
         let mut recovered = after(auth(), Vec::new());
-        recovered.note_sync(&sync_of(vec![report("a", Outcome::Unchanged, Vec::new())]), NOW);
+        recovered.note_sync(&sync_of(vec![report("a", Outcome::Unchanged, vec![in_sync("s")])]), NOW);
         assert_eq!(recovered.health(&one()), Health::Ok, "a later good check clears the failure");
 
         let mut resolved = after(Outcome::NeedsAttention, attention());
@@ -1103,7 +1162,7 @@ mod tests {
         ];
         for (kind, status) in table {
             let got = view(&after(failed(kind), Vec::new()));
-            assert_eq!((got.level, got.status.as_str(), got.detail.as_deref()), (Level::Error, status, Some("it went wrong")), "{kind:?}");
+            assert_eq!((got.level, got.status.as_str(), got.detail.as_deref()), (Level::Error, status, Some("It went wrong")), "{kind:?}");
         }
     }
 
@@ -1163,10 +1222,124 @@ mod tests {
 
         let mut remembered = Board::new();
         remembered.note_last_check("a", 5);
+        remembered.note_verify(&verified(vec![("a", "s", clean())]), NOW);
         assert_eq!(status(&remembered), "Up to date", "checked before this run");
 
         let off = after(failed(FailureKind::Auth), vec![deleted_locally("s")]).views(&cfg(&[("a", false)]), NOW).remove(0);
         assert_eq!((off.status.as_str(), off.level, off.enabled, off.detail), ("Disabled", Level::Ok, false, None));
+    }
+
+    #[test]
+    fn a_repository_that_lists_no_skills_does_not_pass_as_up_to_date() {
+        // The usual mistake: the skills are in a subfolder, and the whole repository was added.
+        let none = after_nothing(Outcome::Unchanged, Vec::new());
+        let got = view(&none);
+        assert_eq!((got.status.as_str(), got.level), ("No skills found", Level::Attention));
+        let detail = got.detail.expect("it says what to do about it");
+        assert!(detail.contains("owner/a") && detail.contains("SKILL.md"), "{detail}");
+        assert!(detail.contains("https://github.com/owner/a/tree/main/skills"), "{detail}");
+        assert!(detail.is_ascii(), "the command line prints it: {detail}");
+        assert_eq!(none.health(&one()), Health::Attention);
+        assert_eq!(none.tooltip(&one()), "Tiny Skill Sync: owner/a: No skills found");
+
+        // After a restart the record says what the last listing had in it.
+        let mut remembered = Board::new();
+        remembered.note_last_check("a", 5);
+        remembered.note_lists_nothing("a", true);
+        assert_eq!(view(&remembered).status, "No skills found");
+
+        // Deleting the last of them, when upstream lists none, ends the same way.
+        let emptied = after_nothing(Outcome::Synced, vec![skill("s", Verdict::Delete, ApplyResult::Done)]);
+        assert_eq!(view(&emptied).status, "No skills found");
+    }
+
+    #[test]
+    fn a_listing_whose_skills_were_all_held_or_skipped_is_not_no_skills() {
+        // Each skill it listed was held on a folder of the user's, or skipped. The record owns none of them, so a
+        // restart has no rows to show, but the listing was not empty.
+        let mut restarted = Board::new();
+        restarted.note_last_check("a", 5);
+        restarted.note_lists_nothing("a", false);
+        assert_ne!(view(&restarted).status, "No skills found");
+        // A check that GitHub answers with "not modified" says nothing new about the listing, either way.
+        restarted.note_sync(&sync_of(vec![report("a", Outcome::Unchanged, Vec::new())]), NOW);
+        assert_ne!(view(&restarted).status, "No skills found");
+        let mut empty = Board::new();
+        empty.note_lists_nothing("a", true);
+        empty.note_sync(&sync_of(vec![report("a", Outcome::Unchanged, Vec::new())]), NOW);
+        assert_eq!(view(&empty).status, "No skills found");
+
+        // A listing with nothing in it replaces what an earlier one showed, and a listing with skills undoes it.
+        let mut refused = report("a", Outcome::NeedsAttention, Vec::new());
+        refused.rejected = vec![Rejected { name: "bad".to_string(), reason: "too long".to_string() }];
+        let mut board = Board::new();
+        board.note_sync(&sync_of(vec![refused]), NOW);
+        board.note_sync(&sync_of(vec![nothing_listed("a", Outcome::Unchanged, Vec::new())]), NOW);
+        assert_eq!(view(&board).status, "No skills found");
+        board.note_sync(&sync_of(vec![report("a", Outcome::Unchanged, vec![in_sync("s")])]), NOW);
+        board.note_verify(&verified(Vec::new()), NOW);
+        assert!(view(&board).skills.is_empty());
+        assert_ne!(view(&board).status, "No skills found");
+    }
+
+    #[test]
+    fn what_to_do_about_no_skills_depends_on_where_the_repository_was_looked_at() {
+        let said = |branch: &str, path: &str| {
+            let config = Config { repos: vec![RepoConfig { branch: branch.to_string(), path: path.to_string(), ..repo("a", true) }], ..Config::default() };
+            after_nothing(Outcome::Unchanged, Vec::new()).views(&config, NOW).remove(0).detail.expect("a detail")
+        };
+        assert!(said("", "").contains("https://github.com/owner/a/tree/main/skills"));
+        assert!(said("dev", "").contains("https://github.com/owner/a/tree/dev/skills"));
+        let in_folder = said("", "docs/skills");
+        assert!(in_folder.contains("'docs/skills'") && in_folder.contains("owner/a") && !in_folder.contains("tree/"), "{in_folder}");
+        assert!(in_folder.is_ascii());
+    }
+
+    #[test]
+    fn only_a_real_answer_with_nothing_in_it_is_no_skills() {
+        let remembered = || {
+            let mut board = Board::new();
+            board.note_last_check("a", 5);
+            board.note_lists_nothing("a", true);
+            board
+        };
+        let status_after = |outcome: Outcome| {
+            let mut board = remembered();
+            board.note_sync(&sync_of(vec![report("a", outcome, Vec::new())]), NOW);
+            view(&board).status
+        };
+        assert_eq!(status_after(failed(FailureKind::Network)), "No connection", "a failed check says what failed");
+        assert_eq!(status_after(Outcome::Cancelled), "Check cancelled");
+        assert_eq!(status_after(Outcome::WouldChange), "Changes pending");
+        assert_eq!(view(&Board::new()).status, "Not checked yet", "nothing was asked yet");
+
+        let off = after_nothing(Outcome::Unchanged, Vec::new()).views(&cfg(&[("a", false)]), NOW).remove(0);
+        assert_eq!((off.status.as_str(), off.level), ("Disabled", Level::Ok), "a disabled repository is the user's choice");
+
+        // Anything shown as a row is something found, even when it is only kept as the user's own or not safe.
+        let mut kept = remembered();
+        kept.note_kept("a", &["Mine".to_string()]);
+        assert_eq!(view(&kept).status, "Up to date");
+        let mut unsafe_only = report("a", Outcome::NeedsAttention, Vec::new());
+        unsafe_only.rejected = vec![Rejected { name: "bad".to_string(), reason: "too long".to_string() }];
+        let mut board = remembered();
+        board.note_sync(&sync_of(vec![unsafe_only]), NOW);
+        assert_eq!(view(&board).status, "Needs attention (1)");
+    }
+
+    #[test]
+    fn the_tooltip_names_a_repository_that_lists_no_skills() {
+        let two = cfg(&[("a", true), ("b", true)]);
+        let tip = |reports: Vec<RepoReport>| {
+            let mut board = Board::new();
+            board.note_sync(&sync_of(reports), NOW);
+            board.tooltip(&two)
+        };
+        let empty = |id: &str| nothing_listed(id, Outcome::Unchanged, Vec::new());
+        assert_eq!(tip(vec![empty("a"), empty("b")]), "Tiny Skill Sync: 2 repositories have no skills");
+        assert_eq!(tip(vec![empty("a"), report("b", Outcome::Synced, vec![in_sync("s")])]), "Tiny Skill Sync: owner/a: No skills found");
+        let needs_the_user = report("b", Outcome::NeedsAttention, vec![deleted_locally("s")]);
+        assert_eq!(tip(vec![empty("a"), needs_the_user]), "Tiny Skill Sync: 1 skill needs attention", "what the user can settle comes first");
     }
 
     #[test]

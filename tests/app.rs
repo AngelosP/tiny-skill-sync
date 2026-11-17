@@ -32,7 +32,7 @@ fn last(mut settled: Vec<(Job, Settled)>) -> Settled {
 /// Answers the next job without an engine, as an engine that fails would.
 fn answer(app: &mut App, result: Result<Answer, EngineError>, next_wake: Option<i64>, now: i64) -> Settled {
     let order = app.next_order().expect("a job is waiting");
-    app.finish(Done { job: order.job, result, next_wake, last_checks: Vec::new(), kept: Vec::new(), stamp: None }, now)
+    app.finish(Done { job: order.job, result, next_wake, last_checks: Vec::new(), kept: Vec::new(), lists_nothing: Vec::new(), stamp: None }, now)
 }
 
 fn broken() -> Result<Answer, EngineError> {
@@ -136,7 +136,15 @@ fn quitting_drops_what_is_waiting_and_saves_last() {
 
     let order = app.next_order().unwrap();
     assert_ne!(app.health(), Health::Working, "saving is not checking");
-    let done = Done { job: order.job, result: Ok(Answer::Flushed), next_wake: Some(T0), last_checks: Vec::new(), kept: Vec::new(), stamp: None };
+    let done = Done {
+        job: order.job,
+        result: Ok(Answer::Flushed),
+        next_wake: Some(T0),
+        last_checks: Vec::new(),
+        kept: Vec::new(),
+        lists_nothing: Vec::new(),
+        stamp: None,
+    };
     app.finish(done, T0);
     assert!(app.is_idle());
     assert_eq!(app.arm(T0), None, "no timer once quitting");
@@ -317,7 +325,40 @@ fn skills_gone_upstream_all_at_once_are_deleted_only_when_the_user_says_so() {
     let told = last(run(&mut app, &mut s.engine, T0));
     assert!(s.w.skill_names().is_empty());
     assert_eq!(told.feedback.as_deref(), Some("Checked: skills were updated"));
-    assert_eq!(app.health(), Health::Ok);
+    // Nothing is left to settle, but a repository that lists no skills is not "up to date" either.
+    assert_eq!(app.health(), Health::Attention);
+    assert_eq!(app.board.views(app.cfg(), T0)[0].status, "No skills found");
+}
+
+#[test]
+fn after_a_restart_only_a_repository_whose_listing_was_empty_says_no_skills_found() {
+    // Upstream lists one skill, and the user has a different folder with its name: it is held, nothing is installed.
+    let mut s = Setup::fresh("app-nothing");
+    for name in ["beta", "gamma"] {
+        s.remote.remove(REPO, &format!("skills/{name}"));
+    }
+    s.w.write("alpha/SKILL.md", "my own alpha\n");
+    let mut app = started(&mut s);
+    app.want(Job::Check(None));
+    run(&mut app, &mut s.engine, T0);
+    assert_eq!(row(&app, "alpha").actions, [Action::Overwrite, Action::KeepMine]);
+
+    let status = |app: &App| app.board.views(app.cfg(), T0).remove(0).status;
+    let mut engine = s.restarted();
+    let mut again = app_for(&s);
+    run(&mut again, &mut engine, T0);
+    assert_ne!(status(&again), "No skills found", "its listing had a skill in it");
+
+    // Once upstream really lists nothing, a restart says so too.
+    s.remote.remove(REPO, "skills/alpha");
+    again.want(Job::Check(None));
+    run(&mut again, &mut engine, T0);
+    assert_eq!(status(&again), "No skills found");
+    let mut engine = s.restarted();
+    let mut third = app_for(&s);
+    run(&mut third, &mut engine, T0);
+    assert_eq!(status(&third), "No skills found");
+    assert_eq!(s.w.read("alpha/SKILL.md"), "my own alpha\n");
 }
 
 #[test]

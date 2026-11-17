@@ -26,7 +26,9 @@ Start with `scripts\dev.ps1`; it runs the others.
 | `scripts\dev.ps1 tss ARGS` | Run `tss` on the sandbox, for example `scripts\dev.ps1 tss check --dry-run`. |
 | `scripts\dev.ps1 dry-run -Repo OWNER/NAME` | Show what a check of that repository would install, in throwaway folders. `-UseToken` for private ones. |
 | `scripts\dev.ps1 bench` | Measure the release app against its budgets (see [Measuring](#measuring)). |
-| `scripts\dev.ps1 clean` | Close the sandbox copy and delete the sandbox, test leftovers in `%TEMP%` and bench results. Keeps `target\`. |
+| `scripts\dev.ps1 e2e` | Run the real exes against real GitHub test repositories and check what they do (see [Live end-to-end runs](#live-end-to-end-runs)). `-Only NAME,NAME`, `-Keep`, `-SkipBuild`. |
+| `scripts\dev.ps1 soak` | Leave the release app running for 75 minutes against a repository that changes every 10 minutes, and sample its memory, handles, threads, CPU and file I/O. `-Minutes`, `-Every`, `-ChangeEveryMinutes`, `-Keep`. |
+| `scripts\dev.ps1 clean` | Close the sandbox copy and any copy a live script left running, and delete the sandbox, test and live-script leftovers in `%TEMP%` and `bench\out`. Keeps `target\`. |
 
 The **sandbox** is `.tss-test\` in the repository (ignored by git): its own settings (`.tss-test\home`) and skills
 folder (`.tss-test\skills`), set through `TSS_HOME` and `TSS_SKILLS_DIR`. A sandbox copy of the tray runs beside a
@@ -44,7 +46,7 @@ scripts\dev.ps1 test
 ```
 
 This runs `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings` and `cargo test --no-fail-fast`. All three
-must pass. There are 354 tests (223 in the library, 131 integration tests); the whole gate takes about 35 seconds when
+must pass. There are 378 tests (241 in the library, 137 integration tests); the whole gate takes about 40 seconds when
 the code is already built.
 
 If the change can affect speed, memory or disk use (startup, verification, the poll, the tray, the settings window),
@@ -69,7 +71,45 @@ there: another drive, a ReFS or Dev Drive volume, or a network share. Run it whe
 an SMB share once found a bug the local NTFS runs could not.
 
 **Live GitHub.** The tests never talk to GitHub. To try the real client, use `scripts\dev.ps1 dry-run -Repo ...` or the
-sandbox (`scripts\dev.ps1 tss add ...` then `tss check`).
+sandbox (`scripts\dev.ps1 tss add ...` then `tss check`), and for everything the tests cannot see, the live runs below.
+
+### Live end-to-end runs
+
+The tests use a fake GitHub and no windows. `scripts\dev.ps1 e2e` is the other half: it starts the real release exes on
+throwaway folders against real GitHub, drives the tray and the settings window the way a person would, and checks what
+ends up on disk, what the app says and what it leaves alone.
+
+- **It needs** the network, a signed-in GitHub CLI (`gh auth login`) that may push to the two fixture repositories, and a
+  release build (it makes one unless you pass `-SkipBuild`).
+- **It changes** only folders in `%TEMP%` and branches of the fixture repositories named `e2e-<time>-<scenario>` or
+  `soak-<time>`, which it deletes afterwards. It refuses to touch any other branch, so `main` is never pushed to. It
+  never touches the real skills folder, the real settings or the saved token. A small proxy inside the script makes
+  GitHub fail in the ways the `failures` scenario needs.
+- **You will see** one tray icon per running copy of the app (Windows 11 keeps new ones in the overflow flyout), and the
+  `ui` scenario opens, moves and photographs windows and the tray menu. Leave the mouse and keyboard alone while it runs.
+- **The result** is in `bench\out\e2e-<time>.txt`: every check, PASS or FAIL, with what was seen, plus a table at the
+  end. The `ui` screenshots are in `bench\out\shots-<time>\`. The exit code is 1 if a check failed.
+
+| Scenario | What it checks |
+| --- | --- |
+| `install` | First start: what is installed, how the idle app behaves, how fast it quits. |
+| `changes` | Six kinds of upstream change reach the disk through the tray's **Check now**. |
+| `local-edit` | An edit made while the app runs, then an upstream change to the same skill. |
+| `edit-stopped` | Edits made while the app was not running, including ones that keep a file's size and time. |
+| `holds` | A skill deleted locally; a skill deleted upstream after being edited; every skill deleted upstream. |
+| `unmanaged` | Folders and files that were there before the app: left alone, or adopted only when identical. |
+| `private` | A private repository with the token and without it; the token never shows in anything the app writes or says. |
+| `hostile` | A branch full of hostile shapes: nothing may be written outside the skills folder. |
+| `names` | Upstream names with control and direction characters are shown escaped, and can still be selected. |
+| `failures` | A bad network, bad answers, a bad token: the skills folder must not change. |
+| `stale` | GitHub answering with a listing that is newer than its commit. |
+| `empty` | A repository added as a whole when its skills are in a subfolder. |
+| `ui` | Layout, tab order, painting and the text of the settings window and the tray menu, including each kind of failure. |
+
+Run it when you change the engine's visible behaviour, the tray, the settings window or anything GitHub-facing, at least
+the scenarios that cover the change (`-Only`). `scripts\dev.ps1 soak` is the long run for leaks and idle cost. The screens
+are checked on real screen copies, not on `PrintWindow`, which sometimes returns an unpainted bottom band for a window
+that is fully painted on screen.
 
 ### Fixing a bug
 

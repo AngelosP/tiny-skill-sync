@@ -43,11 +43,17 @@ pub fn parse_token_output(out: &[u8]) -> Option<String> {
     ok.then(|| text.to_string())
 }
 
+/// Without `--hostname`, gh answers for whichever host it considers the default (`GH_HOST`, or the only host it is signed
+/// in to), and that token would then be sent to github.com.
+fn token_command() -> Command {
+    let mut cmd = Command::new("gh");
+    cmd.args(["auth", "token", "--hostname", "github.com"]).env("GH_PROMPT_DISABLED", "1").env("GH_NO_UPDATE_NOTIFIER", "1").env("NO_COLOR", "1");
+    cmd
+}
+
 /// The error text is plain words for the status line; it never contains the token.
 pub fn gh_token() -> Result<Secret, String> {
-    let mut cmd = Command::new("gh");
-    cmd.args(["auth", "token"]).env("GH_PROMPT_DISABLED", "1").env("GH_NO_UPDATE_NOTIFIER", "1").env("NO_COLOR", "1");
-    match run_capture(cmd, GH_TIMEOUT) {
+    match run_capture(token_command(), GH_TIMEOUT) {
         Ok(Some((status, out))) if status.success() => {
             parse_token_output(&out).map(Secret::new).ok_or_else(|| "the GitHub CLI (gh) returned no token".to_string())
         }
@@ -71,6 +77,13 @@ mod tests {
         assert_eq!(parse_token_output(&[0xff, 0xfe]), None);
         assert_eq!(parse_token_output("é".as_bytes()), None);
         assert_eq!(parse_token_output("a".repeat(513).as_bytes()), None);
+    }
+
+    #[test]
+    fn the_token_asked_for_is_always_the_one_for_github_com() {
+        let cmd = token_command();
+        let args: Vec<String> = cmd.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
+        assert_eq!(args, ["auth", "token", "--hostname", "github.com"]);
     }
 
     #[test]

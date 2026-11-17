@@ -8,7 +8,9 @@ $Sandbox = Join-Path $RepoRoot '.tss-test'
 # Folders the tests make in %TEMP%. A test that fails can leave its folder behind.
 $TestTempPattern = '^tss-(it|apply|fsx|config|engine|state|verify|winfs)-'
 # Throwaway folders these scripts make in %TEMP%. They delete them, unless stopped half way.
-$ScriptTempPattern = '^tss-(dryrun|bench)-'
+$ScriptTempPattern = '^tss-(dryrun|bench|e2e|soak)-'
+# Files the live scripts (e2e, soak) make in %TEMP% to talk to GitHub.
+$ScriptTempFilePattern = '^tss-gh-body-[0-9a-f]+\.json$'
 
 function Use-Cargo {
     if (Get-Command cargo -ErrorAction SilentlyContinue) { return }

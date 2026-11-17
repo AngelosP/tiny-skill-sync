@@ -32,9 +32,10 @@ use super::{
     set_text, show, text_of, tray, trim_memory,
 };
 use crate::app::Job;
-use crate::board::{APP_NAME, Action, Health};
+use crate::board::{APP_NAME, Action, Health, Row};
 use crate::config::{Config, RepoConfig, RepoSpec};
 use crate::interval::Interval;
+use crate::pathsafe::printable;
 use crate::win::{cred, wide};
 
 const CLASS: &str = "TinySkillSyncSettings";
@@ -48,6 +49,11 @@ const WM_REFRESH: u32 = WM_APP + 10;
 const TIMER_REFRESH: usize = 1;
 const REFRESH_MS: u32 = 60_000;
 const PRESETS: &[&str] = &["30 minutes", "1 hour", "6 hours", "12 hours", "1 day", "1 week", "1 month"];
+/// Where the details of the selected skill, or of the repository when none is selected, go (x, y, width, height in
+/// DIPs): beside the action buttons when there are some, across the window when there are none. About three lines of
+/// text fit; what is longer is reached with the scroll bar.
+const DETAIL_BESIDE: [i32; 4] = [12, 342, 304, 52];
+const DETAIL_ACROSS: [i32; 4] = [12, 342, 576, 52];
 
 const ID_REPOS: i32 = 100;
 const ID_EVERY: i32 = 101;
@@ -100,6 +106,9 @@ struct Settings {
     /// The repositories' ids, in the order the list shows them.
     repo_ids: Vec<String>,
     skill_rows: Vec<Vec<String>>,
+    /// The skills' own names in the order the list shows them. The list shows them written out, so its text is not
+    /// the name.
+    skill_names: Vec<String>,
     /// The repository whose skills are shown.
     repo: Option<String>,
     /// The skill whose details are shown, by name.
@@ -181,6 +190,7 @@ pub fn open() {
         repo_rows: Vec::new(),
         repo_ids: Vec::new(),
         skill_rows: Vec::new(),
+        skill_names: Vec::new(),
         repo: None,
         skill: None,
         actions: Vec::new(),
@@ -247,23 +257,24 @@ fn build(f: &mut Form) -> Controls {
     let heading = f.label("Skills", [12, 214, 576, 16]);
     f.embolden(heading);
     let skills = f.list([12, 232, 576, 104], ID_SKILLS, &[("Skill", 170), ("Status", 380)]);
-    let detail = f.add("EDIT", "", (ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL) as u32, 0, [12, 342, 304, 44], ID_DETAIL);
+    let detail_style = WS_TABSTOP | WS_VSCROLL | (ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL) as u32;
+    let detail = f.add("EDIT", "", detail_style, WS_EX_CLIENTEDGE, DETAIL_ACROSS, ID_DETAIL);
     let actions = [f.button("", [324, 342, 128, 26], ID_ACTION_1), f.button("", [460, 342, 128, 26], ID_ACTION_2)];
 
-    f.label("Default check interval", [12, 398, 130, 16]);
-    let default = f.combo([144, 394, 110, 200], ID_DEFAULT, PRESETS);
-    let token = f.label("", [270, 398, 186, 16]);
-    f.button("Set…", [464, 393, 60, 26], ID_TOKEN_SET);
-    let token_clear = f.button("Clear", [528, 393, 60, 26], ID_TOKEN_CLEAR);
-    f.label("Skills folder", [12, 432, 72, 16]);
-    let folder = f.edit([86, 428, 342, 24], ID_FOLDER, ES_READONLY as u32);
-    f.button("Open", [436, 427, 74, 26], ID_OPEN);
-    f.button("Backups", [514, 427, 74, 26], ID_BACKUPS);
+    f.label("Default check interval", [12, 406, 130, 16]);
+    let default = f.combo([144, 402, 110, 200], ID_DEFAULT, PRESETS);
+    let token = f.label("", [270, 406, 186, 16]);
+    f.button("Set…", [464, 401, 60, 26], ID_TOKEN_SET);
+    let token_clear = f.button("Clear", [528, 401, 60, 26], ID_TOKEN_CLEAR);
+    f.label("Skills folder", [12, 440, 72, 16]);
+    let folder = f.edit([86, 436, 342, 24], ID_FOLDER, ES_READONLY as u32);
+    f.button("Open", [436, 435, 74, 26], ID_OPEN);
+    f.button("Backups", [514, 435, 74, 26], ID_BACKUPS);
 
-    let heading = f.label("Messages", [12, 462, 576, 16]);
+    let heading = f.label("Messages", [12, 468, 576, 16]);
     f.embolden(heading);
     let notes_style = WS_TABSTOP | WS_VSCROLL | (ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL) as u32;
-    let notes = f.add("EDIT", "", notes_style, WS_EX_CLIENTEDGE, [12, 480, 576, 58], ID_NOTES);
+    let notes = f.add("EDIT", "", notes_style, WS_EX_CLIENTEDGE, [12, 486, 576, 52], ID_NOTES);
     let status = f.add("STATIC", "", SS_NOPREFIX | SS_ENDELLIPSIS, 0, [12, 551, 400, 16], 0);
     f.button("Check all", [420, 546, 80, 26], ID_CHECK_ALL);
     f.button("Close", [508, 546, 80, 26], IDCANCEL);
@@ -340,7 +351,8 @@ impl Settings {
         }
         enable(c.check_one, repo.is_some_and(|r| r.enabled));
 
-        let skill_rows: Vec<Vec<String>> = view.map(|v| v.skills.iter().map(|r| vec![r.name.clone(), r.text.clone()]).collect()).unwrap_or_default();
+        let (skill_rows, skill_names) = view.map(|v| skill_list(&v.skills)).unwrap_or_default();
+        self.skill_names = skill_names;
         lv_fill(c.skills, &skill_rows, &mut self.skill_rows);
         let skill_index = self.skill.as_ref().and_then(|name| view?.skills.iter().position(|r| &r.name == name));
         if skill_index.is_none() {
@@ -359,8 +371,9 @@ impl Settings {
             },
             (None, None) => String::new(),
         };
-        set_text(c.detail, &detail);
+        set_text(c.detail, &printable(&detail));
         self.actions = row.map(|r| r.actions.clone()).unwrap_or_default();
+        self.form.resize(c.detail, if self.actions.is_empty() { DETAIL_ACROSS } else { DETAIL_BESIDE });
         for (i, button) in c.actions.into_iter().enumerate() {
             if let Some(action) = self.actions.get(i) {
                 set_text(button, action.label());
@@ -403,20 +416,33 @@ impl Settings {
             self.skill = None;
             return true;
         }
-        let name = self.skill_rows.get(index).and_then(|r| r.first()).cloned();
-        if on {
-            if self.skill == name {
-                return false;
-            }
-            self.skill = name;
-        } else {
-            if name.is_none() || self.skill != name {
-                return false;
-            }
-            self.skill = None;
-        }
-        true
+        pick_skill(&mut self.skill, &self.skill_names, index, on)
     }
+}
+
+/// What the skills list shows, and the skills' own names in the same order. Names and messages come from the
+/// repository, so the list shows them written out (`printable`); a skill is told apart, chosen and acted on by its
+/// real name, which the text shown may not be.
+fn skill_list(skills: &[Row]) -> (Vec<Vec<String>>, Vec<String>) {
+    let rows = skills.iter().map(|r| vec![printable(&r.name).into_owned(), printable(&r.text).into_owned()]).collect();
+    (rows, skills.iter().map(|r| r.name.clone()).collect())
+}
+
+/// A row of the skills list was selected (`on`) or deselected. Changes which skill is chosen, and says whether it did.
+fn pick_skill(chosen: &mut Option<String>, names: &[String], index: usize, on: bool) -> bool {
+    let name = names.get(index).cloned();
+    if on {
+        if *chosen == name {
+            return false;
+        }
+        *chosen = name;
+    } else {
+        if name.is_none() || *chosen != name {
+            return false;
+        }
+        *chosen = None;
+    }
+    true
 }
 
 /// Shows `text` in a combo box, selecting the item that says it if there is one.
@@ -715,12 +741,12 @@ fn open_backups() {
 
 /// A skill was double-clicked: show its folder.
 fn open_skill(index: usize) {
-    let Some((dir, name)) = with_state(|st| Some((st.skills_dir.clone(), st.skill_rows.get(index)?.first()?.clone()))).flatten() else { return };
+    let Some((dir, name)) = with_state(|st| Some((st.skills_dir.clone(), st.skill_names.get(index)?.clone()))).flatten() else { return };
     // Only a plain folder name: the name comes from upstream, and a rejected one is listed too.
     let plain = !name.is_empty() && name != "." && name != ".." && !name.contains(['\\', '/', ':']);
     let path = dir.join(&name);
     if !plain || !path.is_dir() {
-        shell::tell(format!("{name} is not in the skills folder."));
+        shell::tell(format!("{} is not in the skills folder.", printable(&name)));
     } else if let Err(e) = open_folder(&path) {
         shell::tell(e);
     }
@@ -853,7 +879,12 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPA
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::board::Level;
     use crate::interval::Unit;
+
+    fn row(name: &str, text: &str) -> Row {
+        Row { name: name.to_string(), text: text.to_string(), level: Level::Attention, actions: Vec::new() }
+    }
 
     #[test]
     fn check_every_is_the_default_unless_it_names_an_interval_that_may_be_polled() {
@@ -863,5 +894,26 @@ mod tests {
         assert_eq!(parse_every(" 2h "), Ok(Some(Interval::new(2, Unit::Hour))));
         assert!(parse_every("1 minute").is_err());
         assert!(parse_every("often").is_err());
+    }
+
+    #[test]
+    fn the_skills_list_shows_text_written_out_and_keeps_the_real_names() {
+        let skills = [row("alpha", "Up to date"), row("rlo-\u{202e}gpj", "Edited\u{1b}")];
+        let (rows, names) = skill_list(&skills);
+        assert_eq!(rows, [vec!["alpha", "Up to date"], vec!["rlo-\\u{202e}gpj", "Edited\\u{1b}"]]);
+        assert_eq!(names, ["alpha", "rlo-\u{202e}gpj"]);
+    }
+
+    #[test]
+    fn a_skill_is_chosen_by_its_real_name_not_by_how_the_list_shows_it() {
+        let names = vec!["alpha".to_string(), "rlo-\u{202e}gpj".to_string()];
+        let mut chosen = None;
+        assert!(pick_skill(&mut chosen, &names, 1, true));
+        assert_eq!(chosen.as_deref(), Some("rlo-\u{202e}gpj"));
+        assert!(!pick_skill(&mut chosen, &names, 1, true), "the same row again changes nothing");
+        assert!(!pick_skill(&mut chosen, &names, 0, false), "deselecting another row changes nothing");
+        assert!(pick_skill(&mut chosen, &names, 1, false));
+        assert_eq!(chosen, None);
+        assert!(!pick_skill(&mut chosen, &names, 9, false), "a row that is not there changes nothing");
     }
 }

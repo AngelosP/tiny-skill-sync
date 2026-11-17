@@ -146,7 +146,8 @@ impl Url {
     }
 
     pub fn is_loopback(&self) -> bool {
-        self.host == "localhost" || self.host.starts_with("127.")
+        // Only a real 127.x.y.z address: a name such as `127.attacker.example` is somebody else's computer.
+        self.host == "localhost" || self.host.parse::<std::net::Ipv4Addr>().is_ok_and(|ip| ip.is_loopback())
     }
 }
 
@@ -463,12 +464,33 @@ mod tests {
     }
 
     #[test]
+    fn only_this_computer_counts_as_loopback() {
+        for yes in ["http://127.0.0.1/", "http://127.1.2.3:80/", "http://localhost:9/", "http://LOCALHOST/"] {
+            assert!(Url::parse(yes).unwrap().is_loopback(), "{yes}");
+        }
+        // A name that merely starts like an address is somebody else's computer.
+        for no in [
+            "http://127.attacker.example/",
+            "http://127.0.0.1.evil.com/",
+            "http://127.0.0.256/",
+            "http://127.0.0/",
+            "http://localhost.evil.com/",
+            "http://128.0.0.1/",
+            "https://example.com/",
+        ] {
+            assert!(!Url::parse(no).unwrap().is_loopback(), "{no}");
+        }
+    }
+
+    #[test]
     fn a_token_is_never_sent_over_plain_http_to_another_host() {
         let client = Client::new("tss-test");
         let token = Secret::new("t");
-        let req = Request { url: Url::parse("http://example.com/").unwrap(), headers: vec![], bearer: Some(&token), max_body: 10 };
-        let err = client.get(&req, &AtomicBool::new(false), &mut |_| true).unwrap_err();
-        assert_eq!(err, HttpError::InsecureToken);
+        for url in ["http://example.com/", "http://127.attacker.example/", "http://127.0.0.1.evil.com/"] {
+            let req = Request { url: Url::parse(url).unwrap(), headers: vec![], bearer: Some(&token), max_body: 10 };
+            let err = client.get(&req, &AtomicBool::new(false), &mut |_| true).unwrap_err();
+            assert_eq!(err, HttpError::InsecureToken, "{url}");
+        }
     }
 
     #[test]

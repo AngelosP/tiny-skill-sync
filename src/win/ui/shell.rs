@@ -37,11 +37,12 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 
 use super::{bench, dialogs, local_time, register_class, sentence, settings, tray, trim_memory};
 use crate::app::{App, Done, Job, Order, perform};
-use crate::board::{APP_NAME, Level, RepoView, span};
+use crate::board::{APP_NAME, Board, Level, RepoView, span};
 use crate::cli::{Host, SystemHost};
 use crate::config::{CONFIG_FILE, Config, Paths};
 use crate::engine::{Engine, EngineError, Stamp, stamp_of};
 use crate::interval::{UnixSecs, now_secs};
+use crate::pathsafe::{printable, printable_lines};
 use crate::win::{wide, wide_os};
 
 /// Tray menu and remote-control commands, sent as `WM_COMMAND`.
@@ -322,8 +323,15 @@ impl Shell {
                 if let Err(mpsc::SendError(order)) = self.orders.send(order) {
                     // Only if the worker died; the job fails like any other, so nothing waits for it forever.
                     let why = "the worker thread stopped; quit and start Tiny Skill Sync again".to_string();
-                    let failed =
-                        Done { job: order.job, result: Err(EngineError::Failed(why)), next_wake: None, last_checks: Vec::new(), kept: Vec::new(), stamp: None };
+                    let failed = Done {
+                        job: order.job,
+                        result: Err(EngineError::Failed(why)),
+                        next_wake: None,
+                        last_checks: Vec::new(),
+                        kept: Vec::new(),
+                        lists_nothing: Vec::new(),
+                        stamp: None,
+                    };
                     self.on_done(failed);
                 }
             }
@@ -466,28 +474,33 @@ impl Shell {
     }
 
     fn notes(&self) -> String {
-        let board = &self.app.board;
-        let mut lines = Vec::new();
-        for problem in board.problem().into_iter().chain(board.failure()) {
-            lines.push(format!("Problem: {problem}"));
-        }
-        if !board.orphans().is_empty() {
-            lines.push(format!(
-                "Skills recorded for repositories that are no longer in the settings are left alone: {}. To stop tracking them, run: tss remove ID",
-                board.orphans().join(", ")
-            ));
-        }
-        let messages: Vec<_> = board.messages().collect();
-        for message in messages.iter().rev() {
-            let level = match message.level {
-                Level::Error => "Error: ",
-                Level::Attention => "Attention: ",
-                Level::Ok => "",
-            };
-            lines.push(format!("{}  {level}{}", local_time(message.at), message.text.replace('\n', "\r\n")));
-        }
-        lines.join("\r\n")
+        notes_of(&self.app.board)
     }
+}
+
+/// The messages the settings window shows. Text that came from a repository is escaped (see `printable_lines`), so a
+/// skill or file name cannot reorder or hide what is shown.
+fn notes_of(board: &Board) -> String {
+    let mut lines = Vec::new();
+    for problem in board.problem().into_iter().chain(board.failure()) {
+        lines.push(format!("Problem: {}", printable(problem)));
+    }
+    if !board.orphans().is_empty() {
+        lines.push(format!(
+            "Skills recorded for repositories that are no longer in the settings are left alone: {}. To stop tracking them, run: tss remove ID",
+            printable(&board.orphans().join(", "))
+        ));
+    }
+    let messages: Vec<_> = board.messages().collect();
+    for message in messages.iter().rev() {
+        let level = match message.level {
+            Level::Error => "Error: ",
+            Level::Attention => "Attention: ",
+            Level::Ok => "",
+        };
+        lines.push(format!("{}  {level}{}", local_time(message.at), printable_lines(&message.text).replace('\n', "\r\n")));
+    }
+    lines.join("\r\n")
 }
 
 /// What the settings window shows.
@@ -817,5 +830,18 @@ mod tests {
         assert_eq!(tag, instance_tag(Path::new(r"c:\users\someone\appdata\local\TINY-SKILL-SYNC")));
         assert_ne!(tag, instance_tag(Path::new(r"C:\Temp\tss-home")));
         assert_eq!(tag.len(), 16);
+    }
+
+    #[test]
+    fn the_messages_never_show_a_control_character_from_a_repository() {
+        let mut board = Board::new();
+        board.say(1_700_000_000, Level::Attention, "fx: a\u{1b}[2K\rb\u{202e}exe.pdf\nsecond line".to_string());
+        board.say(1_700_000_001, Level::Ok, "fx: plain".to_string());
+        let notes = notes_of(&board);
+        assert!(notes.contains("a\\u{1b}[2K\\u{d}b\\u{202e}exe.pdf\r\nsecond line"), "{notes:?}");
+        assert!(notes.contains("fx: plain"), "{notes:?}");
+        // What is left is the line break the edit box needs, written out as CR LF, and nothing else.
+        assert!(notes.chars().all(|c| matches!(c, '\r' | '\n') || !c.is_control()), "{notes:?}");
+        assert!(!notes.contains('\u{202e}'));
     }
 }

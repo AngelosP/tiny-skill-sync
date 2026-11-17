@@ -11,8 +11,10 @@
   tss      Run the command line on the sandbox: scripts\dev.ps1 tss status
   dry-run  Show what a check would change. Options: -Repo OWNER/NAME -UseToken -Release
   bench    Measure startup, memory, CPU and disk use against the budgets. Options: see scripts\bench.ps1
-  clean    Close the sandbox copy, delete the sandbox, test leftovers in %TEMP% and bench results.
-           Keeps target\ (use 'cargo clean' for that).
+  e2e      Run the real app against real GitHub test repositories and check what it does. Options: see scripts\e2e.ps1
+  soak     Leave the app running for an hour or so against a test repository and measure it. Options: see scripts\soak.ps1
+  clean    Close the sandbox copy and any copy a live script left running, delete the sandbox, test leftovers in %TEMP%
+           and bench results. Keeps target\ (use 'cargo clean' for that).
   help     This text.
 
   Nothing here touches the real skills folder, the real settings or the saved GitHub token.
@@ -36,6 +38,8 @@ $scripts = @{
     'tss'     = 'tss.ps1'
     'dry-run' = 'dry-run.ps1'
     'bench'   = 'bench.ps1'
+    'e2e'     = 'e2e.ps1'
+    'soak'    = 'soak.ps1'
 }
 
 switch ($Task) {
@@ -49,16 +53,30 @@ switch ($Task) {
         if (Test-Path $Sandbox) { Remove-Item -Recurse -Force $Sandbox; $gone += $Sandbox }
         $benchOut = Join-Path $RepoRoot 'bench\out'
         if (Test-Path $benchOut) { Remove-Item -Recurse -Force $benchOut; $gone += $benchOut }
-        Get-ChildItem $env:TEMP -Directory -ErrorAction SilentlyContinue |
-            Where-Object { $_.Name -match $TestTempPattern -or $_.Name -match $ScriptTempPattern } |
-            ForEach-Object { Remove-Item -Recurse -Force $_.FullName; $gone += $_.FullName }
+        $leftovers = @(Get-ChildItem $env:TEMP -Directory -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -match $TestTempPattern -or $_.Name -match $ScriptTempPattern })
+        # A live script that was stopped half way can leave its app running on its folder: ask it to quit first.
+        foreach ($d in $leftovers) {
+            $exe = Join-Path $d.FullName 'bin\tiny-skill-sync.exe'
+            if (Test-Path $exe) { Invoke-InSandbox -Root $d.FullName -Body { Start-Process $exe -ArgumentList '--quit' -Wait | Out-Null } }
+        }
+        foreach ($d in $leftovers) {
+            for ($try = 1; ; $try++) {
+                try { Remove-Item -Recurse -Force $d.FullName -ErrorAction Stop; break }
+                catch { if ($try -ge 10) { throw }; Start-Sleep -Milliseconds 300 }
+            }
+            $gone += $d.FullName
+        }
+        Get-ChildItem $env:TEMP -File -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -match $ScriptTempFilePattern } |
+            ForEach-Object { Remove-Item -Force $_.FullName; $gone += $_.FullName }
         if ($gone.Count -eq 0) { 'Nothing to clean.' } else { $gone | ForEach-Object { "Deleted $_" } }
     }
     { $_ -in 'help', '/?' } {
         Get-Help $PSCommandPath -Detailed | Out-Host
     }
     default {
-        Write-Host "Unknown task '$Task'. Tasks: run, build, test, tss, dry-run, bench, clean, help" -ForegroundColor Red
+        Write-Host "Unknown task '$Task'. Tasks: run, build, test, tss, dry-run, bench, e2e, soak, clean, help" -ForegroundColor Red
         exit 3
     }
 }

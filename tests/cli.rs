@@ -180,7 +180,7 @@ fn a_failed_check_deletes_nothing() {
     host.remote.remove(REPO, "skills/alpha");
     host.remote.fail_tree(REPO, Some(RemoteError::new(FailureKind::Network, "the network is down")));
     let ran = tss(&host, "check");
-    expect(&ran, 2, &["[fx]: No connection", "the network is down", "Nothing is deleted because a check failed."]);
+    expect(&ran, 2, &["[fx]: No connection", "The network is down", "Nothing is deleted because a check failed."]);
     assert_eq!(host.world.skill_names(), ["alpha", "beta", "gamma"]);
 }
 
@@ -197,8 +197,36 @@ fn an_empty_listing_deletes_only_when_confirmed() {
 
     expect(&tss(&host, "check --delete-all"), 3, &["one repository"]);
     let ran = tss(&host, "check fx --delete-all");
-    expect(&ran, 0, &["Removed alpha (gone upstream)", "Removed gamma (gone upstream)"]);
+    // Nothing is left to settle, but a repository that lists no skills is not "up to date" either.
+    expect(&ran, 1, &["Removed alpha (gone upstream)", "Removed gamma (gone upstream)", "[fx]: No skills found"]);
     assert!(host.world.skill_names().is_empty());
+}
+
+#[test]
+fn names_from_upstream_cannot_steer_the_terminal() {
+    let host = TestHost::new("cli-spoof");
+    // A folder name that erases the line and returns the cursor, and a file with such a name inside an ordinary skill.
+    host.remote.put(REPO, "skills/a\u{1b}[2K\rb/SKILL.md", "x\n");
+    host.remote.put(REPO, "skills/plain/SKILL.md", "x\n");
+    host.remote.put(REPO, "skills/plain/\u{1b}[31mred.md", "x\n");
+
+    let ran = tss(&host, "check");
+    expect(&ran, 1, &["Installed alpha", "a\\u{1b}[2K\\u{d}b: Skipped: not safe to install", "\\u{1b}[31mred.md"]);
+    let shown = format!("{}{}", ran.out, ran.err);
+    assert!(shown.chars().all(|c| c == '\n' || !c.is_control()), "a control character reached the terminal:\n{shown:?}");
+    assert_eq!(host.world.skill_names(), ["alpha", "beta", "gamma"]);
+}
+
+#[test]
+fn a_skill_name_a_shell_could_run_gets_no_command_to_paste() {
+    let host = TestHost::new("cli-paste");
+    host.remote.put(REPO, "skills/a$(b)/SKILL.md", "x\n");
+    expect(&tss(&host, "check"), 0, &["Installed a$(b)"]);
+
+    host.world.write("a$(b)/SKILL.md", "mine\n");
+    let ran = tss(&host, "status");
+    expect(&ran, 1, &["! a$(b): Edited locally", "Use the settings window: Replace with upstream / Keep mine"]);
+    assert!(!ran.out.contains("tss resolve fx a$(b)") && !ran.out.contains("\"a$(b)\""), "{ran:?}");
 }
 
 #[test]
@@ -264,6 +292,59 @@ fn repositories_are_added_once_and_named_unambiguously() {
     assert_eq!(host.config().repos.len(), 2);
     expect(&tss(&host, "check o/fixtures"), 3, &["matches several repositories (o-fixtures, o-fixtures-2); use the id"]);
     expect(&tss(&host, "check nope"), 3, &["no repository 'nope' is set up; the ids are: o-fixtures, o-fixtures-2"]);
+}
+
+#[test]
+fn a_repository_whose_skills_are_in_a_subfolder_is_not_reported_as_fine() {
+    let host = TestHost::empty("cli-subfolder");
+    host.remote.seed_standard("o/fixtures");
+    expect(&tss(&host, "add o/fixtures"), 0, &[]);
+
+    // Added as a whole, it has no skills at the top: the check must say so, and say what to do about it.
+    let ran = tss(&host, "check");
+    expect(&ran, 1, &["[o-fixtures]: No skills found", "No skills were found at the top of o/fixtures", "https://github.com/o/fixtures/tree/main/skills"]);
+    assert!(ran.out.is_ascii(), "{ran:?}");
+    assert!(host.world.skill_names().is_empty());
+    expect(&tss(&host, "status"), 1, &["[o-fixtures]: No skills found", "No skills from it are installed."]);
+    // A check that GitHub answers with "not modified" still knows what the listing had in it.
+    expect(&tss(&host, "check"), 1, &["[o-fixtures]: No skills found"]);
+
+    // Doing what it says works.
+    expect(&tss(&host, "remove o-fixtures"), 0, &[]);
+    expect(&tss(&host, "add https://github.com/o/fixtures/tree/main/skills"), 0, &[]);
+    expect(&tss(&host, "check"), 0, &["Installed alpha"]);
+    assert_eq!(host.world.skill_names(), ["alpha", "beta", "gamma"]);
+}
+
+#[test]
+fn a_repository_whose_only_skill_is_held_is_not_reported_as_empty() {
+    let host = TestHost::empty("cli-held-only");
+    host.remote.put("o/one", "skills/mine/SKILL.md", "upstream\n");
+    host.world.write("mine/SKILL.md", "my own\n");
+    expect(&tss(&host, "add https://github.com/o/one/tree/main/skills"), 0, &[]);
+
+    let ran = tss(&host, "check");
+    expect(&ran, 1, &["mine", "already exists"]);
+    assert!(!ran.out.contains("No skills found"), "{ran:?}");
+    // The record owns nothing from it, so `status` has no rows for it, but its listing was not empty.
+    let status = tss(&host, "status");
+    assert!(!status.out.contains("No skills found"), "{status:?}");
+    assert_eq!(host.world.read("mine/SKILL.md"), "my own\n");
+}
+
+#[test]
+fn a_repository_whose_only_skill_is_refused_is_not_reported_as_empty() {
+    let host = TestHost::empty("cli-refused-only");
+    host.remote.put("o/one", "skills/a\u{1b}b/SKILL.md", "x\n");
+    expect(&tss(&host, "add https://github.com/o/one/tree/main/skills"), 0, &[]);
+
+    let ran = tss(&host, "check");
+    expect(&ran, 1, &["a\\u{1b}b: Skipped: not safe to install"]);
+    assert!(!ran.out.contains("No skills found"), "{ran:?}");
+    // A refused skill is not in the record either, so after the check only the listing tells it apart from nothing.
+    let status = tss(&host, "status");
+    assert!(!status.out.contains("No skills found"), "{status:?}");
+    assert!(host.world.skill_names().is_empty());
 }
 
 #[test]

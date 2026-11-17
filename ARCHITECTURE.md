@@ -238,10 +238,11 @@ flowchart TD
 ```
 
 - `config.json` is meant to be read and edited by hand. The tray reloads it when it changes.
-- `state.json` holds, per repository: the ETag of the last fully applied listing, the last check time, the "keep mine"
-  list, and per owned skill its commit, its files (path, Git blob hash, size, fingerprint) and an optional pending
-  marker. It is written only when something changed, through a temporary file and a rename. A damaged one is kept as
-  `state.json.damaged-*`; one written by a newer version is not touched.
+- `state.json` holds, per repository: the ETag of the last fully applied listing, the last check time, whether the last
+  listing had no skills in it at all, the "keep mine" list, and per owned skill its commit, its files (path, Git blob
+  hash, size, fingerprint) and an optional pending marker. It is written only when something changed, through a
+  temporary file and a rename. A damaged one is kept as `state.json.damaged-*`; one written by a newer version is not
+  touched.
 - `engine.lock` stops the tray and `tss` from working at the same time; the loser is told to try again.
 - The app keeps nothing inside the skills folder, so Copilot only ever sees skill folders.
 
@@ -249,23 +250,37 @@ flowchart TD
 
 `board.rs` turns the engine's reports into what you see: a level per skill (fine, needs attention, error), a line of
 text, and the buttons that make sense. It is pure, so every sentence and button is tested. The newest news about a
-skill wins; a failed check or a 304 says nothing new about the skills, so the last real rows stay.
+skill wins; a failed check or a 304 says nothing new about the skills, so the last real rows stay. A repository whose
+last listing had no skills in it says "No skills found". That comes from the record, not from an empty list of rows,
+because after a restart a repository whose skills were all held or skipped has no rows either.
 
 The windows (`src\win\ui\`) are plain Win32 controls (common controls 6, through the manifest), with no dialog templates
 and no COM. They are built from a small reusable control layer in `src\win\ui\mod.rs` (`Form` and helpers for labels,
 buttons, check boxes, edit boxes, combo boxes and list views, scaled for the screen's DPI). The settings window is
-created when opened and destroyed when closed, so it costs nothing while closed.
+created when opened and destroyed when closed, so it costs nothing while closed. A list keeps its rows when their
+number is unchanged, and only the cells that changed are set, so the selection and the scroll position stay. When the
+number changes, `lv_fill` refills it with drawing turned off and room for every row made at once, then paints it once:
+463 skills open in about 45 ms, where filling row by row took 68 ms.
 
 A window procedure can be entered again while it runs (a control notifies its parent from inside the call that changed
 it). So the UI state lives in thread-local `RefCell`s borrowed only with `try_borrow_mut`, and no borrow is held across a
 call that runs a message loop (a question, the tray menu, `DestroyWindow`).
+
+The settings window explains things in two places. The status line at the bottom is one line and is cut at its end with
+an ellipsis, so a failed check puts the reason first and the repository last (`app.rs`, `summary`). When a listing was
+empty and nothing was left to do about it, the line says "no skills found", as the row does. The box under the
+skills list shows the whole text: the selected skill's, or the repository's when no skill is selected (`Row.detail`,
+`board.rs`). It has room for about three lines and a scroll bar, and Tab reaches it. Text that came from a repository
+passes through `printable` before it is shown, so a name cannot carry control or text-direction characters.
 
 ## Measuring
 
 When `TSS_BENCH_REPORT` names a file, the tray app appends timing marks to it (`src\win\ui\bench.rs`): the tray icon
 shown, each finished job (with how long it took), the settings window painted, quit and exit. `scripts\bench.ps1` reads
 the marks together with Windows' process counters and compares them with the budgets. Without the variable, nothing is
-written.
+written. `scripts\e2e.ps1` and `scripts\soak.ps1` read the same marks to know when a job has finished; the first also
+reads and drives the real windows with Win32 messages and measures whether text fits (`scripts\e2e-lib.ps1`). See
+[CONTRIBUTING.md](CONTRIBUTING.md#live-end-to-end-runs).
 
 ## Where to change what
 

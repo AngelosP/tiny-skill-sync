@@ -91,6 +91,9 @@ pub struct RepoState {
     /// Skills the user chose to keep as their own; the app leaves same-named upstream skills alone.
     pub ignored: Vec<String>,
     pub skills: Vec<OwnedSkill>,
+    /// The last listing that was read had no skills in it at all, not even ones refused as unsafe.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub lists_nothing: bool,
 }
 
 impl RepoState {

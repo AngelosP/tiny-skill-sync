@@ -14,7 +14,7 @@ use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 
-use crate::board::{Board, Health, Level};
+use crate::board::{Board, Health, Level, capitalized};
 use crate::config::Config;
 use crate::engine::{
     Access, Engine, EngineError, Outcome, RemoveReport, Resolution, ResolveReport, Stamp, StartupReport, SyncOptions, SyncReport, VerifyReport, Which,
@@ -101,6 +101,8 @@ pub struct Done {
     pub next_wake: Option<UnixSecs>,
     pub last_checks: Vec<(String, UnixSecs)>,
     pub kept: Vec<(String, Vec<String>)>,
+    /// Whether the last listing of each repository had no skills in it at all.
+    pub lists_nothing: Vec<(String, bool)>,
     /// The stamp of `state.json` as this job left it.
     pub stamp: Option<Stamp>,
 }
@@ -135,6 +137,7 @@ pub fn perform(engine: &mut Engine, order: &Order, cancel: &AtomicBool) -> Done 
         next_wake: engine.next_wake(cfg),
         last_checks: cfg.repos.iter().filter_map(|r| engine.last_check(&r.id).map(|at| (r.id.clone(), at))).collect(),
         kept: cfg.repos.iter().map(|r| (r.id.clone(), engine.kept(&r.id))).collect(),
+        lists_nothing: cfg.repos.iter().map(|r| (r.id.clone(), engine.lists_nothing(&r.id))).collect(),
         stamp: engine.state_stamp(),
     }
 }
@@ -351,6 +354,9 @@ impl App {
         for (id, names) in &done.kept {
             self.board.note_kept(id, names);
         }
+        for (id, nothing) in &done.lists_nothing {
+            self.board.note_lists_nothing(id, *nothing);
+        }
         self.state_stamp = done.stamp;
         if job == Job::Poll {
             self.hold(now + MIN_POLL_GAP);
@@ -426,21 +432,21 @@ fn backoff(failures: u32) -> UnixSecs {
     (FAILURE_BACKOFF << doublings).min(MAX_FAILURE_BACKOFF)
 }
 
-fn capitalized(text: &str) -> String {
-    let mut chars = text.chars();
-    chars.next().map(|first| first.to_uppercase().chain(chars).collect()).unwrap_or_default()
-}
-
-/// One line about a check the user asked for. The rows say the details.
+/// One line about a check the user asked for. The rows say the details. The line is cut at its end when it is too long,
+/// so the reason comes first and the repository after it.
 fn summary(report: &SyncReport) -> String {
     let failed: Vec<_> = report.repos.iter().filter_map(|r| if let Outcome::Failed(f) = &r.outcome { Some((r, f)) } else { None }).collect();
+    // As the row's "No skills found": the listing was empty and nothing was left to do about it.
+    let empty: Vec<_> = report.repos.iter().filter(|r| r.lists_nothing && r.skills.is_empty()).collect();
     let any = |f: fn(&Outcome) -> bool| report.repos.iter().any(|r| f(&r.outcome));
     match failed.as_slice() {
         _ if report.repos.is_empty() => "There is nothing to check: no repository is enabled".to_string(),
-        [(repo, failure)] => format!("{}: {}", repo.label, failure.message),
+        [(repo, failure)] => format!("{} ({})", capitalized(&failure.message), repo.label),
         [_, ..] => format!("{} repositories could not be checked", failed.len()),
         [] if any(|o| matches!(o, Outcome::Cancelled)) => "The check was stopped".to_string(),
         [] if any(|o| matches!(o, Outcome::NeedsAttention)) => "Checked: some skills need your attention".to_string(),
+        [] if empty.len() == 1 => format!("Checked: no skills found ({})", empty[0].label),
+        [] if !empty.is_empty() => format!("Checked: no skills found in {} repositories", empty.len()),
         [] if any(|o| matches!(o, Outcome::Synced)) => "Checked: skills were updated".to_string(),
         [] => "Checked: everything is up to date".to_string(),
     }
@@ -449,6 +455,50 @@ fn summary(report: &SyncReport) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::{Failure, RepoReport};
+    use crate::github::FailureKind;
+
+    fn repo_report(label: &str, outcome: Outcome) -> RepoReport {
+        RepoReport {
+            repo_id: label.to_string(),
+            label: label.to_string(),
+            outcome,
+            skills: Vec::new(),
+            rejected: Vec::new(),
+            stats: Default::default(),
+            downloaded: 0,
+            finished_at: 0,
+            lists_nothing: false,
+        }
+    }
+
+    fn checked(repos: Vec<RepoReport>) -> SyncReport {
+        SyncReport { repos, notes: Vec::new(), warnings: Vec::new() }
+    }
+
+    fn failed_check(label: &str, message: &str) -> SyncReport {
+        let outcome = Outcome::Failed(Failure { kind: FailureKind::Network, message: message.to_string(), retry_at: None });
+        checked(vec![repo_report(label, outcome)])
+    }
+
+    #[test]
+    fn a_failed_check_says_why_first_because_the_status_line_cuts_the_end() {
+        let lost = failed_check("owner/repo@main : skills", "the connection was lost");
+        assert_eq!(summary(&lost), "The connection was lost (owner/repo@main : skills)");
+        let refused = failed_check("owner/repo@main : skills", "GitHub refused access to owner/repo");
+        assert_eq!(summary(&refused), "GitHub refused access to owner/repo (owner/repo@main : skills)");
+    }
+
+    #[test]
+    fn a_check_that_found_no_skills_does_not_say_everything_is_up_to_date() {
+        let empty = |label| RepoReport { lists_nothing: true, ..repo_report(label, Outcome::Unchanged) };
+        assert_eq!(summary(&checked(vec![empty("o/a"), repo_report("o/b", Outcome::Synced)])), "Checked: no skills found (o/a)");
+        assert_eq!(summary(&checked(vec![empty("o/a"), empty("o/b")])), "Checked: no skills found in 2 repositories");
+        // Skills that need the user come first.
+        let attention = checked(vec![empty("o/a"), repo_report("o/b", Outcome::NeedsAttention)]);
+        assert_eq!(summary(&attention), "Checked: some skills need your attention");
+        assert_eq!(summary(&checked(vec![repo_report("o/b", Outcome::Unchanged)])), "Checked: everything is up to date");
+    }
 
     #[test]
     fn the_wait_after_failures_doubles_up_to_an_hour() {

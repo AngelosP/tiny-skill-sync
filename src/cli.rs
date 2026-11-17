@@ -15,7 +15,7 @@ use crate::config::{CONFIG_FILE, Config, Paths, RepoConfig, RepoSpec};
 use crate::engine::{Access, ApplyResult, Engine, EngineError, Outcome, Resolution, SkillReport, SyncOptions, Tracking, Which};
 use crate::github::{GitHubRemote, Remote, SystemTokens, TokenProvider};
 use crate::interval::{Interval, now_secs};
-use crate::pathsafe::fold;
+use crate::pathsafe::{fold, printable_lines};
 use crate::reconcile::Verdict;
 use crate::state::State;
 use crate::verify::Check;
@@ -356,26 +356,29 @@ fn gap(out: &mut String) {
 }
 
 /// Runs one command. What it prints goes to `out`, problems go to `err`; the result is the exit code.
+///
+/// Everything printed passes through `printable_lines`: names and messages come from the repository, and a control
+/// character in them could move the cursor or erase the line above.
 pub fn run(args: &[String], host: &dyn Host, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
     let command = match parse(args) {
         Ok(command) => command,
         Err(e) => {
-            let _ = writeln!(err, "tss: {e}\nRun 'tss help' to see the commands.");
+            let _ = writeln!(err, "tss: {}\nRun 'tss help' to see the commands.", printable_lines(&e));
             return EXIT_USAGE;
         }
     };
     let mut text = String::new();
     let result = execute(command, host, &mut text);
     // Output that cannot be written (a closed pipe) is not a reason to fail the command.
-    let _ = out.write_all(text.as_bytes()).and_then(|()| out.flush());
+    let _ = out.write_all(printable_lines(&text).as_bytes()).and_then(|()| out.flush());
     match result {
         Ok(code) => code,
         Err(Fail::Usage(e)) => {
-            let _ = writeln!(err, "tss: {e}");
+            let _ = writeln!(err, "tss: {}", printable_lines(&e));
             EXIT_USAGE
         }
         Err(Fail::Failed(e)) => {
-            let _ = writeln!(err, "tss: {e}");
+            let _ = writeln!(err, "tss: {}", printable_lines(&e));
             EXIT_FAILED
         }
     }
@@ -442,17 +445,27 @@ fn exit_code(level: Level) -> i32 {
     }
 }
 
-/// A word as it has to be typed in PowerShell or cmd.
-fn quote(word: &str) -> String {
-    let plain = !word.is_empty() && word.chars().all(|c| c.is_ascii_alphanumeric() || "-_./:".contains(c));
-    if plain { word.to_string() } else { format!("\"{word}\"") }
+/// A word as it has to be typed in PowerShell or cmd, or `None` when no way of writing it is safe to paste.
+///
+/// Skill names come from the repository, and Windows allows `$ ( ) ; ' % ` and curly quotes in a folder name. Inside
+/// double quotes PowerShell still runs `$(...)`, treats a backtick as an escape and ends the string at a curly double
+/// quote, and cmd expands `%NAME%`; single quotes are no safer, because curly single quotes close them too. So a word is
+/// only written out when it is made of letters, digits, spaces and a few plain marks, and the user is pointed to the
+/// settings window for any other.
+fn quote(word: &str) -> Option<String> {
+    let plain = |c: char| c.is_ascii_alphanumeric() || "-_./:".contains(c);
+    if word.is_empty() || !word.chars().all(|c| plain(c) || c.is_alphanumeric() || c == ' ' || c == '+') {
+        return None;
+    }
+    Some(if word.chars().all(plain) { word.to_string() } else { format!("\"{word}\"") })
 }
 
 /// A command the user can copy. A word that starts with '-' comes after `--`, so it is not read as an option.
-fn command_line(command: &str, words: &[&str], options: &[&str]) -> String {
-    let words: Vec<String> = words.iter().map(|w| quote(w)).collect();
+fn command_line(command: &str, words: &[&str], options: &[&str]) -> Option<String> {
+    let dashed = words.iter().any(|w| w.starts_with('-'));
+    let words: Vec<String> = words.iter().map(|w| quote(w)).collect::<Option<_>>()?;
     let mut parts = vec!["tss".to_string(), command.to_string()];
-    if words.iter().any(|w| w.starts_with('-')) {
+    if dashed {
         parts.extend(options.iter().map(|o| o.to_string()));
         parts.push("--".to_string());
         parts.extend(words);
@@ -460,15 +473,23 @@ fn command_line(command: &str, words: &[&str], options: &[&str]) -> String {
         parts.extend(words);
         parts.extend(options.iter().map(|o| o.to_string()));
     }
-    parts.join(" ")
+    Some(parts.join(" "))
 }
 
-fn hints(repo_id: &str, row: &Row) -> Vec<(String, &'static str)> {
-    let hint = |action: Action| match action.resolution() {
-        Some(_) => command_line("resolve", &[repo_id, &row.name, word_for(action)], &[]),
-        None => command_line("check", &[repo_id], &["--delete-all"]),
-    };
-    row.actions.iter().map(|&action| (hint(action), action.label())).collect()
+/// The commands that settle a row, and the labels of the choices that have no command that is safe to paste.
+fn hints(repo_id: &str, row: &Row) -> (Vec<(String, &'static str)>, Vec<&'static str>) {
+    let (mut typed, mut untyped) = (Vec::new(), Vec::new());
+    for &action in &row.actions {
+        let command = match action.resolution() {
+            Some(_) => command_line("resolve", &[repo_id, &row.name, word_for(action)], &[]),
+            None => command_line("check", &[repo_id], &["--delete-all"]),
+        };
+        match command {
+            Some(command) => typed.push((command, action.label())),
+            None => untyped.push(action.label()),
+        }
+    }
+    (typed, untyped)
 }
 
 fn header(out: &mut String, view: &RepoView, repo: &RepoConfig) {
@@ -487,10 +508,13 @@ fn rows(out: &mut String, repo_id: &str, rows: &[Row], all: bool) {
         }
         let mark = if row.level == Level::Ok { ' ' } else { '!' };
         say!(out, "  {mark} {}: {}", row.name, row.text);
-        let hints = hints(repo_id, row);
-        let width = hints.iter().map(|(cmd, _)| cmd.len()).max().unwrap_or(0);
-        for (cmd, label) in hints {
+        let (typed, untyped) = hints(repo_id, row);
+        let width = typed.iter().map(|(cmd, _)| cmd.len()).max().unwrap_or(0);
+        for (cmd, label) in typed {
             say!(out, "      {cmd:<width$}   ({label})");
+        }
+        if !untyped.is_empty() {
+            say!(out, "      No command is shown because the name is not safe to paste. Use the settings window: {}", untyped.join(" / "));
         }
     }
 }
@@ -549,6 +573,7 @@ fn status(host: &dyn Host, out: &mut String) -> Result<i32, Fail> {
             board.note_last_check(&repo.id, at);
         }
         board.note_kept(&repo.id, &engine.kept(&repo.id));
+        board.note_lists_nothing(&repo.id, engine.lists_nothing(&repo.id));
     }
 
     if cfg.repos.is_empty() {
@@ -570,7 +595,11 @@ fn status(host: &dyn Host, out: &mut String) -> Result<i32, Fail> {
     for id in board.orphans() {
         gap(out);
         say!(out, "Skills recorded for '{id}', which is no longer in the settings, are left alone.");
-        say!(out, "  To stop tracking them (the files stay): {}", command_line("remove", &[id], &[]));
+        say!(
+            out,
+            "  To stop tracking them (the files stay): {}",
+            command_line("remove", &[id], &[]).unwrap_or_else(|| "tss remove, followed by that id".to_string())
+        );
     }
     messages(out, &board);
     if report.stats.probed > 0 {
@@ -634,6 +663,10 @@ fn check(host: &dyn Host, out: &mut String, query: Option<&str>, dry_run: bool, 
     // The look at the disk comes first, so local edits are reported even when GitHub says nothing changed.
     let verified = engine.verify(&cfg, if dry_run { Access::ReadOnly } else { Access::Write })?;
     board.note_verify(&verified, now);
+    // What the last listing had in it, for a check that GitHub answers with "not modified".
+    for repo in &cfg.repos {
+        board.note_lists_nothing(&repo.id, engine.lists_nothing(&repo.id));
+    }
     let opts = SyncOptions { dry_run, ignore_etag: full_listing, confirm_mass_delete: delete_all, ..SyncOptions::default() };
     let mut report = engine.sync(&cfg, &which, &opts, &AtomicBool::new(false))?;
     if !dry_run {
@@ -695,7 +728,8 @@ fn installed_name(host: &dyn Host, cfg: &Config, repo: &RepoConfig, skill: &str)
     let state = load_state(host, cfg)?;
     let key = fold(skill);
     if let Some(owner) = state.names_owned_elsewhere(&repo.id).get(&key) {
-        let instead = command_line("resolve", &[owner, skill, "keep"], &[]);
+        let instead =
+            command_line("resolve", &[owner, skill, "keep"], &[]).unwrap_or_else(|| format!("the same command with '{owner}' in place of '{}'", repo.id));
         return Err(Fail::Usage(format!("'{skill}' is managed for '{owner}', not '{}'; use: {instead}", repo.id)));
     }
     if let Some(owned) = state.repo(&repo.id).and_then(|r| r.skill(skill)) {
@@ -733,7 +767,7 @@ fn add(host: &dyn Host, out: &mut String, spec: &str, every: Option<Interval>, u
     let added = cfg.add_repo(&spec, every, use_token).clone();
     cfg.save(&file).map_err(Fail::Failed)?;
     say!(out, "Added {} as '{}'. {}", added.label(), added.id, schedule_text(&cfg, &added));
-    say!(out, "Install its skills now with: {}", command_line("check", &[&added.id], &[]));
+    say!(out, "Install its skills now with: {}", command_line("check", &[&added.id], &[]).unwrap_or_else(|| "tss check".to_string()));
     Ok(EXIT_OK)
 }
 
@@ -936,14 +970,91 @@ mod tests {
 
     #[test]
     fn suggested_commands_can_be_typed_back() {
-        assert_eq!(command_line("resolve", &["fx", "alpha", "keep"], &[]), "tss resolve fx alpha keep");
-        assert_eq!(command_line("resolve", &["fx", "my skill", "keep"], &[]), "tss resolve fx \"my skill\" keep");
-        assert_eq!(command_line("check", &["fx"], &["--delete-all"]), "tss check fx --delete-all");
-        assert_eq!(command_line("check", &["-fx"], &["--delete-all"]), "tss check --delete-all -- -fx");
-        let line = command_line("resolve", &["fx", "-odd", "keep"], &[]);
-        assert_eq!(line, "tss resolve -- fx -odd keep");
-        let typed: Vec<String> = line.split(' ').skip(1).map(str::to_string).collect();
+        let line = |words: &[&str], options: &[&str]| command_line("resolve", words, options).unwrap();
+        assert_eq!(line(&["fx", "alpha", "keep"], &[]), "tss resolve fx alpha keep");
+        assert_eq!(line(&["fx", "my skill", "keep"], &[]), "tss resolve fx \"my skill\" keep");
+        assert_eq!(command_line("check", &["fx"], &["--delete-all"]).unwrap(), "tss check fx --delete-all");
+        assert_eq!(command_line("check", &["-fx"], &["--delete-all"]).unwrap(), "tss check --delete-all -- -fx");
+        let typed = line(&["fx", "-odd", "keep"], &[]);
+        assert_eq!(typed, "tss resolve -- fx -odd keep");
+        let typed: Vec<String> = typed.split(' ').skip(1).map(str::to_string).collect();
         assert_eq!(parse(&typed).unwrap(), Command::Resolve { repo: "fx".into(), skill: "-odd".into(), how: Resolution::KeepMine });
+        // Quoting a word does not hide a leading '-' from the command line parser.
+        assert_eq!(line(&["fx", "-odd one", "keep"], &[]), "tss resolve -- fx \"-odd one\" keep");
+    }
+
+    #[test]
+    fn a_name_a_shell_could_act_on_is_never_printed_as_a_command() {
+        // Windows allows every one of these in a folder name, and inside double quotes PowerShell still runs $(...) and
+        // $variables, treats a backtick as an escape and ends the string at a curly double quote; cmd expands %NAME%.
+        for name in [
+            "a$(b)",
+            "$env:USERNAME",
+            "a`b",
+            "x\u{201d};y;#",
+            "x\u{201c};y;#",
+            "x\u{201e};y;#",
+            "x\u{2019};y;#",
+            "x\u{2018};y;#",
+            "100%",
+            "a;b",
+            "a&b",
+            "a|b",
+            "a'b",
+            "a\"b",
+            "a<b",
+            "a(b)",
+            "a,b",
+            "a@b",
+            "a=b",
+            "a[0]",
+            "a{b}",
+            "a!b",
+            "a^b",
+            "a~b",
+            "a#b",
+            "a\\b",
+            "a\u{2013}b",
+            "a\u{202e}b",
+            "a\u{1b}b",
+            "a\u{ff04}b",
+            "",
+        ] {
+            assert_eq!(command_line("resolve", &["fx", name, "keep"], &[]), None, "{name:?}");
+        }
+        // The repository id is a word too.
+        assert_eq!(command_line("check", &["a$(b)"], &["--delete-all"]), None);
+        // Letters, digits and spaces from any language are fine; a word is quoted when it is not plain ASCII.
+        assert_eq!(command_line("resolve", &["fx", "caf\u{e9}", "keep"], &[]).unwrap(), "tss resolve fx \"caf\u{e9}\" keep");
+        assert_eq!(command_line("resolve", &["fx", "my skill 2", "keep"], &[]).unwrap(), "tss resolve fx \"my skill 2\" keep");
+        assert_eq!(command_line("resolve", &["fx", "c++", "keep"], &[]).unwrap(), "tss resolve fx \"c++\" keep");
+        assert_eq!(command_line("resolve", &["fx", "a_b-c.d", "keep"], &[]).unwrap(), "tss resolve fx a_b-c.d keep");
+    }
+
+    #[test]
+    fn a_row_whose_name_is_not_safe_to_paste_points_to_the_settings_window() {
+        let row = |name: &str, actions: &[Action]| Row {
+            name: name.into(),
+            text: "Edited locally (changed: SKILL.md)".into(),
+            level: Level::Attention,
+            actions: actions.to_vec(),
+        };
+
+        let mut out = String::new();
+        rows(&mut out, "fx", &[row("a$(b)", &[Action::Overwrite, Action::KeepMine])], true);
+        assert!(!out.contains("tss resolve"), "{out}");
+        assert!(out.contains("! a$(b): Edited locally"), "the name is still shown:\n{out}");
+        assert!(out.contains("Use the settings window: Replace with upstream / Keep mine"), "{out}");
+
+        // A command that does not name the skill can still be typed; the one that does cannot.
+        let mut out = String::new();
+        rows(&mut out, "fx", &[row("a$(b)", &[Action::RemoveThem, Action::KeepMine])], true);
+        assert!(out.contains("tss check fx --delete-all   (Delete them)"), "{out}");
+        assert!(!out.contains("tss resolve") && out.contains("Use the settings window: Keep mine"), "{out}");
+
+        let mut out = String::new();
+        rows(&mut out, "fx", &[row("alpha", &[Action::Overwrite, Action::KeepMine])], true);
+        assert!(out.contains("tss resolve fx alpha replace") && out.contains("tss resolve fx alpha keep") && !out.contains("settings window"), "{out}");
     }
 
     #[test]

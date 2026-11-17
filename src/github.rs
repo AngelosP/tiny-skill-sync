@@ -395,6 +395,8 @@ mod tests {
         assert_eq!(clean_base("http://127.0.0.1:8080").unwrap(), "http://127.0.0.1:8080");
         assert_eq!(clean_base("http://localhost:9").unwrap(), "http://localhost:9");
         assert!(clean_base("http://example.com").is_err());
+        assert!(clean_base("http://127.attacker.example").is_err(), "a name that starts with 127. is not this computer");
+        assert!(clean_base("http://127.0.0.1.evil.com").is_err());
         assert!(clean_base("ftp://x").is_err());
         assert!(clean_base("not a url").is_err());
         assert!(GitHubRemote::with_bases("http://example.com", DEFAULT_RAW_BASE).is_err());

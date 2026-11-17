@@ -3,6 +3,7 @@
 //! Everything downloaded ends up as a file on a Windows disk, so a name must be safe there: no traversal,
 //! no reserved device names, no characters Windows rejects, and no two names that differ only by case.
 
+use std::borrow::Cow;
 use std::fmt;
 
 /// The longest full path we install. Windows tools often still fail above 259 characters, even with long paths on.
@@ -82,6 +83,41 @@ pub fn check_rel_path(path: &str) -> Result<(), PathError> {
 /// The key two names share when Windows would treat them as the same file.
 pub fn fold(name: &str) -> String {
     name.to_lowercase()
+}
+
+/// Text that came from a repository, safe to show: control characters (an escape sequence can move the cursor or
+/// erase what is above it), line and paragraph separators, and the characters that reorder text (so `exe.pdf` cannot
+/// read as `pdf.exe`) are written out as `\u{1b}` and the like. The line break is escaped too, so this is for one
+/// line; a name Windows accepts can still hold all of these.
+pub fn printable(text: &str) -> Cow<'_, str> {
+    escape(text, false)
+}
+
+/// Like `printable`, but line breaks (`\n`) stay, for text that is several lines long.
+pub fn printable_lines(text: &str) -> Cow<'_, str> {
+    escape(text, true)
+}
+
+fn needs_escape(c: char, keep_newlines: bool) -> bool {
+    if c == '\n' && keep_newlines {
+        return false;
+    }
+    c.is_control() || matches!(c, '\u{2028}' | '\u{2029}' | '\u{200e}' | '\u{200f}' | '\u{61c}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+}
+
+fn escape(text: &str, keep_newlines: bool) -> Cow<'_, str> {
+    if !text.chars().any(|c| needs_escape(c, keep_newlines)) {
+        return Cow::Borrowed(text);
+    }
+    let mut out = String::with_capacity(text.len() + 16);
+    for c in text.chars() {
+        if needs_escape(c, keep_newlines) {
+            out.push_str(&format!("\\u{{{:x}}}", c as u32));
+        } else {
+            out.push(c);
+        }
+    }
+    Cow::Owned(out)
 }
 
 /// Normalizes a folder path typed by a person: slashes, surrounding spaces and stray slashes. Empty means the repository root.
@@ -169,5 +205,44 @@ mod tests {
     #[test]
     fn installed_length_counts_both_separators() {
         assert_eq!(installed_len(10, "ab", "c/d.md"), 10 + 1 + 2 + 1 + 6);
+    }
+
+    #[test]
+    fn printable_text_is_left_exactly_as_it_is() {
+        for same in ["alpha", "my skill", "caf\u{e9}", "\u{65e5}\u{672c}\u{8a9e}", "a\u{200d}b", "x (changed: a.md, b.md)", ""] {
+            assert!(matches!(printable(same), Cow::Borrowed(s) if s == same), "{same:?}");
+        }
+    }
+
+    #[test]
+    fn printable_writes_out_what_could_steer_a_terminal_or_reorder_text() {
+        assert_eq!(printable("a\u{1b}[2K\rb"), "a\\u{1b}[2K\\u{d}b");
+        assert_eq!(printable("a\nb\tc\u{0}"), "a\\u{a}b\\u{9}c\\u{0}");
+        assert_eq!(printable("a\u{7f}b\u{9b}c"), "a\\u{7f}b\\u{9b}c");
+        // Line and paragraph separators, direction marks and overrides, and the isolates that came after them.
+        for c in [
+            '\u{2028}', '\u{2029}', '\u{200e}', '\u{200f}', '\u{61c}', '\u{202a}', '\u{202b}', '\u{202c}', '\u{202d}', '\u{202e}', '\u{2066}', '\u{2067}',
+            '\u{2068}', '\u{2069}',
+        ] {
+            let text = format!("ex{c}e");
+            let shown = printable(&text);
+            assert!(!shown.contains(c), "U+{:04X} was shown as it is", c as u32);
+            assert_eq!(shown, format!("ex\\u{{{:x}}}e", c as u32));
+        }
+    }
+
+    #[test]
+    fn printable_lines_keep_line_breaks_only() {
+        assert_eq!(printable_lines("one\ntwo\u{1b}\nthree\r"), "one\ntwo\\u{1b}\nthree\\u{d}");
+        assert!(matches!(printable_lines("one\ntwo"), Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn what_a_skill_name_may_contain_and_what_is_shown_agree() {
+        // A name that passes `check_component` can still hold characters that must not reach a screen as they are.
+        for name in ["a\u{202e}b", "a\u{2029}b", "a\u{9b}b"] {
+            assert_eq!(check_component(name), Ok(()), "{name:?} is installable");
+            assert_ne!(printable(name), name, "{name:?} is shown as it is");
+        }
     }
 }

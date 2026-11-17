@@ -17,8 +17,8 @@ use std::ptr::{null, null_mut};
 
 use windows_sys::Win32::Foundation::{ERROR_CLASS_ALREADY_EXISTS, FILETIME, GetLastError, HWND, RECT, SYSTEMTIME};
 use windows_sys::Win32::Graphics::Gdi::{
-    COLOR_BTNFACE, CreateFontIndirectW, DT_CALCRECT, DT_EDITCONTROL, DT_NOPREFIX, DT_WORDBREAK, DeleteObject, DrawTextW, GetDC, HBRUSH, HFONT, ReleaseDC,
-    SelectObject,
+    COLOR_BTNFACE, CreateFontIndirectW, DT_CALCRECT, DT_EDITCONTROL, DT_NOPREFIX, DT_WORDBREAK, DeleteObject, DrawTextW, GetDC, HBRUSH, HFONT, InvalidateRect,
+    ReleaseDC, SelectObject,
 };
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, SetProcessWorkingSetSize};
@@ -26,8 +26,8 @@ use windows_sys::Win32::System::Time::{FileTimeToSystemTime, SystemTimeToTzSpeci
 use windows_sys::Win32::UI::Controls::{
     BST_CHECKED, BST_UNCHECKED, LVCF_SUBITEM, LVCF_TEXT, LVCF_WIDTH, LVCOLUMNW, LVIF_TEXT, LVIS_FOCUSED, LVIS_SELECTED, LVITEMW, LVM_DELETEALLITEMS,
     LVM_ENSUREVISIBLE, LVM_GETITEMCOUNT, LVM_GETNEXTITEM, LVM_INSERTCOLUMNW, LVM_INSERTITEMW, LVM_SETCOLUMNWIDTH, LVM_SETEXTENDEDLISTVIEWSTYLE,
-    LVM_SETITEMSTATE, LVM_SETITEMTEXTW, LVNI_SELECTED, LVS_EX_DOUBLEBUFFER, LVS_EX_FULLROWSELECT, LVS_NOSORTHEADER, LVS_REPORT, LVS_SHOWSELALWAYS,
-    LVS_SINGLESEL, SetWindowTheme,
+    LVM_SETITEMCOUNT, LVM_SETITEMSTATE, LVM_SETITEMTEXTW, LVNI_SELECTED, LVS_EX_DOUBLEBUFFER, LVS_EX_FULLROWSELECT, LVS_NOSORTHEADER, LVS_REPORT,
+    LVS_SHOWSELALWAYS, LVS_SINGLESEL, SetWindowTheme,
 };
 use windows_sys::Win32::UI::HiDpi::{AdjustWindowRectExForDpi, GetDpiForWindow, SystemParametersInfoForDpi};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{EnableWindow, IsWindowEnabled};
@@ -35,7 +35,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     BM_GETCHECK, BM_SETCHECK, BS_AUTOCHECKBOX, BS_PUSHBUTTON, CB_ADDSTRING, CBS_AUTOHSCROLL, CBS_DROPDOWN, CS_HREDRAW, CS_VREDRAW, CreateWindowExW,
     ES_AUTOHSCROLL, GetWindowRect, GetWindowTextLengthW, GetWindowTextW, HICON, HMENU, IDC_ARROW, IsWindowVisible, LoadCursorW, NONCLIENTMETRICSW,
     RegisterClassExW, SPI_GETNONCLIENTMETRICS, SPI_GETWORKAREA, SW_HIDE, SW_SHOWNA, SWP_NOACTIVATE, SWP_NOZORDER, SendMessageW, SetWindowPos, SetWindowTextW,
-    ShowWindow, SystemParametersInfoW, WM_SETFONT, WNDCLASSEXW, WNDPROC, WS_CHILD, WS_EX_CLIENTEDGE, WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
+    ShowWindow, SystemParametersInfoW, WM_SETFONT, WM_SETREDRAW, WNDCLASSEXW, WNDPROC, WS_CHILD, WS_EX_CLIENTEDGE, WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
 };
 
 use super::wide;
@@ -175,6 +175,17 @@ impl Form {
             child.bold = true;
             unsafe { SendMessageW(hwnd, WM_SETFONT, self.bold as usize, 1) };
         }
+    }
+
+    /// Moves a control to `rect` (DIPs) and remembers that place for the next DPI change. Does nothing if it is there.
+    pub fn resize(&mut self, hwnd: HWND, rect: [i32; 4]) {
+        let Some(child) = self.children.iter_mut().find(|c| c.hwnd == hwnd) else { return };
+        if child.rect == rect {
+            return;
+        }
+        child.rect = rect;
+        let [x, y, w, h] = rect.map(|v| scale(v, self.dpi));
+        unsafe { SetWindowPos(hwnd, null_mut(), x, y, w, h, SWP_NOZORDER | SWP_NOACTIVATE) };
     }
 
     /// The height `text` needs when wrapped at `width` DIPs, in DIPs.
@@ -339,7 +350,12 @@ fn lv_set_cell(list: HWND, row: usize, col: usize, text: &str) {
 pub fn lv_fill(list: HWND, rows: &[Vec<String>], shown: &mut Vec<Vec<String>>) {
     let count = unsafe { SendMessageW(list, LVM_GETITEMCOUNT, 0, 0) } as usize;
     if count != rows.len() || shown.len() != rows.len() {
-        unsafe { SendMessageW(list, LVM_DELETEALLITEMS, 0, 0) };
+        // A skills list can have hundreds of rows: room for all of them at once, and one repaint at the end.
+        unsafe {
+            SendMessageW(list, WM_SETREDRAW, 0, 0);
+            SendMessageW(list, LVM_DELETEALLITEMS, 0, 0);
+            SendMessageW(list, LVM_SETITEMCOUNT, rows.len(), 0);
+        }
         for (i, row) in rows.iter().enumerate() {
             let mut first = wide(row.first().map_or("", String::as_str));
             let mut item: LVITEMW = unsafe { zeroed() };
@@ -350,6 +366,10 @@ pub fn lv_fill(list: HWND, rows: &[Vec<String>], shown: &mut Vec<Vec<String>>) {
             for (col, cell) in row.iter().enumerate().skip(1) {
                 lv_set_cell(list, i, col, cell);
             }
+        }
+        unsafe {
+            SendMessageW(list, WM_SETREDRAW, 1, 0);
+            InvalidateRect(list, null(), 1);
         }
     } else {
         for (i, (row, old)) in rows.iter().zip(shown.iter()).enumerate() {

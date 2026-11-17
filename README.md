@@ -64,12 +64,14 @@ you give only `owner/name`):
 Folders whose name starts with a dot, loose files and folders without a `SKILL.md` are ignored.
 
 > **Add the folder that holds the skills.** Many repositories keep their skills in a `skills` folder. If you add only
-> `owner/name` for such a repository, the app finds no skills in the root, installs nothing, and still says
-> "up to date". Add the folder's address instead: `https://github.com/OWNER/NAME/tree/BRANCH/skills`.
+> `owner/name` for such a repository, the app finds no skills in the root and installs nothing. The repository then
+> shows "No skills found", and the settings window and `tss status` say what to do: add the folder's address instead,
+> `https://github.com/OWNER/NAME/tree/BRANCH/skills`.
 
 A skill whose files include something unsafe on Windows (a link, a submodule, a reserved name such as `CON`, two names
 that differ only in case, an over-long path) is not installed, and a version already installed is left as it is. The
-reason is shown in the settings window.
+reason is shown in the settings window and by `tss check` whenever a check reads the repository's listing: the first
+check, each time the repository has changed, and `tss check --full-listing` (see [Limitations](#limitations)).
 
 ## The tray icon
 
@@ -92,6 +94,8 @@ it.
   yours) or delete the ones you did not edit.
 - **Add:** `owner/name` or the address of a GitHub folder. Tick **Private** to send your token.
 - **Skills:** the skills of the selected repository and the state of each, with buttons for the choices that make sense.
+  The box under the list explains the selected skill or, when none is selected, what went wrong with the repository
+  (Tab moves to it, so a long text can be scrolled).
 - **Default check interval**, the GitHub token (**Set…**, **Clear**) and the skills folder (**Open**, **Backups**).
 - **Messages:** what changed recently, and what went wrong.
 
@@ -141,6 +145,12 @@ tss token [status|set|clear]                 gh auth token | tss token set
 `REPO` is the id that `tss status` shows, or `owner/name`. Exit codes: 0 all fine, 1 something needs attention,
 2 failed, 3 bad command line. The tray notices changes made with `tss` and shows them. Only one of them checks at a
 time; the other one is told to try again in a moment.
+
+Names and messages that come from a repository are shown with control and text-direction characters written out
+(`\u{202e}`), in the window and in `tss`, so a name cannot hide part of a line or change how it reads. `tss` prints a
+ready-to-paste `tss resolve` command only for a skill whose name is plain (letters, digits, spaces and a few marks such
+as `-` and `_`), because Windows allows `$`, `;`, `%` and quotes in a folder name; for any other name it points to the
+settings window.
 
 Ctrl+C during `tss check` stops at once without a message. That is safe: the next start finishes or undoes a change that
 was interrupted.
@@ -224,17 +234,25 @@ Measured with `scripts\bench.ps1` on a Ryzen 7 5800X3D with Windows 11, files in
 
 | Measure | 442 files | 1,555 files | Budget |
 | --- | --- | --- | --- |
-| Start to tray icon | 7.9 ms | 8.0 ms | 30 ms median |
-| Start-up check of every installed file | 22 ms | 100 ms | 75 µs per file |
+| Start to tray icon | 8.0 ms | 8.3 ms | 30 ms median |
+| Start-up check of every installed file | 23 ms | 100 ms | 75 µs per file |
 | Idle for 10 s: CPU, disk, page faults | 0, 0, 0 | 0, 0, 0 | 0 |
 | Idle memory: trimmed working set / private | 0.9 / 1.8 MiB | 1.2 / 2.5 MiB | 2 / 4 MiB |
-| Settings window: open to painted (median) | 43 ms | | 50 ms |
-| Settings window open: working set | 11.4 MiB | | 20 MiB |
-| Unchanged check: CPU, file reads and writes | 47 ms, 0, 0 | 16 ms, 0, 0 | 50 ms, 0 |
-| Exe size | 0.86 MiB | | 1 MiB |
+| Settings window: open to painted (median) | 47 ms | 45 ms | 50 ms |
+| Settings window open: working set | 11.5 MiB | 12.3 MiB | 20 MiB |
+| Unchanged check: CPU, file reads and writes | 16 ms, 0, 0 | 31 ms, 0, 0 | 50 ms, 0 |
+| Exe size | 0.87 MiB | 0.87 MiB | 1 MiB |
 
 Windows counts a process's CPU time in ticks of 15.6 ms, so an unchanged check shows as one to three ticks (16 to
-47 ms) from run to run.
+47 ms) from run to run. The settings window is the row with the least room (the budget is 50 ms, and the same build
+varies by a few milliseconds from one day to the next), so run the bench again after any change to it. A list of 463
+skills opens as fast as one of 19, because the list is filled with drawing turned off and painted once (filled row by
+row, it took 68 ms).
+
+Left running for 75 minutes against a test repository with a 5-minute interval and seven upstream changes
+(`scripts\soak.ps1`), the app kept 6 threads and about 340 handles, used 297 ms of CPU in all (0.006 % of one core) and
+ended at 3.2 MiB of private memory. Each change reached the disk within one interval (271 to 306 s). A second run of
+22 minutes gave the same picture: 94 ms of CPU, 3.1 MiB private, changes on disk after 120, 60 and 305 s.
 
 ## Limitations
 
@@ -247,6 +265,17 @@ Windows counts a process's CPU time in ticks of 15.6 ms, so an unchanged check s
 - `gh` is found only on the `PATH`; with several `gh` accounts, the active one is used.
 - When Windows long paths are off, a folder you add inside a skill whose path is longer than 260 characters cannot be
   listed, so that skill counts as edited and is left alone.
+- Skills that were refused as unsafe, and folders of yours that were held because they differ from an upstream skill of
+  the same name, are announced by the check that reads the repository's listing (the first check, each time the
+  repository has changed, and `tss check --full-listing`). The app does not remember them: a later check that finds
+  nothing new says "Up to date", and the settings window forgets a refusal when the app restarts. Nothing is installed
+  or changed in the meantime.
+- GitHub's servers can answer for up to a minute with a version of a public repository that is one change old. When
+  two of its answers disagree, the check stops with "Changed while checking" and changes nothing; the next check works.
+- One check downloads at most 512 MiB (the rest waits for the next check), and a file over 64 MiB or a skill with more
+  than 10,000 files is refused. There is no limit on what all the installed skills add up to.
+- The settings window is 616 by 619 pixels at 100% scale and does not shrink. It has been tried only at 100%; on a small
+  screen with a high scale (for example 1366 by 768 at 125%) part of it is off the screen.
 
 ## More
 

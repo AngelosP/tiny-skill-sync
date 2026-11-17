@@ -11,8 +11,11 @@ These rules keep that from happening. Read [ARCHITECTURE.md](ARCHITECTURE.md) be
 - Never run `tss token set` or `tss token clear`, and never start the app with the real settings. The saved GitHub token
   is shared by every copy of the app.
 - Never print, log or save a token.
-- Run the app only through the scripts (`scripts\dev.ps1 run`, `tss`, `dry-run`, `bench`). They set `TSS_HOME` and
-  `TSS_SKILLS_DIR` to the sandbox or to a throwaway folder. If you run an exe directly, set both variables first.
+- Run the app only through the scripts (`scripts\dev.ps1 run`, `tss`, `dry-run`, `bench`, `e2e`, `soak`). They set
+  `TSS_HOME` and `TSS_SKILLS_DIR` to the sandbox or to a throwaway folder. If you run an exe directly, set both
+  variables first.
+- The live scripts (`e2e`, `soak`) push only to their own branches of the fixture repositories (`e2e-*`, `soak-*`), and
+  delete them afterwards. Never push to a fixture's `main`, and never point a live script at a repository you do not own.
 - Tests make their own folders under `%TEMP%` (or `TSS_TEST_ROOT`). A new test must do the same, through
   `tests\common\mod.rs` (`World`) or the helpers in the module it tests.
 
@@ -62,9 +65,12 @@ path.
 3. If it touches file-system code: the tests also pass on another kind of drive if you have one
    (`scripts\dev.ps1 test -Root FOLDER`).
 4. If it touches speed, memory or disk use: `scripts\dev.ps1 bench` is within budget.
-5. The docs say what the code does: [README.md](README.md) for users, [ARCHITECTURE.md](ARCHITECTURE.md) for how it
+5. If it changes what the app shows or does while it runs (the tray, the settings window, the visible result of a
+   check): the matching scenarios of `scripts\dev.ps1 e2e -Only ...` pass, and for a window you have looked at the
+   screenshots they save.
+6. The docs say what the code does: [README.md](README.md) for users, [ARCHITECTURE.md](ARCHITECTURE.md) for how it
    works, [CONTRIBUTING.md](CONTRIBUTING.md) for commands.
-6. No leftovers: `scripts\dev.ps1 clean` removes the sandbox and test folders.
+7. No leftovers: `scripts\dev.ps1 clean` removes the sandbox and test folders.
 
 ## Where the history is
 

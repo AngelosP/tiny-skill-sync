@@ -171,6 +171,9 @@ pub struct RepoReport {
     pub stats: Stats,
     pub downloaded: u64,
     pub finished_at: UnixSecs,
+    /// The listing this check read had no skills in it at all. False when no listing was read: the check failed, or
+    /// GitHub said nothing changed.
+    pub lists_nothing: bool,
 }
 
 impl RepoReport {
@@ -184,6 +187,7 @@ impl RepoReport {
             stats: Stats::default(),
             downloaded: 0,
             finished_at: 0,
+            lists_nothing: false,
         }
     }
 
@@ -515,6 +519,11 @@ impl Engine {
         self.cache.state.repo(repo_id).map(|r| r.ignored.clone()).unwrap_or_default()
     }
 
+    /// Whether the last listing read for a repository had no skills in it at all, as of the last call.
+    pub fn lists_nothing(&self, repo_id: &str) -> bool {
+        self.cache.state.repo(repo_id).is_some_and(|r| r.lists_nothing)
+    }
+
     /// The stamp of `state.json` as the last call left it, or `None` when it is not known. A different stamp on disk
     /// means another program (such as `tss`) changed the file since.
     pub fn state_stamp(&self) -> Option<Stamp> {
@@ -802,6 +811,7 @@ impl Engine {
 
         let mut report = report;
         report.rejected = discovery.rejected.clone();
+        report.lists_nothing = discovery.skills.is_empty() && discovery.rejected.is_empty();
         if !opts.dry_run {
             let settled = run.stopped.is_none()
                 && !run.cancelled
@@ -811,6 +821,7 @@ impl Engine {
             let rs = s.state.repo_mut(&repo.id);
             // The ETag is kept only when everything is settled; otherwise the next check must look again.
             rs.etag = if settled { new_etag } else { None };
+            rs.lists_nothing = report.lists_nothing;
             if run.stopped.is_none() && !run.cancelled {
                 rs.last_check = Some(now);
             }
