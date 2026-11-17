@@ -183,6 +183,23 @@ The latest results are in [README.md](README.md#measured-cost).
 keeps the tray exe at 0.86 MiB, under its 1 MiB budget (`opt-level = 3` made it 1.06 MiB). `build.rs` embeds
 `app.manifest` (common controls 6, per-monitor DPI, long paths, UTF-8).
 
+## Releases
+
+`.github\workflows\release.yml` publishes a GitHub release when a tag `vX.Y.Z` is pushed:
+
+1. Set `version` in `Cargo.toml`, build once so `Cargo.lock` follows, and commit. Run the live scripts (`e2e`, and
+   `bench` for a change on a measured path) on that commit: the workflow cannot, as they need the fixture repositories
+   and a desktop.
+2. `git tag -a vX.Y.Z -m "tiny-skill-sync X.Y.Z"`, then `git push origin main vX.Y.Z`.
+
+On a Windows runner, the workflow refuses a tag that does not match `Cargo.toml`, runs `scripts\test.ps1` and
+`scripts\build.ps1`, and publishes `tiny-skill-sync-X.Y.Z-windows-x64.zip` (both exes and the README) with
+`SHA256SUMS.txt` (the zip and both exes). A tag with a hyphen (`v0.2.0-rc.1`) makes a pre-release. To check that a
+release would build, without publishing anything: `gh workflow run release.yml`, then `gh run watch`.
+
+The workflow uses the Rust version in its `RUSTUP_TOOLCHAIN`, so a new clippy lint cannot block a release. Raise it when
+you move to a newer Rust here.
+
 ## Spikes
 
 `examples\` and `spikes\` hold the experiments the design was based on. They are not part of the app and are built only

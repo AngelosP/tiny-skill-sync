@@ -1,0 +1,107 @@
+# Builds and publishes a release when a version tag is pushed: git tag v0.1.0; git push origin v0.1.0
+# The tag must match the version in Cargo.toml. Run it by hand (Actions, Release, Run workflow) to check that a
+# release would build, without publishing anything. See CONTRIBUTING.md, "Releases".
+name: Release
+
+on:
+  push:
+    tags: ['v[0-9]*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  # The toolchain the code was last checked with. Changed on purpose, so a new clippy lint cannot block a release.
+  RUSTUP_TOOLCHAIN: '1.100.0'
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release:
+    runs-on: windows-2025
+    timeout-minutes: 45
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        shell: pwsh
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          rustup toolchain install $env:RUSTUP_TOOLCHAIN --profile minimal --component rustfmt,clippy
+          rustc --version
+          cargo --version
+
+      - name: Read the version
+        id: version
+        shell: pwsh
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          $meta = cargo metadata --no-deps --format-version 1 | ConvertFrom-Json
+          $version = ($meta.packages | Where-Object name -eq 'tiny-skill-sync').version
+          if ($env:GITHUB_REF_TYPE -eq 'tag' -and $env:GITHUB_REF_NAME -ne "v$version") {
+            throw "The tag $env:GITHUB_REF_NAME does not match the version in Cargo.toml ($version)."
+          }
+          "version=$version" >> $env:GITHUB_OUTPUT
+
+      - name: Check (formatting, clippy, every test)
+        shell: pwsh
+        run: scripts\test.ps1
+
+      - name: Build
+        shell: pwsh
+        run: scripts\build.ps1
+
+      - name: Package
+        id: package
+        shell: pwsh
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          $name = "tiny-skill-sync-$env:VERSION-windows-x64"
+          $dist = Join-Path $env:RUNNER_TEMP 'dist'
+          $stage = Join-Path $env:RUNNER_TEMP $name
+          New-Item -ItemType Directory -Force $dist, $stage | Out-Null
+          Copy-Item target\release\tiny-skill-sync.exe, target\release\tss.exe, README.md -Destination $stage
+          $zip = Join-Path $dist "$name.zip"
+          Compress-Archive -Path (Join-Path $stage '*') -DestinationPath $zip
+          $files = @(Get-Item $zip) + @(Get-ChildItem $stage -Filter '*.exe')
+          $sums = foreach ($file in $files) {
+            '{0}  {1}' -f (Get-FileHash $file.FullName -Algorithm SHA256).Hash.ToLowerInvariant(), $file.Name
+          }
+          [IO.File]::WriteAllText((Join-Path $dist 'SHA256SUMS.txt'), (($sums -join "`n") + "`n"))
+          Get-ChildItem $dist | Format-Table Name, Length -AutoSize | Out-String | Write-Host
+          Get-Content (Join-Path $dist 'SHA256SUMS.txt') | Write-Host
+          "dist=$dist" >> $env:GITHUB_OUTPUT
+          "zip=$name.zip" >> $env:GITHUB_OUTPUT
+
+      - name: Publish the release
+        if: github.ref_type == 'tag'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          DIST: ${{ steps.package.outputs.dist }}
+          ZIP: ${{ steps.package.outputs.zip }}
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          $notes = @(
+            'Windows 10 and 11, x64. The exes are not signed.'
+            ''
+            "Unzip ``$env:ZIP`` into a folder of your choice, for example ``%LOCALAPPDATA%\Programs\tiny-skill-sync``,"
+            'and start `tiny-skill-sync.exe`. To update, quit the app from its tray menu first, then replace both exes;'
+            'your settings and records stay in `%LOCALAPPDATA%\tiny-skill-sync`. See the README in the zip.'
+            ''
+            '`SHA256SUMS.txt` holds the SHA-256 of the zip and of both exes.'
+          ) -join "`n"
+          $create = @('release', 'create', $env:TAG, '--repo', $env:GITHUB_REPOSITORY, '--verify-tag',
+            '--title', "tiny-skill-sync $env:TAG", '--notes', $notes, '--generate-notes')
+          if ($env:TAG.Contains('-')) { $create += '--prerelease' }
+          gh @create (Join-Path $env:DIST $env:ZIP) (Join-Path $env:DIST 'SHA256SUMS.txt')

@@ -36,11 +36,17 @@ These are the rules the app follows. Each one is covered by tests (see [CONTRIBU
 
 ## Quick start
 
-1. Build it (see [CONTRIBUTING.md](CONTRIBUTING.md)): `scripts\dev.ps1 build`. This makes
-   `target\release\tiny-skill-sync.exe` (the tray app) and `target\release\tss.exe` (the command line).
-2. Copy both exes to a folder of your choice, for example `%LOCALAPPDATA%\Programs\tiny-skill-sync`, and start
-   `tiny-skill-sync.exe`. A round icon appears in the notification area. The first start of a new exe can take up to a
-   second while Microsoft Defender scans it.
+1. Download `tiny-skill-sync-VERSION-windows-x64.zip` from the
+   [releases](https://github.com/AngelosP/tiny-skill-sync/releases), or let the GitHub CLI fetch the latest one (it
+   also works while the repository is private to you):
+   `gh release download --repo AngelosP/tiny-skill-sync --pattern *`. `SHA256SUMS.txt` holds the SHA-256 of the zip
+   and of both exes. Or build them yourself (see [CONTRIBUTING.md](CONTRIBUTING.md)): `scripts\dev.ps1 build` makes
+   them in `target\release`.
+2. Put both exes, `tiny-skill-sync.exe` (the tray app) and `tss.exe` (the command line), in a folder of your choice, for
+   example `%LOCALAPPDATA%\Programs\tiny-skill-sync`, and start `tiny-skill-sync.exe`. A round icon appears in the
+   notification area. The first start of a new exe can take up to a second while Microsoft Defender scans it. The exes
+   are not signed, so if a browser downloaded them, Windows may ask before the first start (**More info**, **Run
+   anyway**).
 3. Click the icon to open the settings window. Paste the address of a GitHub folder that holds skills into the box at
    the bottom of the repositories list, and click **Add**. For example:
 
@@ -52,6 +58,9 @@ These are the rules the app follows. Each one is covered by tests (see [CONTRIBU
 
 To start the app when you sign in, put a shortcut to `tiny-skill-sync.exe` in your Startup folder (`Win+R`,
 `shell:startup`). The app does not register itself.
+
+To update it, quit the app (right-click the icon, **Quit**), replace both exes with the new ones and start it again.
+The settings and the record of what it installed stay in `%LOCALAPPDATA%\tiny-skill-sync`.
 
 ## Which folders are skills
 
