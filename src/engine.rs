@@ -34,7 +34,7 @@ use crate::pathsafe::fold;
 use crate::reconcile::{self, Decision, DirtyInfo, Input, LocalState, OwnedView, Skip, Verdict};
 use crate::scheduler::Schedule;
 use crate::secret::Secret;
-use crate::state::{Fingerprint, OwnedSkill, Pending, State, VolumeId};
+use crate::state::{Fingerprint, Folder, OwnedSkill, Pending, State, VolumeId};
 use crate::tree::{self, Discovery, Rejected, SkillFile};
 use crate::verify::{self, Check, Stats, check_for_volume};
 use crate::win::fs::{Kind, probe, volume_id};
@@ -109,6 +109,10 @@ impl std::error::Error for EngineError {}
 
 fn failed(why: impl Into<String>) -> EngineError {
     EngineError::Failed(why.into())
+}
+
+fn folder_changed() -> EngineError {
+    failed("the skills folder changed since the app last looked at it; check now (or run 'tss check') first, then try again")
 }
 
 #[derive(Clone, Debug)]
@@ -335,6 +339,19 @@ struct Session {
 }
 
 impl Session {
+    /// Finishes or undoes the changes a crash interrupted. Only a call that may write does it.
+    fn recover(&mut self) {
+        if self.access == Access::Write && self.state.has_pending() {
+            match self.applier.recover(&mut self.state) {
+                Ok(notes) => self.notes = notes,
+                Err(e) => {
+                    self.suspect = true;
+                    self.warnings.push(format!("could not sort out interrupted changes: {e}"));
+                }
+            }
+        }
+    }
+
     /// Writes the state. A failure is remembered as a warning and the state is read from disk again next time.
     fn save(&mut self) -> Result<(), String> {
         if self.access == Access::ReadOnly {
@@ -578,12 +595,15 @@ impl Engine {
         }
     }
 
-    fn begin(&mut self, access: Access) -> Result<Session, EngineError> {
+    /// Starts a call: takes the lock, reads the state and ties it to the skills folder. Says whether the records were
+    /// made for another skills folder. Changes a crash interrupted are not sorted out yet; `begin` does that.
+    fn open(&mut self, access: Access) -> Result<(Session, bool), EngineError> {
         let lock = self.acquire(access)?;
         let path = self.paths.state_file();
         let mut warnings = Vec::new();
         let mut suspect = false;
         let mut must_save = false;
+        let mut moved = false;
 
         let stamp = stamp_of(&path);
         let reusable = self.cache.stamp.is_some() && self.cache.stamp == stamp;
@@ -602,6 +622,40 @@ impl Engine {
         // From here on the state lives in the session; `end` puts it back.
         self.cache.stamp = None;
 
+        // Records made for another skills folder must not be applied to this one, nor their interrupted changes
+        // finished here. `begin` does that after this, so this comes first.
+        match state.follow_folder(&self.paths.skills.to_string_lossy()) {
+            Folder::Same => {}
+            Folder::Recorded => must_save |= !state.repos.is_empty(),
+            Folder::Moved { from, managed, unfinished, back } => {
+                must_save = true;
+                moved = true;
+                // Check times held back belong to the old records.
+                self.lazy.clear();
+                let here = self.paths.skills.display();
+                if back {
+                    let mut text =
+                        format!("the skills folder changed from {from} back to {here}, which the app used before: the skills there are managed as they were");
+                    if managed {
+                        text.push_str(", and those in the old folder were left there as they are and are no longer kept up to date");
+                    }
+                    warnings.push(text);
+                } else if managed {
+                    warnings.push(format!(
+                        "the skills folder changed from {from} to {here}: the skills installed in the old folder were left there as they are and are no longer kept up to date, and the new folder gets its own copies"
+                    ));
+                }
+                if !unfinished.is_empty() {
+                    let old_work = Paths::new(self.paths.home.clone(), PathBuf::from(&from)).work_dir();
+                    warnings.push(format!(
+                        "a change to {} was interrupted in the old skills folder; it will be finished if the app uses that folder again, and until then what it set aside is in {}",
+                        unfinished.join(", "),
+                        old_work.display()
+                    ));
+                }
+            }
+        }
+
         for (id, at) in &self.lazy {
             if let Some(r) = state.repos.get_mut(id) {
                 if r.last_check.is_none_or(|c| c < *at) {
@@ -612,7 +666,7 @@ impl Engine {
 
         let mut applier = Applier::new(self.paths.skills.clone(), self.paths.work_dir(), path);
         applier.hook = self.step_hook.take();
-        let mut s = Session {
+        let s = Session {
             _lock: lock,
             access,
             state,
@@ -629,16 +683,28 @@ impl Engine {
             notes: Vec::new(),
             warnings,
         };
-        if access == Access::Write && s.state.has_pending() {
-            match s.applier.recover(&mut s.state) {
-                Ok(notes) => s.notes = notes,
-                Err(e) => {
-                    s.suspect = true;
-                    s.warnings.push(format!("could not sort out interrupted changes: {e}"));
-                }
-            }
-        }
+        Ok((s, moved))
+    }
+
+    /// Starts a call that reports warnings, so it may also take in a change of skills folder.
+    fn begin(&mut self, access: Access) -> Result<Session, EngineError> {
+        let (mut s, _) = self.open(access)?;
+        s.recover();
         Ok(s)
+    }
+
+    /// Starts a call that changes the records but reports no warnings. If the skills folder changed since the state
+    /// was saved, it changes nothing and gives `None`: a check must first take in the change and tell the user.
+    fn begin_settled(&mut self) -> Result<Option<Session>, EngineError> {
+        let (mut s, moved) = self.open(Access::Write)?;
+        if moved {
+            s.must_save = false;
+            s.suspect = true;
+            self.finish(s);
+            return Ok(None);
+        }
+        s.recover();
+        Ok(Some(s))
     }
 
     /// Saves what must be saved, hands the state back to the cache and lets go of the lock. Returns the warnings.
@@ -667,12 +733,13 @@ impl Engine {
         Ok(value)
     }
 
-    /// Writes `last_check` times that were held back. Call before the program exits.
+    /// Writes `last_check` times that were held back. Call before the program exits. If the skills folder changed, the
+    /// times belong to records of another folder, so nothing is written.
     pub fn flush(&mut self) -> Result<(), EngineError> {
         if self.lazy.is_empty() {
             return Ok(());
         }
-        let mut s = self.begin(Access::Write)?;
+        let Some(mut s) = self.begin_settled()? else { return Ok(()) };
         s.must_save = true;
         self.conclude(s, Ok(()))
     }
@@ -938,7 +1005,7 @@ impl Engine {
     /// Settles one skill that needs the user's decision.
     pub fn resolve(&mut self, cfg: &Config, repo_id: &str, skill: &str, how: Resolution, cancel: &AtomicBool) -> Result<ResolveReport, EngineError> {
         let repo = cfg.find(repo_id).ok_or_else(|| failed(format!("no repository '{repo_id}' is set up")))?;
-        let mut s = self.begin(Access::Write)?;
+        let mut s = self.begin_settled()?.ok_or_else(folder_changed)?;
         let result = self.resolve_in(&mut s, repo, skill, how, cancel);
         self.conclude(s, result)
     }
@@ -1020,7 +1087,7 @@ impl Engine {
 
     /// Stops managing a repository's skills. The caller removes the repository from the settings afterwards.
     pub fn remove_repo(&mut self, repo_id: &str, delete_skills: bool) -> Result<RemoveReport, EngineError> {
-        let mut s = self.begin(Access::Write)?;
+        let mut s = self.begin_settled()?.ok_or_else(folder_changed)?;
         let mut report = RemoveReport::default();
         let names: Vec<String> = s.state.repo(repo_id).map(|r| r.skills.iter().map(|k| k.name.clone()).collect()).unwrap_or_default();
         for name in names {
@@ -1038,7 +1105,7 @@ impl Engine {
                 }
             }
         }
-        if s.state.repos.remove(repo_id).is_some() {
+        if s.state.drop_repo(repo_id) {
             s.must_save = true;
         }
         self.schedule.forget(repo_id);

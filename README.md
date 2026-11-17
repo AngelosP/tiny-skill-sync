@@ -168,6 +168,14 @@ The skills folder contains only skill folders; the app keeps its own files elsew
 damaged `state.json` is kept as `state.json.damaged-*` and the app starts over with an empty record (it then takes over
 skills that are identical to upstream and asks about the rest).
 
+Pointing the app at another skills folder (`skills_dir`, or `TSS_SKILLS_DIR`) moves nothing. The new folder gets its own
+copies at the next check, which the tray runs at once when the settings change; the skills in the old folder stay as
+they are, are no longer kept up to date, and the app says so once. The record of the old folder is kept (for the last
+four folders used), so going back to it carries on where it left off: edits made there in the meantime are still found
+and kept, and a change that was interrupted there is finished then, not before. Until the app has taken in the new
+folder (the tray does at once; with `tss` alone, run `tss check`), a choice about a skill or the removal of a repository
+is refused with a request to check first.
+
 `config.json` can be edited by hand while the app runs; it is picked up at once. An example:
 
 ```json
@@ -276,9 +284,10 @@ ended at 3.2 MiB of private memory. Each change reached the disk within one inte
   than 10,000 files is refused. There is no limit on what all the installed skills add up to.
 - The settings window is 616 by 619 pixels at 100% scale and does not shrink. It has been tried only at 100%; on a small
   screen with a high scale (for example 1366 by 768 at 125%) part of it is off the screen.
-- Setting `skills_dir` in `config.json` does not move skills that are already installed. In the new folder they show as
-  "Deleted locally" and nothing is installed there until you restore each one (`tss resolve REPO SKILL restore`); the
-  old folder is left as it is.
+- Changing the skills folder does not move installed skills (see [Files](#files)). Once more than four other folders
+  have been used, the oldest record is forgotten; going back to that folder then works like a damaged `state.json`.
+  Two names for one folder that only the disk could tell apart (a short 8.3 name, a mapped drive, a link) count as two
+  folders.
 
 ## More
 

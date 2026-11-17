@@ -128,9 +128,7 @@ impl World {
 
     /// The same, for the skills folder only.
     pub fn skills_snapshot(&self) -> BTreeMap<String, Vec<u8>> {
-        let mut out = BTreeMap::new();
-        walk(&self.skills, &self.skills, &mut out, true);
-        out
+        snapshot_of(&self.skills)
     }
 
     /// Folders the app keeps for what it replaced or could not remove safely.
@@ -160,6 +158,13 @@ impl Drop for World {
             let _ = fs::remove_dir_all(&self.root);
         }
     }
+}
+
+/// Everything below `dir`, as `World::snapshot` gives it.
+pub fn snapshot_of(dir: &Path) -> BTreeMap<String, Vec<u8>> {
+    let mut out = BTreeMap::new();
+    walk(dir, dir, &mut out, true);
+    out
 }
 
 fn walk(dir: &Path, base: &Path, out: &mut BTreeMap<String, Vec<u8>>, with_dirs: bool) {

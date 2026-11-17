@@ -397,3 +397,29 @@ fn new_settings_are_planned_for_before_the_timer_is_set() {
     assert_eq!(app.arm(T0), Some(T0), "the new repository is due now");
     assert_ne!(app.health(), Health::Working);
 }
+
+#[test]
+fn another_skills_folder_in_the_settings_is_taken_in_at_once_the_way_the_app_starts() {
+    let mut s = Setup::installed("app-folder");
+    let mut app = started(&mut s);
+    let home = s.w.skills.clone();
+    let new = s.w.root.join("elsewhere").join("skills");
+
+    app.set_cfg(s.cfg.clone(), new.clone());
+    assert_eq!(app.queued(), &[Job::Startup], "a look would change nothing, and the change would wait for a check");
+    run(&mut app, &mut s.engine, T0);
+    assert_eq!(s.w.state().skills_dir.as_deref(), new.to_str(), "recorded at once, so it is said once");
+    assert_eq!(app.arm(T0), Some(T0), "the new folder gets its own copies now");
+
+    s.w.write("beta/SKILL.md", "edited while the app looked elsewhere\n");
+    app.set_cfg(s.cfg.clone(), home.clone());
+    run(&mut app, &mut s.engine, T0);
+    assert_eq!(s.w.state().skills_dir.as_deref(), home.to_str());
+    assert!(row(&app, "beta").text.starts_with("Edited locally"), "managed as before: {:?}", row(&app, "beta"));
+    assert_eq!(app.arm(T0), Some(T0 + DAY), "and checked when it was due anyway");
+
+    app.set_cfg(s.cfg.clone(), new);
+    assert_eq!(answer(&mut app, Err(EngineError::Busy), None, T0), Settled::default());
+    app.on_timer(T0 + BUSY_RETRY);
+    assert_eq!(app.queued(), &[Job::Startup], "tried again while tss works, like the first start");
+}

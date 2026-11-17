@@ -416,7 +416,6 @@ impl Shell {
         self.app.set_cfg(cfg, skills);
         if moved {
             self.skills_watch = Watch::open(self.app.skills_dir(), true, SKILL_CHANGES);
-            self.app.want(Job::Look);
         }
     }
 

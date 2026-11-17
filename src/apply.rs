@@ -582,9 +582,10 @@ impl Applier {
     }
 
     /// Deletes leftovers that can never hold anyone's data: half-downloaded stages, and folders already proven
-    /// removable. Does nothing while any change is unsettled.
+    /// removable. Does nothing while any change is unsettled, including one in a skills folder used before, which may
+    /// share this work folder.
     pub fn sweep(&self, state: &State) {
-        if state.has_pending() {
+        if state.has_pending() || state.has_pending_set_aside() {
             return;
         }
         let Ok(entries) = fs::read_dir(&self.work_dir) else { return };

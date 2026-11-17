@@ -604,6 +604,193 @@ fn a_machine_without_a_skills_folder_gets_one() {
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
+// The skills folder
+// ---------------------------------------------------------------------------------------------------------------------
+
+/// Another skills folder in the same world, so it goes when the world goes.
+fn elsewhere(w: &World) -> PathBuf {
+    w.root.join("elsewhere").join("skills")
+}
+
+fn names_in(dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = fs::read_dir(dir).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+    names.sort();
+    names
+}
+
+#[test]
+fn a_new_skills_folder_gets_its_own_copies_and_the_old_one_is_left_as_it_is() {
+    let mut s = Setup::installed("moved");
+    s.w.write("alpha/SKILL.md", "my own words\n");
+    let old = s.w.skills_snapshot();
+    let new = elsewhere(&s.w);
+    s.engine.set_skills_dir(new.clone());
+    let old_name = s.w.skills.display().to_string();
+    let told = |warnings: &[String]| warnings.iter().any(|w| w.contains(&old_name) && w.contains("left there"));
+
+    // A look before the next check finds nothing installed, rather than three skills deleted by hand.
+    let look = s.engine.verify(&s.cfg, Access::ReadOnly).unwrap();
+    assert!(look.skills.is_empty(), "{:?}", look.skills);
+    assert!(told(&look.warnings), "{:?}", look.warnings);
+
+    let report = s.sync();
+
+    assert!(matches!(only(&report).outcome, Outcome::Synced), "{report:?}");
+    for name in ["alpha", "beta", "gamma"] {
+        assert_eq!(skill(only(&report), name).verdict, Verdict::Install, "{name}");
+    }
+    assert!(told(&report.warnings), "{:?}", report.warnings);
+    assert_eq!(names_in(&new), ["alpha", "beta", "gamma"]);
+    assert_eq!(s.w.skills_snapshot(), old, "the old folder, edit and all, is as it was");
+    let state = s.w.state();
+    assert_eq!(state.skills_dir.as_deref(), new.to_str());
+    assert_eq!(state.repo("fx").unwrap().skills.len(), 3);
+
+    let next = s.sync();
+    assert!(next.warnings.is_empty(), "it is said once: {:?}", next.warnings);
+}
+
+#[test]
+fn going_back_to_a_folder_used_before_manages_its_skills_as_they_were() {
+    let mut s = Setup::installed("moved-back");
+    let home = s.w.skills.clone();
+    let new = elsewhere(&s.w);
+    s.engine.set_skills_dir(new.clone());
+    assert!(matches!(only(&s.sync()).outcome, Outcome::Synced));
+    s.w.write("alpha/SKILL.md", "edited while the app looked elsewhere\n");
+    let there = snapshot_of(&new);
+    s.remote.put(REPO, "skills/alpha/SKILL.md", ALPHA_V2);
+    s.remote.reset();
+
+    s.engine.set_skills_dir(home.clone());
+    let report = s.sync();
+
+    let back = format!("back to {}", home.display());
+    assert!(report.warnings.iter().any(|w| w.contains(&back) && w.contains("left there")), "{:?}", report.warnings);
+    let repo = only(&report);
+    assert!(
+        matches!(skill(repo, "alpha").verdict, Verdict::Held(Hold::UpdateBlocked(_))),
+        "still known as an edit of a managed skill: {:?}",
+        skill(repo, "alpha").verdict
+    );
+    assert_eq!(skill(repo, "beta").verdict, Verdict::InSync);
+    assert_eq!(skill(repo, "gamma").verdict, Verdict::InSync);
+    assert_eq!(s.w.read("alpha/SKILL.md"), "edited while the app looked elsewhere\n");
+    assert_eq!(snapshot_of(&new), there, "the folder it left is as it was");
+    assert_eq!(s.remote.calls().file, 0);
+    let state = s.w.state();
+    assert_eq!(state.set_aside.len(), 1);
+    assert_eq!(state.set_aside[0].skills_dir, new.display().to_string());
+}
+
+#[test]
+fn a_change_cut_off_in_the_old_folder_is_left_there_and_never_finished_in_the_new_one() {
+    let s = update_cut_off_at("moved-mid-change", Step::OldMoved);
+    assert_eq!(alpha(&s.w), "missing");
+    let saved = work_folder_starting_with(&s.w, "old-");
+    let old_skills = s.w.skills_snapshot();
+    let old_work = snapshot_of(&s.w.work_dir());
+    let new = elsewhere(&s.w);
+
+    let mut app = s.restarted();
+    app.set_skills_dir(new.clone());
+    let started = app.startup(&s.cfg).unwrap();
+
+    let work_name = s.w.work_dir().display().to_string();
+    assert!(started.verify.warnings.iter().any(|w| w.contains("alpha was interrupted") && w.contains(&work_name)), "{:?}", started.verify.warnings);
+    assert!(started.verify.notes.is_empty(), "nothing was sorted out: {:?}", started.verify.notes);
+    let state = s.w.state();
+    assert!(!state.has_pending());
+    assert!(state.has_pending_set_aside(), "kept for when the old folder is used again");
+
+    let report = sync_all(&mut app, &s.cfg);
+    assert_eq!(skill(only(&report), "alpha").verdict, Verdict::Install);
+    assert_eq!(fs::read_to_string(new.join("alpha").join("SKILL.md")).unwrap(), ALPHA_V2);
+    assert_eq!(s.w.skills_snapshot(), old_skills, "the old folder is as the crash left it");
+    assert_eq!(snapshot_of(&s.w.work_dir()), old_work, "and so is its work folder");
+    assert!(saved.join("SKILL.md").exists());
+}
+
+#[test]
+fn a_change_cut_off_in_a_folder_left_behind_is_never_finished_in_the_folder_next_to_it() {
+    // The two folders share one work folder, and the new one holds the user's own folder of the same name.
+    let s = update_cut_off_at("moved-next-door", Step::OldMoved);
+    let next_door = s.w.root.join("skills2");
+    fs::create_dir_all(next_door.join("alpha")).unwrap();
+    fs::write(next_door.join("alpha").join("SKILL.md"), "my own alpha\n").unwrap();
+    let mine = snapshot_of(&next_door);
+    let old_skills = s.w.skills_snapshot();
+    let work = snapshot_of(&s.w.work_dir());
+    assert!(work.keys().any(|k| k.starts_with("stage-")) && work.keys().any(|k| k.starts_with("old-")), "{:?}", work.keys());
+
+    let mut app = s.restarted();
+    app.set_skills_dir(next_door.clone());
+    let started = app.startup(&s.cfg).unwrap();
+
+    assert!(started.verify.notes.is_empty(), "{:?}", started.verify.notes);
+    assert_eq!(snapshot_of(&next_door), mine, "the user's own alpha is untouched");
+    assert_eq!(s.w.skills_snapshot(), old_skills);
+    assert_eq!(snapshot_of(&s.w.work_dir()), work, "nothing in the shared work folder was finished, undone or swept");
+
+    // Back in the first folder, the change is sorted out where it started.
+    let mut back = s.restarted();
+    let started = back.startup(&s.cfg).unwrap();
+    assert_eq!(started.verify.notes.len(), 1, "{:?}", started.verify.notes);
+    assert!(started.verify.notes[0].text.contains("the previous version is back"), "{}", started.verify.notes[0].text);
+    assert_eq!(alpha(&s.w), "v1");
+    assert_eq!(snapshot_of(&next_door), mine);
+    let state = s.w.state();
+    assert!(!state.has_pending() && !state.has_pending_set_aside());
+}
+
+#[test]
+fn a_choice_a_removal_or_a_late_write_waits_until_a_check_has_taken_in_a_new_skills_folder() {
+    let mut s = Setup::installed("moved-then-asked");
+    s.advance(86_400);
+    assert!(matches!(only(&sync_which(&mut s.engine, &s.cfg, &Which::Due)).outcome, Outcome::Unchanged));
+    let state_file = s.w.home.join("state.json");
+    let on_disk = fs::read(&state_file).unwrap();
+    let skills = s.w.skills_snapshot();
+    let new = elsewhere(&s.w);
+    s.engine.set_skills_dir(new.clone());
+    let cancel = AtomicBool::new(false);
+
+    let refused = s.engine.resolve(&s.cfg, "fx", "alpha", Resolution::KeepMine, &cancel).unwrap_err().to_string();
+    assert!(refused.contains("skills folder changed"), "{refused}");
+    let refused = s.engine.remove_repo("fx", true).unwrap_err().to_string();
+    assert!(refused.contains("skills folder changed"), "{refused}");
+    s.engine.flush().unwrap();
+
+    assert_eq!(fs::read(&state_file).unwrap(), on_disk, "nothing was saved");
+    assert_eq!(s.w.skills_snapshot(), skills);
+    assert!(!new.exists());
+
+    let report = s.sync();
+    assert!(report.warnings.iter().any(|w| w.contains("left there")), "{:?}", report.warnings);
+    s.engine.resolve(&s.cfg, "fx", "alpha", Resolution::KeepMine, &cancel).unwrap();
+}
+
+#[test]
+fn a_repository_removed_while_another_folder_is_used_leaves_its_skills_in_the_first_folder_alone_too() {
+    let mut s = Setup::installed("moved-then-removed");
+    let home = s.w.skills.clone();
+    s.engine.set_skills_dir(elsewhere(&s.w));
+    assert!(matches!(only(&s.sync()).outcome, Outcome::Synced));
+    s.engine.remove_repo("fx", false).unwrap();
+    assert!(s.w.state().set_aside.is_empty(), "{:?}", s.w.state().set_aside);
+
+    // The same repository added again, after going back to the first folder: its skills there are the user's now.
+    s.remote.put(REPO, "skills/alpha/SKILL.md", ALPHA_V2);
+    s.engine.set_skills_dir(home);
+    let report = s.sync();
+
+    let repo = only(&report);
+    assert_eq!(skill(repo, "alpha").verdict, Verdict::Held(Hold::UnmanagedDiffers));
+    assert_eq!(skill(repo, "beta").verdict, Verdict::Adopt);
+    assert_eq!(s.w.read("alpha/SKILL.md"), ALPHA_V1);
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
 // The schedule
 // ---------------------------------------------------------------------------------------------------------------------
 

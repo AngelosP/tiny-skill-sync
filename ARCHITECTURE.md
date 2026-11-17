@@ -92,7 +92,8 @@ least 30 seconds apart; and after the computer wakes from sleep, the app waits 3
 
 A change in the skills folder only leads to a read-only look, two seconds after the last change, so the settings
 window shows an edit without waiting for the next check. Safety never depends on it: every change starts by comparing
-the disk with the record.
+the disk with the record. Settings that name another skills folder lead to a start-up job instead, retried like the
+first one, so the change of folder is recorded and reported at once (see [Files on disk](#files-on-disk)).
 
 ## A check
 
@@ -243,6 +244,14 @@ flowchart TD
   hash, size, fingerprint) and an optional pending marker. It is written only when something changed, through a
   temporary file and a rename. A damaged one is kept as `state.json.damaged-*`; one written by a newer version is not
   touched.
+- `state.json` also names the skills folder its records describe (`skills_dir`). Every call compares it with the folder
+  in use before it reads a fingerprint or sorts out an interrupted change (`State::follow_folder`). On a change the
+  records are set aside under the old folder's name (`set_aside`, the last four folders), and the new folder's own
+  records from an earlier visit, or empty ones, take their place, so the old folder is never touched and its unfinished
+  changes are never replayed in the new one. Only calls that report warnings take in such a change: start-up and check
+  record it, and a read-only look (`tss status`) only reports it. The others (`resolve`, `remove_repo`, `flush`) leave
+  the file alone and ask for a check first. `sweep` waits
+  while a set-aside record holds an unfinished change, because two skills folders can share a work folder.
 - `engine.lock` stops the tray and `tss` from working at the same time; the loser is told to try again.
 - The app keeps nothing inside the skills folder, so Copilot only ever sees skill folders.
 

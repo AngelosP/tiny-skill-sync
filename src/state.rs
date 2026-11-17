@@ -123,20 +123,55 @@ impl RepoState {
         self.skills.push(skill);
         self.skills.sort_by_cached_key(|s| pathsafe::fold(&s.name));
     }
+
+    pub fn has_pending(&self) -> bool {
+        self.skills.iter().any(|s| s.pending.is_some())
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct State {
     pub version: u32,
+    /// The skills folder the records describe. Files written before it was kept have none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub skills_dir: Option<String>,
     pub volume: Option<VolumeId>,
     pub repos: BTreeMap<String, RepoState>,
+    /// The records of skills folders used before, most recent first, in case one is used again.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub set_aside: Vec<SetAside>,
 }
 
 impl Default for State {
     fn default() -> Self {
-        State { version: STATE_VERSION, volume: None, repos: BTreeMap::new() }
+        State { version: STATE_VERSION, skills_dir: None, volume: None, repos: BTreeMap::new(), set_aside: Vec::new() }
     }
+}
+
+/// The records of a skills folder the app no longer uses.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SetAside {
+    pub skills_dir: String,
+    pub volume: Option<VolumeId>,
+    pub repos: BTreeMap<String, RepoState>,
+}
+
+/// How many skills folders used before are remembered. The one used longest ago is forgotten first.
+pub const MAX_SET_ASIDE: usize = 4;
+
+/// What `State::follow_folder` found.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Folder {
+    /// The records describe this folder.
+    Same,
+    /// The records named no folder, so they are taken to describe this one, which is now written down.
+    Recorded,
+    /// The records described another folder, so they were set aside, and this folder's own records (from when it was
+    /// used before, `back`) or empty ones took their place. `managed` says whether skills were installed in the old
+    /// folder, `unfinished` names the skills whose changes there were interrupted.
+    Moved { from: String, managed: bool, unfinished: Vec<String>, back: bool },
 }
 
 pub struct Loaded {
@@ -212,7 +247,53 @@ impl State {
     }
 
     pub fn has_pending(&self) -> bool {
-        self.repos.values().any(|r| r.skills.iter().any(|s| s.pending.is_some()))
+        self.repos.values().any(RepoState::has_pending)
+    }
+
+    /// Whether the records of a folder used before hold a change that was interrupted there.
+    pub fn has_pending_set_aside(&self) -> bool {
+        self.set_aside.iter().any(|a| a.repos.values().any(RepoState::has_pending))
+    }
+
+    /// Ties the records to the skills folder `dir`. Records made for another folder say nothing about this one: they
+    /// are set aside as they are, for when that folder is used again, and this folder's own records from when it was
+    /// used before take their place, or empty ones, so that its skills are installed afresh.
+    pub fn follow_folder(&mut self, dir: &str) -> Folder {
+        let Some(from) = self.skills_dir.clone() else {
+            self.skills_dir = Some(dir.to_string());
+            return Folder::Recorded;
+        };
+        let key = folder_key(dir);
+        let from_key = folder_key(&from);
+        if from_key == key {
+            return Folder::Same;
+        }
+        let managed = self.repos.values().any(|r| !r.skills.is_empty());
+        let unfinished = self.repos.values().flat_map(|r| &r.skills).filter(|s| s.pending.is_some()).map(|s| s.name.clone()).collect();
+        let old = SetAside { skills_dir: from.clone(), volume: self.volume.take(), repos: std::mem::take(&mut self.repos) };
+        let own = self.set_aside.iter().position(|a| folder_key(&a.skills_dir) == key).map(|i| self.set_aside.remove(i));
+        self.set_aside.retain(|a| folder_key(&a.skills_dir) != from_key);
+        if old.repos.values().any(|r| !r.skills.is_empty() || !r.ignored.is_empty()) {
+            self.set_aside.insert(0, old);
+            self.set_aside.truncate(MAX_SET_ASIDE);
+        }
+        let back = own.is_some();
+        if let Some(own) = own {
+            self.volume = own.volume;
+            self.repos = own.repos;
+        }
+        self.skills_dir = Some(dir.to_string());
+        Folder::Moved { from, managed, unfinished, back }
+    }
+
+    /// Forgets a repository's records, for this folder and for the folders used before. Says whether there were any.
+    pub fn drop_repo(&mut self, id: &str) -> bool {
+        let mut found = self.repos.remove(id).is_some();
+        for a in &mut self.set_aside {
+            found |= a.repos.remove(id).is_some();
+        }
+        self.set_aside.retain(|a| !a.repos.is_empty());
+        found
     }
 
     /// Drops records whose names or transaction ids could point outside the skills or work folder, which only a
@@ -220,7 +301,8 @@ impl State {
     /// never deleted. Returns one sentence per dropped record.
     pub fn sanitize(&mut self) -> Vec<String> {
         let mut notes = Vec::new();
-        for (repo_id, repo) in &mut self.repos {
+        let all = self.repos.iter_mut().chain(self.set_aside.iter_mut().flat_map(|a| a.repos.iter_mut()));
+        for (repo_id, repo) in all {
             repo.skills.retain(|s| match check_record(s) {
                 Ok(()) => true,
                 Err(why) => {
@@ -260,6 +342,21 @@ fn check_txn(txn: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Two spellings of one folder give the same key: `/` or `\`, any case, a trailing separator, `.` and `..`, trailing
+/// dots and spaces, a `\\?\` prefix. Spellings it cannot match (a short 8.3 name, a mapped drive, a link) count as
+/// another folder, whose records are then set aside: that costs a fresh look, never a file.
+fn folder_key(dir: &str) -> String {
+    let dir = dir.replace('/', "\\");
+    let dir = match dir.strip_prefix(r"\\?\UNC\") {
+        Some(share) => format!(r"\\{share}"),
+        None => dir.strip_prefix(r"\\?\").unwrap_or(&dir).to_string(),
+    };
+    let path = Path::new(&dir);
+    // Only for a full path: a relative one would depend on the folder the program happened to start in.
+    let full = if path.is_absolute() { std::path::absolute(path).map_or_else(|_| dir.clone(), |p| p.to_string_lossy().into_owned()) } else { dir.clone() };
+    pathsafe::fold(full.trim_end_matches('\\'))
+}
+
 pub fn state_path_in(home: &Path) -> PathBuf {
     home.join("state.json")
 }
@@ -289,7 +386,11 @@ mod tests {
 
     #[test]
     fn state_round_trips_with_large_numbers_intact() {
-        let mut st = State { volume: Some(VolumeId { serial: u64::MAX - 1, journal: 133_800_000_000_000_000 }), ..State::default() };
+        let mut st = State {
+            skills_dir: Some(r"C:\Users\me\.copilot\skills".to_string()),
+            volume: Some(VolumeId { serial: u64::MAX - 1, journal: 133_800_000_000_000_000 }),
+            ..State::default()
+        };
         let repo = st.repo_mut("r");
         repo.etag = Some("W/\"abc\"".to_string());
         repo.last_check = Some(1_800_000_000);
@@ -299,6 +400,13 @@ mod tests {
         pending.pending = Some(Pending::Update { txn: "t1".into(), commit: "d".repeat(40), files: vec![file("SKILL.md", true)] });
         repo.upsert_skill(pending);
         repo.upsert_skill(OwnedSkill { pending: Some(Pending::Delete { txn: "t2".into() }), ..skill("gamma") });
+        let mut old = RepoState::default();
+        old.upsert_skill(skill("delta"));
+        st.set_aside.push(SetAside {
+            skills_dir: r"D:\skills".to_string(),
+            volume: Some(VolumeId { serial: 5, journal: 6 }),
+            repos: BTreeMap::from([("r".to_string(), old)]),
+        });
 
         let json = serde_json::to_string(&st).unwrap();
         let back: State = serde_json::from_str(&json).unwrap();
@@ -410,5 +518,136 @@ mod tests {
         let seen_by_a = st.names_owned_elsewhere("a");
         assert_eq!(seen_by_a.get("other").map(String::as_str), Some("b"));
         assert!(!seen_by_a.contains_key("shared"));
+    }
+
+    const HOME_SKILLS: &str = r"C:\Users\me\.copilot\skills";
+
+    #[test]
+    fn records_that_name_no_folder_are_taken_to_describe_the_current_one() {
+        let mut st = State::default();
+        st.repo_mut("r").upsert_skill(skill("alpha"));
+        let repos = st.repos.clone();
+
+        assert_eq!(st.follow_folder(HOME_SKILLS), Folder::Recorded);
+        assert_eq!(st.skills_dir.as_deref(), Some(HOME_SKILLS));
+        assert_eq!(st.repos, repos, "nothing is forgotten");
+        assert_eq!(st.follow_folder(HOME_SKILLS), Folder::Same);
+    }
+
+    #[test]
+    fn the_same_folder_written_another_way_is_the_same_folder() {
+        let spellings = [
+            HOME_SKILLS,
+            r"c:\users\ME\.COPILOT\Skills",
+            "C:/Users/me/.copilot/skills",
+            r"C:\Users\me\.copilot\skills\",
+            "C:/Users/me/.copilot/skills//",
+            r"C:\Users\me\.copilot\skills\..\skills",
+            r"C:\Users\me\.copilot\.\skills",
+            r"\\?\C:\Users\me\.copilot\skills",
+            r"C:\Users\me\.copilot\skills.",
+            r"C:\Users\me\.copilot\skills ",
+        ];
+        for other in spellings {
+            let mut st = State { skills_dir: Some(HOME_SKILLS.to_string()), ..State::default() };
+            st.repo_mut("r").upsert_skill(skill("alpha"));
+            let before = st.clone();
+            assert_eq!(st.follow_folder(other), Folder::Same, "{other}");
+            assert_eq!(st, before, "{other}");
+        }
+        let mut share = State { skills_dir: Some(r"\\server\share\skills".to_string()), ..State::default() };
+        assert_eq!(share.follow_folder(r"\\?\UNC\server\share\skills\"), Folder::Same);
+    }
+
+    #[test]
+    fn another_folder_sets_the_records_aside_and_hears_what_was_left_behind() {
+        let volume = Some(VolumeId { serial: 1, journal: 2 });
+        let mut st = State { skills_dir: Some(HOME_SKILLS.to_string()), volume, ..State::default() };
+        let repo = st.repo_mut("r");
+        repo.etag = Some("W/\"abc\"".to_string());
+        repo.last_check = Some(1_800_000_000);
+        repo.ignored.push("mine".to_string());
+        repo.lists_nothing = true;
+        repo.upsert_skill(skill("alpha"));
+        repo.upsert_skill(OwnedSkill { pending: Some(Pending::Delete { txn: "t1".into() }), ..skill("beta") });
+        let old = st.repos.clone();
+
+        let moved = st.follow_folder(r"D:\skills");
+
+        assert_eq!(moved, Folder::Moved { from: HOME_SKILLS.to_string(), managed: true, unfinished: vec!["beta".to_string()], back: false });
+        let aside = vec![SetAside { skills_dir: HOME_SKILLS.to_string(), volume, repos: old }];
+        assert_eq!(st, State { skills_dir: Some(r"D:\skills".to_string()), set_aside: aside, ..State::default() });
+        assert!(!st.has_pending(), "the interrupted change is never finished in the new folder");
+        assert!(st.has_pending_set_aside());
+
+        // A folder whose name starts with the old one is still another folder, and records that hold nothing worth
+        // keeping are not set aside.
+        let mut quiet = State { skills_dir: Some(HOME_SKILLS.to_string()), ..State::default() };
+        quiet.repo_mut("r").last_check = Some(1_800_000_000);
+        let moved = quiet.follow_folder(&format!("{HOME_SKILLS}2"));
+        assert_eq!(moved, Folder::Moved { from: HOME_SKILLS.to_string(), managed: false, unfinished: vec![], back: false });
+        assert!(quiet.repos.is_empty());
+        assert!(quiet.set_aside.is_empty());
+    }
+
+    #[test]
+    fn going_back_to_a_folder_restores_its_records() {
+        let mut st = State { skills_dir: Some(HOME_SKILLS.to_string()), volume: Some(VolumeId { serial: 1, journal: 2 }), ..State::default() };
+        st.repo_mut("r").upsert_skill(skill("alpha"));
+        let home = st.clone();
+        st.follow_folder(r"D:\skills");
+        st.volume = Some(VolumeId { serial: 3, journal: 4 });
+        st.repo_mut("r").ignored.push("mine".to_string());
+        let away = st.clone();
+
+        let moved = st.follow_folder(&HOME_SKILLS.to_lowercase());
+
+        assert_eq!(moved, Folder::Moved { from: r"D:\skills".to_string(), managed: false, unfinished: vec![], back: true });
+        assert_eq!(st.volume, home.volume);
+        assert_eq!(st.repos, home.repos);
+        assert_eq!(st.skills_dir.as_deref(), Some(HOME_SKILLS.to_lowercase().as_str()));
+        assert_eq!(
+            st.set_aside,
+            [SetAside { skills_dir: r"D:\skills".to_string(), volume: away.volume, repos: away.repos.clone() }],
+            "only the folder just left is set aside"
+        );
+
+        assert!(matches!(st.follow_folder(r"d:\SKILLS\"), Folder::Moved { back: true, managed: true, .. }));
+        assert_eq!(st.repos, away.repos);
+        assert_eq!(st.set_aside.len(), 1);
+        assert_eq!(st.set_aside[0].repos, home.repos);
+    }
+
+    #[test]
+    fn only_a_few_folders_used_before_are_remembered() {
+        let mut st = State { skills_dir: Some(r"C:\s0".to_string()), ..State::default() };
+        for i in 1..=MAX_SET_ASIDE + 2 {
+            st.repo_mut("r").upsert_skill(skill(&format!("skill{}", i - 1)));
+            st.follow_folder(&format!(r"C:\s{i}"));
+        }
+        let kept: Vec<&str> = st.set_aside.iter().map(|a| a.skills_dir.as_str()).collect();
+        assert_eq!(kept, [r"C:\s5", r"C:\s4", r"C:\s3", r"C:\s2"], "most recent first, the oldest forgotten");
+        assert_eq!(st.set_aside[0].repos["r"].skills[0].name, "skill5");
+    }
+
+    #[test]
+    fn set_aside_records_are_checked_and_forgotten_with_their_repository() {
+        let mut st = State::default();
+        st.repo_mut("r").upsert_skill(skill("fine"));
+        st.repo_mut("other").upsert_skill(skill("kept"));
+        let mut damaged = RepoState::default();
+        damaged.upsert_skill(skill("..\\evil"));
+        damaged.upsert_skill(skill("fine"));
+        st.set_aside.push(SetAside { skills_dir: r"D:\skills".to_string(), volume: None, repos: BTreeMap::from([("r".to_string(), damaged)]) });
+
+        let notes = st.sanitize();
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert_eq!(st.set_aside[0].repos["r"].skills.len(), 1);
+
+        assert!(st.drop_repo("r"));
+        assert!(!st.repos.contains_key("r"));
+        assert!(st.set_aside.is_empty(), "records left with nothing in them are not kept");
+        assert!(st.repos.contains_key("other"));
+        assert!(!st.drop_repo("r"));
     }
 }

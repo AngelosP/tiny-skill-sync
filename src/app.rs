@@ -35,7 +35,8 @@ pub const MAX_FAILURE_BACKOFF: UnixSecs = 60 * 60;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Job {
-    /// The first job: look at the disk and find out whether the skills folder can be used.
+    /// The first job, and the first for another skills folder: look at the disk and find out whether the skills folder
+    /// can be used.
     Startup,
     /// Something changed on disk (in the skills folder, or `state.json` by `tss`): look again, change nothing.
     Look,
@@ -198,11 +199,18 @@ impl App {
         &self.skills_dir
     }
 
-    /// New settings. The next job uses them; when to wake up is worked out again.
+    /// New settings. The next job uses them; when to wake up is worked out again. Another skills folder is taken in
+    /// the way the app starts, so the change is recorded, and the user told, at once rather than at the next check.
     pub fn set_cfg(&mut self, cfg: Config, skills_dir: PathBuf) {
+        let moved = skills_dir != self.skills_dir;
         self.cfg = cfg;
         self.skills_dir = skills_dir;
-        self.want(Job::Plan);
+        if moved {
+            self.started = false;
+            self.want(Job::Startup);
+        } else {
+            self.want(Job::Plan);
+        }
     }
 
     pub fn health(&self) -> Health {

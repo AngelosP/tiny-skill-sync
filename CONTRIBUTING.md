@@ -95,7 +95,7 @@ ends up on disk, what the app says and what it leaves alone.
 | Scenario | What it checks |
 | --- | --- |
 | `install` | First start: what is installed, how the idle app behaves, how fast it quits. |
-| `places` | With `TSS_HOME` and `TSS_SKILLS_DIR` unset and the profile folders pointed at `%TEMP%`: skills go to `%USERPROFILE%\.copilot\skills` beside a skill written by hand, the settings to `%LOCALAPPDATA%\tiny-skill-sync`, nothing anywhere else; then `skills_dir` set in `config.json`. |
+| `places` | With `TSS_HOME` and `TSS_SKILLS_DIR` unset and the profile folders pointed at `%TEMP%`: skills go to `%USERPROFILE%\.copilot\skills` beside a skill written by hand, the settings to `%LOCALAPPDATA%\tiny-skill-sync`, nothing anywhere else. Then `skills_dir` set in `config.json`: the new folder gets its own copies and the old one is left as it is; taken out again while the tray runs, the first folder is managed as before, with an edit made there meanwhile kept and shown. |
 | `changes` | Six kinds of upstream change reach the disk through the tray's **Check now**. |
 | `local-edit` | An edit made while the app runs, then an upstream change to the same skill. |
 | `edit-stopped` | Edits made while the app was not running, including ones that keep a file's size and time. |

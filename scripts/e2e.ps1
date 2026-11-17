@@ -300,26 +300,57 @@ function Test-Places {
         $r = Tss $c @('status') $real
         Check 'tss status after the app has gone: up to date, exit 0' ($r.Code -eq 0 -and $r.Text -match 'Up to date') "exit $($r.Code)"
 
-        # The skills folder named in config.json instead, for an install that already exists.
+        # The skills folder named in config.json instead, for an install that already exists: the new folder gets its own
+        # copies, and the one used before is left exactly as it was.
         $moved = Join-Path $c.Root 'moved\skills'
         $before = Get-DiskStamp $skills
         $cfgFile = Join-Path $appDir 'config.json'
-        $cfg = [IO.File]::ReadAllText($cfgFile) | ConvertFrom-Json
-        $cfg | Add-Member -NotePropertyName 'skills_dir' -NotePropertyValue $moved -Force
-        [IO.File]::WriteAllText($cfgFile, ($cfg | ConvertTo-Json -Depth 8))
+        Set-SkillsDir $cfgFile $moved
         $r = Tss $c @('status') $real
-        Check 'with skills_dir in config.json, tss status names that folder' ($r.Text -match [regex]::Escape("Skills folder: $moved")) ''
+        $told = $r.Text -match [regex]::Escape("Warning: the skills folder changed from $skills to $moved")
+        Check 'with skills_dir in config.json, tss status names that folder, has nothing installed there, and says why' ($r.Text -match [regex]::Escape("Skills folder: $moved") -and $r.Text -match 'No skills from it are installed' -and $told) "exit $($r.Code)"
         $r = Tss $c @('check') $real
-        # The record still lists the skills, so in the new folder they read as deleted here and are held (see the plan).
-        Check 'after the move a check holds them as deleted here: nothing installed, nothing deleted' ($r.Code -eq 1 -and $r.Text -match 'alpha: Deleted locally' -and -not (Test-Path -LiteralPath $moved)) "exit $($r.Code); new folder: '$(Get-Entries $moved)'"
-        Check 'the folder used before is left exactly as it was' ((Get-DiskStamp $skills) -eq $before) ''
-        $r = Tss $c @('resolve', $c.Id, 'alpha', 'restore') $real
-        $diff = @(Compare-WithUpstream $moved $c.Repo $c.Ref 'skills' | Where-Object { $_ -match ': alpha/' })
-        Check 'resolve restore installs into the folder named in config.json' ($r.Code -eq 0 -and (Test-Path -LiteralPath (Join-Path $moved 'alpha\SKILL.md')) -and $diff.Count -eq 0) "exit $($r.Code) $($diff -join '; ')"
+        $diff = Compare-WithUpstream $moved $c.Repo $c.Ref 'skills'
+        $names = Get-Entries $moved
+        Check 'a check installs every skill in the new folder, equal to upstream' ($r.Code -eq 0 -and $names -eq 'alpha,beta,gamma' -and $diff.Count -eq 0) "exit $($r.Code); $names; $(($diff | Select-Object -First 4) -join '; ')"
         $around = Get-Entries (Split-Path $moved)
         Check 'with its work folder beside it' ($around -eq '.tss-work,skills') $around
-        Check 'and the folder used before is still as it was' ((Get-DiskStamp $skills) -eq $before) ''
+        Check 'the folder used before, with the skill written by hand, is left exactly as it was' ((Get-DiskStamp $skills) -eq $before) ''
+
+        # Back to the default folder while the tray runs, after an edit made there in the meantime: the tray notices the
+        # settings changed and starts again with that folder, manages the skills there as it did before, keeps the edit
+        # and shows it as one, and leaves the other folder as it is.
+        $edited = Join-Path $skills 'beta\SKILL.md'
+        [IO.File]::AppendAllText($edited, "`nEdited while the app looked elsewhere.`n")
+        $editedText = [IO.File]::ReadAllText($edited)
+        $movedStamp = Get-DiskStamp $moved
+        [void](Start-Tray $c $real)
+        [void](Wait-Live { (Get-MarkCount $c.Report 'job-startup') -ge 1 } 'the tray to start' 60)
+        [void](Wait-Quiet $c.Report 4)
+        $starts = Get-MarkCount $c.Report 'job-startup'
+        Set-SkillsDir $cfgFile $null
+        [void](Wait-Live { (Get-MarkCount $c.Report 'job-startup') -gt $starts } 'a start with the folder named again' 60)
+        [void](Wait-Quiet $c.Report 4)
+        Stop-LiveTray $c.Tray
+        $st = [IO.File]::ReadAllText((Join-Path $appDir 'state.json')) | ConvertFrom-Json
+        $managed = @($st.repos.($c.Id).skills | ForEach-Object { $_.name }) -join ','
+        $aside = @($st.set_aside | ForEach-Object { $_.skills_dir }) -join ','
+        Check 'the tray manages the skills in the folder named again as it did before, and keeps the other folder''s record aside' ($st.skills_dir -eq $skills -and $managed -eq 'alpha,beta,gamma' -and $aside -eq $moved) "skills_dir $($st.skills_dir); managed: $managed; set aside: $aside"
+        $r = Tss $c @('status') $real
+        Check 'it left the edited one as it is, and tss status shows it as edited' ([IO.File]::ReadAllText($edited) -eq $editedText -and $r.Text -match 'beta: Edited locally') "exit $($r.Code)"
+        Check 'the skill written by hand is untouched, and so is the folder the tray left' ((Get-DiskStamp (Join-Path $skills 'my-own')) -eq $mine -and (Get-DiskStamp $moved) -eq $movedStamp) ''
     } finally { Close-Env $c }
+}
+
+# Names the skills folder in config.json, or with an empty $Dir takes the name out again.
+function Set-SkillsDir([string]$File, [string]$Dir) {
+    $cfg = [IO.File]::ReadAllText($File) | ConvertFrom-Json
+    if ($Dir) {
+        $cfg | Add-Member -NotePropertyName 'skills_dir' -NotePropertyValue $Dir -Force
+    } else {
+        $cfg.PSObject.Properties.Remove('skills_dir')
+    }
+    [IO.File]::WriteAllText($File, ($cfg | ConvertTo-Json -Depth 8))
 }
 
 function Test-Changes {
