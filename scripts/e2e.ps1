@@ -13,6 +13,7 @@
 
   Scenarios (all by default; name some with -Only):
     install       first start: what is installed, how the idle app behaves, how fast it quits
+    places        with no TSS_ folders: skills go to %USERPROFILE%\.copilot\skills, beside skills written by hand
     changes       six kinds of upstream change reach the disk through the tray's "Check now"
     local-edit    an edit made while the app runs, then an upstream change to the same skill
     edit-stopped  edits made while the app was not running, including ones that keep the file's size and time
@@ -171,6 +172,13 @@ function Get-SkillNames($c) {
     @(Get-ChildItem -LiteralPath $c.Skills -Directory -Force -ErrorAction SilentlyContinue | Sort-Object Name | ForEach-Object { $_.Name })
 }
 
+# The names of everything directly in a folder, in ordinal order, joined by commas ('' when there is none).
+function Get-Entries([string]$Dir) {
+    $names = [string[]]@(Get-ChildItem -LiteralPath $Dir -Force -ErrorAction SilentlyContinue | ForEach-Object { $_.Name })
+    [Array]::Sort($names, [StringComparer]::OrdinalIgnoreCase)
+    $names -join ','
+}
+
 function Read-Skill($c, [string]$Relative) {
     [IO.File]::ReadAllText((Join-Path $c.Skills $Relative))
 }
@@ -234,7 +242,85 @@ function Test-Install {
     } finally { Close-Env $c }
 }
 
-# ---------------------------------------------------------------- changes
+# ---------------------------------------------------------------- places
+
+# Every other scenario names the app's folders with TSS_HOME and TSS_SKILLS_DIR. Here both are removed, so the app
+# works its folders out as on a real computer: from %USERPROFILE% and %LOCALAPPDATA%, which point into the throwaway
+# folder. A cmd.exe started with the same environment proves that before the app runs.
+function Test-Places {
+    $c = New-Env 'places' -NoBranch
+    try {
+        $user = Join-Path $c.Root 'user'
+        $local = Join-Path $c.Root 'local'
+        $copilot = Join-Path $user '.copilot'
+        $skills = Join-Path $copilot 'skills'
+        $appDir = Join-Path $local 'tiny-skill-sync'
+        $real = @{ TSS_HOME = $null; TSS_SKILLS_DIR = $null; USERPROFILE = $user; LOCALAPPDATA = $local }
+
+        # What a computer that uses Copilot already has: a skill written by hand, and Copilot's own files.
+        New-Item -ItemType Directory -Force (Join-Path $skills 'my-own'), $local | Out-Null
+        [IO.File]::WriteAllText((Join-Path $skills 'my-own\SKILL.md'), "---`nname: my-own`ndescription: Written by hand.`n---`n`nMine.`n")
+        [IO.File]::WriteAllText((Join-Path $copilot 'config.json'), "{}`n")
+        $mine = Get-DiskStamp (Join-Path $skills 'my-own')
+        $copilotFile = Get-BlobId (Join-Path $copilot 'config.json')
+
+        $seen = Get-LiveChildEnv $c.Root $real
+        $safe = $seen['USERPROFILE'] -eq $user -and $seen['LOCALAPPDATA'] -eq $local -and -not $seen.ContainsKey('TSS_HOME') -and -not $seen.ContainsKey('TSS_SKILLS_DIR')
+        Check 'a program started this way sees the throwaway profile and no TSS_ folders' $safe "USERPROFILE=$($seen['USERPROFILE']); LOCALAPPDATA=$($seen['LOCALAPPDATA'])"
+        if (-not $safe) { throw 'refusing to start the app: it could use the real folders' }
+
+        $r = Tss $c @('status') $real
+        $where = ($r.Text -match [regex]::Escape("Skills folder: $skills")) -and ($r.Text -match [regex]::Escape("Settings: $appDir\config.json"))
+        Check 'tss status names %USERPROFILE%\.copilot\skills and %LOCALAPPDATA%\tiny-skill-sync' $where ''
+        if (-not $where) { throw 'refusing to go on: the app chose other folders' }
+
+        $r = Tss $c @('add', (Get-Address $c), '--every', '6h') $real
+        if ($r.Text -match "as '([^']+)'") { $c.Id = $Matches[1] }
+        Check 'tss add saves the settings in %LOCALAPPDATA%\tiny-skill-sync' ($r.Code -eq 0 -and $c.Id -and (Test-Path -LiteralPath (Join-Path $appDir 'config.json'))) "exit $($r.Code)"
+
+        [void](Start-Tray $c $real)
+        [void](Wait-Live { Test-Path -LiteralPath (Join-Path $skills 'alpha\scripts\hello.ps1') } 'the first install' 90)
+        [void](Wait-Live { (Get-MarkCount $c.Report 'job-poll') -ge 1 } 'the first poll to finish' 60)
+        [void](Get-ChildItem -LiteralPath $skills -Recurse -Force -ErrorAction SilentlyContinue)
+        [void](Wait-Quiet $c.Report 4)
+
+        $diff = @(Compare-WithUpstream $skills $c.Repo $c.Ref 'skills' | Where-Object { $_ -notmatch ': my-own/' })
+        Check 'the tray installed every skill in %USERPROFILE%\.copilot\skills, equal to upstream' ($diff.Count -eq 0) (($diff | Select-Object -First 4) -join '; ')
+        $names = Get-Entries $skills
+        Check 'beside the skill written by hand, and nothing else is in the folder' ($names -eq 'alpha,beta,gamma,my-own') $names
+        Check 'the skill written by hand and Copilot''s own file are untouched' ((Get-DiskStamp (Join-Path $skills 'my-own')) -eq $mine -and (Get-BlobId (Join-Path $copilot 'config.json')) -eq $copilotFile) ''
+        $around = Get-Entries $copilot
+        Check 'the work folder is beside the skills folder: .copilot\.tss-work' ($around -eq '.tss-work,config.json,skills') $around
+        $app = Get-Entries $appDir
+        Check 'the settings and the record are in %LOCALAPPDATA%\tiny-skill-sync' ((Test-Path -LiteralPath (Join-Path $appDir 'config.json')) -and (Test-Path -LiteralPath (Join-Path $appDir 'state.json'))) $app
+        $elsewhere = "user: $(Get-Entries $user); local: $(Get-Entries $local); TSS_SKILLS_DIR: $(Get-Entries $c.Skills); TSS_HOME: $(Get-Entries $c.Home)"
+        Check 'nothing was written anywhere else' ($elsewhere -eq 'user: .copilot; local: tiny-skill-sync; TSS_SKILLS_DIR: ; TSS_HOME: ') $elsewhere
+
+        Stop-LiveTray $c.Tray
+        $r = Tss $c @('status') $real
+        Check 'tss status after the app has gone: up to date, exit 0' ($r.Code -eq 0 -and $r.Text -match 'Up to date') "exit $($r.Code)"
+
+        # The skills folder named in config.json instead, for an install that already exists.
+        $moved = Join-Path $c.Root 'moved\skills'
+        $before = Get-DiskStamp $skills
+        $cfgFile = Join-Path $appDir 'config.json'
+        $cfg = [IO.File]::ReadAllText($cfgFile) | ConvertFrom-Json
+        $cfg | Add-Member -NotePropertyName 'skills_dir' -NotePropertyValue $moved -Force
+        [IO.File]::WriteAllText($cfgFile, ($cfg | ConvertTo-Json -Depth 8))
+        $r = Tss $c @('status') $real
+        Check 'with skills_dir in config.json, tss status names that folder' ($r.Text -match [regex]::Escape("Skills folder: $moved")) ''
+        $r = Tss $c @('check') $real
+        # The record still lists the skills, so in the new folder they read as deleted here and are held (see the plan).
+        Check 'after the move a check holds them as deleted here: nothing installed, nothing deleted' ($r.Code -eq 1 -and $r.Text -match 'alpha: Deleted locally' -and -not (Test-Path -LiteralPath $moved)) "exit $($r.Code); new folder: '$(Get-Entries $moved)'"
+        Check 'the folder used before is left exactly as it was' ((Get-DiskStamp $skills) -eq $before) ''
+        $r = Tss $c @('resolve', $c.Id, 'alpha', 'restore') $real
+        $diff = @(Compare-WithUpstream $moved $c.Repo $c.Ref 'skills' | Where-Object { $_ -match ': alpha/' })
+        Check 'resolve restore installs into the folder named in config.json' ($r.Code -eq 0 -and (Test-Path -LiteralPath (Join-Path $moved 'alpha\SKILL.md')) -and $diff.Count -eq 0) "exit $($r.Code) $($diff -join '; ')"
+        $around = Get-Entries (Split-Path $moved)
+        Check 'with its work folder beside it' ($around -eq '.tss-work,skills') $around
+        Check 'and the folder used before is still as it was' ((Get-DiskStamp $skills) -eq $before) ''
+    } finally { Close-Env $c }
+}
 
 function Test-Changes {
     $c = New-Env 'changes'
@@ -1123,6 +1209,7 @@ function Test-Ui {
 
 $scenarios = [ordered]@{
     'install'      = 'Test-Install'
+    'places'       = 'Test-Places'
     'changes'      = 'Test-Changes'
     'local-edit'   = 'Test-LocalEdit'
     'edit-stopped' = 'Test-EditStopped'

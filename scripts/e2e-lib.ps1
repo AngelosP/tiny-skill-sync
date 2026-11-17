@@ -420,8 +420,29 @@ function New-LiveStartInfo($Root, [string]$Exe, [string[]]$AppArgs, [hashtable]$
     $psi.UseShellExecute = $false
     $psi.EnvironmentVariables['TSS_HOME'] = Join-Path $Root 'home'
     $psi.EnvironmentVariables['TSS_SKILLS_DIR'] = Join-Path $Root 'skills'
-    foreach ($key in @($Env.Keys)) { $psi.EnvironmentVariables[$key] = [string]$Env[$key] }
+    # A $null value removes the variable.
+    foreach ($key in @($Env.Keys)) {
+        if ($null -eq $Env[$key]) { $psi.EnvironmentVariables.Remove($key) } else { $psi.EnvironmentVariables[$key] = [string]$Env[$key] }
+    }
     $psi
+}
+
+# The environment a program started with these settings gets, as cmd.exe reports it: name -> value. Lets a scenario
+# that removes TSS_HOME and TSS_SKILLS_DIR prove which folders the app would use before it starts the app.
+function Get-LiveChildEnv($Root, [hashtable]$Env = @{}) {
+    $psi = New-LiveStartInfo $Root 'tss.exe' @() $Env
+    $psi.FileName = $env:ComSpec
+    $psi.Arguments = '/d /c set'
+    $psi.RedirectStandardOutput = $true
+    $p = [Diagnostics.Process]::Start($psi)
+    $text = $p.StandardOutput.ReadToEnd()
+    $p.WaitForExit()
+    $map = @{}
+    foreach ($line in ($text -split "`r?`n")) {
+        $kv = $line -split '=', 2
+        if ($kv.Count -eq 2 -and $kv[0]) { $map[$kv[0]] = $kv[1] }
+    }
+    $map
 }
 
 # Starts the tray app on the throwaway install.

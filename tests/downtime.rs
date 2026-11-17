@@ -427,7 +427,7 @@ fn without_a_change_journal_every_file_is_read_and_the_edit_is_still_found() {
     let installed = s.sync();
     assert!(matches!(only(&installed).outcome, Outcome::Synced), "{installed:?}");
 
-    let full = Tracking { check: Check::Full, volume_changed: false, journal: false };
+    let full = Tracking { check: Check::Full, volume_changed: false, journal: false, folder_missing: false };
     let before = s.engine.startup(&s.cfg).unwrap();
     assert_eq!((before.verify.tracking, before.verify.stats.hashed), (full, FILES), "nothing can vouch, so everything is read");
     assert_clean_except(&before.verify, &[]);
@@ -476,7 +476,7 @@ fn a_drive_that_cannot_be_asked_is_read_in_full_and_trusted_again_when_it_answer
 
     restart_with(&mut s, cannot_be_asked);
     let report = s.engine.verify(&s.cfg, Access::Write).unwrap();
-    let full = Tracking { check: Check::Full, volume_changed: false, journal: false };
+    let full = Tracking { check: Check::Full, volume_changed: false, journal: false, folder_missing: false };
     assert_eq!((report.tracking, report.stats.hashed), (full, FILES));
     assert_eq!(status_of(&report, "alpha"), edited_guide());
     assert_clean_except(&report, &["alpha"]);

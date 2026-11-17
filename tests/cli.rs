@@ -146,6 +146,18 @@ fn a_check_installs_and_status_looks_only_at_the_disk() {
 }
 
 #[test]
+fn status_says_the_skills_folder_is_missing_rather_than_blaming_the_drive() {
+    let host = TestHost::new("cli-no-folder");
+    expect(&tss(&host, "check"), 0, &["Installed alpha"]);
+    std::fs::remove_dir_all(&host.world.skills).unwrap();
+
+    let ran = tss(&host, "status");
+    expect(&ran, 1, &["  ! alpha: Deleted locally", " 0 read (the skills folder does not exist)."]);
+    assert!(!ran.out.contains("change journal"), "{ran:?}");
+    assert!(!host.world.skills.exists(), "status only looks");
+}
+
+#[test]
 fn an_edit_holds_an_update_until_the_user_settles_it() {
     let host = TestHost::new("cli-held");
     expect(&tss(&host, "check"), 0, &[]);

@@ -12,8 +12,9 @@ These rules keep that from happening. Read [ARCHITECTURE.md](ARCHITECTURE.md) be
   is shared by every copy of the app.
 - Never print, log or save a token.
 - Run the app only through the scripts (`scripts\dev.ps1 run`, `tss`, `dry-run`, `bench`, `e2e`, `soak`). They set
-  `TSS_HOME` and `TSS_SKILLS_DIR` to the sandbox or to a throwaway folder. If you run an exe directly, set both
-  variables first.
+  `TSS_HOME` and `TSS_SKILLS_DIR` to the sandbox or to a throwaway folder; the one exception, the e2e `places`
+  scenario, removes them and points `USERPROFILE` and `LOCALAPPDATA` at a throwaway folder instead, and proves that
+  before the app starts. If you run an exe directly, set both `TSS_` variables first.
 - The live scripts (`e2e`, `soak`) push only to their own branches of the fixture repositories (`e2e-*`, `soak-*`), and
   delete them afterwards. Never push to a fixture's `main`, and never point a live script at a repository you do not own.
 - Tests make their own folders under `%TEMP%` (or `TSS_TEST_ROOT`). A new test must do the same, through

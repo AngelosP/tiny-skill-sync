@@ -229,6 +229,8 @@ pub struct Tracking {
     pub volume_changed: bool,
     /// The skills drive has an NTFS change journal.
     pub journal: bool,
+    /// The skills folder does not exist, so its drive could not be asked about a journal.
+    pub folder_missing: bool,
 }
 
 #[derive(Debug)]
@@ -308,6 +310,7 @@ struct Volume {
     current: Option<VolumeId>,
     check: Check,
     changed: bool,
+    folder_missing: bool,
 }
 
 /// Everything one call works on. Created by `begin`, returned by `end`.
@@ -358,8 +361,9 @@ impl Session {
         if let Some(v) = self.vol {
             return v;
         }
-        let Ok(current) = (self.volume_probe)(&self.applier.skills_dir) else {
-            return Volume { current: None, check: Check::Full, changed: false };
+        let current = match (self.volume_probe)(&self.applier.skills_dir) {
+            Ok(current) => current,
+            Err(e) => return Volume { current: None, check: Check::Full, changed: false, folder_missing: e.kind() == io::ErrorKind::NotFound },
         };
         let changed = self.state.volume != Some(current);
         let check = check_for_volume(self.state.volume.as_ref(), &current);
@@ -368,14 +372,14 @@ impl Session {
             self.state.volume = Some(current);
             self.must_save = true;
         }
-        let v = Volume { current: Some(current), check, changed };
+        let v = Volume { current: Some(current), check, changed, folder_missing: false };
         self.vol = Some(v);
         v
     }
 
     fn tracking(&mut self) -> Tracking {
         let v = self.volume();
-        Tracking { check: v.check, volume_changed: v.changed, journal: v.current.is_some_and(|c| c.journal != 0) }
+        Tracking { check: v.check, volume_changed: v.changed, journal: v.current.is_some_and(|c| c.journal != 0), folder_missing: v.folder_missing }
     }
 
     /// Remembers a successful check that found nothing new. Not worth a write by itself.

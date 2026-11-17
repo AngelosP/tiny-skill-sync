@@ -748,7 +748,7 @@ mod tests {
             skills: found.into_iter().map(|(repo_id, name, status)| LocalReport { repo_id: repo_id.to_string(), name: name.to_string(), status }).collect(),
             orphans: Vec::new(),
             stats: Stats::default(),
-            tracking: Tracking { check: Check::Full, volume_changed: false, journal: true },
+            tracking: Tracking { check: Check::Full, volume_changed: false, journal: true, folder_missing: false },
             notes: Vec::new(),
             warnings: Vec::new(),
         }

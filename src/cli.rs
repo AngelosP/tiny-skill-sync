@@ -548,6 +548,7 @@ fn tracking_text(tracking: Tracking) -> &'static str {
     match tracking {
         Tracking { volume_changed: true, .. } => "the drive is not the one on record, so every file was read",
         Tracking { check: Check::Quick, .. } => "the NTFS change journal vouched for the files that were not read",
+        Tracking { folder_missing: true, .. } => "the skills folder does not exist",
         Tracking { journal: false, .. } => "this drive keeps no change journal, so every file is read",
         _ => "every file was read; later looks can rely on the change journal",
     }

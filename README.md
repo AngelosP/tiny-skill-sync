@@ -276,6 +276,9 @@ ended at 3.2 MiB of private memory. Each change reached the disk within one inte
   than 10,000 files is refused. There is no limit on what all the installed skills add up to.
 - The settings window is 616 by 619 pixels at 100% scale and does not shrink. It has been tried only at 100%; on a small
   screen with a high scale (for example 1366 by 768 at 125%) part of it is off the screen.
+- Setting `skills_dir` in `config.json` does not move skills that are already installed. In the new folder they show as
+  "Deleted locally" and nothing is installed there until you restore each one (`tss resolve REPO SKILL restore`); the
+  old folder is left as it is.
 
 ## More
 

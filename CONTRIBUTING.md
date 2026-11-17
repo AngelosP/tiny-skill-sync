@@ -83,7 +83,9 @@ ends up on disk, what the app says and what it leaves alone.
   release build (it makes one unless you pass `-SkipBuild`).
 - **It changes** only folders in `%TEMP%` and branches of the fixture repositories named `e2e-<time>-<scenario>` or
   `soak-<time>`, which it deletes afterwards. It refuses to touch any other branch, so `main` is never pushed to. It
-  never touches the real skills folder, the real settings or the saved token. A small proxy inside the script makes
+  never touches the real skills folder, the real settings or the saved token. The `places` scenario, which runs the app
+  without the `TSS_` folders, points `USERPROFILE` and `LOCALAPPDATA` into `%TEMP%` and checks with `cmd.exe` and
+  `tss status` that the app sees only those before it lets the app write anything. A small proxy inside the script makes
   GitHub fail in the ways the `failures` scenario needs.
 - **You will see** one tray icon per running copy of the app (Windows 11 keeps new ones in the overflow flyout), and the
   `ui` scenario opens, moves and photographs windows and the tray menu. Leave the mouse and keyboard alone while it runs.
@@ -93,6 +95,7 @@ ends up on disk, what the app says and what it leaves alone.
 | Scenario | What it checks |
 | --- | --- |
 | `install` | First start: what is installed, how the idle app behaves, how fast it quits. |
+| `places` | With `TSS_HOME` and `TSS_SKILLS_DIR` unset and the profile folders pointed at `%TEMP%`: skills go to `%USERPROFILE%\.copilot\skills` beside a skill written by hand, the settings to `%LOCALAPPDATA%\tiny-skill-sync`, nothing anywhere else; then `skills_dir` set in `config.json`. |
 | `changes` | Six kinds of upstream change reach the disk through the tray's **Check now**. |
 | `local-edit` | An edit made while the app runs, then an upstream change to the same skill. |
 | `edit-stopped` | Edits made while the app was not running, including ones that keep a file's size and time. |
@@ -126,7 +129,8 @@ its first run is not yet proof that it tests anything. Check it with deliberate 
 2. Run the tests. At least one must fail. If none does, the tests have a gap: add a test.
 3. Undo the change, and make sure the file is byte for byte as before (compare its hash).
 
-This has been done for `apply`, the engine, the downtime tests, the board, the HTTP layer and the command line.
+This has been done for `apply`, the engine, the downtime tests, the board, the HTTP layer and the command line, and for
+the `places` scenario (a wrong default skills folder stops it before the app writes anything).
 
 ## Measuring
 
