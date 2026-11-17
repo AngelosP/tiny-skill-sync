@@ -187,7 +187,8 @@ keeps the tray exe at 0.86 MiB, under its 1 MiB budget (`opt-level = 3` made it 
 
 `.github\workflows\release.yml` publishes a GitHub release when a tag `vX.Y.Z` is pushed:
 
-1. Set `version` in `Cargo.toml`, build once so `Cargo.lock` follows, and commit. Run the live scripts (`e2e`, and
+1. Set `version` in `Cargo.toml` and in `app.manifest` (`assemblyIdentity`, with a fourth `.0`), build once so
+   `Cargo.lock` follows, and commit. Run the live scripts (`e2e`, and
    `bench` for a change on a measured path) on that commit: the workflow cannot, as they need the fixture repositories
    and a desktop.
 2. `git tag -a vX.Y.Z -m "tiny-skill-sync X.Y.Z"`, then `git push origin main vX.Y.Z`.
