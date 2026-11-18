@@ -13,8 +13,9 @@
   bench    Measure startup, memory, CPU and disk use against the budgets. Options: see scripts\bench.ps1
   e2e      Run the real app against real GitHub test repositories and check what it does. Options: see scripts\e2e.ps1
   soak     Leave the app running for an hour or so against a test repository and measure it. Options: see scripts\soak.ps1
-  clean    Close the sandbox copy and any copy a live script left running, delete the sandbox, test leftovers in %TEMP%
-           and bench results. Keeps target\ (use 'cargo clean' for that).
+  clean    Close the sandbox copy and any copy a live script left running, delete the sandbox, test leftovers in %TEMP%,
+           the test startup entries (HKCU\Software\tiny-skill-sync-test) and bench results. Keeps target\ (use
+           'cargo clean' for that).
   help     This text.
 
   Nothing here touches the real skills folder, the real settings or the saved GitHub token.
@@ -63,13 +64,20 @@ switch ($Task) {
         foreach ($d in $leftovers) {
             for ($try = 1; ; $try++) {
                 try { Remove-Item -Recurse -Force $d.FullName -ErrorAction Stop; break }
-                catch { if ($try -ge 10) { throw }; Start-Sleep -Milliseconds 300 }
+                catch {
+                    # Windows PowerShell cannot delete a path longer than 260 characters (e2e's signin scenario makes
+                    # some); the \\?\ form can.
+                    try { [IO.Directory]::Delete('\\?\' + $d.FullName, $true); break } catch { }
+                    if ($try -ge 10) { throw }; Start-Sleep -Milliseconds 300
+                }
             }
             $gone += $d.FullName
         }
         Get-ChildItem $env:TEMP -File -ErrorAction SilentlyContinue |
             Where-Object { $_.Name -match $ScriptTempFilePattern } |
             ForEach-Object { Remove-Item -Force $_.FullName; $gone += $_.FullName }
+        # The startup entries of tests and scripts: never Windows' own Run key.
+        if (Test-Path $TestRegistryRoot) { Remove-Item -Recurse -Force $TestRegistryRoot; $gone += $TestRegistryRoot }
         if ($gone.Count -eq 0) { 'Nothing to clean.' } else { $gone | ForEach-Object { "Deleted $_" } }
     }
     { $_ -in 'help', '/?' } {

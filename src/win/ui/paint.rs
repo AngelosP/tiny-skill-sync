@@ -102,6 +102,7 @@ pub mod glyph {
     pub const OPEN: char = '\u{E8A7}';
     pub const FOLDER: char = '\u{E8B7}';
     pub const KEY: char = '\u{E8D7}';
+    pub const POWER: char = '\u{E7E8}';
     pub const INFO: char = '\u{E946}';
     pub const ERROR_BADGE: char = '\u{EA39}';
     pub const BACK: char = '\u{E72B}';

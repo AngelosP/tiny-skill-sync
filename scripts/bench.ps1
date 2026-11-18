@@ -10,11 +10,15 @@
   1. Install: 'tss add' and 'tss check' fill the throwaway skills folder.
   2. Startup: the tray app starts -Runs times on that install (warm: the files are in the cache). The app writes
      timing marks to a file named by TSS_BENCH_REPORT (see src\win\ui\bench.rs).
-  3. Idle: one copy is watched for -IdleSeconds: CPU, I/O and page faults should stay at 0.
-  4. Settings: a second start makes the first copy open its window, which shows on the screen for about
+  3. Start at sign-in: the app starts -Runs times the way Windows starts it at sign-in ('--background'). It shows its
+     icon and waits 30 s before it looks at the skills or checks GitHub, so the 3 s after the icon must run no job. The
+     CPU and file I/O it uses up to then are held to Task Manager's "low" startup impact: under 300 ms of CPU and
+     under 300 KB of disk I/O.
+  4. Idle: one copy is watched for -IdleSeconds: CPU, I/O and page faults should stay at 0.
+  5. Settings: a second start makes the first copy open its window, which shows on the screen for about
      2 seconds and is then closed; memory is measured on it. The time to open is measured -SettingsRuns times, each
      time the first opening in a fresh copy (the window flashes up each time). Skip with -NoSettings.
-  5. Poll: the record is changed so every repository is due, and the app is started again: it checks GitHub at
+  6. Poll: the record is changed so every repository is due, and the app is started again: it checks GitHub at
      once. Nothing changed upstream, so it should get one "not modified" answer and touch no files.
 
   Counters are the ones Task Manager uses (WMI Win32_PerfRawData_PerfProc_Process). File reads and writes are
@@ -28,7 +32,7 @@
   answers that a repository is private or missing.
 
 .PARAMETER Runs
-  How many times to measure startup. Default 10.
+  How many times to measure startup, and the start at sign-in. Default 10.
 
 .PARAMETER IdleSeconds
   How long to watch the idle app. Default 10.
@@ -189,7 +193,13 @@ function Get-Snapshot([Diagnostics.Process]$P) {
     $P.Refresh()
     [uint64]$cycles = 0
     [void][TssBenchNative]::QueryProcessCycleTime($P.Handle, [ref]$cycles)
-    $q = Get-CimInstance -ClassName Win32_PerfRawData_PerfProc_Process -Filter ("IDProcess={0}" -f $P.Id)
+    # A process that has just started may not be listed yet; its counters would read as 0.
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    do {
+        $q = Get-CimInstance -ClassName Win32_PerfRawData_PerfProc_Process -Filter ("IDProcess={0}" -f $P.Id)
+        if (-not $q) { Start-Sleep -Milliseconds 100 }
+    } while (-not $q -and $sw.ElapsedMilliseconds -lt 5000)
+    if (-not $q) { throw "Windows lists no counters for process $($P.Id)." }
     [pscustomobject]@{
         WorkingSetKiB = [int64]($P.WorkingSet64 / 1KB)
         PrivateKiB    = [int64]($P.PrivateMemorySize64 / 1KB)
@@ -301,7 +311,41 @@ try {
     Add-Row 'Quit to exit' ('median {0:N1} ms, max {1:N1} ms' -f $qs.Median, $qs.Max) '2 s or less (quit wait)' ($qs.Max -le 2000)
     Add-Row 'Files written by startup and quit (from the first start after tss check)' (Format-List2 $writtenByStartup) 'none' (@($writtenByStartup).Count -eq 0)
 
-    # 3. Idle
+    # 3. Start at sign-in, as Windows starts it (src\autostart.rs). The app shows its icon and then waits 30 s
+    # (app::SIGN_IN_GRACE) before it looks at the skills or checks GitHub, so all Windows sees while it is still
+    # starting is the start itself. Any job in the quiet time after the icon is a failure.
+    Write-Host "== Start at sign-in x $Runs" -ForegroundColor Cyan
+    $quietMs = 3000
+    $filesBefore = Get-Files
+    $signTray = @(); $signCpu = @(); $signIo = @(); $signJobs = @()
+    for ($i = 1; $i -le $Runs; $i++) {
+        $report = Join-Path $reports "sign-in-$i.txt"
+        $p = Start-Tray $report @('--background')
+        $t = Wait-Mark $report 'tray'
+        Start-Sleep -Milliseconds $quietMs
+        # Marks are counted before the snapshot, so a mark written in between is never subtracted without being counted.
+        $marks = Get-MarkIo $report
+        $snap = Get-Snapshot $p
+        $signJobs += @(Read-Marks $report | Where-Object { $_.Mark -like 'job-*' } | ForEach-Object { "$($_.Mark) in run $i" })
+        Stop-Tray $p
+        $signTray += $t.AtMs; $signCpu += $snap.CpuMs
+        $signIo += [pscustomobject]@{
+            ReadBytes = $snap.ReadBytes; ReadOps = $snap.ReadOps
+            WriteBytes = $snap.WriteBytes - $marks.Bytes; WriteOps = $snap.WriteOps - $marks.Ops
+        }
+    }
+    $writtenAtSignIn = Compare-Files $filesBefore (Get-Files)
+    $quiet = '{0:N0} s' -f ($quietMs / 1000)
+    $st = Get-Stats $signTray
+    Add-Row 'Start at sign-in (--background): process creation to tray icon added' ('median {0:N1} ms, p95 {1:N1} ms (n {2})' -f $st.Median, $st.P95, $st.N) '' $null
+    $sc = Get-Stats $signCpu
+    Add-Row "Start at sign-in: CPU in the first $quiet" ('median {0:N1} ms, max {1:N1} ms (process timer ticks are 15.6 ms)' -f $sc.Median, $sc.Max) 'under 300 ms (Task Manager: low impact)' ($sc.Max -lt 300)
+    $worst = $signIo | Sort-Object { $_.ReadBytes + $_.WriteBytes } -Descending | Select-Object -First 1
+    $worstBytes = $worst.ReadBytes + $worst.WriteBytes
+    Add-Row "Start at sign-in: file I/O in the first $quiet (the largest start), jobs run, files changed" ('read {0:N0} bytes in {1} operations, written {2:N0} bytes in {3} operations; jobs: {4}; files changed: {5}' -f $worst.ReadBytes, $worst.ReadOps, $worst.WriteBytes, $worst.WriteOps, (Format-List2 $signJobs), (Format-List2 $writtenAtSignIn)) 'under 300,000 bytes (Task Manager: low impact); none; none' ($worstBytes -lt 300000 -and $signJobs.Count -eq 0 -and @($writtenAtSignIn).Count -eq 0)
+    $notes.Add('Start at sign-in: warm starts. The app looks at the skills 30 s after it starts, as background work that costs what the startup job above costs, and then checks a repository that is due, at the cost the unchanged poll rows show. The I/O leaves out the bench''s own mark lines.')
+
+    # 4. Idle
     Write-Host "== Idle $IdleSeconds s" -ForegroundColor Cyan
     $report = Join-Path $reports 'idle.txt'
     $p = Start-Tray $report
@@ -318,7 +362,7 @@ try {
     Add-Row 'Idle working set (trimmed after startup) / private bytes' ('{0} / {1}' -f (MiB $b.WorkingSetKiB), (MiB $b.PrivateKiB)) '2 MiB or less trimmed / 4 MiB or less' ($b.WorkingSetKiB -le 2048 -and $b.PrivateKiB -le 4096)
     Add-Row 'Idle threads / handles' ('{0} / {1}' -f $b.Threads, $b.Handles) '' $null
 
-    # 4. Settings
+    # 5. Settings
     if (-not $NoSettings) {
         Write-Host "== Window (shows for about 2 s, then flashes up $($SettingsRuns - 1) more times)" -ForegroundColor Cyan
         $sw = [Diagnostics.Stopwatch]::StartNew()
@@ -358,7 +402,7 @@ try {
     }
     Stop-Tray $p
 
-    # 5. Poll
+    # 6. Poll
     Write-Host '== Unchanged poll' -ForegroundColor Cyan
     # Make every repository due. The record is edited as text: a JSON round trip in PowerShell could round large numbers.
     $stateFile = Join-Path $homeDir 'state.json'
@@ -393,7 +437,7 @@ try {
     Add-Row 'Files written when quitting after the poll' (Format-List2 (Compare-Files $filesBefore (Get-Files))) '' $null
     $notes.Add('Poll I/O is the poll run (startup, poll, 8 s) minus the idle run after startup (both start the same way), minus the bench''s own extra mark lines.')
 
-    # 6. Size
+    # 7. Size
     $size = (Get-Item $exe).Length
     Add-Row 'tiny-skill-sync.exe' ('{0:N0} bytes ({1:N2} MiB)' -f $size, ($size / 1MB)) '1 MiB or less' ($size -le 1MB)
 } finally {

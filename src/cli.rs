@@ -10,6 +10,7 @@ use std::io::{self, IsTerminal, Write};
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 
+use crate::autostart::{Exe, Keys, Startup, Via};
 use crate::board::{Action, Board, Level, RepoView, Row};
 use crate::config::{CONFIG_FILE, Config, Paths, RepoConfig, RepoSpec};
 use crate::engine::{Access, ApplyResult, Engine, EngineError, Outcome, Resolution, SkillReport, SyncOptions, Tracking, Which};
@@ -19,12 +20,15 @@ use crate::pathsafe::{fold, printable_lines};
 use crate::reconcile::Verdict;
 use crate::state::State;
 use crate::verify::Check;
-use crate::win::{console, cred, proc};
+use crate::win::{autorun, console, cred, proc};
 
 pub const EXIT_OK: i32 = 0;
 pub const EXIT_ATTENTION: i32 = 1;
 pub const EXIT_FAILED: i32 = 2;
 pub const EXIT_USAGE: i32 = 3;
+
+/// The tray app's file name, which `tss startup` looks for beside `tss.exe`.
+const TRAY_EXE: &str = "tiny-skill-sync.exe";
 
 const NO_REPOS: &str = "No repositories are set up. Add one with: tss add OWNER/NAME";
 
@@ -58,6 +62,11 @@ Usage:
       The GitHub token, saved in Windows Credential Manager. Without one, the
       GitHub CLI's token is used (gh auth login). 'set' reads the token without
       showing it, or from a pipe: gh auth token | tss token set
+  tss startup [status | on | off]
+      Whether Windows starts the tray app (tiny-skill-sync.exe, in the same
+      folder) when you sign in. It starts without its window and waits a
+      little before it looks at your skills or checks GitHub, so it does not
+      slow sign-in down.
   tss help
   tss --version
 
@@ -88,6 +97,11 @@ pub trait Host {
     fn gh_signed_in(&self) -> Result<(), String>;
     /// A token typed at the console (not shown) or piped in.
     fn read_token(&self) -> Result<String, String>;
+    /// Whether Windows starts the tray app when the user signs in. Only reads.
+    fn startup(&self) -> Result<Startup, String>;
+    /// Has Windows start the tray app when the user signs in, or stop starting it. Another copy's entry is only
+    /// replaced by turning this one on.
+    fn set_startup(&self, on: bool) -> Result<Startup, String>;
 }
 
 /// The real computer.
@@ -137,6 +151,26 @@ impl Host for SystemHost {
         }
         Ok(token.to_string())
     }
+
+    fn startup(&self) -> Result<Startup, String> {
+        autorun::state(&Keys::current(), &tray_app()?).map_err(|e| e.to_string())
+    }
+
+    fn set_startup(&self, on: bool) -> Result<Startup, String> {
+        let (keys, tray) = (Keys::current(), tray_app()?);
+        let result = if on { autorun::turn_on(&keys, &tray) } else { autorun::turn_off(&keys, &tray) };
+        result.map_err(|e| e.to_string())
+    }
+}
+
+/// The tray app in the folder `tss.exe` is in. It is what Windows starts; `tss` itself never is.
+fn tray_app() -> Result<Exe, String> {
+    let tss = std::env::current_exe().map_err(|e| format!("the folder tss.exe is in cannot be found: {e}"))?;
+    let tray = tss.with_file_name(TRAY_EXE);
+    if !tray.is_file() {
+        return Err(format!("the tray app, {TRAY_EXE}, is not in the same folder as tss.exe"));
+    }
+    Ok(autorun::exe_at(&tray))
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -149,6 +183,7 @@ pub enum Command {
     Add { spec: String, every: Option<Interval>, use_token: bool },
     Remove { repo: String, delete_skills: bool },
     Token(TokenAction),
+    Startup(StartupAction),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -156,6 +191,13 @@ pub enum TokenAction {
     Status,
     Set,
     Clear,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StartupAction {
+    Status,
+    On,
+    Off,
 }
 
 /// Options as given: `--name` or `--name=value`.
@@ -196,6 +238,7 @@ fn usage_of(command: &str) -> &'static str {
         "add" => "tss add OWNER/NAME [--every INTERVAL] [--use-token]",
         "remove" => "tss remove REPO [--delete-skills]",
         "token" => "tss token [status|set|clear]",
+        "startup" => "tss startup [status|on|off]",
         _ => "tss status",
     }
 }
@@ -307,6 +350,16 @@ pub fn parse(args: &[String]) -> Result<Command, String> {
             };
             Command::Token(action)
         }
+        "startup" => {
+            expect_words(&name, words, 0, 1)?;
+            let action = match words.first().map(|w| w.to_ascii_lowercase()).as_deref() {
+                None | Some("status") => StartupAction::Status,
+                Some("on") => StartupAction::On,
+                Some("off") => StartupAction::Off,
+                Some(_) => return Err(format!("'{}' is not a startup action; use: {}", words[0], usage_of("startup"))),
+            };
+            Command::Startup(action)
+        }
         _ => return Err(format!("unknown command '{first}'")),
     };
     flags.finish(&name)?;
@@ -400,6 +453,7 @@ fn execute(command: Command, host: &dyn Host, out: &mut String) -> Result<i32, F
         Command::Add { spec, every, use_token } => add(host, out, &spec, every, use_token),
         Command::Remove { repo, delete_skills } => remove(host, out, &repo, delete_skills),
         Command::Token(action) => token(host, out, action),
+        Command::Startup(action) => startup(host, out, action),
     }
 }
 
@@ -871,6 +925,19 @@ fn token(host: &dyn Host, out: &mut String, action: TokenAction) -> Result<i32, 
     }
 }
 
+/// Only the registry is read or written: no settings, no state, no skills folder and no network.
+fn startup(host: &dyn Host, out: &mut String, action: StartupAction) -> Result<i32, Fail> {
+    let state = match action {
+        StartupAction::Status => host.startup().map_err(|e| format!("Start with Windows cannot be read: {e}")),
+        StartupAction::On => host.set_startup(true).map_err(|e| format!("Start with Windows could not be turned on: {e}")),
+        StartupAction::Off => host.set_startup(false).map_err(|e| format!("Start with Windows could not be turned off: {e}")),
+    }
+    .map_err(Fail::Failed)?;
+    say!(out, "Start with Windows: {}", state.summary());
+    say!(out, "{}", state.note(Via::Tss));
+    Ok(EXIT_OK)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -915,6 +982,10 @@ mod tests {
         assert_eq!(parsed("token"), Command::Token(TokenAction::Status));
         assert_eq!(parsed("token set"), Command::Token(TokenAction::Set));
         assert_eq!(parsed("token CLEAR"), Command::Token(TokenAction::Clear));
+        assert_eq!(parsed("startup"), Command::Startup(StartupAction::Status));
+        assert_eq!(parsed("startup status"), Command::Startup(StartupAction::Status));
+        assert_eq!(parsed("Startup ON"), Command::Startup(StartupAction::On));
+        assert_eq!(parsed("startup off"), Command::Startup(StartupAction::Off));
         for help in ["help", "-h", "--help", "check --help", "help me"] {
             assert_eq!(parsed(help), Command::Help, "{help}");
         }
@@ -949,6 +1020,9 @@ mod tests {
         assert!(refused("add o/r --every soon").contains("--every:"));
         assert!(refused("remove").contains("something is missing"));
         assert!(refused("token show").contains("'show' is not a token action"));
+        assert!(refused("startup maybe").contains("'maybe' is not a startup action; use: tss startup [status|on|off]"));
+        assert!(refused("startup on off").contains("'off' was not expected"));
+        assert!(refused("startup on --now").contains("'startup' has no option --now"));
     }
 
     fn cfg_with(repos: &[(&str, &str, &str)]) -> Config {

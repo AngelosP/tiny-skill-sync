@@ -11,6 +11,11 @@ These rules keep that from happening. Read [ARCHITECTURE.md](ARCHITECTURE.md) be
 - Never run `tss token set` or `tss token clear`, and never start the app with the real settings. The saved GitHub token
   is shared by every copy of the app.
 - Never print, log or save a token.
+- Never write Windows' startup keys (`HKCU\Software\Microsoft\Windows\CurrentVersion\Run` and
+  `...\Explorer\StartupApproved\Run`): never run `tss startup on` or `off`, nor turn the Start with Windows switch or
+  accept its offer, in a copy without `TSS_HOME`. Copies with `TSS_HOME` and the tests keep their entry under
+  `HKCU\Software\tiny-skill-sync-test`, which Windows never reads and `scripts\dev.ps1 clean` deletes; a new test must
+  do the same.
 - Run the app only through the scripts (`scripts\dev.ps1 run`, `tss`, `dry-run`, `bench`, `e2e`, `soak`). They set
   `TSS_HOME` and `TSS_SKILLS_DIR` to the sandbox or to a throwaway folder; the one exception, the e2e `places`
   scenario, removes them and points `USERPROFILE` and `LOCALAPPDATA` at a throwaway folder instead, and proves that

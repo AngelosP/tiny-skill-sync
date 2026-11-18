@@ -13,6 +13,7 @@ use super::control::{Deco, Item, Kind, Look, Mark, Surface, two_lines};
 use super::paint::{Font, Rect, Tone, glyph};
 use super::sentence;
 use super::theme::Role;
+use crate::autostart::{Startup, Via};
 use crate::board::{self, Action, Board, Level, RepoView, Row, ago, repo_name};
 use crate::config::{RepoConfig, RepoSpec};
 use crate::diff::{Body, FileChange, Presence, Row as Line, TextDiff};
@@ -63,6 +64,7 @@ pub mod id {
     pub const OPEN_BACKUPS: i32 = 322;
     pub const SAVE_TOKEN: i32 = 323;
     pub const DELETE_TOKEN: i32 = 324;
+    pub const STARTUP: i32 = 325;
     pub const BACK: i32 = 330;
     /// Plus the index of the action in the skill's row.
     pub const DIFF_ACTION: i32 = 333;
@@ -74,6 +76,7 @@ pub mod id {
     pub const SKILLS_DIR: i32 = 410;
     pub const TOKEN_TEXT: i32 = 411;
     pub const EMPTY: i32 = 412;
+    pub const STARTUP_TEXT: i32 = 413;
     /// Plus the index of the repository in the settings.
     pub const NAV_REPO: i32 = 1_000;
     pub const NOTE: i32 = 100_000;
@@ -635,12 +638,25 @@ pub struct SettingsPage<'a> {
     pub default: Interval,
     pub skills_dir: &'a str,
     pub token_saved: bool,
+    /// Whether Windows starts this copy when the user signs in, or why that can't be told.
+    pub startup: Result<&'a Startup, &'a str>,
     pub version: &'a str,
 }
 
 enum Ctl {
     Button(Btn),
-    Combo { id: i32, items: Vec<String>, shown: String },
+    Combo {
+        id: i32,
+        items: Vec<String>,
+        shown: String,
+    },
+    /// An on/off switch; `text` is what it is for.
+    Toggle {
+        id: i32,
+        text: String,
+        on: bool,
+        enabled: bool,
+    },
 }
 
 enum Desc {
@@ -656,6 +672,7 @@ fn setting(o: &mut Out, x: i32, y: i32, cw: i32, mark: char, title: &str, desc: 
         .map(|c| match c {
             Ctl::Button(b) => o.button_width(&b.text, b.glyph),
             Ctl::Combo { .. } => COMBO_W,
+            Ctl::Toggle { .. } => TOGGLE_W,
         })
         .collect();
     let all = widths.iter().sum::<i32>() + 8 * (widths.len() as i32 - 1).max(0);
@@ -689,6 +706,7 @@ fn setting(o: &mut Out, x: i32, y: i32, cw: i32, mark: char, title: &str, desc: 
                 o.button(b, cx, cy, 32);
             }
             Ctl::Combo { id, items, shown } => o.item(id, [cx, cy, w, 32], shown, Look::Combo { items }, true),
+            Ctl::Toggle { id, text, on, enabled } => o.item(id, [cx, cy, w, 32], text, Look::Toggle { on }, enabled),
         }
         cx += w + 8;
     }
@@ -712,6 +730,12 @@ pub fn settings_page(p: &SettingsPage, w: i32, fit: Fit) -> Surface {
     let every = Ctl::Combo { id: id::DEFAULT_EVERY, items, shown };
     let desc = Desc::Text(0, "Used by every repository set to Default".to_string());
     y = setting(&mut o, x, y, cw, glyph::TIMER, "Check for updates every", desc, vec![every]) + GAP;
+    let (on, enabled, note) = match p.startup {
+        Ok(state) => (state.is_on(), state.can_change(), state.note(Via::Window)),
+        Err(e) => (false, false, format!("Whether Windows starts it can’t be read: {e}")),
+    };
+    let switch = Ctl::Toggle { id: id::STARTUP, text: "Start with Windows".to_string(), on, enabled };
+    y = setting(&mut o, x, y, cw, glyph::POWER, "Start with Windows", Desc::Text(id::STARTUP_TEXT, note), vec![switch]) + GAP;
     let open = |n| Ctl::Button(btn(n, "Open", Kind::Standard, Some(glyph::OPEN)));
     let desc = Desc::Path(id::SKILLS_DIR, printable(p.skills_dir).into_owned());
     y = setting(&mut o, x, y, cw, glyph::FOLDER, "Skills folder", desc, vec![open(id::OPEN_SKILLS)]) + GAP;
@@ -1112,6 +1136,8 @@ pub struct Question {
     pub choice: usize,
     pub note: Option<(char, String)>,
     pub ok: String,
+    /// The Cancel button's label; "Cancel" when empty.
+    pub cancel: String,
 }
 
 /// Lays out a question [`ASK_W`] wide. Also returns where the text box's edit control goes.
@@ -1175,7 +1201,8 @@ pub fn ask(q: &Question, fit: Fit) -> (Surface, Option<Rect>) {
     o.fill([0, y, ASK_W, 1], 0, Role::Divider, Role::None);
     let bw = (cw - 8) / 2;
     o.item(ask_id::OK, [x, y + 20, bw, 32], q.ok.as_str(), Look::Button { kind: Kind::Accent, glyph: None }, true);
-    o.item(ask_id::CANCEL, [x + bw + 8, y + 20, cw - bw - 8, 32], "Cancel", Look::Button { kind: Kind::Standard, glyph: None }, true);
+    let cancel = if q.cancel.is_empty() { "Cancel" } else { q.cancel.as_str() };
+    o.item(ask_id::CANCEL, [x + bw + 8, y + 20, cw - bw - 8, 32], cancel, Look::Button { kind: Kind::Standard, glyph: None }, true);
     (o.done(y + FOOT_H), edit)
 }
 
@@ -1422,7 +1449,15 @@ mod tests {
         let r = RepoConfig { interval: Some(Interval::new(2, Unit::Hour)), ..repo("o/a") };
         let v = RepoView { private: true, detail: Some("GitHub answered not found.".to_string()), ..view("o/a", vec![edited("e"), ok("x")]) };
         let none = HashSet::new();
-        let settings = SettingsPage { default: DEFAULT_INTERVAL, skills_dir: r"C:\Users\someone\.copilot\skills", token_saved: true, version: "0.2.0" };
+        // The longest note there is, with a path that has no spaces to break at.
+        let other = Startup::OtherCopy(format!(r"D:\{}\tiny-skill-sync.exe", "d".repeat(200)));
+        let settings = SettingsPage {
+            default: DEFAULT_INTERVAL,
+            skills_dir: r"C:\Users\someone\.copilot\skills",
+            token_saved: true,
+            startup: Ok(&other),
+            version: "0.2.0",
+        };
         for w in [344, 900] {
             let p = RepoPage { view: &v, repo: &r, default: DEFAULT_INTERVAL, now: NOW, toggled: &none };
             let s = repo_page(&p, w, &fit);
@@ -1441,7 +1476,7 @@ mod tests {
 
     #[test]
     fn the_settings_page_offers_to_replace_a_saved_token_and_to_save_one_otherwise() {
-        let p = |token_saved| SettingsPage { default: DEFAULT_INTERVAL, skills_dir: "C:\\skills", token_saved, version: "0.2.0" };
+        let p = |token_saved| SettingsPage { default: DEFAULT_INTERVAL, skills_dir: "C:\\skills", token_saved, startup: Ok(&Startup::Off), version: "0.2.0" };
         let saved = settings_page(&p(true), 700, &fit);
         assert_eq!(item(&saved, id::SAVE_TOKEN).text, "Replace token…");
         assert_eq!(item(&saved, id::DELETE_TOKEN).text, "Delete token");
@@ -1449,6 +1484,34 @@ mod tests {
         let none = settings_page(&p(false), 700, &fit);
         assert_eq!(item(&none, id::SAVE_TOKEN).text, "Save a token…");
         assert!(!none.items.iter().any(|i| i.id == id::DELETE_TOKEN));
+    }
+
+    #[test]
+    fn start_with_windows_is_a_switch_that_says_how_it_is_and_is_greyed_out_when_it_cant_be_changed() {
+        let page = |startup: Result<&Startup, &str>| {
+            settings_page(&SettingsPage { default: DEFAULT_INTERVAL, skills_dir: "C:\\skills", token_saved: false, startup, version: "0.2.0" }, 700, &fit)
+        };
+        let switch = |s: &Surface| {
+            let i = item(s, id::STARTUP);
+            (i.look.clone(), i.enabled)
+        };
+        let s = page(Ok(&Startup::On));
+        assert_eq!(item(&s, id::STARTUP).text, "Start with Windows", "what a screen reader says it is for");
+        assert_eq!(switch(&s), (Look::Toggle { on: true }, true));
+        assert_eq!(item(&s, id::STARTUP_TEXT).text, Startup::On.note(Via::Window));
+        assert_eq!(hit(id::STARTUP), Hit::Other(id::STARTUP));
+        for state in [Startup::Off, Startup::OffInWindows, Startup::OtherCopy(r"D:\old\tiny-skill-sync.exe".to_string())] {
+            let s = page(Ok(&state));
+            assert_eq!(switch(&s), (Look::Toggle { on: false }, true), "{state:?} can be turned on");
+            assert_eq!(item(&s, id::STARTUP_TEXT).text, state.note(Via::Window));
+        }
+        let s = page(Ok(&Startup::TooLong));
+        assert_eq!(switch(&s), (Look::Toggle { on: false }, false), "greyed out");
+        assert_eq!(item(&s, id::STARTUP_TEXT).text, Startup::TooLong.note(Via::Window));
+        let s = page(Err("Access is denied. (os error 5)"));
+        assert_eq!(switch(&s), (Look::Toggle { on: false }, false), "not changed blind");
+        assert_eq!(item(&s, id::STARTUP_TEXT).text, "Whether Windows starts it can’t be read: Access is denied. (os error 5)");
+        fits_in(&s, 700);
     }
 
     #[test]
@@ -1674,6 +1737,7 @@ mod tests {
             choice: 1,
             note: Some((glyph::LOCK, "A note".to_string())),
             ok: "Remove".to_string(),
+            cancel: String::new(),
         };
         let (s, edit) = ask(&q, &fit);
         assert_eq!(edit, None);
@@ -1693,5 +1757,8 @@ mod tests {
         assert!(item(&s, ask_id::LABEL).at[1] + LINE_H <= ey && ey + eh <= item(&s, ask_id::HINT).at[1]);
         assert_eq!(item(&s, ask_id::HINT).text, "Not a repository");
         assert_eq!(item(&s, ask_id::HINT).look, Look::Text { font: Font::Caption, ink: Role::Err, flags: WRAP });
+
+        let offer = Question { ok: "Turn on".to_string(), cancel: "Not now".to_string(), ..typed };
+        assert_eq!(item(&ask(&offer, &fit).0, ask_id::CANCEL).text, "Not now");
     }
 }

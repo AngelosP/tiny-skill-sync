@@ -9,6 +9,9 @@ what came from GitHub and was later removed there; files you add are yours, and 
 
 - **Small and quiet.** One exe of 0.9 MiB, no runtime to install. It starts in about 8 ms, uses about 1 MiB of
   memory while idle, and does no work at all between checks: no CPU, no disk, no network.
+- **Starts with Windows, without slowing it down.** Turn on **Start with Windows** (the app offers it when you add your
+  first repository). At sign-in it goes straight to the tray and waits 30 seconds before it looks at your skills or
+  checks GitHub, and then does both at low priority.
 - **Cheap checks.** An unchanged repository costs one small "has anything changed?" request to GitHub, which reads and
   writes no files.
 - **Public and private repositories.** Public ones need nothing. Private ones are read with the GitHub CLI's sign-in
@@ -17,7 +20,7 @@ what came from GitHub and was later removed there; files you add are yours, and 
   line by line what is different between GitHub and your copy of a skill. It follows the Windows light or dark mode.
 - **A command line** (`tss`) that does the same work one command at a time.
 
-Windows 10 and 11, x64. Version 0.1: there is no installer yet, and the exe is not signed.
+Windows 10 and 11, x64. There is no installer yet, and the exes are not signed.
 
 ## Safety promises
 
@@ -64,13 +67,30 @@ These are the rules the app follows. Each one is covered by tests (see [CONTRIBU
    https://github.com/anthropics/skills/tree/main/skills
    ```
 
-4. The app installs the skills at once and then checks once a day.
-
-To start the app when you sign in, put a shortcut to `tiny-skill-sync.exe` in your Startup folder (`Win+R`,
-`shell:startup`). The app does not register itself.
+4. The app installs the skills at once and then checks once a day. It also asks whether to start with Windows.
 
 To update it, quit the app (right-click the icon, **Quit**), replace both exes with the new ones and start it again.
-The settings and the record of what it installed stay in `%LOCALAPPDATA%\tiny-skill-sync`.
+The settings and the record of what it installed stay in `%LOCALAPPDATA%\tiny-skill-sync`, and Start with Windows
+stays as it was, because it names the exe's path.
+
+### Start with Windows
+
+With **Start with Windows** on (in Settings, or `tss startup on`), Windows starts the app when you sign in. Windows
+starts such apps only once the desktop is up. The app then goes straight to the tray without opening its window and
+waits 30 seconds, so that Windows can finish starting and the network can come up (the tooltip says "waiting for
+Windows to finish starting"). Then it looks over the installed skills and checks GitHub, at low priority, so it does
+not slow your sign-in down. If you open the window before then, it looks over the skills at once; it checks GitHub
+before the 30 seconds are up only when you ask it to (**Sync now**).
+
+- The app offers this when you add your first repository (**Turn on** or **Not now**). It never turns it on by itself,
+  and never turns it back on after you turned it off.
+- It is the entry that Task Manager (**Startup apps**) and Windows Settings (**Apps** > **Startup**) list as Tiny Skill
+  Sync. Turned off there, it stays off, and Settings in the app says so; turning it on in the app turns it on there too.
+- The entry names the exe by its path. If you move the app to another folder, Settings says that Windows starts
+  another copy, until you turn it on in the new folder. Before you delete the app, turn it off (or run
+  `tss startup off`), so that no entry is left behind.
+- Only the settings file can make it open its window at sign-in: when `config.json` can't be read, nothing can be
+  checked until it is fixed, so the window says why.
 
 ## Which folders are skills
 
@@ -97,14 +117,15 @@ check, each time the repository has changed, and `tss check --full-listing` (see
 | Icon | Meaning |
 | --- | --- |
 | Blue disc | All skills are up to date. |
-| Blue ring | Checking for updates. |
+| Blue ring | Checking for updates, or, just after sign-in, waiting for Windows to finish starting. |
 | Grey ring | No repositories are set up. |
 | Amber disc with `!` | A skill needs you (see below). |
 | Red disc with `x` | A check failed. The tooltip and the window say why. |
 
 The tooltip says what the state is. Click the icon to open the window, or right-click for **Open Tiny Skill Sync**,
 **Sync now** and **Quit**. Starting `tiny-skill-sync.exe` again opens the window of the copy that already runs;
-`tiny-skill-sync.exe --quit` closes it.
+`tiny-skill-sync.exe --quit` closes it. `tiny-skill-sync.exe --background` starts it the way Windows does at sign-in
+(see [Start with Windows](#start-with-windows)); when a copy already runs, it does nothing.
 
 ## The window
 
@@ -148,6 +169,8 @@ room from the page beside it, and narrows again when the mouse leaves.
 - **Activity:** what the app did recently, newest first, and what went wrong.
 - **Settings:**
   - **Check for updates every**: the default interval, for every repository set to **Default** (1 day at first).
+  - **Start with Windows**: a switch, and a line under it that says how it is, also when it was turned off in Task
+    Manager or when Windows starts another copy of the app (see [Start with Windows](#start-with-windows)).
   - **Skills folder** and **Backups**, each with **Open**.
   - **GitHub sign-in for private repositories**: **Save a token…**, and once one is saved, **Replace token…** and
     **Delete token**.
@@ -204,11 +227,15 @@ tss add OWNER/NAME|URL [--every 6h] [--use-token]
 tss remove REPO [--delete-skills]
 tss resolve REPO SKILL replace|restore|keep|leave|manage
 tss token [status|set|clear]                 gh auth token | tss token set
+tss startup [status|on|off]                  start the tray app when you sign in
 ```
 
 `REPO` is the id that `tss status` shows, or `owner/name`. Exit codes: 0 all fine, 1 something needs attention,
 2 failed, 3 bad command line. The tray notices changes made with `tss` and shows them. Only one of them checks at a
 time; the other one is told to try again in a moment.
+
+`tss startup` works on the tray app in the same folder as `tss.exe` (see [Start with Windows](#start-with-windows)).
+It changes only Windows' startup entry, and says how it is in two lines: `on`, `off` or `not possible`, then why.
 
 Names and messages that come from a repository are shown with control and text-direction characters written out
 (`\u{202e}`), in the window and in `tss`, so a name cannot hide part of a line or change how it reads. `tss` prints a
@@ -274,11 +301,15 @@ every request to that repository; without it, a private repository is still read
 [Private repositories](#private-repositories)). Never change an `id`: the installed skills are recorded under it. When
 the app or `tss` saves the settings, it writes only the fields above, so anything else you added by hand is dropped.
 
+`skills_dir`, when you set it, must be a full path such as `D:\skills`. A relative one would depend on the folder the
+app was started from (at sign-in, Windows chooses that), so a `config.json` with one can't be read, and the window
+and `tss` say why.
+
 Environment variables, mainly for tests and scripts:
 
 | Variable | Meaning |
 | --- | --- |
-| `TSS_HOME` | Use this folder instead of `%LOCALAPPDATA%\tiny-skill-sync`. One copy of the tray runs per folder. |
+| `TSS_HOME` | Use this folder instead of `%LOCALAPPDATA%\tiny-skill-sync`. One copy of the tray runs per folder. Such a copy keeps its Start with Windows entry under `HKCU\Software\tiny-skill-sync-test`, which Windows does not read. |
 | `TSS_SKILLS_DIR` | Use this skills folder, whatever the settings say. |
 | `TSS_BENCH_REPORT` | Write timing marks to this file (used by `scripts\bench.ps1`). |
 | `TSS_API_BASE`, `TSS_RAW_BASE` | Other GitHub addresses (used by the HTTP tests). |
@@ -325,13 +356,14 @@ Measured with `scripts\bench.ps1` on a Ryzen 7 5800X3D with Windows 11, files in
 | --- | --- | --- | --- |
 | Start to tray icon | 8.4 ms | 8.6 ms | 30 ms median |
 | Start-up check of every installed file | 21 ms | 105 ms | 75 µs per file |
+| Start at sign-in, its first 3 s: CPU, file I/O | 16 ms, 241 bytes | under 16 ms, 251 bytes | 300 ms, 300 KB |
 | Idle for 10 s: CPU, disk, page faults | 0, 0, 0 | 0, 0, 0 | 0 |
 | Idle memory: trimmed working set / private | 1.0 / 1.9 MiB | 1.2 / 2.6 MiB | 2 / 4 MiB |
 | Window: open to painted (median) | 41 ms | 43 ms | 100 ms |
 | Window open: working set | 13.5 MiB | 14.4 MiB | 40 MiB |
 | Window closed: working set (trimmed) | 1.5 MiB | 1.5 MiB | 2 MiB |
 | Unchanged check: CPU, file reads and writes | 31 ms, 0, 0 | 16 ms, 0, 0 | 50 ms, 0 |
-| Exe size | 0.91 MiB | 0.91 MiB | 1 MiB |
+| Exe size | 0.93 MiB | 0.93 MiB | 1 MiB |
 
 Windows counts a process's CPU time in ticks of 15.6 ms, so an unchanged check shows as one to three ticks (16 to
 47 ms) from run to run. The exe is built for size: built for speed it would be 1.01 MiB, over its budget, and hash
@@ -340,6 +372,16 @@ the rows within about two screens of what is shown are made at first; the rest a
 for every skill, it took 120 ms). Widening the list of repositories under the mouse takes 18 ms with those 463 skills
 on the page.
 
+The start at sign-in (`--background`) is measured against what Task Manager calls a "low" startup impact: under 300 ms
+of CPU and under 300 KB of disk I/O. It was measured later, when the second repository had 464 skills and 1,556 files.
+For its first 30 seconds the app only shows its icon: in the first 3 seconds it read its settings and nothing else,
+wrote nothing and ran no job. Then it looks at the skills at low priority, so it gives way to everything else Windows
+does then. That look costs what the start-up check costs, and nearly all of its reads are `state.json`, about 500 bytes
+for each installed file. A repository that is due is checked after it, at the cost of an unchanged check. These are
+warm runs: at a real sign-in the files are not in the cache yet. Task Manager rates startup apps from a trace Windows
+records at each start, and it is not known whether that trace still runs 30 seconds in (see
+[Limitations](#limitations)).
+
 Left running for 75 minutes against a test repository with a 5-minute interval and seven upstream changes
 (`scripts\soak.ps1`), the app kept 6 threads and about 340 handles, used 297 ms of CPU in all (0.006 % of one core) and
 ended at 3.2 MiB of private memory. Each change reached the disk within one interval (271 to 306 s). A second run of
@@ -347,7 +389,17 @@ ended at 3.2 MiB of private memory. Each change reached the disk within one inte
 
 ## Limitations
 
-- No installer, no automatic start at sign-in, no signed exe, no automatic updates of the app itself.
+- No installer, no signed exe, no automatic updates of the app itself.
+- Start with Windows names the exe by its path, and Windows starts no command over 260 characters, so the path can be
+  at most 245 characters (the rest is the quotes and `--background`). In a deeper folder the app names itself by its
+  short (8.3) path, such as `C:\Users\you\AppData\Local\TINY-S~1\TINY-S~1.EXE`, which works only on drives that keep
+  short names (most `C:` drives do). When even that is too long, the switch is greyed out, and the line under it says
+  to move the app to a shorter folder.
+- Start with Windows is tested by starting the app with the command Windows reads at sign-in, the way Windows starts
+  it. The tests cannot sign in to Windows themselves.
+- Task Manager's rating of the start at sign-in has not been seen at a real sign-in. The app waits 30 seconds before it
+  looks at the skills; if Task Manager still counts that look, more than about 600 installed files can make it say
+  "medium" impact rather than "low" (see [Measured cost](#measured-cost)).
 - It is not checked yet whether a running Copilot session notices new or changed skills without a restart.
 - A repository that is renamed or moved on GitHub is reported as a failure; update its address yourself.
 - No icon in the exe file, and the tray icon is drawn for the screen scale at start.

@@ -11,6 +11,9 @@ $TestTempPattern = '^tss-(it|apply|fsx|config|engine|state|verify|winfs)-'
 $ScriptTempPattern = '^tss-(dryrun|bench|e2e|soak)-'
 # Files the live scripts (e2e, soak) make in %TEMP% to talk to GitHub.
 $ScriptTempFilePattern = '^tss-gh-body-[0-9a-f]+\.json$'
+# Where a copy started with TSS_HOME keeps its startup entry, one key per app folder (autostart::TEST_ROOT). A copy
+# with an app folder of its own never writes Windows' Run key.
+$TestRegistryRoot = 'HKCU:\Software\tiny-skill-sync-test'
 
 function Use-Cargo {
     if (Get-Command cargo -ErrorAction SilentlyContinue) { return }

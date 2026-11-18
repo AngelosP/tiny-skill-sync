@@ -1,5 +1,6 @@
 //! The only place that talks to Win32 directly. The rest of the crate stays plain Rust and easy to test.
 
+pub mod autorun;
 pub mod console;
 pub mod cred;
 pub mod fs;

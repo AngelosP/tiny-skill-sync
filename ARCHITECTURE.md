@@ -41,6 +41,7 @@ case by case. Code that talks to Windows is kept in `src\win\`.
 | `interval` | `30m`, `6h`, `1d`, `2w`, `1mo` and calendar-month arithmetic. | yes |
 | `board` | What the tray and the window say: one line per repository and per skill, and the buttons. | yes |
 | `app` | The tray app without its windows: which job runs next and when to wake up. | yes |
+| `autostart` | Start with Windows: what the startup entry says, what it means, and which registry keys may be written. | yes |
 | `diff` | What is different between the GitHub copy of a skill and the copy on disk, line by line ("Show changes"). | yes |
 | `text` | When two copies of a file are the same: line endings, the line break at the end and blank lines don't count. | yes |
 | `state` | `state.json`, the ownership record: what the app installed, file by file. | file I/O |
@@ -53,6 +54,7 @@ case by case. Code that talks to Windows is kept in `src\win\`.
 | `win::fs` | File facts `std` does not give: file id, USN, volume, links; one-handle folder listing. | Windows |
 | `win::http` | A small blocking HTTP client on WinHTTP. The only networking code. | Windows |
 | `win::cred`, `win::proc` | The token from Credential Manager, or from `gh auth token`. | Windows |
+| `win::autorun` | The startup entry in the registry: read, written and deleted only when the user asks. | Windows |
 | `win::ui` | The tray icon, the window, questions, and the controls they are drawn with (see [below](#the-tray-and-the-window)). | Windows |
 
 ## Threads and waking up
@@ -72,6 +74,7 @@ sequenceDiagram
     participant E as Engine
     Note over UI: start: one copy per app folder (named mutex)
     UI->>UI: hidden window and tray icon (about 8 ms)
+    Note over UI: started at sign-in: 30 s pass first, unless you come
     UI->>W: Startup job
     W->>E: startup: finish interrupted changes, load the record, quick check
     E-->>W: report
@@ -85,12 +88,21 @@ sequenceDiagram
 ```
 
 Timed checks run in Windows' background mode (low I/O and CPU priority); the start-up look and checks you ask for run
-at normal priority. After the start-up job, after a timed check and when the window closes, the app trims its
-working set so it holds about 1 MiB while idle.
+at normal priority, except the start-up look after a start at sign-in (below). After the start-up job, after a timed
+check and when the window closes, the app trims its working set so it holds about 1 MiB while idle.
 
 `app.rs` guards against busy loops whatever the engine answers: a job that could not run at all is retried after
 5 minutes, doubling up to an hour; a job that found `tss` working is retried after a minute; two timed checks are at
 least 30 seconds apart; and after the computer wakes from sleep, the app waits 30 seconds for the network.
+
+Started by Windows at sign-in (`--background`, see [Start with Windows](#start-with-windows)), the app shows its icon
+and then does nothing for 30 seconds (`SIGN_IN_GRACE`), so that Windows can finish starting and the network can come
+up: the start-up job is taken off the queue (`App::started_by_windows`) and the timer queues it when the time is up.
+It then runs in background mode, followed by the check of any repository that is due. Meanwhile the icon is a blue
+ring with the tooltip "waiting for Windows to finish starting" (`Health::Waiting`). Someone coming ends the wait:
+opening the window, or any job they ask for, queues the start-up job at once at normal priority (`App::user_here`);
+timed checks still wait for the 30 seconds. A look the skills folder's notification asks for during the wait is
+dropped, because the start-up job looks anyway.
 
 A change in the skills folder only leads to a read-only look, two seconds after the last change, so the window shows
 an edit without waiting for the next check. Safety never depends on it: every change starts by comparing
@@ -365,6 +377,38 @@ all is well. A skill row opens to show its whole text (`Row.detail`, `board.rs`)
 you starts open. Text that came from a repository passes through `printable` before it is shown, so a name cannot carry
 control or text-direction characters.
 
+## Start with Windows
+
+Windows starts the app at sign-in from one `REG_SZ` value, `Tiny Skill Sync`, under the user's
+`HKCU\Software\Microsoft\Windows\CurrentVersion\Run` key: `"<path of tiny-skill-sync.exe>" --background`. Windows reads
+that key once the desktop is up, at a low priority and after a delay of its own. Task Manager's Startup apps page and
+Settings > Apps > Startup switch an entry off with a binary value of the same name under
+`...\Explorer\StartupApproved\Run`, whose first byte is odd then.
+
+`autostart.rs` decides, and is pure. `Startup::decide` turns the entry and that mark into one of five states: off, on,
+switched off in Windows (the app's own entry with an odd mark), another copy (the entry starts an exe at another
+path) and too long. The entry is matched by the program it starts, found the way Windows finds it (`program`), with
+no case and in either form of this exe's path. `win\autorun.rs` reads and writes the registry:
+
+- It reads only when the Settings page is shown, before the offer to turn it on after the first repository is added,
+  and in `tss startup`. Never at start or on a timer.
+- It writes only when the user turns the switch, accepts the offer or runs `tss startup on|off`, and never puts back
+  an entry the user deleted or switched off. Turning it on writes the entry and deletes Windows' mark; turning it off
+  deletes both, but only when the entry starts this copy.
+- Windows starts no command over 260 characters from the `Run` key (`MAX_COMMAND`), so the entry names the exe by its
+  long path when the command fits (a path of at most 245 characters), else by its short (8.3) path from
+  `GetShortPathNameW`. When neither fits, the state is too long and the switch is greyed out. The `\\?\` prefix is
+  never written.
+- A copy with an app folder of its own (`TSS_HOME`: the scripts and tests) keeps its entry and mark under
+  `HKCU\Software\tiny-skill-sync-test\<instance>\`, which Windows never reads. `Keys::allowed` and `autorun::guard`
+  refuse to write any other key, and refuse Windows' own keys from the tests and from such a copy whatever keys it is
+  handed. `scripts\dev.ps1 clean` deletes `HKCU\Software\tiny-skill-sync-test`.
+
+`--background` is all a start at sign-in changes: no window (unless `config.json` can't be read, which the window
+says), the 30-second wait described in [Threads and waking up](#threads-and-waking-up), and a second start while a copy
+runs ends at once with 0 instead of opening that copy's window. `build.rs` writes a version resource into both exes
+(about 1 KiB), so Task Manager names the entry "Tiny Skill Sync" rather than the exe's file name.
+
 ## Measuring
 
 When `TSS_BENCH_REPORT` names a file, the tray app appends timing marks to it (`src\win\ui\bench.rs`): the tray icon
@@ -385,6 +429,7 @@ text fits (`scripts\e2e-lib.ps1`). See [CONTRIBUTING.md](CONTRIBUTING.md#live-en
 | How edits are found | `verify.rs`, `win\fs.rs` |
 | Requests to GitHub | `github.rs`, `win\http.rs` |
 | When checks happen | `scheduler.rs`, `app.rs` |
+| Start with Windows | `autostart.rs` (what is written and what it means), `win\autorun.rs` (the registry), `app.rs` (the wait at sign-in) |
 | What the user reads | `board.rs` (tray and window), `win\ui\page.rs` (the window's pages), `cli.rs` (`tss`) |
 | How two copies of a file are compared | `text.rs` (when they are the same), `diff.rs` (Show changes) |
 | The windows | `win\ui\window.rs`, `win\ui\tray.rs`, `win\ui\dialogs.rs` |

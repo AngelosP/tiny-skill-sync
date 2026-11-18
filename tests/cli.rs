@@ -3,15 +3,23 @@
 
 mod common;
 
+use std::ffi::c_void;
 use std::net::TcpListener;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::ptr::null_mut;
 use std::sync::{Arc, Mutex};
 
 use common::*;
+use tiny_skill_sync::autostart::{Keys, Startup, TEST_ROOT, VALUE_NAME, program};
+use tiny_skill_sync::board::APP_NAME;
 use tiny_skill_sync::cli::{self, Host};
 use tiny_skill_sync::config::{CONFIG_FILE, Config};
 use tiny_skill_sync::github::{FailureKind, Remote, RemoteError, TokenProvider};
+use tiny_skill_sync::win::{autorun, wide};
+use windows_sys::Win32::Foundation::ERROR_SUCCESS;
+use windows_sys::Win32::Storage::FileSystem::{GetFileVersionInfoSizeW, GetFileVersionInfoW, VS_FFI_SIGNATURE, VS_FIXEDFILEINFO, VerQueryValueW};
+use windows_sys::Win32::System::Registry::{HKEY_CURRENT_USER, RRF_RT_REG_SZ, RegDeleteTreeW, RegGetValueW};
 
 struct TestHost {
     world: World,
@@ -20,6 +28,8 @@ struct TestHost {
     saved: Mutex<Option<String>>,
     gh: Result<(), String>,
     typed: Mutex<Option<String>>,
+    /// What the registry layer would say. It is tested on the registry itself; here only what `tss` makes of it.
+    startup: Mutex<Result<Startup, String>>,
 }
 
 impl Host for TestHost {
@@ -59,6 +69,22 @@ impl Host for TestHost {
     fn read_token(&self) -> Result<String, String> {
         self.typed.lock().unwrap().take().ok_or_else(|| "no token was given".to_string())
     }
+
+    fn startup(&self) -> Result<Startup, String> {
+        self.startup.lock().unwrap().clone()
+    }
+
+    fn set_startup(&self, on: bool) -> Result<Startup, String> {
+        let mut state = self.startup.lock().unwrap();
+        let now = match (on, state.clone()?) {
+            (true, Startup::TooLong) => return Err("this copy's path is too long for Windows to start it".to_string()),
+            (true, _) => Startup::On,
+            (false, Startup::On | Startup::OffInWindows) => Startup::Off,
+            (false, other) => other,
+        };
+        *state = Ok(now.clone());
+        Ok(now)
+    }
 }
 
 impl TestHost {
@@ -79,6 +105,7 @@ impl TestHost {
             saved: Mutex::new(None),
             gh: Err("the GitHub CLI is not signed in".to_string()),
             typed: Mutex::new(None),
+            startup: Mutex::new(Ok(Startup::Off)),
         }
     }
 
@@ -414,6 +441,38 @@ fn the_token_is_saved_shown_and_cleared() {
 }
 
 #[test]
+fn start_with_windows_is_shown_and_switched_and_nothing_else_is_touched() {
+    let host = TestHost::new("cli-startup");
+    let before = host.world.snapshot();
+    let set = |state: Startup| *host.startup.lock().unwrap() = Ok(state);
+    expect(&tss(&host, "startup"), 0, &["Start with Windows: off\nStarts in the tray when you sign in to Windows, without opening its window.\n"]);
+    expect(&tss(&host, "startup on"), 0, &["Start with Windows: on\n"]);
+    expect(&tss(&host, "startup status"), 0, &["Start with Windows: on\n"]);
+    expect(&tss(&host, "Startup OFF"), 0, &["Start with Windows: off\n"]);
+    assert_eq!(*host.startup.lock().unwrap(), Ok(Startup::Off));
+
+    set(Startup::OffInWindows);
+    expect(&tss(&host, "startup"), 0, &["Start with Windows: off\n", "Task Manager or Settings). Run 'tss startup on' to start it again."]);
+    let other = r"D:\old\tiny-skill-sync.exe";
+    set(Startup::OtherCopy(other.to_string()));
+    let ran = tss(&host, "startup off");
+    expect(&ran, 0, &["Start with Windows: off\n", &format!("Windows starts another copy when you sign in: {other}. Run 'tss startup on'")]);
+    assert!(ran.err.is_empty(), "{ran:?}");
+
+    set(Startup::TooLong);
+    expect(&tss(&host, "startup"), 0, &["Start with Windows: not possible\n", "path is too long for Windows to start it"]);
+    expect(&tss(&host, "startup on"), 2, &["tss: Start with Windows could not be turned on: this copy's path is too long"]);
+    *host.startup.lock().unwrap() = Err("Access is denied. (os error 5)".to_string());
+    let ran = tss(&host, "startup");
+    expect(&ran, 2, &["tss: Start with Windows cannot be read: Access is denied. (os error 5)"]);
+    assert!(ran.out.is_empty(), "nothing is said to be on or off: {ran:?}");
+    expect(&tss(&host, "startup off"), 2, &["tss: Start with Windows could not be turned off: Access is denied."]);
+
+    assert_eq!(host.world.snapshot(), before, "no settings, state or skills");
+    assert!(host.remote.log().is_empty(), "nothing is asked of GitHub");
+}
+
+#[test]
 fn a_repository_found_to_be_private_is_shown_as_sending_the_token() {
     let host = TestHost { tokens: FakeTokens::some("tok"), gh: Ok(()), ..TestHost::new("cli-auto-token") };
     host.remote.make_private(REPO, "tok");
@@ -483,4 +542,104 @@ fn the_executable_runs_against_its_own_folders() {
     let ran = exe(&world, &dead, &["check"]);
     expect(&ran, 2, &["[o-fixtures]: No connection", "Nothing is deleted because a check failed."]);
     assert!(world.skill_names().is_empty());
+}
+
+/// The startup entry's keys of an app folder, which Windows never reads. Deleted when the test ends.
+struct OwnKeys(Keys);
+
+impl OwnKeys {
+    fn of(home: &Path) -> OwnKeys {
+        let keys = Keys::choose(Some(home));
+        assert!(keys.run.starts_with(TEST_ROOT) && keys.approved.starts_with(TEST_ROOT), "{keys:?}");
+        OwnKeys(keys)
+    }
+
+    fn entry(&self) -> Option<String> {
+        let (key, name) = (wide(&self.0.run), wide(VALUE_NAME));
+        let mut buf = vec![0u16; 2048];
+        let mut size = (buf.len() * 2) as u32;
+        let status = unsafe { RegGetValueW(HKEY_CURRENT_USER, key.as_ptr(), name.as_ptr(), RRF_RT_REG_SZ, null_mut(), buf.as_mut_ptr().cast(), &mut size) };
+        (status == ERROR_SUCCESS).then(|| String::from_utf16_lossy(&buf[..size as usize / 2]).trim_end_matches('\0').to_string())
+    }
+}
+
+impl Drop for OwnKeys {
+    fn drop(&mut self) {
+        let root = self.0.run.strip_suffix(r"\Run").expect("a key of its own");
+        unsafe { RegDeleteTreeW(HKEY_CURRENT_USER, wide(root).as_ptr()) };
+    }
+}
+
+#[test]
+fn the_executable_has_windows_start_the_tray_app_beside_it() {
+    let world = World::new("cli-exe-startup");
+    let keys = OwnKeys::of(&world.home);
+    let port = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+    let dead = format!("http://127.0.0.1:{port}");
+
+    expect(&exe(&world, &dead, &["startup"]), 0, &["Start with Windows: off"]);
+    expect(&exe(&world, &dead, &["startup", "on"]), 0, &["Start with Windows: on"]);
+    let entry = keys.entry().expect("the entry is in the key of this app folder");
+    let tray = autorun::exe_at(Path::new(env!("CARGO_BIN_EXE_tiny-skill-sync")));
+    assert!(tray.is(program(&entry)) && entry.ends_with("\" --background"), "{entry}");
+    expect(&exe(&world, &dead, &["startup"]), 0, &["Start with Windows: on"]);
+    expect(&exe(&world, &dead, &["startup", "off"]), 0, &["Start with Windows: off"]);
+    assert_eq!(keys.entry(), None);
+}
+
+/// A program's version resource, as Windows reads it.
+struct VersionInfo(Vec<u8>);
+
+impl VersionInfo {
+    fn of(exe: &str) -> Option<VersionInfo> {
+        let path = wide(exe);
+        let size = unsafe { GetFileVersionInfoSizeW(path.as_ptr(), null_mut()) };
+        let mut data = vec![0u8; size as usize];
+        (size > 0 && unsafe { GetFileVersionInfoW(path.as_ptr(), 0, size, data.as_mut_ptr().cast()) } != 0).then_some(VersionInfo(data))
+    }
+
+    /// The value at `path`, and its size: in bytes, or in characters for a string.
+    fn query(&self, path: &str) -> Option<(*const c_void, usize)> {
+        let (mut value, mut len) = (null_mut(), 0u32);
+        let found = unsafe { VerQueryValueW(self.0.as_ptr().cast(), wide(path).as_ptr(), &mut value, &mut len) } != 0;
+        (found && !value.is_null()).then_some((value.cast_const(), len as usize))
+    }
+
+    /// One of its strings, in the language its translation names, as Task Manager and Explorer look it up.
+    fn text(&self, name: &str) -> Option<String> {
+        let (value, len) = self.query(r"\VarFileInfo\Translation")?;
+        assert!(len >= 4, "a translation is a language and a code page");
+        let (language, page) = unsafe { (*value.cast::<u16>(), *value.cast::<u16>().add(1)) };
+        let (value, len) = self.query(&format!(r"\StringFileInfo\{language:04x}{page:04x}\{name}"))?;
+        let units = unsafe { std::slice::from_raw_parts(value.cast::<u16>(), len) };
+        Some(String::from_utf16_lossy(units).trim_end_matches('\0').to_string())
+    }
+
+    /// Its file and product versions, in numbers.
+    fn numbers(&self) -> Option<[u32; 4]> {
+        let (value, len) = self.query(r"\")?;
+        assert_eq!(len, size_of::<VS_FIXEDFILEINFO>());
+        let fixed = unsafe { &*value.cast::<VS_FIXEDFILEINFO>() };
+        assert_eq!(fixed.dwSignature, VS_FFI_SIGNATURE as u32);
+        assert_eq!((fixed.dwProductVersionMS, fixed.dwProductVersionLS), (fixed.dwFileVersionMS, fixed.dwFileVersionLS));
+        Some([fixed.dwFileVersionMS >> 16, fixed.dwFileVersionMS & 0xFFFF, fixed.dwFileVersionLS >> 16, fixed.dwFileVersionLS & 0xFFFF])
+    }
+}
+
+#[test]
+fn both_executables_tell_windows_their_name_and_version() {
+    let number = |n: &str| n.parse::<u32>().unwrap();
+    let numbers = [number(env!("CARGO_PKG_VERSION_MAJOR")), number(env!("CARGO_PKG_VERSION_MINOR")), number(env!("CARGO_PKG_VERSION_PATCH")), 0];
+    for (exe, file, description) in [
+        (env!("CARGO_BIN_EXE_tiny-skill-sync"), "tiny-skill-sync.exe", APP_NAME.to_string()),
+        (env!("CARGO_BIN_EXE_tss"), "tss.exe", format!("{APP_NAME} command line")),
+    ] {
+        let info = VersionInfo::of(exe).unwrap_or_else(|| panic!("{exe} has no version resource"));
+        assert_eq!(info.text("FileDescription"), Some(description), "the name Task Manager's startup apps show");
+        assert_eq!(info.text("ProductName").as_deref(), Some(APP_NAME));
+        assert_eq!(info.text("OriginalFilename").as_deref(), Some(file));
+        assert_eq!(info.text("FileVersion").as_deref(), Some(env!("CARGO_PKG_VERSION")));
+        assert_eq!(info.text("ProductVersion").as_deref(), Some(env!("CARGO_PKG_VERSION")));
+        assert_eq!(info.numbers(), Some(numbers), "{file}");
+    }
 }

@@ -8,8 +8,10 @@
   (named e2e-STAMP-SCENARIO; nothing else is ever changed or deleted). Both are removed afterwards (-Keep leaves the
   folders). Needs the network and a signed-in GitHub CLI (gh) that may push to the test repositories.
 
-  Nothing here touches the real skills folder, the real settings or the saved GitHub token. While a scenario runs,
-  its tray app shows an icon in the notification area, and the ui scenario opens and moves windows on screen.
+  Nothing here touches the real skills folder, the real settings, the saved GitHub token or Windows' startup apps (a
+  copy started with TSS_HOME keeps its Start with Windows entry in keys of its own, which the scenarios delete). While a
+  scenario runs, its tray app shows an icon in the notification area, and the ui scenario opens and moves windows on
+  screen.
 
   Scenarios (all by default; name some with -Only):
     install       first start: what is installed, how the idle app behaves, how fast it quits
@@ -25,6 +27,7 @@
     failures      a bad network, bad answers, a bad token: the skills folder must not change
     stale         GitHub answering with a tree that is newer than its commit
     empty         a repository added as a whole when its skills are in a subfolder
+    signin        Start with Windows: the entry, a start the way Windows starts it at sign-in, copies in long folders
     ui            the window, its questions and the tray menu, driven and read from outside, with screenshots
 
   A summary table is printed at the end and the whole run is saved in bench\out\e2e-STAMP.txt. The exit code is 1
@@ -127,9 +130,10 @@ function Get-EnvOf($c, [hashtable]$More = @{}) {
     $e
 }
 
-# Runs the command line on the scenario's folder and writes down what it printed.
-function Tss($c, [string[]]$TssArgs, [hashtable]$Env = @{}) {
-    $r = Invoke-LiveTss $c.Root $TssArgs (Get-EnvOf $c $Env)
+# Runs the command line on the scenario's folder and writes down what it printed. $Exe runs another copy of tss.exe.
+function Tss($c, [string[]]$TssArgs, [hashtable]$Env = @{}, [string]$Exe = '') {
+    $r = Invoke-LiveTss $c.Root $TssArgs (Get-EnvOf $c $Env) -Exe $Exe
+    if ($Exe) { Log "  tss at $Exe" 'DarkGray' }
     Log ('  > tss {0}   (exit {1})' -f ($TssArgs -join ' '), $r.Code) 'DarkGray'
     foreach ($line in ($r.Text -split "`r?`n")) { if ($line.Trim()) { Log "      $line" 'DarkGray' } }
     $r
@@ -250,6 +254,7 @@ function Test-Install {
 function Test-Places {
     $c = New-Env 'places' -NoBranch
     try {
+        $realStartup = Get-RealStartup
         $user = Join-Path $c.Root 'user'
         $local = Join-Path $c.Root 'local'
         $copilot = Join-Path $user '.copilot'
@@ -339,6 +344,8 @@ function Test-Places {
         $r = Tss $c @('status') $real
         Check 'it left the edited one as it is, and tss status shows it as edited' ([IO.File]::ReadAllText($edited) -eq $editedText -and $r.Text -match 'beta: Edited locally') "exit $($r.Code)"
         Check 'the skill written by hand is untouched, and so is the folder the tray left' ((Get-DiskStamp (Join-Path $skills 'my-own')) -eq $mine -and (Get-DiskStamp $moved) -eq $movedStamp) ''
+        $after = Get-RealStartup
+        Check 'Windows'' startup apps were not touched' ($after -eq $realStartup) $after
     } finally { Close-Env $c }
 }
 
@@ -1140,6 +1147,8 @@ function Test-ListHover($c, [IntPtr]$Window, [switch]$Diff) {
 function Test-Ui {
     Add-Type -AssemblyName System.Windows.Forms
     $c = New-Env 'ui' -WithProxy
+    $keys = Get-StartupKeys $c.Home
+    $uiEntry = "`"$([TssLive]::LongPath((Join-Path $c.Root 'bin\tiny-skill-sync.exe')))`" --background"
     try {
         $area = [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea
         $tray = $null
@@ -1180,8 +1189,12 @@ function Test-Ui {
         $delete = Read-Ui $win $UiPanel.Page 324
         $agrees = ($token -match 'No token is saved, so your GitHub CLI sign-in is used' -and $save -like 'Save a token*' -and $null -eq $delete) -or ($token -match 'Your token is saved' -and $save -like 'Replace token*' -and $delete -eq 'Delete token')
         Check 'it says the token is used by itself, and offers to save, replace or delete one as fits' $agrees "$token / $save / $delete"
+        $switch = Find-Ui $win $UiPanel.Page $UiId.Startup
+        $startNote = Read-Ui $win $UiPanel.Page $UiId.StartupText
+        $offSwitch = $switch -ne [IntPtr]::Zero -and [TssLive]::IsWindowEnabled($switch) -and -not (Get-Checked $win $UiPanel.Page $UiId.Startup)
+        Check 'it has a Start with Windows switch, off and ready to turn on, and says what it does' ($offSwitch -and $startNote -eq 'Starts in the tray when you sign in to Windows, without opening its window.') $startNote
         $pic = Save-Shot $win '02-settings'
-        Test-Painted $pic $win 'Settings' @(@($UiPanel.Page, $UiId.DefaultEvery), @($UiPanel.Page, $UiId.SkillsDir), @($UiPanel.Page, 323))
+        Test-Painted $pic $win 'Settings' @(@($UiPanel.Page, $UiId.DefaultEvery), @($UiPanel.Page, $UiId.Startup), @($UiPanel.Page, $UiId.SkillsDir), @($UiPanel.Page, 323))
         Test-Layout $win 'Settings'
         Test-TabOrder $win 'Settings'
 
@@ -1206,6 +1219,25 @@ function Test-Ui {
         $c.Proxy.SetMode('api', 'slow:2500')
         Click-Ui $ask $AskPanel $AskId.Ok
         $seen = New-Object System.Collections.Generic.List[string]
+        $sample = { $t = Read-Ui $win $UiPanel.Hero $UiId.HeroSub; if ($t -and -not $seen.Contains($t)) { $seen.Add($t) } }
+
+        # ---- the first repository added: the offer to start with Windows comes over the window while the check goes on
+        $offer = Wait-Maybe { & $sample; $d = Find-Ask $tray; if ($d -ne [IntPtr]::Zero -and (Read-Ui $d $AskPanel $AskId.Heading) -eq 'Start with Windows?') { $d } } 10
+        Check 'adding the first repository offers to start with Windows' ($null -ne $offer)
+        if ($null -ne $offer) {
+            $said = Read-Ui $offer $AskPanel $AskId.Text
+            $yes = Read-Ui $offer $AskPanel $AskId.Ok
+            $no = Read-Ui $offer $AskPanel $AskId.Cancel
+            $plainly = $said -match 'start in the tray when you sign in' -and $said -match 'does not slow your sign-in down' -and $said -match 'change this in Settings'
+            Check 'it says it starts in the tray, does not slow sign-in down and can be changed in Settings, with Turn on and Not now' ($plainly -and $yes -eq 'Turn on' -and $no -eq 'Not now') "$said / $yes / $no"
+            $pic = Save-Shot $offer '04a-start-with-windows'
+            Test-Painted $pic $offer 'the offer to start with Windows' @(@($AskPanel, $AskId.Heading), @($AskPanel, $AskId.Text), @($AskPanel, $AskId.Ok), @($AskPanel, $AskId.Cancel))
+            Test-Layout $offer 'the offer to start with Windows'
+            Test-TabOrder $offer 'the offer to start with Windows'
+            Click-Ui $offer $AskPanel $AskId.Cancel
+            $closed = Wait-Maybe { & $sample; if ((Find-Ask $tray) -eq [IntPtr]::Zero) { $true } } 5
+            Check '"Not now" closes it and writes no entry' ($closed -and $null -eq (Read-StartupEntry $keys)) "entry: $(Read-StartupEntry $keys)"
+        }
         $worst = 0
         $watch = [Diagnostics.Stopwatch]::StartNew()
         $done = $false
@@ -1258,6 +1290,28 @@ function Test-Ui {
         Choose-Ui $win $UiPanel.Page $UiId.DefaultEvery '6 hours'
         $cfg = Wait-Maybe { $x = Get-Config $c; if ($x -and $x.default_interval -eq '6h') { $x } } 8
         Check 'choosing 6 hours as the default in Settings is saved, and the repository keeps its own' ($null -ne $cfg -and $cfg.repos[0].interval -eq '12h') ('default ' + $(if ($cfg) { $cfg.default_interval } else { '-' }))
+
+        # ---- Start with Windows, in Settings
+        Click-Ui $win $UiPanel.Page $UiId.Startup
+        $on = Wait-Maybe { if ((Read-StartupEntry $keys) -and (Get-Checked $win $UiPanel.Page $UiId.Startup)) { $true } } 8
+        $now = Read-StartupEntry $keys
+        Check 'turning Start with Windows on writes an entry that starts this copy with --background' ($on -and $now -eq $uiEntry) $now
+        [void](Save-Shot $win '07a-startup-on')
+        Set-StartupMark $keys
+        Click-Ui $win $UiPanel.Nav $UiId.NavActivity
+        [void](Wait-Maybe { if ((Find-Ui $win $UiPanel.Page $UiId.Startup) -eq [IntPtr]::Zero) { $true } } 5)
+        Click-Ui $win $UiPanel.Nav $UiId.NavSettings
+        $said = Wait-Maybe { $t = Read-Ui $win $UiPanel.Page $UiId.StartupText; if ($t -match 'turned off in Windows' -and -not (Get-Checked $win $UiPanel.Page $UiId.Startup)) { $t } } 8
+        Check 'switched off in Task Manager, Settings shows the switch off, says so, and how to start it again' ($said -match 'Turn it on here to start it again') (Read-Ui $win $UiPanel.Page $UiId.StartupText)
+        $pic = Save-Shot $win '07b-off-in-windows'
+        Test-Painted $pic $win 'Start with Windows switched off in Windows' @(@($UiPanel.Page, $UiId.Startup), @($UiPanel.Page, $UiId.StartupText))
+        Click-Ui $win $UiPanel.Page $UiId.Startup
+        $back = Wait-Maybe { if ($null -eq (Read-StartupMark $keys) -and (Get-Checked $win $UiPanel.Page $UiId.Startup)) { $true } } 8
+        Check 'turning it on there deletes Windows'' mark and keeps the entry' ($back -and (Read-StartupEntry $keys) -eq $uiEntry) "mark: $(Read-StartupMark $keys)"
+        Click-Ui $win $UiPanel.Page $UiId.Startup
+        $off = Wait-Maybe { if ($null -eq (Read-StartupEntry $keys) -and -not (Get-Checked $win $UiPanel.Page $UiId.Startup)) { $true } } 8
+        Check 'turning it off deletes the entry' ($null -ne $off) "entry: $(Read-StartupEntry $keys)"
+
         Open-Repo $win 0
         Choose-Ui $win $UiPanel.Page $UiId.Every 'Default (6 hours)'
         $cfg = Wait-Maybe { $x = Get-Config $c; if ($x -and -not $x.repos[0].interval) { $x } } 8
@@ -1469,7 +1523,202 @@ function Test-Ui {
         Check 'the app showed no error box' ($box -eq [IntPtr]::Zero)
         Send-LiveCommand $tray $CMD_QUIT
         Check 'Quit ends the app' ($tray.WaitForExit(5000))
-    } finally { Close-Env $c }
+    } finally {
+        if (-not $Keep) { try { Remove-StartupKeys $keys } catch { Note "could not delete $($keys.Root): $_" } }
+        Close-Env $c
+    }
+}
+
+# ---------------------------------------------------------------- signin
+
+# Start with Windows. A copy started with TSS_HOME keeps its entry in keys of its own under $TestKeyRoot, never in
+# Windows' keys, and the scenario starts the app from that entry the way Windows does when the user signs in: the
+# command line exactly as written, from System32. Windows' own keys are read before and after, to prove they were not
+# touched. Copies in deep folders show how a path too long for Windows to start is named by its short (8.3) form.
+function Test-Signin {
+    $c = New-Env 'signin' -NoBranch
+    $keys = Get-StartupKeys $c.Home
+    $running = New-Object System.Collections.Generic.List[object]
+    try {
+        $real = Get-RealStartup
+        $mainTray = [TssLive]::LongPath((Join-Path $c.Root 'bin\tiny-skill-sync.exe'))
+        $entry = "`"$mainTray`" --background"
+        $quiet = @{ TSS_HOME = $c.Home; TSS_SKILLS_DIR = $c.Skills; TSS_BENCH_REPORT = $null }
+        $plain = 'Starts in the tray when you sign in to Windows, without opening its window.'
+        $other = { param([string]$Path) "Windows starts another copy when you sign in: $Path. Run 'tss startup on' to start this copy instead." }
+        # What tss startup printed: exit 0, the state in a few words, then the note.
+        $says = {
+            param($r, [string]$Summary, [string]$Said)
+            $lines = @($r.Text -split "`r?`n" | Where-Object { $_.Trim() })
+            $r.Code -eq 0 -and $lines.Count -eq 2 -and $lines[0] -eq "Start with Windows: $Summary" -and $lines[1] -eq $Said
+        }
+        $inTray = { param([Diagnostics.Process]$P) Wait-Maybe { if ((Find-LiveWindow $P.Id $TRAY_CLASS) -ne [IntPtr]::Zero) { $true } } 10 }
+
+        # ---- the entry, through tss startup
+        $r = Tss $c @('startup')
+        Check 'at first tss startup says off, and what turning it on does; looking writes nothing' ((& $says $r 'off' $plain) -and -not (Test-Path -LiteralPath "HKCU:\$($keys.Root)")) ''
+        $r = Tss $c @('startup', 'on')
+        $now = Read-StartupEntry $keys
+        Check 'tss startup on: on, and the entry starts this copy''s tray app with --background' ((& $says $r 'on' $plain) -and $now -eq $entry -and $null -eq (Read-StartupMark $keys)) $now
+        Set-StartupMark $keys
+        $r = Tss $c @('startup')
+        Check 'switched off in Task Manager: tss startup says off, and how to start it again' (& $says $r 'off' "It is turned off in Windows' startup apps (Task Manager or Settings). Run 'tss startup on' to start it again.") ''
+        $r = Tss $c @('startup', 'on')
+        Check 'tss startup on then deletes Windows'' mark and keeps the entry' ((& $says $r 'on' $plain) -and $null -eq (Read-StartupMark $keys) -and (Read-StartupEntry $keys) -eq $entry) "mark: $(Read-StartupMark $keys)"
+
+        # ---- started from the entry with nothing set up yet: the tray only
+        $p = Get-EntryProcess (Start-Entry $entry $quiet)
+        $running.Add($p)
+        $tray = & $inTray $p
+        Start-Sleep -Seconds 3
+        Check 'started from the entry with nothing set up, the app is in the tray and opens no window' ($tray -and -not $p.HasExited -and (Find-LiveWindow $p.Id $WINDOW_CLASS -Visible) -eq [IntPtr]::Zero) "pid $($p.Id)"
+        Stop-LiveTray $p
+        Check 'and quits when asked' ($p.HasExited -and $p.ExitCode -eq 0) "exit code $($p.ExitCode)"
+
+        # ---- started from the entry with a repository: for 30 s it neither looks at the skills folder nor checks
+        # GitHub, so that Windows can finish starting; then it looks, and checks
+        Add-Repo $c
+        Remove-Item -LiteralPath $c.Report -Force -ErrorAction SilentlyContinue
+        $withReport = $quiet.Clone()
+        $withReport['TSS_BENCH_REPORT'] = $c.Report
+        $clock = [Diagnostics.Stopwatch]::StartNew()
+        $c.Tray = Get-EntryProcess (Start-Entry $entry $withReport)
+        $rest = 15000 - $clock.ElapsedMilliseconds
+        if ($rest -gt 0) { Start-Sleep -Milliseconds $rest }
+        $jobs = @(Read-Marks $c.Report | Where-Object { $_.Mark -like 'job-*' } | ForEach-Object { $_.Mark })
+        $names = @(Get-SkillNames $c)
+        Check 'for its first 15 s it neither looked at the skills folder nor checked GitHub: nothing is installed yet' ($jobs.Count -eq 0 -and $names.Count -eq 0) "jobs: $($jobs -join ','); skills: $($names -join ',')"
+        [void](Wait-Live { (Get-MarkCount $c.Report 'job-startup') -ge 1 } 'the first look at the skills folder' 75)
+        $look = @(Read-Marks $c.Report | Where-Object { $_.Mark -eq 'job-startup' })[0]
+        Check ('its first look at the skills folder came after that wait: it ended {0:N1} s after the start' -f ($look.AtMs / 1000)) ($look.AtMs -ge 29000 -and $look.AtMs -lt 60000) 'between 29 and 60 s'
+        [void](Wait-Live { (Get-MarkCount $c.Report 'job-poll') -ge 1 } 'the first check of GitHub' 75)
+        $poll = @(Read-Marks $c.Report | Where-Object { $_.Mark -eq 'job-poll' })[0]
+        Check ('then it checked GitHub: the check ended {0:N1} s after the start' -f ($poll.AtMs / 1000)) ($poll.AtMs -gt $look.AtMs -and $poll.AtMs -lt 90000) 'after the look, within 90 s'
+        Wait-Settled $c
+        Note ('app marks: ' + ((@(Read-Marks $c.Report) | ForEach-Object { '{0} at {1:N0} ms' -f $_.Mark, $_.AtMs }) -join ', '))
+        $diff = Compare-WithUpstream $c.Skills $c.Repo $c.Ref 'skills'
+        $names = (Get-SkillNames $c) -join ','
+        Check 'then it installed alpha, beta and gamma, equal to upstream' ($diff.Count -eq 0 -and $names -eq 'alpha,beta,gamma') "$names; $(($diff | Select-Object -First 4) -join '; ')"
+        Check 'and it still has no window open' ((Find-LiveWindow $c.Tray.Id $WINDOW_CLASS -Visible) -eq [IntPtr]::Zero) ''
+
+        # ---- started from the entry again while it runs: the second copy ends at once, quietly
+        $again = Start-Entry $entry $quiet
+        try {
+            $code = [TssLive]::Exited($again.Handle, 8000)
+            if ($code -lt 0) { [void][TssLive]::TerminateProcess($again.Handle, 1) }
+        } finally { [void][TssLive]::CloseHandle($again.Handle) }
+        Check 'started from the entry again while it runs, the second copy ends at once with 0 and shows nothing' ($code -eq 0 -and (Find-LiveWindow $c.Tray.Id $WINDOW_CLASS -Visible) -eq [IntPtr]::Zero) "exit code $code"
+
+        # ---- started by hand while it runs: the running copy opens its window
+        $byHand = Start-LiveTray $c.Root
+        $running.Add($byHand)
+        $ended = $byHand.WaitForExit(8000)
+        $win = Wait-Maybe { $w = Find-LiveWindow $c.Tray.Id $WINDOW_CLASS -Visible; if ($w -ne [IntPtr]::Zero) { $w } } 10
+        Check 'started by hand while it runs, the second copy ends with 0 and the running copy opens its window' ($ended -and $byHand.ExitCode -eq 0 -and $null -ne $win) "ended: $ended"
+        Close-Window $c.Tray
+        Stop-LiveTray $c.Tray
+        Check 'the copy started at sign-in quits when asked' ($c.Tray.HasExited -and $c.Tray.ExitCode -eq 0) "exit code $($c.Tray.ExitCode)"
+
+        # ---- started from the entry, then by hand while it waits: someone is there to see the window, so it looks at
+        # once; checking GitHub still waits for the network
+        Remove-Item -LiteralPath $c.Report -Force -ErrorAction SilentlyContinue
+        $c.Tray = Get-EntryProcess (Start-Entry $entry $withReport)
+        [void](& $inTray $c.Tray)
+        $byHand = Start-LiveTray $c.Root
+        $running.Add($byHand)
+        $ended = $byHand.WaitForExit(8000)
+        $win = Wait-Maybe { $w = Find-LiveWindow $c.Tray.Id $WINDOW_CLASS -Visible; if ($w -ne [IntPtr]::Zero) { $w } } 10
+        [void](Wait-Live { (Get-MarkCount $c.Report 'job-startup') -ge 1 } 'the first look once the window opened' 20)
+        $look = @(Read-Marks $c.Report | Where-Object { $_.Mark -eq 'job-startup' })[0]
+        $polls = Get-MarkCount $c.Report 'job-poll'
+        Check ('started by hand while the copy started at sign-in waits, its window opens and it looks at once ({0:N1} s after its start), and checks nothing yet' -f ($look.AtMs / 1000)) ($ended -and $byHand.ExitCode -eq 0 -and $null -ne $win -and $look.AtMs -lt 15000 -and $polls -eq 0) "ended: $ended; window: $($null -ne $win); checks: $polls"
+        Close-Window $c.Tray
+        Stop-LiveTray $c.Tray
+
+        # ---- settings that cannot be read: the window opens even at sign-in, as nothing is checked until they are fixed
+        $cfgFile = Join-Path $c.Home 'config.json'
+        $saved = [IO.File]::ReadAllText($cfgFile)
+        try {
+            [IO.File]::WriteAllText($cfgFile, '{ not json')
+            $p = Get-EntryProcess (Start-Entry $entry $quiet)
+            $running.Add($p)
+            $win = Wait-Maybe { $w = Find-LiveWindow $p.Id $WINDOW_CLASS -Visible; if ($w -ne [IntPtr]::Zero) { $w } } 10
+            $hero = if ($null -ne $win) { Read-Hero $win } else { $null }
+            Check 'with settings that cannot be read, a start from the entry opens the window to say so' ($null -ne $win) $(if ($hero) { "$($hero.Title) / $($hero.Sub)" } else { '' })
+            Stop-LiveTray $p
+        } finally { [IO.File]::WriteAllText($cfgFile, $saved) }
+
+        # ---- a copy in a folder whose path is longer than Windows starts a program from: its entry names it by its short
+        # (8.3) path
+        $deep = "$($c.Root)\sf"
+        for ($i = 1; ($deep.Length + '\tiny-skill-sync.exe'.Length) -le 262; $i++) { $deep += ('\a-rather-long-folder-name-{0:d2}' -f $i) }
+        Copy-AppTo $c $deep
+        $deepTray = [TssLive]::LongPath("$deep\tiny-skill-sync.exe")
+        $shortTray = [TssLive]::ShortPath($deepTray)
+        $shortTss = [TssLive]::ShortPath("$deep\tss.exe")
+        Note ('a copy whose tray app is at a path of {0} characters; its short path has {1}' -f $deepTray.Length, $(if ($shortTray) { $shortTray.Length } else { 'none' }))
+        if (-not $shortTray -or -not $shortTss -or $shortTray -eq $deepTray) {
+            Note 'this volume keeps no short (8.3) names, so a copy in a long folder cannot be started at sign-in; not checked'
+        } else {
+            $r = Tss $c @('startup') -Exe $shortTss
+            Check 'a copy in a long folder: tss startup there says off, and names the copy Windows starts' (& $says $r 'off' (& $other $mainTray)) ''
+            $r = Tss $c @('startup', 'on') -Exe $shortTss
+            $now = Read-StartupEntry $keys
+            $fits = $now -eq "`"$shortTray`" --background" -and $now.Length -le 260 -and [TssLive]::LongPath($shortTray) -eq $deepTray
+            Check 'tss startup on there writes an entry that names it by its short path, which fits' ((& $says $r 'on' $plain) -and $fits) "$($now.Length) characters: $now"
+            $r = Tss $c @('startup')
+            Check 'and this copy''s tss startup names the other copy by that path' (& $says $r 'off' (& $other $shortTray)) ''
+
+            $p = Get-EntryProcess (Start-Entry $now $quiet)
+            $running.Add($p)
+            $tray = & $inTray $p
+            Start-Sleep -Seconds 2
+            $ran = try { [TssLive]::LongPath($p.MainModule.FileName) } catch { "unknown: $($_.Exception.Message)" }
+            Check 'Windows can start that copy from its entry: it is in the tray, with no window' ($tray -and -not $p.HasExited -and (Find-LiveWindow $p.Id $WINDOW_CLASS -Visible) -eq [IntPtr]::Zero) "running $ran"
+            Stop-LiveTray $p
+            Check 'and it quits when asked' ($p.HasExited -and $p.ExitCode -eq 0) "exit code $($p.ExitCode)"
+
+            $r = Tss $c @('startup', 'on')
+            Check 'tss startup on in this copy takes the entry back' ((& $says $r 'on' $plain) -and (Read-StartupEntry $keys) -eq $entry) (Read-StartupEntry $keys)
+            $r = Tss $c @('startup', 'off') -Exe $shortTss
+            Check 'tss startup off in the other copy leaves this copy''s entry alone' ((& $says $r 'off' (& $other $mainTray)) -and (Read-StartupEntry $keys) -eq $entry) (Read-StartupEntry $keys)
+        }
+
+        # ---- a copy in a folder so deep that even its short path is too long for an entry: the folder's short path
+        # leaves room for tss.exe (259 characters at most) but not for the entry (260)
+        $tl = "$($c.Root)\tl"
+        [void][IO.Directory]::CreateDirectory($tl)
+        $levels = [math]::Max(0, [math]::Ceiling((233 - ([TssLive]::ShortPath($tl)).Length) / 9))
+        $dir = $tl + ('\dddddddd' * $levels)
+        Copy-AppTo $c $dir
+        $shortDir = [TssLive]::ShortPath($dir)
+        $shortCommand = "`"$([TssLive]::ShortPath("$dir\tiny-skill-sync.exe"))`" --background"
+        Note ('a copy in a folder whose short path has {0} characters; its entry would have {1}' -f $shortDir.Length, $shortCommand.Length)
+        if ($shortDir.Length -lt 233 -or $shortDir.Length -gt 251 -or $shortCommand.Length -le 260) { throw "the too-deep folder is not as intended: its short path has $($shortDir.Length) characters" }
+        $deepTss = "$shortDir\tss.exe"
+        $r = Tss $c @('startup') -Exe $deepTss
+        Check 'a copy in a folder too deep for an entry: tss startup there says not possible, and why' (& $says $r 'not possible' 'This copy is in a folder whose path is too long for Windows to start it. Move it to a shorter folder to use this.') ''
+        $r = Tss $c @('startup', 'on') -Exe $deepTss
+        $lines = @($r.Text -split "`r?`n" | Where-Object { $_.Trim() })
+        $refused = $r.Code -eq 2 -and $lines.Count -eq 1 -and $lines[0] -eq "tss: Start with Windows could not be turned on: this copy's path is too long for Windows to start it"
+        Check 'and tss startup on there fails with exit 2, says why, and leaves the entry as it was' ($refused -and (Read-StartupEntry $keys) -eq $entry) "exit $($r.Code)"
+
+        # ---- off
+        $r = Tss $c @('startup', 'off')
+        Check 'tss startup off: off, with no entry and no mark left' ((& $says $r 'off' $plain) -and $null -eq (Read-StartupEntry $keys) -and $null -eq (Read-StartupMark $keys)) ''
+        $after = Get-RealStartup
+        Check 'Windows'' own startup keys were not touched' ($after -eq $real) $after
+    } finally {
+        foreach ($p in $running) { try { Stop-LiveTray $p } catch { } }
+        if (-not $Keep) { try { Remove-StartupKeys $keys } catch { Note "could not delete $($keys.Root): $_" } }
+        Close-Env $c
+    }
+}
+
+# Copies the app's two programs into a folder at any depth, which Windows PowerShell makes only through \\?\.
+function Copy-AppTo($c, [string]$Dir) {
+    [void][IO.Directory]::CreateDirectory('\\?\' + $Dir)
+    foreach ($exe in 'tiny-skill-sync.exe', 'tss.exe') { [IO.File]::Copy('\\?\' + (Join-Path $c.Root "bin\$exe"), "\\?\$Dir\$exe") }
 }
 
 # ---- more scenarios go above this line
@@ -1490,6 +1739,7 @@ $scenarios = [ordered]@{
     'failures'     = 'Test-Failures'
     'stale'        = 'Test-Stale'
     'empty'        = 'Test-Empty'
+    'signin'       = 'Test-Signin'
     'ui'           = 'Test-Ui'
 }
 

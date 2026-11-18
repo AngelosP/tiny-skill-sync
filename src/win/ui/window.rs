@@ -38,11 +38,12 @@ use super::shell::{self, Snapshot};
 use super::theme::{self, Role};
 use super::{bench, local_time, open_folder, place, register_class, scale, sentence, text_of, tray, trim_memory};
 use crate::app::Job;
+use crate::autostart::{Keys, Startup};
 use crate::board::{APP_NAME, Action, Health, RepoView, Row};
 use crate::config::{Config, Paths, RepoConfig, RepoSpec};
 use crate::interval::{Interval, MIN_POLL_MINUTES};
 use crate::pathsafe::printable;
-use crate::win::{cred, wide};
+use crate::win::{autorun, cred, wide};
 
 const CLASS: &str = "TinySkillSyncWindow";
 const STYLE: u32 = WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN;
@@ -102,6 +103,9 @@ struct Win {
     /// The control that opened the diff view; it gets the focus back.
     diff_from: i32,
     token_saved: bool,
+    /// Whether Windows starts this copy at sign-in, or why that can't be told. Read when Settings is shown, and only
+    /// then: the registry is not read for any other page.
+    startup: Option<Result<Startup, String>>,
     /// The control that had the focus when the window was last deactivated.
     focus: HWND,
     /// The Sync now button that has its tooltip.
@@ -251,6 +255,7 @@ pub fn open() {
         diff: None,
         diff_from: 0,
         token_saved: cred::has_token(),
+        startup: None,
         focus: null_mut(),
         tipped: null_mut(),
     };
@@ -400,7 +405,12 @@ fn page_of(st: &Win, snap: &Snapshot, w: i32, fit: Fit) -> Surface {
         Some(Page::Activity) => page::activity_page(&snap.notes, &local_time, w, fit),
         Some(Page::Settings) => {
             let skills_dir = snap.skills_dir.display().to_string();
-            let settings = SettingsPage { default, skills_dir: &skills_dir, token_saved: st.token_saved, version: env!("CARGO_PKG_VERSION") };
+            let startup = match &st.startup {
+                Some(Ok(state)) => Ok(state),
+                Some(Err(e)) => Err(e.as_str()),
+                None => Err("it was not read"),
+            };
+            let settings = SettingsPage { default, skills_dir: &skills_dir, token_saved: st.token_saved, startup, version: env!("CARGO_PKG_VERSION") };
             page::settings_page(&settings, w, fit)
         }
         None => page::welcome(w, fit),
@@ -521,11 +531,17 @@ fn on_rested(hwnd: HWND) {
 
 /// Shows another page on the right.
 fn go(hwnd: HWND, page: Option<Page>) {
+    // Read before the state is borrowed, and again each time: it may have been changed in Task Manager meanwhile.
+    let startup = (page == Some(Page::Settings)).then(startup_now);
+    let read = startup.is_some();
     let Some((changed, panel)) = with_state(|st| {
         let changed = st.page != page;
         if changed {
             st.page = page;
             st.toggled.clear();
+        }
+        if read {
+            st.startup = startup;
         }
         (changed, st.p.page)
     }) else {
@@ -533,8 +549,15 @@ fn go(hwnd: HWND, page: Option<Page>) {
     };
     if changed {
         control::scroll_top(panel);
+    }
+    if changed || read {
         render(hwnd);
     }
+}
+
+/// Whether Windows starts this copy when the user signs in, as the registry says now.
+fn startup_now() -> Result<Startup, String> {
+    autorun::this_exe().and_then(|exe| autorun::state(&Keys::current(), &exe)).map_err(|e| e.to_string())
 }
 
 /// Runs `f` on the repository whose page is shown: its settings and how it is.
@@ -583,15 +606,18 @@ fn add(hwnd: HWND) {
     };
     let every = page::parse_every(&reply.combo).unwrap_or(None);
     let mut added = None;
+    let mut first = false;
     let result = shell::edit_config(|cfg| {
         let full_name = spec.full_name();
         if let Some(existing) = cfg.repos.iter().find(|r| r.repo.eq_ignore_ascii_case(&full_name) && r.branch == spec.branch && r.path == spec.path) {
             return Err(format!("{} is already set up", existing.label()));
         }
+        first = cfg.repos.is_empty();
         added = Some(cfg.add_repo(&spec, every, false).id.clone());
         Ok(true)
     });
-    if let (Ok(true), Some(id)) = (result, added) {
+    let saved = matches!(result, Ok(true));
+    if let (true, Some(id)) = (saved, added) {
         let panel = with_state(|st| {
             st.page = Some(Page::Repo(id.clone()));
             st.toggled.clear();
@@ -603,6 +629,32 @@ fn add(hwnd: HWND) {
         shell::want(Job::Check(Some(id)));
     }
     update(hwnd);
+    if saved && first {
+        offer_startup(hwnd);
+    }
+}
+
+/// Offers to start with Windows, when the first repository was just added and it does not yet. "Not now" is not
+/// remembered: the offer comes again only when a first repository is added again.
+fn offer_startup(hwnd: HWND) {
+    if startup_now() != Ok(Startup::Off) {
+        return;
+    }
+    let question = Ask {
+        heading: "Start with Windows?".to_string(),
+        text: "Tiny Skill Sync can start in the tray when you sign in, without opening its window, so your skills stay up to date. \
+               It waits a little before it looks at your skills or checks GitHub, so it does not slow your sign-in down. \
+               You can change this in Settings."
+            .to_string(),
+        ok: "Turn on".to_string(),
+        cancel: "Not now".to_string(),
+        ..Ask::default()
+    };
+    if dialogs::ask(hwnd, question).is_some() {
+        let now = switch_startup(true);
+        with_state(|st| st.startup = Some(now));
+        refresh();
+    }
 }
 
 /// Check every, of the repository shown or (`default`) in Settings: an entry was chosen.
@@ -685,6 +737,24 @@ fn set_enabled(toggle: HWND) {
         shell::want(Job::Check(Some(repo)));
     }
     refresh();
+}
+
+/// Start with Windows was switched.
+fn set_startup(toggle: HWND) {
+    let on = unsafe { SendMessageW(toggle, BM_GETCHECK, 0, 0) } != 0;
+    let now = switch_startup(on);
+    with_state(|st| st.startup = Some(now));
+    refresh();
+}
+
+/// Has Windows start this copy at sign-in, or stop starting it. Says so when that fails, and returns how it is now.
+fn switch_startup(on: bool) -> Result<Startup, String> {
+    let keys = Keys::current();
+    let result = autorun::this_exe().and_then(|exe| if on { autorun::turn_on(&keys, &exe) } else { autorun::turn_off(&keys, &exe) });
+    result.or_else(|e| {
+        shell::tell(format!("Start with Windows could not be turned {}: {e}", if on { "on" } else { "off" }));
+        startup_now()
+    })
 }
 
 fn more(hwnd: HWND, button: HWND) {
@@ -959,6 +1029,7 @@ fn on_command(hwnd: HWND, wp: WPARAM, lp: LPARAM) {
             id::NAV_SETTINGS | id::OPEN_SETTINGS => go(hwnd, Some(Page::Settings)),
             id::MORE => more(hwnd, ctl),
             id::ENABLED => set_enabled(ctl),
+            id::STARTUP => set_startup(ctl),
             id::RETRY => {
                 if let Some(repo) = shown_repo(|r, _| r.id.clone()) {
                     shell::want(Job::Check(Some(repo)));
@@ -984,10 +1055,15 @@ fn on_activate(hwnd: HWND, active: bool) -> bool {
         }
         return false;
     }
-    // A token may have been saved or deleted with `tss` meanwhile.
+    // A token may have been saved or deleted with `tss` meanwhile, and Start with Windows changed in Task Manager.
     let saved = cred::has_token();
+    let settings = with_state(|st| st.page == Some(Page::Settings)).unwrap_or(false);
+    let startup = settings.then(startup_now);
     let focus = with_state(|st| {
         st.token_saved = saved;
+        if startup.is_some() {
+            st.startup = startup;
+        }
         st.focus
     })
     .unwrap_or(null_mut());

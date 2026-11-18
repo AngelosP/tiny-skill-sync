@@ -28,12 +28,13 @@ Start with `scripts\dev.ps1`; it runs the others.
 | `scripts\dev.ps1 bench` | Measure the release app against its budgets (see [Measuring](#measuring)). |
 | `scripts\dev.ps1 e2e` | Run the real exes against real GitHub test repositories and check what they do (see [Live end-to-end runs](#live-end-to-end-runs)). `-Only NAME,NAME`, `-Keep`, `-SkipBuild`. |
 | `scripts\dev.ps1 soak` | Leave the release app running for 75 minutes against a repository that changes every 10 minutes, and sample its memory, handles, threads, CPU and file I/O. `-Minutes`, `-Every`, `-ChangeEveryMinutes`, `-Keep`. |
-| `scripts\dev.ps1 clean` | Close the sandbox copy and any copy a live script left running, and delete the sandbox, test and live-script leftovers in `%TEMP%` and `bench\out`. Keeps `target\`. |
+| `scripts\dev.ps1 clean` | Close the sandbox copy and any copy a live script left running, and delete the sandbox, test and live-script leftovers in `%TEMP%` and `bench\out`, and the test copies' Start with Windows keys (`HKCU\Software\tiny-skill-sync-test`). Keeps `target\`. |
 
 The **sandbox** is `.tss-test\` in the repository (ignored by git): its own settings (`.tss-test\home`) and skills
 folder (`.tss-test\skills`), set through `TSS_HOME` and `TSS_SKILLS_DIR`. A sandbox copy of the tray runs beside a
-real one, with its own icon. The saved GitHub token is the one thing it shares with the real app, so
-`scripts\dev.ps1 tss token set` and `token clear` are refused.
+real one, with its own icon. Its Start with Windows entry is kept under `HKCU\Software\tiny-skill-sync-test`, which
+Windows never reads, so turning it on there starts nothing at sign-in. The saved GitHub token is the one thing it
+shares with the real app, so `scripts\dev.ps1 tss token set` and `token clear` are refused.
 
 Two small public and private fixture repositories are used for live tries:
 `AngelosP/tiny-skill-sync-fixtures-public` and `AngelosP/tiny-skill-sync-fixtures-private` (the private one needs a
@@ -46,7 +47,7 @@ scripts\dev.ps1 test
 ```
 
 This runs `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings` and `cargo test --no-fail-fast`. All three
-must pass. There are 486 tests (312 in the library, 174 integration tests); the whole gate takes about 40 seconds when
+must pass. There are 506 tests (327 in the library, 179 integration tests); the whole gate takes about 40 seconds when
 the code is already built.
 
 If the change can affect speed, memory or disk use (startup, verification, the poll, the tray, the window),
@@ -56,11 +57,13 @@ also run `scripts\dev.ps1 bench` and check that every row is still within budget
 
 **Every test works in its own throwaway folder** under `%TEMP%` (named `tss-<area>-...`). No test reads or writes the
 real skills folder, the real settings or the saved GitHub token. A failing test can leave its folder behind;
-`scripts\dev.ps1 clean` removes those.
+`scripts\dev.ps1 clean` removes those. The Start with Windows tests (`win::autorun`, `tests\cli.rs`) write only keys of
+their own under `HKCU\Software\tiny-skill-sync-test`, which Windows never reads, and delete them when they end; the code
+refuses to write Windows' own keys from a test.
 
 | Where | What |
 | --- | --- |
-| `src\*.rs` (`#[cfg(test)]`) | Unit tests next to the code. The modules that make decisions (`reconcile`, `tree`, `scheduler`, `board`, `app`, `interval`, `pathsafe`) are pure, so every rule is tested without a disk or a network; so are the comparison behind **Show changes** (`diff`) and the window's pages (`win::ui::page`). `apply` and `win::fs` are tested on the real file system. |
+| `src\*.rs` (`#[cfg(test)]`) | Unit tests next to the code. The modules that make decisions (`reconcile`, `tree`, `scheduler`, `board`, `app`, `interval`, `pathsafe`, `autostart`) are pure, so every rule is tested without a disk or a network; so are the comparison behind **Show changes** (`diff`) and the window's pages (`win::ui::page`). `apply` and `win::fs` are tested on the real file system, `win::autorun` on the real registry. |
 | `tests\engine_sync.rs`, `engine_failures.rs`, `engine_lifecycle.rs` | The engine end to end, on the real file system, with a fake GitHub (`tests\common\mod.rs`: `FakeRemote`, `World`). Failures, crashes in every step of a change, restarts. |
 | `tests\downtime.rs` | Edits made while the app was stopped, and drives that cannot vouch for a file. The evidence for [How edits are found](README.md#how-edits-are-found). |
 | `tests\http.rs` | The real WinHTTP client against a local test server: redirects, timeouts, limits, cancel. |
@@ -81,9 +84,11 @@ ends up on disk, what the app says and what it leaves alone.
 
 - **It needs** the network, a signed-in GitHub CLI (`gh auth login`) that may push to the two fixture repositories, and a
   release build (it makes one unless you pass `-SkipBuild`).
-- **It changes** only folders in `%TEMP%` and branches of the fixture repositories named `e2e-<time>-<scenario>` or
-  `soak-<time>`, which it deletes afterwards. It refuses to touch any other branch, so `main` is never pushed to. It
-  never touches the real skills folder, the real settings or the saved token. The `places` scenario, which runs the app
+- **It changes** only folders in `%TEMP%`, keys under `HKCU\Software\tiny-skill-sync-test` (which Windows never reads),
+  and branches of the fixture repositories named `e2e-<time>-<scenario>` or `soak-<time>`, which it deletes afterwards.
+  It refuses to touch any other branch, so `main` is never pushed to. It never touches the real skills folder, the real
+  settings, the saved token or Windows' own startup keys (the `signin` scenario reads them before and after, to prove
+  it). The `places` scenario, which runs the app
   without the `TSS_` folders, points `USERPROFILE` and `LOCALAPPDATA` into `%TEMP%` and checks with `cmd.exe` and
   `tss status` that the app sees only those before it lets the app write anything. A small proxy inside the script makes
   GitHub fail in the ways the `failures` scenario needs.
@@ -110,6 +115,7 @@ ends up on disk, what the app says and what it leaves alone.
 | `stale` | GitHub answering with a listing that is newer than its commit. |
 | `empty` | A repository added as a whole when its skills are in a subfolder. |
 | `ui` | The window, its questions and the tray menu, driven and read from outside: layout, tab order, painting, the text at the top for each kind of failure, a skill row opening, **Show changes** (after a push to its own branch, with a file the user added that must not be listed) and back, the repository and diff file lists widening under the mouse (with scroll positions kept), and a new size remembered. It runs in the light or dark mode Windows is in. |
+| `signin` | Start with Windows: `tss startup` on, off, and switched off in Task Manager; the app started from its entry the way Windows starts it at sign-in: only the tray, nothing looked at or checked for 30 seconds, then the look and the check; started by hand during that wait, it looks at once; a second start; settings that cannot be read; copies in folders too deep for the entry (named by the short path, or not possible). |
 
 Run it when you change the engine's visible behaviour, the tray, the window or anything GitHub-facing, at least
 the scenarios that cover the change (`-Only`). `scripts\dev.ps1 soak` is the long run for leaks and idle cost. The screens
@@ -131,8 +137,9 @@ passes on its first run is not yet proof that it tests anything. Check it with d
 2. Run the tests. At least one must fail. If none does, the tests have a gap: add a test.
 3. Undo the change, and make sure the file is byte for byte as before (compare its hash).
 
-This has been done for `apply`, the engine, the downtime tests, the board, the HTTP layer and the command line, and for
-the `places` scenario (a wrong default skills folder stops it before the app writes anything).
+This has been done for `apply`, the engine, the downtime tests, the board, the HTTP layer and the command line, the
+start at sign-in (`app`), and for the `places` scenario (a wrong default skills folder stops it before the app writes
+anything).
 
 ## Measuring
 
@@ -143,8 +150,8 @@ scripts\dev.ps1 bench -Repo https://github.com/github/awesome-copilot/tree/main/
 
 The bench builds the release exes first. It installs real skills from GitHub into a throwaway folder (this needs the
 network), then starts the release tray app many times and reads Windows' own counters: time to the tray icon, the
-start-up check, CPU, memory, disk and network operations while idle, the window and an unchanged poll. The app
-writes timing marks only when `TSS_BENCH_REPORT` names a file (`src\win\ui\bench.rs`).
+start-up check, the start at sign-in, CPU, memory, disk and network operations while idle, the window and an unchanged
+poll. The app writes timing marks only when `TSS_BENCH_REPORT` names a file (`src\win\ui\bench.rs`).
 
 It prints a table, saves it as `bench\out\bench-<time>.md` (ignored by git) and exits with 1 if any row is over budget.
 The window step briefly shows the app's window five times; leave the mouse and keyboard alone while it runs.
@@ -155,6 +162,7 @@ The budgets, agreed before the app was written:
 | --- | --- |
 | Process start to tray icon | median 30 ms, p95 60 ms |
 | Start-up check | 10 ms for an install of 84 files; 75 µs per file at scale |
+| Start at sign-in | no job in the first 3 s after the icon; under 300 ms of CPU and 300 KB of file I/O by then (Task Manager's "low" startup impact) |
 | Idle | 0 CPU, 0 disk or network operations, 0 page faults |
 | Idle memory | 12 MiB working set, 2 MiB once trimmed; 4 MiB private |
 | Window | open to painted in 100 ms; 40 MiB working set while open; 2 MiB (trimmed) after it closes |
@@ -182,9 +190,10 @@ The latest results are in [README.md](README.md#measured-cost).
 
 `Cargo.toml` and `.cargo\config.toml` set the release profile: `opt-level = "z"`, fat LTO, one codegen unit,
 `panic = "abort"`, stripped symbols and a static C runtime (no Visual C++ redistributable needed). `opt-level = "z"`
-keeps the tray exe at 0.91 MiB, under its 1 MiB budget (`opt-level = "s"` made it 1.01 MiB, `opt-level = 3` larger
+keeps the tray exe at 0.93 MiB, under its 1 MiB budget (`opt-level = "s"` made it 1.01 MiB, `opt-level = 3` larger
 still). It costs about 12% of SHA-1 speed (339 MB/s instead of 384) and nothing the bench can see. `build.rs` embeds
-`app.manifest` (common controls 6, per-monitor DPI, long paths, UTF-8).
+`app.manifest` (common controls 6, per-monitor DPI, long paths, UTF-8) and a version resource: the name and version
+Windows shows for each exe, as in Task Manager's startup apps (about 1 KiB).
 
 ## Releases
 

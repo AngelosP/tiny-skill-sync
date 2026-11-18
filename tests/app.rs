@@ -6,7 +6,7 @@ mod common;
 use std::path::PathBuf;
 
 use common::*;
-use tiny_skill_sync::app::{self, Answer, App, BUSY_RETRY, Done, FAILURE_BACKOFF, Job, MIN_POLL_GAP, RESUME_GRACE, Settled};
+use tiny_skill_sync::app::{self, Answer, App, BUSY_RETRY, Done, FAILURE_BACKOFF, Job, MIN_POLL_GAP, RESUME_GRACE, SIGN_IN_GRACE, Settled};
 use tiny_skill_sync::board::{Action, Health, Level, Row};
 use tiny_skill_sync::config::Config;
 use tiny_skill_sync::engine::{self, Engine, EngineError, Resolution, SyncReport};
@@ -22,6 +22,14 @@ fn run(app: &mut App, engine: &mut Engine, now: i64) -> Vec<(Job, Settled)> {
         out.push((order.job, app.finish(done, now)));
     }
     out
+}
+
+/// Runs the next job. Returns it, and whether it ran as background work.
+fn run_next(app: &mut App, engine: &mut Engine, now: i64) -> (Job, bool) {
+    let order = app.next_order().expect("a job is waiting");
+    let done = app::perform(engine, &order, &cancel_flag());
+    app.finish(done, now);
+    (order.job, order.background)
 }
 
 /// What the last job settled.
@@ -283,6 +291,59 @@ fn a_timer_that_fires_long_after_its_time_waits_for_the_network() {
     let woke = T0 + DAY + 5;
     app.resumed(woke);
     assert_eq!(app.arm(woke), Some(woke + RESUME_GRACE), "waking up says the same");
+}
+
+#[test]
+fn a_start_at_sign_in_waits_before_it_looks_then_looks_and_checks_as_background_work() {
+    let mut s = Setup::fresh("app-signin");
+    let mut app = app_for(&s);
+    app.started_by_windows(T0);
+    assert!(app.next_order().is_none(), "not even a look at the disk while Windows is still starting");
+    assert_eq!(app.health(), Health::Waiting);
+    assert_eq!(app.tooltip(), "Tiny Skill Sync: waiting for Windows to finish starting", "nothing was looked at, so nothing is up to date yet");
+    assert!(!app.want(Job::Look), "a change on disk waits for the first look, which looks anyway");
+    assert_eq!(app.arm(T0), Some(T0 + SIGN_IN_GRACE));
+    app.on_timer(T0 + SIGN_IN_GRACE - 1);
+    assert!(app.queued().is_empty());
+
+    let at = T0 + SIGN_IN_GRACE;
+    app.on_timer(at);
+    assert_eq!(run_next(&mut app, &mut s.engine, at), (Job::Startup, true), "its look gives way to whatever the user is doing");
+    assert_eq!(app.arm(at), Some(at), "a check is due, and the network has had its time");
+    app.on_timer(at);
+    assert_eq!(run_next(&mut app, &mut s.engine, at), (Job::Poll, true));
+    assert_eq!(s.w.skill_names(), ["alpha", "beta", "gamma"]);
+    assert_eq!(app.health(), Health::Ok);
+    assert!(app.want(Job::Look), "from now on a change on disk is looked at");
+    run(&mut app, &mut s.engine, at);
+
+    app.set_cfg(s.cfg.clone(), s.w.skills.join("moved"));
+    let order = app.next_order().expect("a look at the new skills folder");
+    assert_eq!((order.job, order.background), (Job::Startup, false), "only the first look after sign-in gives way");
+
+    let mut app = app_for(&s);
+    assert_eq!(run_next(&mut app, &mut s.engine, T0), (Job::Startup, false), "started by the user, it looks as usual");
+}
+
+#[test]
+fn someone_who_comes_while_the_app_waits_after_sign_in_is_not_kept_waiting() {
+    let mut s = Setup::fresh("app-signin-user");
+    let mut app = app_for(&s);
+    app.started_by_windows(T0);
+    app.user_here();
+    assert_eq!(run_next(&mut app, &mut s.engine, T0 + 5), (Job::Startup, false), "the window shows what it finds, so it looks at once, at full speed");
+    app.user_here();
+    assert!(app.queued().is_empty(), "one look is enough");
+    assert_eq!(app.arm(T0 + 5), Some(T0 + SIGN_IN_GRACE), "the timer's check still gives the network its time");
+
+    let mut engine = s.restarted();
+    let mut app = app_for(&s);
+    app.started_by_windows(T0);
+    assert!(app.want(Job::Check(None)));
+    assert_eq!(app.queued(), &[Job::Startup, Job::Check(None)], "Sync now: the first look, then the check");
+    assert_eq!(run_next(&mut app, &mut engine, T0 + 5), (Job::Startup, false));
+    assert_eq!(run_next(&mut app, &mut engine, T0 + 5), (Job::Check(None), false));
+    assert_eq!(s.w.skill_names(), ["alpha", "beta", "gamma"]);
 }
 
 #[test]

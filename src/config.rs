@@ -122,6 +122,10 @@ impl Config {
         if cfg.version > CONFIG_VERSION {
             return Err(format!("config.json was written by a newer version (format {}, this app understands {CONFIG_VERSION})", cfg.version));
         }
+        // A relative folder would depend on the folder the app is started in, which at sign-in is Windows' own.
+        if let Some(dir) = cfg.skills_dir.as_deref().map(str::trim).filter(|d| !d.is_empty() && !Path::new(d).is_absolute()) {
+            return Err(format!("the skills folder in {CONFIG_FILE} must be a full path, such as D:\\skills; '{dir}' is not one"));
+        }
         cfg.version = CONFIG_VERSION;
         cfg.assign_missing_ids();
         Ok(cfg)
@@ -290,9 +294,14 @@ pub struct Paths {
 }
 
 impl Paths {
+    /// The app folder `TSS_HOME` gives this copy, when it does: the scripts and tests use one of their own.
+    pub fn own_home() -> Option<PathBuf> {
+        std::env::var_os("TSS_HOME").filter(|v| !v.is_empty()).map(PathBuf::from)
+    }
+
     pub fn home_dir() -> PathBuf {
-        if let Some(h) = std::env::var_os("TSS_HOME").filter(|v| !v.is_empty()) {
-            return PathBuf::from(h);
+        if let Some(h) = Paths::own_home() {
+            return h;
         }
         let base = std::env::var_os("LOCALAPPDATA").map(PathBuf::from).unwrap_or_else(std::env::temp_dir);
         base.join("tiny-skill-sync")
@@ -329,6 +338,16 @@ impl Paths {
             _ => self.skills.join(".tss-work"),
         }
     }
+}
+
+/// A short name for an app folder, the same every time. One copy of the app runs per folder, and a copy with a folder
+/// of its own (`TSS_HOME`) also has a Start with Windows entry of its own.
+pub fn instance_tag(home: &Path) -> String {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in home.to_string_lossy().to_lowercase().bytes() {
+        hash = (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3);
+    }
+    format!("{hash:016x}")
 }
 
 #[cfg(test)]
@@ -444,6 +463,20 @@ mod tests {
         assert!(problems.iter().any(|p| p.contains("owner/name")), "{problems:?}");
         assert!(problems.iter().any(|p| p.contains("folder")), "{problems:?}");
         assert!(problems.iter().any(|p| p.contains("branch")), "{problems:?}");
+    }
+
+    #[test]
+    fn a_skills_folder_that_is_not_a_full_path_is_a_settings_error() {
+        // Each would depend on the folder the app happens to be started in, which at sign-in is Windows' own.
+        for relative in ["skills", r".\skills", r"\skills", "C:skills", r"%USERPROFILE%\skills", " skills "] {
+            let json = serde_json::json!({ "skills_dir": relative }).to_string();
+            let e = Config::parse(json.as_bytes()).unwrap_err();
+            assert!(e.starts_with("the skills folder") && e.contains("full path") && e.contains(relative.trim()), "{relative}: {e}");
+        }
+        for fine in [r"C:\skills", "D:/skills", r"\\server\share\skills", r"\\?\C:\skills", "", "  "] {
+            let json = serde_json::json!({ "skills_dir": fine }).to_string();
+            assert!(Config::parse(json.as_bytes()).is_ok(), "{fine}");
+        }
     }
 
     #[test]

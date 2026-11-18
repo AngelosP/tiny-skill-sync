@@ -38,9 +38,10 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 use super::page::{self, Note};
 use super::{bench, dialogs, register_class, sentence, tray, trim_memory, window};
 use crate::app::{App, Done, Job, Order, Shown, perform};
+use crate::autostart::BACKGROUND;
 use crate::board::{APP_NAME, Level, RepoView, span};
 use crate::cli::{Host, SystemHost};
-use crate::config::{CONFIG_FILE, Config, Paths};
+use crate::config::{CONFIG_FILE, Config, Paths, instance_tag};
 use crate::engine::{Engine, EngineError, Stamp, stamp_of};
 use crate::interval::{UnixSecs, now_secs};
 use crate::win::{wide, wide_os};
@@ -134,18 +135,25 @@ pub fn run() -> i32 {
     let home = Paths::home_dir();
     let title = format!("{APP_NAME} {}", instance_tag(&home));
     let args: Vec<String> = std::env::args().skip(1).collect();
+    // How Windows starts it at sign-in (autostart::BACKGROUND): in the tray only, and quietly.
+    let mut background = false;
     match args.as_slice() {
         [] => {}
         [only] if only.eq_ignore_ascii_case("--quit") => return quit_other(&title),
+        [only] if only.eq_ignore_ascii_case(BACKGROUND) => background = true,
         _ => {
-            message_box(&format!("'{}' is not understood. {APP_NAME} takes no options, except --quit to close the copy that is running.", args.join(" ")));
+            message_box(&format!(
+                "'{}' is not understood. {APP_NAME} takes no options, except {BACKGROUND} to start in the tray without opening its window, and --quit to close the copy that is running.",
+                args.join(" ")
+            ));
             return 2;
         }
     }
     // One copy per app folder. The mutex is never closed: Windows releases it when the process ends.
     let mutex = unsafe { CreateMutexW(null(), 0, wide(&format!("Local\\tiny-skill-sync-{}", instance_tag(&home))).as_ptr()) };
     if !mutex.is_null() && unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
-        return wake_other(&title);
+        // Already running: a start at sign-in has nothing to show.
+        return if background { 0 } else { wake_other(&title) };
     }
     if let Err(e) = std::fs::create_dir_all(&home) {
         message_box(&format!("The folder {} cannot be created: {e}", home.display()));
@@ -206,6 +214,9 @@ pub fn run() -> i32 {
 
     let now = now_secs();
     let mut app = App::new(cfg, skills.clone());
+    if background {
+        app.started_by_windows(now);
+    }
     for problem in app.cfg().problems() {
         app.board.say(now, Level::Attention, format!("Settings problem: {problem}"));
     }
@@ -233,8 +244,9 @@ pub fn run() -> i32 {
     tray::init(hwnd);
     bench::mark("tray", None);
     on_kick();
-    if first_run || cfg_error.is_some() {
-        window::open();
+    // A settings error is shown whatever started the app: nothing is checked until it is fixed.
+    if cfg_error.is_some() || (first_run && !background) {
+        open_window();
     }
 
     let code = pump(None);
@@ -242,15 +254,6 @@ pub fn run() -> i32 {
     SHELL.with(|s| s.borrow_mut().take());
     bench::mark("exit", None);
     code
-}
-
-/// Keeps one copy per app folder: `TSS_HOME` gives tests a copy of their own.
-fn instance_tag(home: &Path) -> String {
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for byte in home.to_string_lossy().to_lowercase().bytes() {
-        hash = (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3);
-    }
-    format!("{hash:016x}")
 }
 
 fn find_other(title: &str) -> HWND {
@@ -290,8 +293,9 @@ fn spawn_worker(mut engine: Engine, orders: Receiver<Order>, done: Sender<Done>,
     let hwnd = hwnd as usize;
     std::thread::Builder::new().name("worker".into()).stack_size(1 << 20).spawn(move || {
         for order in orders {
-            // A timed check is background work: lower CPU, I/O and memory priority, so it never gets in the way.
-            let background = order.job == Job::Poll;
+            // Background work (a timed check, the first look after sign-in) runs at lower CPU, I/O and memory
+            // priority, so it never gets in the way.
+            let background = order.background;
             if background {
                 unsafe { SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_BEGIN) };
             }
@@ -746,8 +750,15 @@ fn on_tray(hwnd: HWND, wp: WPARAM, lp: LPARAM) {
         let y = i32::from(((wp >> 16) & 0xFFFF) as u16 as i16);
         show_menu(hwnd, x, y);
     } else {
-        window::open();
+        open_window();
     }
+}
+
+/// Opens the window, or brings it to the front. Someone is looking, so nothing waits for sign-in to settle.
+fn open_window() {
+    with_shell(|s| s.app.user_here());
+    kick();
+    window::open();
 }
 
 fn on_command(hwnd: HWND, id: usize) {
@@ -756,7 +767,7 @@ fn on_command(hwnd: HWND, id: usize) {
         CMD_SETTINGS if !ask.is_null() => unsafe {
             SetForegroundWindow(ask);
         },
-        CMD_SETTINGS => window::open(),
+        CMD_SETTINGS => open_window(),
         CMD_CHECK => {
             want(Job::Check(None));
         }

@@ -8,7 +8,10 @@
 //! * a job that failed as a whole (the engine could not work) is retried after 5 minutes, doubling up to an hour;
 //! * a job that found the engine busy (`tss` was working) is retried after a minute;
 //! * two timer-driven checks are at least 30 seconds apart;
-//! * a timer that fires much later than it was set for (the computer slept) waits 30 seconds for the network.
+//! * a timer that fires much later than it was set for (the computer slept) waits 30 seconds for the network;
+//! * started by Windows at sign-in, the first look at the disk and the first check wait 30 seconds, so that Windows
+//!   can finish starting and the network can come up, and then run as background work. The user coming (the window,
+//!   or a job they ask for) starts the look at once.
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
@@ -28,6 +31,8 @@ pub const BUSY_RETRY: UnixSecs = 60;
 pub const MIN_POLL_GAP: UnixSecs = 30;
 /// After waking from sleep, the network gets this long to come back before checking.
 pub const RESUME_GRACE: UnixSecs = 30;
+/// Started by Windows at sign-in, the network gets this long to come up before the first check.
+pub const SIGN_IN_GRACE: UnixSecs = RESUME_GRACE;
 /// A timer that fires this much later than it was set for means the computer slept.
 pub const LATE_TIMER: UnixSecs = 60;
 /// The first wait after the engine could not work at all. It doubles with every failure in a row.
@@ -87,6 +92,8 @@ pub struct Order {
     pub job: Job,
     pub cfg: Config,
     pub skills_dir: PathBuf,
+    /// Run it as background work: lower CPU, I/O and memory priority, so it never gets in the way.
+    pub background: bool,
 }
 
 #[derive(Debug)]
@@ -191,6 +198,10 @@ pub struct App {
     started: bool,
     /// When the timer was last set to fire.
     armed: Option<UnixSecs>,
+    /// Windows started the app at sign-in, and its first look, still to come, is background work.
+    at_sign_in: bool,
+    /// Started at sign-in, the first look waits for the timer, or for the user to come.
+    sign_in_wait: bool,
     quitting: bool,
     state_stamp: Option<Stamp>,
 }
@@ -209,6 +220,8 @@ impl App {
             failures: 0,
             started: false,
             armed: None,
+            at_sign_in: false,
+            sign_in_wait: false,
             quitting: false,
             state_stamp: None,
         }
@@ -269,15 +282,20 @@ impl App {
         self.state_stamp
     }
 
-    /// Asks for a job. A job that one already waiting covers is dropped. Returns whether it was queued.
+    /// Asks for a job. A job that one already waiting covers is dropped. Returns whether it was queued. A job the
+    /// user asks for ends the wait after sign-in: the first look runs before it.
     pub fn want(&mut self, job: Job) -> bool {
         if self.quitting || self.queue.contains(&job) {
             return false;
         }
+        if job.by_user() {
+            self.user_here();
+        }
         let has = |q: &VecDeque<Job>, f: fn(&Job) -> bool| q.iter().any(f);
         let covered = match &job {
             Job::Poll | Job::Check(Some(_)) => has(&self.queue, |j| *j == Job::Check(None)),
-            Job::Look => has(&self.queue, |j| matches!(j, Job::Startup | Job::Look | Job::Check(_))),
+            // The first look after sign-in is still to come, and it looks anyway.
+            Job::Look => self.sign_in_wait || has(&self.queue, |j| matches!(j, Job::Startup | Job::Look | Job::Check(_))),
             Job::Plan => !self.queue.is_empty(),
             _ => false,
         };
@@ -288,6 +306,8 @@ impl App {
             self.queue.retain(|j| !matches!(j, Job::Poll | Job::Look | Job::Check(_)));
         }
         if job == Job::Startup {
+            self.sign_in_wait = false;
+            self.board.set_waiting(false);
             self.queue.push_front(job);
         } else {
             self.queue.push_back(job);
@@ -306,7 +326,8 @@ impl App {
         }
         self.busy = Some(job.clone());
         self.armed = None;
-        Some(Order { job, cfg: self.cfg.clone(), skills_dir: self.skills_dir.clone() })
+        let background = job == Job::Poll || (job == Job::Startup && self.at_sign_in);
+        Some(Order { job, cfg: self.cfg.clone(), skills_dir: self.skills_dir.clone(), background })
     }
 
     /// Takes in what the worker sent back.
@@ -345,6 +366,7 @@ impl App {
                     Answer::Started(report) => {
                         self.board.note_startup(&report, now);
                         self.started = true;
+                        self.at_sign_in = false;
                     }
                     Answer::Looked(report) => self.board.note_verify(&report, now),
                     Answer::Checked { verified, sync } => {
@@ -443,6 +465,28 @@ impl App {
     /// The computer woke up: give the network a moment.
     pub fn resumed(&mut self, now: UnixSecs) {
         self.hold(now + RESUME_GRACE);
+    }
+
+    /// Windows started the app as the user signed in. Nothing it does then is urgent: the first look at the disk waits
+    /// as long as the first check, which gives the network time to come up, and both are background work. When the
+    /// wait is over, the timer queues the look as it does after a failed one.
+    pub fn started_by_windows(&mut self, now: UnixSecs) {
+        self.at_sign_in = true;
+        self.hold(now + SIGN_IN_GRACE);
+        if self.queue.contains(&Job::Startup) {
+            self.queue.retain(|job| *job != Job::Startup);
+            self.sign_in_wait = true;
+            self.board.set_waiting(true);
+        }
+    }
+
+    /// The user opened the window or asked for a job. A first look still waiting after sign-in starts now, at full
+    /// speed, since they are waiting for it. A check the timer starts still gives the network its time.
+    pub fn user_here(&mut self) {
+        if self.sign_in_wait {
+            self.at_sign_in = false;
+            self.want(Job::Startup);
+        }
     }
 
     /// Nothing more starts; the queue ends with saving what is waiting to be saved.

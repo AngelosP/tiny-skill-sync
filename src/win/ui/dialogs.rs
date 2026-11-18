@@ -73,6 +73,8 @@ pub struct Ask {
     pub note: Option<(char, String)>,
     /// The OK button's label.
     pub ok: String,
+    /// The Cancel button's label; "Cancel" when empty.
+    pub cancel: String,
 }
 
 pub struct Reply {
@@ -146,7 +148,18 @@ pub fn ask(owner: HWND, a: Ask) -> Option<Reply> {
         None => (None, String::new(), String::new(), false, None),
     };
     let has_field = field.is_some();
-    let q = Question { heading: a.heading, text: a.text, field, focused: has_field, combo: a.combo, choices: a.choices, choice: 0, note: a.note, ok: a.ok };
+    let q = Question {
+        heading: a.heading,
+        text: a.text,
+        field,
+        focused: has_field,
+        combo: a.combo,
+        choices: a.choices,
+        choice: 0,
+        note: a.note,
+        ok: a.ok,
+        cancel: a.cancel,
+    };
     // Made where it will roughly end up, so it starts on the right monitor and DPI; sized again once it is there.
     let dpi = dpi_of(owner);
     let height = page::ask(&q, &|t: &str, f: Font, w: i32| paint::measure(t, f, w, dpi)).0.height;

@@ -5,6 +5,7 @@
 
 pub mod app;
 pub mod apply;
+pub mod autostart;
 pub mod board;
 pub mod cli;
 pub mod config;

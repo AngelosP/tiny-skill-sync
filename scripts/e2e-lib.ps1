@@ -258,6 +258,73 @@ public static class TssLive {
         SendMessageW(hwnd, 0x000D, (IntPtr)(n + 1), sb);
         return sb.ToString();
     }
+
+    // The tag the app gives an app folder (config.rs, instance_tag): its mutex and, for a copy started with TSS_HOME, its
+    // startup entry's key are named by it.
+    public static string InstanceTag(string home) {
+        ulong hash = 0xcbf29ce484222325UL;
+        foreach (byte b in Encoding.UTF8.GetBytes(home.ToLowerInvariant())) {
+            unchecked { hash = (hash ^ b) * 0x100000001b3UL; }
+        }
+        return hash.ToString("x16");
+    }
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode)] static extern uint GetShortPathNameW(string path, StringBuilder buf, uint size);
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode)] static extern uint GetLongPathNameW(string path, StringBuilder buf, uint size);
+
+    // A path that exists in its short (8.3) or long form, at any length, without \\?\; null when Windows does not say.
+    public static string ShortPath(string path) { return PathForm(true, path); }
+    public static string LongPath(string path) { return PathForm(false, path); }
+
+    static string PathForm(bool shortForm, string path) {
+        string given = path.StartsWith(@"\\?\") ? path : @"\\?\" + path;
+        StringBuilder sb = new StringBuilder(32768);
+        uint n = shortForm ? GetShortPathNameW(given, sb, (uint)sb.Capacity) : GetLongPathNameW(given, sb, (uint)sb.Capacity);
+        if (n == 0 || n >= sb.Capacity) return null;
+        string s = sb.ToString();
+        return s.StartsWith(@"\\?\") ? s.Substring(4) : s;
+    }
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    struct STARTUPINFO {
+        public int cb; public string lpReserved, lpDesktop, lpTitle;
+        public int dwX, dwY, dwXSize, dwYSize, dwXCountChars, dwYCountChars, dwFillAttribute, dwFlags;
+        public short wShowWindow, cbReserved2; public IntPtr lpReserved2, hStdInput, hStdOutput, hStdError;
+    }
+    [StructLayout(LayoutKind.Sequential)] struct PROCESS_INFORMATION { public IntPtr hProcess, hThread; public int dwProcessId, dwThreadId; }
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    static extern bool CreateProcessW(string app, StringBuilder command, IntPtr procAttr, IntPtr threadAttr, bool inherit, uint flags, IntPtr env, string cwd, ref STARTUPINFO si, out PROCESS_INFORMATION pi);
+    [DllImport("kernel32.dll")] public static extern bool CloseHandle(IntPtr handle);
+    [DllImport("kernel32.dll")] public static extern uint GetProcessId(IntPtr process);
+    [DllImport("kernel32.dll")] public static extern bool TerminateProcess(IntPtr process, uint code);
+    [DllImport("kernel32.dll")] static extern uint WaitForSingleObject(IntPtr handle, uint ms);
+    [DllImport("kernel32.dll")] static extern bool GetExitCodeProcess(IntPtr process, out uint code);
+
+    // Starts a command line as a startup entry is started: the whole line as it is written, no program named apart from
+    // it, with this environment ("NAME=value" each) and working folder. Returns the process's handle (CloseHandle it).
+    public static IntPtr StartCommand(string command, string[] env, string cwd) {
+        string[] sorted = (string[])env.Clone();
+        Array.Sort(sorted, StringComparer.OrdinalIgnoreCase);
+        IntPtr block = Marshal.StringToHGlobalUni(string.Join("\0", sorted) + "\0\0");
+        try {
+            STARTUPINFO si = new STARTUPINFO();
+            si.cb = Marshal.SizeOf(typeof(STARTUPINFO));
+            PROCESS_INFORMATION pi;
+            if (!CreateProcessW(null, new StringBuilder(command, command.Length + 1), IntPtr.Zero, IntPtr.Zero, false, 0x400, block, cwd, ref si, out pi)) {
+                throw new System.ComponentModel.Win32Exception();
+            }
+            CloseHandle(pi.hThread);
+            return pi.hProcess;
+        } finally { Marshal.FreeHGlobal(block); }
+    }
+
+    // A process's exit code once it has ended, waiting for it up to this long; -1 while it is still running.
+    public static long Exited(IntPtr process, int waitMs) {
+        if (WaitForSingleObject(process, (uint)waitMs) != 0) return -1;
+        uint code;
+        if (!GetExitCodeProcess(process, out code)) return -1;
+        return code;
+    }
 }
 '@
 
@@ -294,7 +361,7 @@ $UiId = @{
     Sync = 200; HeroTitle = 201; HeroSub = 202
     NavAdd = 300; NavActivity = 301; NavSettings = 302; NavHead = 303; NavRepo = 1000
     WelcomeAdd = 305; More = 310; Every = 311; Enabled = 312; Retry = 313; OpenSettings = 314
-    DefaultEvery = 320; OpenSkills = 321; OpenBackups = 322
+    DefaultEvery = 320; OpenSkills = 321; OpenBackups = 322; Startup = 325; StartupText = 413
     Title = 400; Private = 401; Sub = 402; InfoLead = 403; InfoText = 404; SkillsDir = 410; TokenText = 411; Empty = 412
     Back = 330; DiffAction = 333; Note = 100000; File = 200000; Gap = 300000
     # Plus 8 per skill, plus the part: 0 the row ("name`ntag"), 1 its details, 2 Show changes, 3 Open folder, 4 and on
@@ -363,10 +430,12 @@ function Start-LiveTray($Root, [string[]]$AppArgs = @(), [hashtable]$Env = @{}) 
     [Diagnostics.Process]::Start($psi)
 }
 
-# Runs the command line on the throwaway install and returns its exit code and everything it printed.
-function Invoke-LiveTss($Root, [string[]]$TssArgs, [hashtable]$Env = @{}, [int]$TimeoutSec = 240) {
+# Runs the command line on the throwaway install and returns its exit code and everything it printed. $Exe runs another
+# copy of tss.exe on the same folders instead.
+function Invoke-LiveTss($Root, [string[]]$TssArgs, [hashtable]$Env = @{}, [int]$TimeoutSec = 240, [string]$Exe = '') {
     Assert-NotTokenChange $TssArgs
     $psi = New-LiveStartInfo $Root 'tss.exe' $TssArgs $Env
+    if ($Exe) { $psi.FileName = $Exe }
     $psi.RedirectStandardOutput = $true
     $psi.RedirectStandardError = $true
     $psi.StandardOutputEncoding = [Text.Encoding]::UTF8
@@ -406,6 +475,9 @@ function Stop-LiveTray([Diagnostics.Process]$P) {
 function Remove-LiveRoot([string]$Root) {
     if ($Root -and (Test-Path $Root) -and (Split-Path $Root -Leaf) -match '^tss-[a-z0-9]+-[0-9a-f]{8}$') {
         Remove-Item -Recurse -Force $Root -ErrorAction SilentlyContinue
+        # Windows PowerShell cannot delete a path longer than 260 characters (the signin scenario makes some); the \\?\
+        # form can.
+        if (Test-Path $Root) { try { [IO.Directory]::Delete('\\?\' + $Root, $true) } catch { } }
     }
 }
 
@@ -825,4 +897,89 @@ function Show-TrayMenu([Diagnostics.Process]$P) {
 function Hide-TrayMenu([Diagnostics.Process]$P) {
     $tray = Find-LiveWindow $P.Id $TRAY_CLASS
     if ($tray -ne [IntPtr]::Zero) { [void][TssLive]::PostMessageW($tray, $WM_CANCELMODE, [IntPtr]::Zero, [IntPtr]::Zero) }
+}
+
+# ---------------------------------------------------------------- Start with Windows
+
+# The entry's name (autostart::VALUE_NAME), and Windows' own keys under HKEY_CURRENT_USER, which a script only reads: to
+# prove, before and after, that a scenario did not change them. A copy started with TSS_HOME uses keys of its own
+# under $TestKeyRoot (autostart::TEST_ROOT), which scripts\dev.ps1 clean deletes.
+$StartupValue = 'Tiny Skill Sync'
+$RealRunKey = 'Software\Microsoft\Windows\CurrentVersion\Run'
+$RealApprovedKey = 'Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run'
+$TestKeyRoot = 'Software\tiny-skill-sync-test'
+
+# A value under HKEY_CURRENT_USER as it is stored (variables not expanded, bytes as "hex:..."), or $null.
+function Read-UserValue([string]$Key, [string]$Name) {
+    $k = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($Key, $false)
+    if ($null -eq $k) { return $null }
+    try {
+        $v = $k.GetValue($Name, $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+        if ($v -is [byte[]]) { return 'hex:' + ([BitConverter]::ToString($v) -replace '-', '') }
+        $v
+    } finally { $k.Close() }
+}
+
+# What Windows' own keys say about the app, to compare before and after a scenario.
+function Get-RealStartup {
+    "Run: $(Read-UserValue $RealRunKey $StartupValue); StartupApproved: $(Read-UserValue $RealApprovedKey $StartupValue)"
+}
+
+# The keys a copy started with this app folder (TSS_HOME) uses instead of Windows' own (autostart::Keys::choose).
+function Get-StartupKeys([string]$AppHome) {
+    $root = "$TestKeyRoot\$([TssLive]::InstanceTag($AppHome))"
+    [pscustomobject]@{ Root = $root; Run = "$root\Run"; Approved = "$root\StartupApproved\Run" }
+}
+
+function Read-StartupEntry($Keys) { Read-UserValue $Keys.Run $StartupValue }
+
+function Read-StartupMark($Keys) { Read-UserValue $Keys.Approved $StartupValue }
+
+function Assert-TestKey([string]$Key) {
+    if (-not $Key.StartsWith("$TestKeyRoot\", [StringComparison]::OrdinalIgnoreCase)) { throw "'$Key' is not a key of the scripts; refusing to change it." }
+}
+
+# Switches the entry off the way Task Manager's Startup apps page does: a mark whose first byte is odd, then when.
+function Set-StartupMark($Keys) {
+    Assert-TestKey $Keys.Approved
+    $k = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey($Keys.Approved)
+    try {
+        $mark = [byte[]](@(3, 0, 0, 0) + [BitConverter]::GetBytes([DateTime]::UtcNow.ToFileTimeUtc()))
+        $k.SetValue($StartupValue, $mark, [Microsoft.Win32.RegistryValueKind]::Binary)
+    } finally { $k.Close() }
+}
+
+function Remove-StartupKeys($Keys) {
+    Assert-TestKey $Keys.Root
+    [Microsoft.Win32.Registry]::CurrentUser.DeleteSubKeyTree($Keys.Root, $false)
+}
+
+# Starts an entry's command the way Windows does when the user signs in: the command line exactly as written, from
+# System32. The environment is this one with the changes given ($null removes a variable), and it must give the app a
+# throwaway app folder and skills folder. Returns the process's handle and id: Get-EntryProcess for one that keeps
+# running, or [TssLive]::Exited and CloseHandle.
+function Start-Entry([string]$Command, [hashtable]$Env) {
+    $vars = @{}
+    $now = [Environment]::GetEnvironmentVariables()
+    foreach ($k in $now.Keys) { $vars[[string]$k] = [string]$now[$k] }
+    foreach ($k in $Env.Keys) { if ($null -eq $Env[$k]) { $vars.Remove($k) } else { $vars[$k] = [string]$Env[$k] } }
+    foreach ($k in 'TSS_HOME', 'TSS_SKILLS_DIR') {
+        if (-not $vars[$k] -or -not ([string]$vars[$k]).StartsWith("$env:TEMP\tss-", [StringComparison]::OrdinalIgnoreCase)) {
+            throw "refusing to start $Command`: $k is not a throwaway folder"
+        }
+    }
+    $block = [string[]]@($vars.Keys | ForEach-Object { "$_=$($vars[$_])" })
+    $h = [TssLive]::StartCommand($Command, $block, (Join-Path $env:SystemRoot 'System32'))
+    [pscustomobject]@{ Handle = $h; Id = [int][TssLive]::GetProcessId($h) }
+}
+
+# The process a start from an entry made, as a Process with a handle of its own (the start's handle is closed).
+function Get-EntryProcess($Started) {
+    try {
+        $code = [TssLive]::Exited($Started.Handle, 0)
+        if ($code -ge 0) { throw "the app started from the entry ended at once, with exit code $code" }
+        $p = [Diagnostics.Process]::GetProcessById($Started.Id)
+        [void]$p.Handle
+        $p
+    } finally { [void][TssLive]::CloseHandle($Started.Handle) }
 }

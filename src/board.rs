@@ -44,6 +44,8 @@ pub enum Level {
 pub enum Health {
     NotConfigured,
     Ok,
+    /// Started at sign-in, the app has not looked at anything yet: it lets Windows finish starting first.
+    Waiting,
     Working,
     Attention,
     Error,
@@ -367,6 +369,8 @@ pub struct Board {
     /// a later call succeeds.
     failure: Option<String>,
     working: bool,
+    /// Started at sign-in, nothing was looked at yet: the app waits for Windows to finish starting.
+    waiting: bool,
     messages: VecDeque<Message>,
 }
 
@@ -513,6 +517,10 @@ impl Board {
         self.working = working;
     }
 
+    pub fn set_waiting(&mut self, waiting: bool) {
+        self.waiting = waiting;
+    }
+
     /// Repositories that have skills on record but are no longer in the settings. Their skills stay protected.
     pub fn orphans(&self) -> &[String] {
         &self.orphans
@@ -542,6 +550,8 @@ impl Board {
         let from_repos = self.views(cfg, 0).iter().filter(|view| view.enabled).map(|view| view.level).max().unwrap_or(Level::Ok);
         let from_problem = if self.problem.is_some() || self.failure.is_some() { Level::Error } else { Level::Ok };
         match from_repos.max(from_problem) {
+            // Nothing was looked at yet, so all is not known to be well.
+            Level::Ok if self.waiting => Health::Waiting,
             Level::Ok => Health::Ok,
             Level::Attention => Health::Attention,
             Level::Error => Health::Error,
@@ -554,6 +564,7 @@ impl Board {
         let enabled = || views.iter().filter(|view| view.enabled);
         let body = match self.health(cfg) {
             Health::Working => "checking for updates…".to_string(),
+            Health::Waiting => "waiting for Windows to finish starting".to_string(),
             Health::NotConfigured => "no repositories are set up".to_string(),
             Health::Ok => "all skills are up to date".to_string(),
             Health::Attention => {
@@ -1137,6 +1148,14 @@ mod tests {
         assert_eq!(busy.health(&one()), Health::Working, "working shows over everything");
         busy.set_working(false);
         assert_eq!(busy.health(&one()), Health::Error);
+
+        let mut waiting = Board::new();
+        waiting.set_waiting(true);
+        assert_eq!(waiting.health(&one()), Health::Waiting, "nothing was looked at yet, so it is not up to date");
+        assert_eq!(waiting.health(&Config::default()), Health::NotConfigured, "there is nothing to wait for");
+        let mut waiting = after(auth(), Vec::new());
+        waiting.set_waiting(true);
+        assert_eq!(waiting.health(&one()), Health::Error, "waiting never hides a problem");
 
         let mut recovered = after(auth(), Vec::new());
         recovered.note_sync(&sync_of(vec![report("a", Outcome::Unchanged, vec![in_sync("s")])]), NOW);

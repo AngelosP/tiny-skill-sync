@@ -410,14 +410,16 @@ fn draw_ctl(hwnd: HWND) {
         Look::Toggle { on } => {
             let track = [x + w - 40, y + (h - 20) / 2, 40, 20];
             let [tx, ty, ..] = track;
+            let ink = if enabled { Role::Text2 } else { Role::Text3 };
             if *on {
                 paint::fill(track, 10, if enabled { Role::Accent } else { Role::Text3 }, Role::None);
                 paint::fill([tx + 24, ty + 4, 12, 12], 6, Role::OnAccent, Role::None);
             } else {
-                paint::fill(track, 10, tint, Role::Text2);
-                paint::fill([tx + 4, ty + 4, 12, 12], 6, Role::Text2, Role::None);
+                paint::fill(track, 10, tint, ink);
+                paint::fill([tx + 4, ty + 4, 12, 12], 6, ink, Role::None);
             }
-            paint::text([x, y, w - 52, h], if *on { "On" } else { "Off" }, Font::Body, Role::Text, DT_SINGLELINE | DT_VCENTER | DT_RIGHT);
+            let state = if *on { "On" } else { "Off" };
+            paint::text([x, y, w - 52, h], state, Font::Body, if enabled { Role::Text } else { Role::Text3 }, DT_SINGLELINE | DT_VCENTER | DT_RIGHT);
         }
         Look::Radio { on } => {
             if tint != Role::None {

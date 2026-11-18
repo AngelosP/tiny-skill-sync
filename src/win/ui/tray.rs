@@ -23,7 +23,7 @@ struct Tray {
     hwnd: HWND,
     size: i32,
     /// Made the first time each one is shown, indexed by `Health as usize`.
-    icons: [HICON; 5],
+    icons: [HICON; 6],
     /// What the icon shows now, if it is in the notification area.
     shown: Option<(Health, String)>,
     /// What it should show.
@@ -47,7 +47,7 @@ thread_local! {
 /// Prepares the icon for `hwnd`. Nothing is shown until [`show`].
 pub fn init(hwnd: HWND) {
     let size = unsafe { GetSystemMetricsForDpi(SM_CXSMICON, GetDpiForSystem()) }.max(16);
-    TRAY.with(|t| *t.borrow_mut() = Some(Tray { hwnd, size, icons: [null_mut(); 5], shown: None, want: None }));
+    TRAY.with(|t| *t.borrow_mut() = Some(Tray { hwnd, size, icons: [null_mut(); 6], shown: None, want: None }));
 }
 
 fn data(hwnd: HWND) -> NOTIFYICONDATAW {
@@ -167,7 +167,7 @@ fn pixel(health: Health, x: f32, y: f32, r: f32) -> (u32, f32) {
     };
     match health {
         Health::Ok => (BLUE, coverage(disc)),
-        Health::Working => ring(BLUE),
+        Health::Working | Health::Waiting => ring(BLUE),
         Health::NotConfigured => ring(GREY),
         Health::Attention => {
             let bar = segment(x, y, (0.0, -0.55 * r), (0.0, 0.1 * r), 0.14 * r);
