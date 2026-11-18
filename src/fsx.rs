@@ -59,6 +59,11 @@ pub fn rename_retry(from: &Path, to: &Path) -> io::Result<()> {
     retry(|| fs::rename(from, to))
 }
 
+/// Like [`rename_retry`], but never replaces what is at `to` (see [`crate::win::fs::move_no_replace`]).
+pub fn move_no_replace_retry(from: &Path, to: &Path) -> io::Result<()> {
+    retry(|| crate::win::fs::move_no_replace(from, to))
+}
+
 /// Removes a folder tree; a missing folder counts as success.
 pub fn remove_dir_all_retry(path: &Path) -> io::Result<()> {
     match retry(|| fs::remove_dir_all(path)) {

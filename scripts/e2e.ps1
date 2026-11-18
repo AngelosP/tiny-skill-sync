@@ -471,7 +471,7 @@ function Test-EditStopped {
 
         # (a) a same-size edit with the time put back, in a skill that upstream does not touch;
         # (b) the same in a skill that upstream does change: only the content tells them apart from "untouched";
-        # (c) an added file and a deleted file.
+        # (c) a deleted file, and an added file, which is mine and so is never reported.
         Set-SameSizeEdit $alphaGuide
         Set-SameSizeEdit $betaMd
         [IO.File]::WriteAllText((Join-Path $c.Skills 'alpha\added-while-stopped.txt'), "mine`n")
@@ -498,7 +498,7 @@ function Test-EditStopped {
         $byName = @{}
         foreach ($row in $rows) { $byName[$row.Name] = "$($row.Tag): $($row.Detail)" }
         Note ('the window shows, before any check: ' + (($rows | ForEach-Object { "$($_.Name): $($_.Tag)" + $(if ($_.Detail) { " ($($_.Detail))" } else { '' }) }) -join ' | '))
-        Check 'the window flags alpha (same-size edit, added file, deleted file) at start-up' ($byName['alpha'] -match '^Edited on this PC: Edited locally') $byName['alpha']
+        Check 'the window flags alpha (same-size edit, deleted file) at start-up, and not the file I added' ($byName['alpha'] -match '^Edited on this PC: Edited locally' -and $byName['alpha'] -notmatch 'added-while-stopped') $byName['alpha']
         Check 'the window flags beta (same-size edit) at start-up' ($byName['beta'] -match '^Edited on this PC: Edited locally') $byName['beta']
         Check 'the window does not flag gamma, which nobody touched' ($byName.ContainsKey('gamma') -and $byName['gamma'] -notmatch 'Edited|held') $byName['gamma']
         Close-Window $c.Tray
@@ -509,7 +509,7 @@ function Test-EditStopped {
         do { $tries++; [void](Invoke-TrayCheck $c.Tray $c.Report); $gammaNew = (Read-Skill $c 'gamma\SKILL.md') -match 'while stopped'; if (-not $gammaNew) { Start-Sleep 5 } } while (-not $gammaNew -and $tries -lt 4)
         Check 'a check then updated gamma (nobody touched it)' $gammaNew "$tries check(s)"
         Check 'it left my same-size edit in beta alone, although upstream changed beta' ((Get-BlobId $betaMd) -eq $mineBeta -and (Read-Skill $c 'beta\SKILL.md') -notmatch 'while stopped')
-        Check 'it left alpha alone: edit, added file, deleted file' ((Get-BlobId $alphaGuide) -eq $mineGuide -and (Test-Path -LiteralPath (Join-Path $c.Skills 'alpha\added-while-stopped.txt')) -and -not (Test-Path -LiteralPath (Join-Path $c.Skills 'alpha\scripts\hello.ps1')))
+        Check 'it left alpha alone: edit, deleted file, and the file I added' ((Get-BlobId $alphaGuide) -eq $mineGuide -and (Test-Path -LiteralPath (Join-Path $c.Skills 'alpha\added-while-stopped.txt')) -and -not (Test-Path -LiteralPath (Join-Path $c.Skills 'alpha\scripts\hello.ps1')))
     } finally { Close-Env $c }
 }
 
@@ -539,12 +539,28 @@ function Test-Holds {
         $r = Tss $c @('resolve', $c.Id, 'gamma', 'keep')
         Check 'resolve keep: ok, and it stays' ($r.Code -eq 0 -and (Test-Path -LiteralPath (Join-Path $c.Skills 'gamma\SKILL.md')))
 
+        # A file of my own in alpha: it stays when alpha goes, and it does not make alpha an edit.
+        [IO.File]::WriteAllText((Join-Path $c.Skills 'alpha\my-notes.md'), "my notes`n")
+
+        # GitHub then adds a file where I had added one: GitHub's goes in, mine is kept as a backup, and the check names
+        # it and the backup (and not my other file). A check may first stop while GitHub's servers catch up.
+        [IO.File]::WriteAllText((Join-Path $c.Skills 'alpha\references\clash.md'), "my clash`n")
+        [void](Push-Upstream $c.Repo $c.Branch @(@{ Path = 'skills/alpha/references/clash.md'; Text = "github's clash`n" }) 'live: alpha gains a file I had added too')
+        $tries = 0
+        do { $tries++; $r = Tss $c @('check'); $told = $r.Text -match 'references/clash\.md'; if (-not $told) { Start-Sleep 15 } } while (-not $told -and $tries -lt 10)
+        $kept = @(Get-ChildItem -LiteralPath (Join-Path $c.Root '.tss-work') -Directory -Filter 'backup-alpha-*' | Where-Object { Test-Path -LiteralPath (Join-Path $_.FullName 'references\clash.md') })
+        $backup = if ($kept.Count -eq 1) { $kept[0].FullName } else { '' }
+        $mineKept = $backup -and [IO.File]::ReadAllText((Join-Path $backup 'references\clash.md')) -eq "my clash`n"
+        Check 'GitHub adds a file I had added: theirs goes in, mine is kept as a backup, and the check names both' ($told -and $mineKept -and (Read-Skill $c 'alpha\references\clash.md') -eq "github's clash`n" -and $r.Text -match ('Warning: alpha: .*' + [regex]::Escape($backup)) -and $r.Text -notmatch 'my-notes') "exit $($r.Code); $($kept.Count) backup(s) with it"
+        Check 'my other file stays in alpha' ((Read-Skill $c 'alpha\my-notes.md') -eq "my notes`n")
+
         [void](Push-Upstream $c.Repo $c.Branch @(@{ DeleteFolder = 'skills/alpha' }, @{ DeleteFolder = 'skills/beta' }) 'live: every skill is gone upstream')
         $tries = 0
         do { $tries++; $r = Tss $c @('check'); $mass = $r.Text -match 'lists no skills at all'; if (-not $mass) { Start-Sleep 5 } } while (-not $mass -and $tries -lt 4)
         Check 'every skill gone upstream: removal is held, nothing deleted' ($mass -and (Test-Path -LiteralPath (Join-Path $c.Skills 'alpha\SKILL.md')) -and (Test-Path -LiteralPath (Join-Path $c.Skills 'beta\SKILL.md'))) "exit $($r.Code)"
         $r = Tss $c @('check', $c.Id, '--delete-all')
-        Check 'check --delete-all then removes them, and not the one I keep' (-not (Test-Path -LiteralPath (Join-Path $c.Skills 'alpha'))) ((Get-SkillNames $c) -join ',')
+        Check 'check --delete-all then removes what GitHub put there, and not the one I keep' (-not (Test-Path -LiteralPath (Join-Path $c.Skills 'alpha\SKILL.md')) -and -not (Test-Path -LiteralPath (Join-Path $c.Skills 'beta'))) ("exit $($r.Code); " + ((Get-SkillNames $c) -join ','))
+        Check 'the file I added to alpha stays, alone in its folder' ((Get-Entries (Join-Path $c.Skills 'alpha')) -eq 'my-notes.md' -and (Read-Skill $c 'alpha\my-notes.md') -eq "my notes`n") (Get-Entries (Join-Path $c.Skills 'alpha'))
         Check 'the skill I kept as mine is still there' (Test-Path -LiteralPath (Join-Path $c.Skills 'gamma\SKILL.md'))
     } finally { Close-Env $c }
 }
@@ -560,14 +576,15 @@ function Test-Unmanaged {
         [IO.File]::WriteAllText((Join-Path $c.Skills 'stray.txt'), "a loose file`n")
         New-Item -ItemType Directory -Force (Join-Path $c.Skills 'beta') | Out-Null
         [IO.File]::WriteAllText((Join-Path $c.Skills 'beta\SKILL.md'), "my own beta, not the repository's`n")
-        # gamma: a copy that is exactly what upstream has, so it may be taken over.
+        # gamma: a copy that is exactly what upstream has, so it may be taken over, with a file of my own beside it.
         $sha = Invoke-Gh @('api', "repos/$($c.Repo)/git/ref/heads/$($c.Branch)", '--jq', '.object.sha')
         $raw = "https://raw.githubusercontent.com/$($c.Repo)/$sha/skills/gamma/SKILL.md"
         $bytes = (Invoke-WebRequest -UseBasicParsing -Uri $raw).Content
         if ($bytes -is [string]) { $bytes = [Text.Encoding]::UTF8.GetBytes($bytes) }
         New-Item -ItemType Directory -Force (Join-Path $c.Skills 'gamma') | Out-Null
         [IO.File]::WriteAllBytes((Join-Path $c.Skills 'gamma\SKILL.md'), $bytes)
-        $before = @{ mine = Get-BlobId (Join-Path $mine 'SKILL.md'); stray = Get-BlobId (Join-Path $c.Skills 'stray.txt'); beta = Get-BlobId (Join-Path $c.Skills 'beta\SKILL.md') }
+        [IO.File]::WriteAllText((Join-Path $c.Skills 'gamma\my-extra.md'), "my extra`n")
+        $before = @{ mine = Get-BlobId (Join-Path $mine 'SKILL.md'); stray = Get-BlobId (Join-Path $c.Skills 'stray.txt'); beta = Get-BlobId (Join-Path $c.Skills 'beta\SKILL.md'); extra = Get-BlobId (Join-Path $c.Skills 'gamma\my-extra.md') }
 
         Add-Repo $c
         $r = Tss $c @('check')
@@ -579,11 +596,12 @@ function Test-Unmanaged {
         [void](Push-Upstream $c.Repo $c.Branch @(@{ Path = 'skills/gamma/SKILL.md'; Text = "---`nname: gamma`ndescription: gamma once adopted`n---`n" }) 'live: gamma changes')
         $tries = 0
         do { $tries++; [void](Tss $c @('check')); $adopted = (Read-Skill $c 'gamma\SKILL.md') -match 'once adopted'; if (-not $adopted) { Start-Sleep 5 } } while (-not $adopted -and $tries -lt 4)
-        Check 'an identical copy was taken over: it follows upstream (gamma)' $adopted "$tries check(s)"
+        Check 'a copy identical in every file GitHub has was taken over, my own file beside it notwithstanding: it follows upstream (gamma)' $adopted "$tries check(s)"
+        Check 'the update kept my own file in gamma' ((Get-BlobId (Join-Path $c.Skills 'gamma\my-extra.md')) -eq $before.extra)
 
         $r = Tss $c @('remove', $c.Id, '--delete-skills')
-        Check 'remove --delete-skills deletes what it installed (alpha, gamma)' (-not (Test-Path -LiteralPath (Join-Path $c.Skills 'alpha')) -and -not (Test-Path -LiteralPath (Join-Path $c.Skills 'gamma'))) ((Get-SkillNames $c) -join ',')
-        Check 'and leaves everything that was mine (mine-only, stray.txt, beta)' ((Get-BlobId (Join-Path $mine 'SKILL.md')) -eq $before.mine -and (Get-BlobId (Join-Path $c.Skills 'stray.txt')) -eq $before.stray -and (Get-BlobId (Join-Path $c.Skills 'beta\SKILL.md')) -eq $before.beta)
+        Check 'remove --delete-skills deletes what it installed (alpha, and gamma but for my file)' (-not (Test-Path -LiteralPath (Join-Path $c.Skills 'alpha')) -and (Get-Entries (Join-Path $c.Skills 'gamma')) -eq 'my-extra.md') (((Get-SkillNames $c) -join ',') + '; gamma: ' + (Get-Entries (Join-Path $c.Skills 'gamma')))
+        Check 'and leaves everything that was mine (mine-only, stray.txt, beta, gamma\my-extra.md)' ((Get-BlobId (Join-Path $mine 'SKILL.md')) -eq $before.mine -and (Get-BlobId (Join-Path $c.Skills 'stray.txt')) -eq $before.stray -and (Get-BlobId (Join-Path $c.Skills 'beta\SKILL.md')) -eq $before.beta -and (Get-BlobId (Join-Path $c.Skills 'gamma\my-extra.md')) -eq $before.extra)
     } finally { Close-Env $c }
 }
 
@@ -867,6 +885,14 @@ function Test-Stale {
         Check 'installed' ($r.Code -eq 0 -and (Compare-WithUpstream $c.Skills $c.Repo $c.Ref 'skills').Count -eq 0) "exit $($r.Code)"
         $good = Get-DiskStamp $c.Skills
 
+        # A file the listing names that the old commit does not have: GitHub answers "not found" for it, which is a
+        # change under way, never a missing or private repository.
+        [void](Push-Upstream $c.Repo $c.Branch @(@{ Path = 'skills/alpha/references/added.md'; Text = "# Added`n`nafter the install`n" }) 'live: alpha gains a file')
+        [void](Wait-Live { (Get-PublicFiles $c.Repo $c.Branch 'skills').Contains('alpha/references/added.md') } 'the listing without a token to show the pushed file' 90 15000)
+        $r = Tss $c @('check')
+        $same = (Get-DiskStamp $c.Skills) -eq $good
+        Check 'a listed file the old commit does not have: "Changed while checking", not "not found" or "private", nothing changed' ($r.Code -ne 0 -and $r.Text -match 'Changed while checking' -and $r.Text -notmatch 'not found|private' -and $same) "exit $($r.Code); folder unchanged: $same"
+
         [void](Push-Upstream $c.Repo $c.Branch @(@{ Path = 'skills/alpha/references/guide.md'; Text = "# Guide`n`nchanged after the install`n" }) 'live: alpha changes')
         $r = Tss $c @('check')
         $replayed = @($c.Proxy.Entries() | Where-Object { $_ -match 'REPLAYED AN EARLIER ANSWER' })
@@ -877,7 +903,7 @@ function Test-Stale {
         $c.Proxy.Thaw()
         $r = Tss $c @('check')
         $diff = Compare-WithUpstream $c.Skills $c.Repo $c.Ref 'skills'
-        Check 'once the old answer is gone, the change arrives and the folder equals upstream' ($r.Code -eq 0 -and $diff.Count -eq 0 -and (Read-Skill $c 'alpha\references\guide.md') -match 'changed after the install') "exit $($r.Code); $($diff.Count) difference(s)"
+        Check 'once the old answer is gone, the change arrives and the folder equals upstream' ($r.Code -eq 0 -and $diff.Count -eq 0 -and (Read-Skill $c 'alpha\references\guide.md') -match 'changed after the install' -and (Read-Skill $c 'alpha\references\added.md') -match 'after the install') "exit $($r.Code); $($diff.Count) difference(s)"
     } finally { Close-Env $c }
 }
 
@@ -1040,33 +1066,72 @@ function Move-Pointer([IntPtr]$Handle) {
 # The list on the left widens when the mouse rests on it and a name in it is cut, taking the room from the page, and
 # narrows when the mouse leaves it. The window asks Windows where the mouse is, so this moves the real mouse pointer,
 # and puts it back afterwards.
-function Test-NavHover($c, [IntPtr]$Window) {
+function Test-ListHover($c, [IntPtr]$Window, [switch]$Diff) {
     $over = [TssLive]::CoveredBy($Window)
     if ($over -ne '') { Note "the list widening under the mouse was not checked, because a window ($over) is on top of this one"; return }
-    $nav = [TssLive]::GetDlgItem($Window, $UiPanel.Nav)
-    $pane = [TssLive]::GetDlgItem($Window, $UiPanel.Page)
+    $listPanel = if ($Diff) { $UiPanel.Files } else { $UiPanel.Nav }
+    $pagePanel = if ($Diff) { $UiPanel.Code } else { $UiPanel.Page }
+    $entry = if ($Diff) { $UiId.File + 4 } else { $UiId.NavRepo }
+    $mark = if ($Diff) { 'files' } else { 'nav' }
+    $state = if ($Diff) { 'the diff file list widened' } else { 'the repository list widened' }
+    $nav = [TssLive]::GetDlgItem($Window, $listPanel)
+    $pane = [TssLive]::GetDlgItem($Window, $pagePanel)
     $was = ([TssLive]::CursorAt()) -split ','
     try {
         # The pointer could be resting on the list already.
         Move-Pointer $pane
         Start-Sleep -Milliseconds 300
+        if ($Diff) {
+            Click-Ui $Window $listPanel $entry
+            Start-Sleep -Milliseconds 100
+            # Keep both panes away from the top: widening must not lose the place or the selected file.
+            [void][TssLive]::SendMessageW($nav, 0x115, [IntPtr]1, [IntPtr]::Zero)
+            [void][TssLive]::SendMessageW($pane, 0x115, [IntPtr]1, [IntPtr]::Zero)
+        }
+        $listScroll = [TssLive]::GetScrollPos($nav, 1)
+        $pageScroll = [TssLive]::GetScrollPos($pane, 1)
         $narrow = Get-Width $nav
         $both = $narrow + (Get-Width $pane)
+        $windowWidth = Get-Width $Window
         $half = [int](([TssLive]::Client($Window)) -split ',')[0] / 2
-        $marks = Get-MarkCount $c.Report 'nav'
-        Move-Pointer (Get-Ui $Window $UiPanel.Nav $UiId.NavRepo)
+        $marks = Get-MarkCount $c.Report $mark
+        if ($Diff) { [void](Save-Shot $Window '09a-files-narrow') }
+        Move-Pointer (Get-Ui $Window $listPanel $entry)
         Start-Sleep -Milliseconds 100
         $early = Get-Width $nav
         $wide = Wait-Maybe { $n = Get-Width $nav; if ($n -gt $narrow) { $n } } 3 25
-        $took = @(Read-Marks $c.Report | Where-Object { $_.Mark -eq 'nav' } | Select-Object -Skip $marks | ForEach-Object { $_.TookMs })
+        if ($null -ne $wide) { [void](Wait-Maybe { if ((Get-MarkCount $c.Report $mark) -gt $marks) { $true } } 3 25) }
+        $took = @(Read-Marks $c.Report | Where-Object { $_.Mark -eq $mark } | Select-Object -Skip $marks | ForEach-Object { $_.TookMs })
         $evidence = "list $narrow, then $early after 0.1 s, then $wide px; list and page $both, then $($wide + (Get-Width $pane)) px; half the window $half px; re-laid out in $($took -join ', ') ms"
-        Check 'resting the mouse on a name that is cut widens the list, after a moment, by taking room from the page' ($early -eq $narrow -and $null -ne $wide -and $wide -le $half + 1 -and [math]::Abs($wide + (Get-Width $pane) - $both) -le 1) $evidence
-        $pic = Save-Shot $Window '05b-list-widened'
-        Test-Painted $pic $Window 'the list widened' @(@($UiPanel.Nav, $UiId.NavRepo), @($UiPanel.Page, $UiId.Title))
-        Test-Layout $Window 'the list widened'
+        Check "${state}: resting the mouse on a cut name widens the list after a moment, taking room from the page" ($early -eq $narrow -and $null -ne $wide -and $wide -le $half + 1 -and [math]::Abs($wide + (Get-Width $pane) - $both) -le 1 -and (Get-Width $Window) -eq $windowWidth) $evidence
+        $pic = Save-Shot $Window $(if ($Diff) { '09b-files-widened' } else { '05b-list-widened' })
+        $painted = if ($Diff) { @(@($UiPanel.Files, $entry), @($UiPanel.Head, $UiId.Title)) } else { @(@($UiPanel.Nav, $UiId.NavRepo), @($UiPanel.Page, $UiId.Title)) }
+        Test-Painted $pic $Window $state $painted
+        Test-Layout $Window $state
+        if ($Diff) {
+            Check 'widening the diff keeps both scroll positions' ($listScroll -gt 0 -and $pageScroll -gt 0 -and [TssLive]::GetScrollPos($nav, 1) -eq $listScroll -and [TssLive]::GetScrollPos($pane, 1) -eq $pageScroll) "files $listScroll, code $pageScroll"
+            Move-Pointer (Get-Ui $Window $listPanel ($entry + 1))
+            Start-Sleep -Milliseconds 300
+            Check 'moving between diff files keeps the list wide' ((Get-Width $nav) -eq $wide)
+        }
         Move-Pointer $pane
         $back = Wait-Maybe { if ((Get-Width $nav) -eq $narrow) { $true } } 3 25
-        Check 'moving the mouse onto the page narrows the list again' ($null -ne $back -and (Get-Width $nav) + (Get-Width $pane) -eq $both) ("list $(Get-Width $nav) px, page $(Get-Width $pane) px")
+        Check "${state}: moving the mouse onto the page narrows the list again" ($null -ne $back -and (Get-Width $nav) + (Get-Width $pane) -eq $both) ("list $(Get-Width $nav) px, page $(Get-Width $pane) px")
+        if ($Diff) {
+            Check 'narrowing the diff keeps both scroll positions' ([TssLive]::GetScrollPos($nav, 1) -eq $listScroll -and [TssLive]::GetScrollPos($pane, 1) -eq $pageScroll)
+            Move-Pointer (Get-Ui $Window $listPanel $entry)
+            Start-Sleep -Milliseconds 100
+            Move-Pointer $pane
+            Start-Sleep -Milliseconds 300
+            Check 'passing over the diff file list does not widen it' ((Get-Width $nav) -eq $narrow)
+            Move-Pointer (Get-Ui $Window $listPanel $entry)
+            $wideAgain = Wait-Maybe { if ((Get-Width $nav) -gt $narrow) { $true } } 3 25
+            Send-Key (Get-Ui $Window $UiPanel.Head $UiId.Back) $VK_ESCAPE
+            $left = Wait-Maybe { if (-not [TssLive]::Shown($nav)) { $true } } 5
+            Move-Pointer ([TssLive]::GetDlgItem($Window, $UiPanel.Page))
+            $dpi = [int][TssLive]::GetDpiForWindow($Window)
+            Check 'leaving the widened diff resets the repository list width' ($wideAgain -and $left -and [math]::Abs((Get-Width ([TssLive]::GetDlgItem($Window, $UiPanel.Nav))) - 248 * $dpi / 96) -le 1)
+        }
     } finally {
         [void][TssLive]::SetCursorPos([int]$was[0], [int]$was[1])
     }
@@ -1074,7 +1139,7 @@ function Test-NavHover($c, [IntPtr]$Window) {
 
 function Test-Ui {
     Add-Type -AssemblyName System.Windows.Forms
-    $c = New-Env 'ui' -NoBranch -WithProxy
+    $c = New-Env 'ui' -WithProxy
     try {
         $area = [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea
         $tray = $null
@@ -1087,6 +1152,8 @@ function Test-Ui {
         $opened = $clock.ElapsedMilliseconds
         Check 'with nothing set up, the window opens by itself' ($null -ne $win) "visible $opened ms after the start"
         if ($null -eq $win) { return }
+        # Keep this throwaway window visible even when the installed app is open too.
+        [void][TssLive]::SetWindowPos($win, [IntPtr](-1), 0, 0, 0, 0, 0x13)
         Start-Sleep -Milliseconds 800
         $b = ([TssLive]::Bounds($win)) -split ','
         Check 'the window is on the screen' ([int]$b[0] -ge $area.Left - 16 -and [int]$b[1] -ge $area.Top -and [int]$b[2] -le $area.Right + 16 -and [int]$b[3] -le $area.Bottom + 16) ("window $($b -join ',') in the work area $($area.Left),$($area.Top),$($area.Right),$($area.Bottom)")
@@ -1161,7 +1228,7 @@ function Test-Ui {
         $title = Read-Ui $win $UiPanel.Page $UiId.Title
         $sub = Read-Ui $win $UiPanel.Page $UiId.Sub
         Note "the page: $title / $sub"
-        Check 'the page of the new repository is shown: its name, public, its folder and branch, when it was checked' ($title -eq $c.Repo -and $sub -match '^Public' -and $sub -match 'the skills folder on main' -and $sub -match 'checked') "$title / $sub"
+        Check 'the page of the new repository is shown: its name, public, its folder and branch, when it was checked' ($title -eq $c.Repo -and $sub -match '^Public' -and $sub -match "the skills folder on $([regex]::Escape($c.Ref))" -and $sub -match 'checked') "$title / $sub"
         $skills = @(Read-Skills $win)
         Note ('the skills: ' + (($skills | ForEach-Object { "$($_.Name) / $($_.Tag)" }) -join ' ;; '))
         Check 'the skills listed are alpha, beta and gamma, each installed and closed' ((($skills | ForEach-Object { $_.Name }) -join ',') -eq 'alpha,beta,gamma' -and @($skills | Where-Object { $_.Tag -notmatch '^(Installed|Up to date)$' -or $null -ne $_.Detail }).Count -eq 0)
@@ -1173,7 +1240,7 @@ function Test-Ui {
         Test-Painted $pic $win 'a repository added' @(@($UiPanel.Hero, $UiId.HeroTitle), @($UiPanel.Hero, $UiId.Sync), @($UiPanel.Nav, $UiId.NavRepo), @($UiPanel.Nav, $UiId.NavSettings), @($UiPanel.Page, $UiId.Title), @($UiPanel.Page, $UiId.Every), @($UiPanel.Page, ($UiId.Skill + 16)))
         Test-Layout $win 'a repository added'
         Test-TabOrder $win 'a repository added'
-        Test-NavHover $c $win
+        Test-ListHover $c $win
         Click-Ui $win $UiPanel.Nav $UiId.NavActivity
         $notes = Wait-Maybe { $t = Read-Ui $win $UiPanel.Page $UiId.Note; if ($t) { $t } } 5
         Check 'Activity tells what was done' ($notes -match 'alpha' -or $notes -match 'nstalled') (Read-Panel $win $UiPanel.Page)
@@ -1213,6 +1280,9 @@ function Test-Ui {
 
         # ---- a local edit appears by itself, with what can be done about it
         [IO.File]::AppendAllText((Join-Path $c.Skills 'alpha\SKILL.md'), "`nmy own words`n")
+        Remove-Item -LiteralPath (Join-Path $c.Skills 'alpha\scripts\hello.ps1')
+        # A file of my own in the skill: it is mine, so it is not an edit and is never shown.
+        [IO.File]::WriteAllText((Join-Path $c.Skills 'alpha\my-notes.md'), "my notes`n")
         $edited = Wait-Maybe { $r = @(Read-Skills $win | Where-Object { $_.Name -eq 'alpha' -and $_.Tag -eq 'Edited on this PC' }); if ($r.Count -ge 1) { $r[0] } } 40
         Check 'an edit made to a skill shows as "Edited on this PC" without anyone asking' ($null -ne $edited) ((@(Read-Skills $win) | ForEach-Object { "$($_.Name) / $($_.Tag)" }) -join ' ;; ')
         $nav = Wait-Maybe { $n = @(Read-Nav $win); if ($n.Count -ge 1 -and $n[0].Sub -eq "3 skills $dot 1 needs you") { $n[0] } } 10
@@ -1220,24 +1290,45 @@ function Test-Ui {
         Check 'the list says the repository needs you, and the top of the window says a skill does' ($null -ne $nav -and $hero.Title -eq '1 skill needs your attention') ((Show-Nav $win) + " / $($hero.Title)")
         if ($null -eq $edited) { return }
         $texts = @($edited.Buttons | ForEach-Object { $_.Text })
-        Check 'its row opens by itself, says what changed, and offers Show changes, Use the GitHub version and Keep my version' ($edited.Detail -match '^Edited locally' -and $texts -contains 'Show changes' -and $texts -contains 'Use the GitHub version' -and $texts -contains 'Keep my version') ("$($edited.Detail) / " + ($texts -join ', '))
+        Check 'its row opens by itself, says what changed (not my own file), and offers Show changes, Use the GitHub version and Keep my version' ($edited.Detail -match '^Edited locally' -and $edited.Detail -notmatch 'my-notes' -and $texts -contains 'Show changes' -and $texts -contains 'Use the GitHub version' -and $texts -contains 'Keep my version') ("$($edited.Detail) / " + ($texts -join ', '))
         $pic = Save-Shot $win '08-skill-edited'
         Test-Painted $pic $win 'an edited skill' @(@($UiPanel.Hero, $UiId.HeroTitle), @($UiPanel.Page, $edited.Id), @($UiPanel.Page, ($edited.Id + 1)), @($UiPanel.Page, ($edited.Id + 2)))
         Test-Layout $win 'an edited skill'
         Test-TabOrder $win 'an edited skill'
 
         # ---- Show changes, and back
+        # Meanwhile GitHub gives alpha a library of 32 reference files and removes its guide; the edit holds that update.
+        $library = @(foreach ($i in 1..32) { @{ Path = ('skills/alpha/references/library/component-{0:00}-guide.md' -f $i); Text = ((1..80 | ForEach-Object { "component $i, line $_" }) -join "`n") + "`n" } })
+        [void](Push-Upstream $c.Repo $c.Branch ($library + @(@{ Delete = $true; Path = 'skills/alpha/references/guide.md' })) 'live: alpha gains a library and loses its guide')
+        [void](Wait-Live { $up = Get-UpstreamFiles $c.Repo $c.Branch; $up.Contains('skills/alpha/references/library/component-32-guide.md') -and -not $up.Contains('skills/alpha/references/guide.md') } 'GitHub to list the pushed change' 30)
+        # This repository was added without a token, so the app sees the change only once GitHub's servers do. It asks
+        # for the branch's commit and for its listing separately, and each answer may be up to a minute old on its own.
+        $head = ([string](Invoke-Gh @('api', "repos/$($c.Repo)/git/ref/heads/$($c.Branch)", '--jq', '.object.sha'))).Trim().ToLowerInvariant()
+        [void](Wait-Live { (Get-PublicCommit $c.Repo $c.Branch) -eq $head -and ($up = Get-PublicFiles $c.Repo $c.Branch 'skills').Contains('alpha/references/library/component-32-guide.md') -and -not $up.Contains('alpha/references/guide.md') } 'the answers without a token to show the pushed change' 150 15000)
         Click-Ui $win $UiPanel.Page ($edited.Id + 2)
         $file = Wait-Maybe { $t = Read-Ui $win $UiPanel.Files $UiId.File; if ($t) { $t } } 15
         $inPlace = [TssLive]::Shown([TssLive]::GetDlgItem($win, $UiPanel.Head)) -and -not [TssLive]::Shown([TssLive]::GetDlgItem($win, $UiPanel.Page)) -and -not [TssLive]::Shown([TssLive]::GetDlgItem($win, $UiPanel.Nav))
         Check 'Show changes shows the differences in place of the pages' $inPlace
-        Check 'the file that differs is listed: SKILL.md, changed' ($file -match "^SKILL\.md`nChanged $dot \d+ added, \d+ removed$") ($file -replace "`n", ' / ')
+        $library1 = Read-Ui $win $UiPanel.Files ($UiId.File + 1)
+        $script = Read-Ui $win $UiPanel.Files ($UiId.File + 33)
+        $skillFile = Read-Ui $win $UiPanel.Files ($UiId.File + 34)
+        $past = Read-Ui $win $UiPanel.Files ($UiId.File + 35)
+        # The changes read as what taking GitHub's version would do here: my added line and the guide would go, the
+        # library and the deleted script would come. My own file sorts first if it is listed, and it is not.
+        Check 'the guide GitHub removed, the 32 files it added, the script deleted here and the edited SKILL.md are listed, from this PC to GitHub; my own file is not' ($file -match '^references/guide\.md\nOnly on this PC$' -and $library1 -match '^references/library/component-01-guide\.md\nOnly on GitHub$' -and $script -match '^scripts/hello\.ps1\nOnly on GitHub$' -and $skillFile -match "^SKILL\.md`nChanged $dot 0 added, 1 removed$" -and $null -eq $past) ((@($file, $library1, $script, $skillFile, $past) -join ' / ') -replace "`n", ' / ')
         $head = Read-Panel $win $UiPanel.Head
         Check 'it names the skill, says nothing changes until a choice is made, and offers the choices' ((Read-Ui $win $UiPanel.Head $UiId.Title) -eq 'alpha' -and $head -match 'Nothing changes until you choose' -and $head -match 'Use the GitHub version' -and $head -match 'Keep my version') $head
         $pic = Save-Shot $win '09-changes'
         Test-Painted $pic $win 'the changes of a skill' @(@($UiPanel.Head, $UiId.Back), @($UiPanel.Head, $UiId.Title), @($UiPanel.Head, $UiId.DiffAction), @($UiPanel.Files, $UiId.File))
         Test-Layout $win 'the changes of a skill'
-        Send-Key (Get-Ui $win $UiPanel.Head $UiId.Back) $VK_ESCAPE
+        Click-Ui $win $UiPanel.Files ($UiId.File + 33)
+        Start-Sleep -Milliseconds 400
+        $pic = Save-Shot $win '09c-only-on-github'
+        Test-Painted $pic $win 'a file only on GitHub' @(@($UiPanel.Head, $UiId.Back), @($UiPanel.Head, $UiId.Title))
+        Test-ListHover $c $win -Diff
+        if ([TssLive]::Shown([TssLive]::GetDlgItem($win, $UiPanel.Head))) {
+            Send-Key (Get-Ui $win $UiPanel.Head $UiId.Back) $VK_ESCAPE
+        }
         $back = Wait-Maybe { if ([TssLive]::Shown([TssLive]::GetDlgItem($win, $UiPanel.Page)) -and -not [TssLive]::Shown([TssLive]::GetDlgItem($win, $UiPanel.Head))) { $true } } 5
         Check 'Esc goes back to the page of the repository, and nothing changed' ($back -and (Read-Skill $c 'alpha\SKILL.md') -match 'my own words')
 

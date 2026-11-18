@@ -39,7 +39,7 @@ use crate::secret::Secret;
 use crate::state::{Fingerprint, Folder, OwnedSkill, Pending, State, VolumeId};
 use crate::text;
 use crate::tree::{self, Discovery, Rejected, SkillFile};
-use crate::verify::{self, Check, Likeness, Stats, check_for_volume};
+use crate::verify::{self, Check, Likeness, Spot, Spots, Stats, check_for_volume};
 use crate::win::fs::{self as winfs, FileHasher, Kind, probe, volume_id};
 
 const LOCK_FILE: &str = "engine.lock";
@@ -494,39 +494,58 @@ fn root_len(applier: &Applier) -> usize {
     skills.max(work)
 }
 
-/// The files of a skill's folder on this PC, without following any link, or `None` when the folder is not there.
-fn files_here(dir: &Path) -> Result<Option<Vec<winfs::Found>>, EngineError> {
-    let cannot = |e: io::Error| failed(format!("{} cannot be read: {e}", dir.display()));
-    match winfs::Folder::open(dir).map_err(cannot)? {
-        None => Ok(None),
-        Some(folder) if folder.kind == Kind::Dir => folder.list_files().map(Some).map_err(cannot),
+/// Whether a skill's folder is on this PC. A link is never followed, so a link there is an error.
+fn here(dir: &Path) -> Result<bool, EngineError> {
+    match winfs::kind_at(dir).map_err(|e| failed(format!("{} cannot be read: {e}", dir.display())))? {
+        None => Ok(false),
+        Some(Kind::Dir) => Ok(true),
         Some(_) => Err(failed(format!("{} is not a plain folder (a link is never followed)", dir.display()))),
     }
+}
+
+/// The paths "Show changes" looks at in a skill's folder: the files on GitHub and the files the app installed there,
+/// once each whatever their case. Any other file there is one the user added, which the app never touches or shows.
+fn wanted_here(upstream: &[SkillFile], recorded: Option<&OwnedSkill>) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let installed = recorded.into_iter().flat_map(|k| k.files.iter().map(|f| &f.path));
+    upstream.iter().map(|f| &f.path).chain(installed).filter(|path| seen.insert(fold(path))).cloned().collect()
 }
 
 /// The files on this PC that are different from GitHub, and the folded paths of the ones that are the same.
 type ReadHere = (Vec<(String, Content)>, HashSet<String>);
 
-/// Reads the files on this PC for "Show changes", comparing each with its copy on GitHub (`theirs`, by folded path).
-/// Bytes are kept only while there is room.
-fn read_here(dir: &Path, found: Vec<winfs::Found>, theirs: &HashMap<String, &SkillFile>, cancel: &AtomicBool) -> Result<ReadHere, EngineError> {
+/// Reads the files at `rels` on this PC for "Show changes", comparing each with its copy on GitHub (`theirs`, by folded
+/// path). A path with nothing there is left out. Bytes are kept only while there is room.
+fn read_here(dir: &Path, rels: Vec<String>, theirs: &HashMap<String, &SkillFile>, cancel: &AtomicBool) -> Result<ReadHere, EngineError> {
     let mut hasher = FileHasher::default();
+    let mut spots = Spots::new(dir);
+    let mut stats = Stats::default();
     let mut budget = DIFF_TOTAL_BYTES;
     let mut different = Vec::new();
     let mut same = HashSet::new();
-    for file in found {
+    for rel in rels {
         if cancel.load(Ordering::Relaxed) {
             return Err(failed("showing the changes was stopped"));
         }
-        if file.kind != Kind::File {
-            different.push((file.rel, Content::Hidden("it is a link, which is never followed".into())));
+        let unread = match spots.find(&rel, &mut stats) {
+            Spot::Missing => continue,
+            Spot::Found(found) => match found.kind {
+                Kind::File => None,
+                Kind::Link => Some("it is a link, which is never followed"),
+                Kind::Dir => Some("it is a folder here, not a file"),
+            },
+            Spot::Blocked => Some("a folder on its way is a link or a file here, and a link is never followed"),
+            Spot::Unreadable => Some("it could not be read"),
+        };
+        if let Some(why) = unread {
+            different.push((rel, Content::Hidden(why.into())));
             continue;
         }
-        let key = fold(&file.rel);
+        let key = fold(&rel);
         let upstream = theirs.get(&key);
         // A file too big to show that is larger than its copy on GitHub is different whatever it holds; it is not read.
         let limit = upstream.map_or(0, |t| t.size).max(DIFF_FILE_BYTES);
-        let content = match hasher.read(&join_rel(dir, &file.rel), DIFF_FILE_BYTES.min(budget), limit) {
+        let content = match hasher.read(&join_rel(dir, &rel), DIFF_FILE_BYTES.min(budget), limit) {
             Ok(read) if upstream.is_some_and(|t| t.blob == read.blob) => {
                 same.insert(key);
                 continue;
@@ -540,7 +559,7 @@ fn read_here(dir: &Path, found: Vec<winfs::Found>, theirs: &HashMap<String, &Ski
             Err(e) if e.kind() == io::ErrorKind::FileTooLarge => Content::Hidden(TOO_BIG.into()),
             Err(e) => Content::Hidden(format!("it could not be read: {e}")),
         };
-        different.push((file.rel, content));
+        different.push((rel, content));
     }
     Ok((different, same))
 }
@@ -1126,8 +1145,12 @@ impl Engine {
     }
 
     fn act(&self, s: &mut Session, cx: &Ctx, discovery: &Discovery, d: &Decision, commit: &mut Option<String>) -> Result<ApplyResult, RemoteError> {
-        let result = |applied: Applied| match applied {
+        let result = |applied: Applied, warnings: &mut Vec<String>| match applied {
             Applied::Done => ApplyResult::Done,
+            Applied::Displaced { paths, backup } => {
+                warnings.push(format!("{}: {}", d.name, apply::displaced_text(&paths, &backup)));
+                ApplyResult::Done
+            }
             Applied::Held(why) => ApplyResult::Held(why),
         };
         let id = cx.repo.id.as_str();
@@ -1138,7 +1161,8 @@ impl Engine {
             }
             Verdict::Delete => {
                 s.ensure_preflight()?;
-                Ok(result(s.applier.delete(&mut s.state, id, &d.name)?))
+                let applied = s.applier.delete(&mut s.state, id, &d.name)?;
+                Ok(result(applied, &mut s.warnings))
             }
             Verdict::Install | Verdict::Update | Verdict::Adopt => {
                 let skill = discovery
@@ -1164,19 +1188,22 @@ impl Engine {
                 let commit = commit.as_deref().unwrap_or_default();
                 if !downloads {
                     let theirs = cx.theirs.get(&fold(&skill.name)).cloned().unwrap_or_default();
-                    return Ok(result(s.applier.adopt(&mut s.state, id, skill, commit, &theirs)?));
+                    let applied = s.applier.adopt(&mut s.state, id, skill, commit, &theirs)?;
+                    return Ok(result(applied, &mut s.warnings));
                 }
                 let bytes = Cell::new(0u64);
                 let mut fetch = |file: &SkillFile, sink: &mut dyn FnMut(&[u8]) -> bool| -> Result<(), RemoteError> {
                     let rel = cx.rel(&skill.name, &file.path);
-                    self.remote.file(&cx.repo_ref, commit, &rel, file.size, cx.token.as_deref(), cx.cancel, &mut |chunk: &[u8]| {
-                        bytes.set(bytes.get() + chunk.len() as u64);
-                        sink(chunk)
-                    })
+                    self.remote
+                        .file(&cx.repo_ref, commit, &rel, file.size, cx.token.as_deref(), cx.cancel, &mut |chunk: &[u8]| {
+                            bytes.set(bytes.get() + chunk.len() as u64);
+                            sink(chunk)
+                        })
+                        .map_err(|e| missing_means_changed(e, &file.path))
                 };
                 let applied = s.applier.install(&mut s.state, id, skill, commit, Mode::Normal, &mut fetch, cx.cancel);
                 s.downloaded += bytes.get();
-                Ok(result(applied?))
+                Ok(result(applied?, &mut s.warnings))
             }
             _ => Ok(ApplyResult::NotApplicable),
         }
@@ -1242,17 +1269,20 @@ impl Engine {
                 let bytes = Cell::new(0u64);
                 let mut fetch = |file: &SkillFile, sink: &mut dyn FnMut(&[u8]) -> bool| -> Result<(), RemoteError> {
                     let rel = if single { file.path.clone() } else { format!("{}/{}", upstream.name, file.path) };
-                    self.remote.file(&repo_ref, &commit, &rel, file.size, token.as_deref(), cancel, &mut |chunk: &[u8]| {
-                        bytes.set(bytes.get() + chunk.len() as u64);
-                        sink(chunk)
-                    })
+                    self.remote
+                        .file(&repo_ref, &commit, &rel, file.size, token.as_deref(), cancel, &mut |chunk: &[u8]| {
+                            bytes.set(bytes.get() + chunk.len() as u64);
+                            sink(chunk)
+                        })
+                        .map_err(|e| missing_means_changed(e, &file.path))
                 };
                 let applied = s.applier.install(&mut s.state, &repo.id, upstream, &commit, Mode::Overwrite, &mut fetch, cancel);
                 s.downloaded += bytes.get();
                 let applied = applied.inspect_err(|_| s.suspect = true).map_err(|e| failed(e.message))?;
                 let backups: Vec<PathBuf> = backups_in(&s.applier.work_dir).into_iter().filter(|b| !backups_before.contains(b)).collect();
                 match applied {
-                    Applied::Done => {
+                    // An overwrite never reports what was in the way: every backup is reported below.
+                    Applied::Done | Applied::Displaced { .. } => {
                         s.state.repo_mut(&repo.id).etag = None;
                         s.must_save = true;
                         let kept = if backups.is_empty() { String::new() } else { "; what was there is kept in the backups folder".to_string() };
@@ -1282,7 +1312,7 @@ impl Engine {
         }
         let repo_ref = RepoRef::of(repo).map_err(failed)?;
         let dir = s.applier.skills_dir.join(skill);
-        let found = files_here(&dir)?;
+        let here = here(&dir)?;
         let (reply, token) = self.list(s, repo, &repo_ref, None, false, cancel).map_err(|f| failed(f.message))?;
         let snapshot = match reply {
             TreeReply::Snapshot { snapshot, .. } => snapshot,
@@ -1298,16 +1328,22 @@ impl Engine {
         let files = upstream.map_or(&[][..], |k| k.files.as_slice());
         let by_name: HashMap<String, &SkillFile> = files.iter().map(|f| (fold(&f.path), f)).collect();
 
-        let here = found.is_some();
-        let (ours, same) = match found {
-            Some(found) => read_here(&dir, found, &by_name, cancel)?,
-            None => Default::default(),
+        let (ours, same) = if here {
+            let recorded = s.state.repo(&repo.id).and_then(|r| r.skill(skill));
+            read_here(&dir, wanted_here(files, recorded), &by_name, cancel)?
+        } else {
+            Default::default()
         };
         let mut theirs = Vec::new();
         let mut commit: Option<String> = None;
         let mut budget = DIFF_TOTAL_BYTES;
+        // A file not read on this PC is shown only with the reason, so its copy on GitHub is not downloaded either.
+        let unread: HashMap<String, &str> =
+            ours.iter().filter_map(|(path, content)| if let Content::Hidden(why) = content { Some((fold(path), why.as_str())) } else { None }).collect();
         for file in files.iter().filter(|f| !same.contains(&fold(&f.path))) {
-            let content = if file.size > DIFF_FILE_BYTES {
+            let content = if let Some(why) = unread.get(&fold(&file.path)) {
+                Content::Hidden(why.to_string())
+            } else if file.size > DIFF_FILE_BYTES {
                 Content::Hidden(TOO_BIG.into())
             } else if file.size > budget {
                 Content::Hidden(TOO_MUCH.into())
@@ -1338,7 +1374,7 @@ impl Engine {
             }
             let outcome = s.ensure_preflight().and_then(|()| s.applier.delete(&mut s.state, repo_id, &name));
             match outcome {
-                Ok(Applied::Done) => report.deleted.push(name),
+                Ok(Applied::Done | Applied::Displaced { .. }) => report.deleted.push(name),
                 Ok(Applied::Held(why)) => report.kept.push((name, why)),
                 Err(e) => {
                     s.suspect = true;
@@ -1458,6 +1494,16 @@ fn backups_in(work_dir: &Path) -> Vec<PathBuf> {
     out
 }
 
+fn changed_on_github(path: &str) -> RemoteError {
+    RemoteError::new(FailureKind::Changed, format!("the repository changed on GitHub while {path} was being read; try again"))
+}
+
+/// A file the listing named that the commit being read does not have: a push landed between the two reads, or GitHub
+/// answered them from caches of different ages. It is never a missing or private repository.
+fn missing_means_changed(e: RemoteError, path: &str) -> RemoteError {
+    if e.kind == FailureKind::NotFound { changed_on_github(path) } else { e }
+}
+
 /// Downloads one file into memory and proves it is the one that was listed.
 fn download(
     remote: &dyn Remote,
@@ -1477,11 +1523,11 @@ fn download(
         }
         !over
     });
-    let changed = || RemoteError::new(FailureKind::Changed, format!("{} changed on GitHub while it was being read; try again", file.path));
+    let changed = || changed_on_github(&file.path);
     if over {
         return Err(changed());
     }
-    got?;
+    got.map_err(|e| missing_means_changed(e, &file.path))?;
     if blob_hex(&bytes) != file.blob {
         return Err(changed());
     }

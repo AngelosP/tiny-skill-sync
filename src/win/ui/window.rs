@@ -32,7 +32,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 
 use super::control::{self, BN_CLICKED, CBN_SELENDOK, Surface};
 use super::dialogs::{self, Ask, Check, Field};
-use super::page::{self, CUSTOM, DiffView, Fit, HERO_H, Hit, NAV_W, Page, Part, RepoPage, Report, SYNC_TIP, SettingsPage, id};
+use super::page::{self, CUSTOM, DIFF_FILES_W, DiffView, Fit, HERO_H, Hit, NAV_W, Page, Part, RepoPage, Report, SYNC_TIP, SettingsPage, id};
 use super::paint::{self, Font, Rect, glyph};
 use super::shell::{self, Snapshot};
 use super::theme::{self, Role};
@@ -58,8 +58,8 @@ const WM_REFRESH: u32 = WM_APP + 10;
 const TIMER_REFRESH: usize = 1;
 const REFRESH_MS: u32 = 60_000;
 /// The list on the left widens once the mouse has rested on it this long, so passing over it does nothing.
-const TIMER_NAV: usize = 2;
-const NAV_REST_MS: u32 = 250;
+const TIMER_LIST: usize = 2;
+const LIST_REST_MS: u32 = 250;
 /// The panels' ids. Not 1 or 2: Enter and Escape make the dialog manager look for a child with those.
 const HERO: i32 = 101;
 const NAV: i32 = 102;
@@ -115,11 +115,11 @@ thread_local! {
     /// What the window draws behind the panels; kept apart from the state, so painting never needs to borrow it.
     static DIFF_MODE: Cell<bool> = const { Cell::new(false) };
     /// How wide the list on the left is laid out, in DIPs; also for painting.
-    static NAV_SHOWN: Cell<i32> = const { Cell::new(NAV_W) };
+    static LIST_SHOWN: Cell<i32> = const { Cell::new(NAV_W) };
     /// The mouse is on the list on the left and the rest timer runs.
-    static NAV_RESTING: Cell<bool> = const { Cell::new(false) };
+    static LIST_RESTING: Cell<bool> = const { Cell::new(false) };
     /// The mouse rested on the list, so it is as wide as its names need.
-    static NAV_WIDE: Cell<bool> = const { Cell::new(false) };
+    static LIST_WIDE: Cell<bool> = const { Cell::new(false) };
 }
 
 pub fn window() -> HWND {
@@ -337,7 +337,7 @@ fn update(hwnd: HWND) {
 /// What each panel shows and where, or `None` to hide it.
 type Plan = Vec<(HWND, Option<(Rect, Surface)>)>;
 
-fn lay_out(st: &Win, nav_w: i32, w: i32, h: i32, bar: i32, fit: Fit) -> Plan {
+fn lay_out(st: &Win, list_w: i32, w: i32, h: i32, bar: i32, fit: Fit) -> Plan {
     let p = st.p;
     let Some(snap) = &st.snap else { return Vec::new() };
     // Laid out again without the scroll bar's width when it does not fit.
@@ -347,12 +347,12 @@ fn lay_out(st: &Win, nav_w: i32, w: i32, h: i32, bar: i32, fit: Fit) -> Plan {
         Some((at, surface))
     };
     if let Some(d) = &st.diff {
-        let l = page::diff_layout(w, h);
+        let l = page::diff_layout(w, h, list_w);
         return vec![
             (p.hero, None),
             (p.nav, None),
             (p.page, None),
-            (p.head, Some((l.head, page::diff_head(d, w, fit)))),
+            (p.head, Some((l.head, page::diff_head(d, &l, fit)))),
             (p.files, fitted(l.files, &|w| page::diff_files(d, w, fit))),
             (p.code, fitted(l.code, &|w| page::diff_code(d, w, fit))),
         ];
@@ -364,17 +364,26 @@ fn lay_out(st: &Win, nav_w: i32, w: i32, h: i32, bar: i32, fit: Fit) -> Plan {
     let shown = st.page.as_ref().unwrap_or(&welcome);
     vec![
         (p.hero, Some(([0, 0, w, HERO_H], page::hero(&hero, can_sync, w, fit)))),
-        (p.nav, fitted([0, HERO_H, nav_w, body], &|w| page::nav(&snap.views, shown, w, body, fit))),
-        (p.page, fitted([nav_w, HERO_H, (w - nav_w).max(0), body], &|w| page_of(st, snap, w, fit))),
+        (p.nav, fitted([0, HERO_H, list_w, body], &|w| page::nav(&snap.views, shown, w, body, fit))),
+        (p.page, fitted([list_w, HERO_H, (w - list_w).max(0), body], &|w| page_of(st, snap, w, fit))),
         (p.head, None),
         (p.files, None),
         (p.code, None),
     ]
 }
 
-/// How wide the list on the left is: [`NAV_W`], or as wide as its names need while the mouse rests on it.
-fn nav_width(st: &Win, w: i32, h: i32, bar: i32, fit: Fit) -> i32 {
-    let Some(snap) = st.snap.as_ref().filter(|_| NAV_WIDE.with(Cell::get) && st.diff.is_none()) else { return NAV_W };
+/// How wide the active list on the left is, including the card borders in the diff view.
+fn list_width(st: &Win, w: i32, h: i32, bar: i32, fit: Fit) -> i32 {
+    let wide = LIST_WIDE.with(Cell::get);
+    if let Some(d) = &st.diff {
+        if !wide {
+            return DIFF_FILES_W;
+        }
+        let l = page::diff_layout(w, h, DIFF_FILES_W);
+        let scrolls = page::diff_files(d, l.files[2], fit).height > l.files[3];
+        return page::diff_files_width(d, w, if scrolls { bar } else { 0 }, fit);
+    }
+    let Some(snap) = st.snap.as_ref().filter(|_| wide) else { return NAV_W };
     let body = (h - HERO_H).max(0);
     let shown = st.page.clone().unwrap_or(Page::Repo(String::new()));
     let scrolls = page::nav(&snap.views, &shown, NAV_W, body, fit).height > body;
@@ -403,8 +412,8 @@ fn render(hwnd: HWND) {
     lay_out_again(hwnd, false);
 }
 
-/// Lays everything out again; with `if_nav_moves`, only when the list on the left is to change width.
-fn lay_out_again(hwnd: HWND, if_nav_moves: bool) {
+/// Lays everything out again; with `if_list_moves`, only when the list on the left is to change width.
+fn lay_out_again(hwnd: HWND, if_list_moves: bool) {
     let started = Instant::now();
     let dpi = dpi_of(hwnd);
     let (w, h) = client(hwnd);
@@ -417,13 +426,19 @@ fn lay_out_again(hwnd: HWND, if_nav_moves: bool) {
         (px * 96 + dpi as i32 - 1) / dpi as i32
     };
     let laid = with_state(|st| {
-        let nav_w = nav_width(st, w, h, bar, &fit);
-        let moves = nav_w != NAV_SHOWN.with(Cell::get);
-        (moves || !if_nav_moves).then(|| (lay_out(st, nav_w, w, h, bar, &fit), st.diff.is_some(), st.p.hero, nav_w))
+        let diff = st.diff.is_some();
+        if diff != DIFF_MODE.with(Cell::get) {
+            unsafe { KillTimer(hwnd, TIMER_LIST) };
+            LIST_RESTING.with(|r| r.set(false));
+            LIST_WIDE.with(|w| w.set(false));
+        }
+        let list_w = list_width(st, w, h, bar, &fit);
+        let moves = list_w != LIST_SHOWN.with(Cell::get);
+        (moves || !if_list_moves).then(|| (lay_out(st, list_w, w, h, bar, &fit), diff, st.p.hero, list_w))
     });
-    let Some((plan, diff, hero, nav_w)) = laid.flatten() else { return };
+    let Some((plan, diff, hero, list_w)) = laid.flatten() else { return };
     let switched = DIFF_MODE.with(|d| d.replace(diff)) != diff;
-    let widened = NAV_SHOWN.with(|n| n.replace(nav_w)) != nav_w;
+    let widened = LIST_SHOWN.with(|n| n.replace(list_w)) != list_w;
     for (panel, part) in plan {
         match part {
             None => unsafe {
@@ -442,14 +457,17 @@ fn lay_out_again(hwnd: HWND, if_nav_moves: bool) {
     if switched || widened {
         unsafe { RedrawWindow(hwnd, null(), null_mut(), RDW_INVALIDATE | RDW_ALLCHILDREN) };
     }
-    if if_nav_moves && bench::on() {
+    if if_list_moves && bench::on() {
         // As for "settings": paint now, so that the mark includes drawing the panels at their new widths.
         unsafe { RedrawWindow(hwnd, null(), null_mut(), RDW_UPDATENOW | RDW_ALLCHILDREN) };
-        bench::mark("nav", Some(started.elapsed()));
+        bench::mark(if diff { "files" } else { "nav" }, Some(started.elapsed()));
     }
     let sync = control::child(hero, id::SYNC);
     if !sync.is_null() && with_state(|st| std::mem::replace(&mut st.tipped, sync)).is_some_and(|before| before != sync) {
         control::tip(sync, SYNC_TIP);
+    }
+    if switched {
+        on_hover(hwnd);
     }
 }
 
@@ -458,9 +476,9 @@ fn draw_bg(hwnd: HWND) {
     let (w, h) = client(hwnd);
     paint::fill([0, 0, w, h], 0, Role::Bg, Role::None);
     if DIFF_MODE.with(Cell::get) {
-        control::draw(&page::diff_backdrop(&page::diff_layout(w, h), w, h));
+        control::draw(&page::diff_backdrop(&page::diff_layout(w, h, LIST_SHOWN.with(Cell::get)), w, h));
     } else {
-        control::draw(&page::backdrop(NAV_SHOWN.with(Cell::get), w, h));
+        control::draw(&page::backdrop(LIST_SHOWN.with(Cell::get), w, h));
     }
 }
 
@@ -475,28 +493,28 @@ fn pointer_on(panel: HWND) -> bool {
 }
 
 /// The mouse came onto or left a part of the window. The list on the left widens once the mouse has rested on it for
-/// [`NAV_REST_MS`], and narrows as soon as the mouse is anywhere else.
+/// [`LIST_REST_MS`], and narrows as soon as the mouse is anywhere else.
 fn on_hover(hwnd: HWND) {
-    let Some(nav) = with_state(|st| st.p.nav) else { return };
-    if pointer_on(nav) {
-        if !NAV_WIDE.with(Cell::get) && !NAV_RESTING.with(|r| r.replace(true)) {
-            unsafe { SetTimer(hwnd, TIMER_NAV, NAV_REST_MS, None) };
+    let Some(list) = with_state(|st| if st.diff.is_some() { st.p.files } else { st.p.nav }) else { return };
+    if pointer_on(list) {
+        if !LIST_WIDE.with(Cell::get) && !LIST_RESTING.with(|r| r.replace(true)) {
+            unsafe { SetTimer(hwnd, TIMER_LIST, LIST_REST_MS, None) };
         }
         return;
     }
-    if NAV_RESTING.with(|r| r.replace(false)) {
-        unsafe { KillTimer(hwnd, TIMER_NAV) };
+    if LIST_RESTING.with(|r| r.replace(false)) {
+        unsafe { KillTimer(hwnd, TIMER_LIST) };
     }
-    if NAV_WIDE.with(|w| w.replace(false)) {
+    if LIST_WIDE.with(|w| w.replace(false)) {
         lay_out_again(hwnd, true);
     }
 }
 
 fn on_rested(hwnd: HWND) {
-    unsafe { KillTimer(hwnd, TIMER_NAV) };
-    NAV_RESTING.with(|r| r.set(false));
-    let Some(nav) = with_state(|st| st.p.nav) else { return };
-    if pointer_on(nav) && !NAV_WIDE.with(|w| w.replace(true)) {
+    unsafe { KillTimer(hwnd, TIMER_LIST) };
+    LIST_RESTING.with(|r| r.set(false));
+    let Some(list) = with_state(|st| if st.diff.is_some() { st.p.files } else { st.p.nav }) else { return };
+    if pointer_on(list) && !LIST_WIDE.with(|w| w.replace(true)) {
         lay_out_again(hwnd, true);
     }
 }
@@ -999,15 +1017,15 @@ fn on_theme(hwnd: HWND) {
 fn on_destroyed(hwnd: HWND) {
     unsafe {
         KillTimer(hwnd, TIMER_REFRESH);
-        KillTimer(hwnd, TIMER_NAV);
+        KillTimer(hwnd, TIMER_LIST);
     }
     let state = STATE.with(|s| s.try_borrow_mut().ok().and_then(|mut s| s.take()));
     WINDOW.with(|w| w.set(null_mut()));
     REFRESH_POSTED.with(|p| p.set(false));
     DIFF_MODE.with(|d| d.set(false));
-    NAV_SHOWN.with(|n| n.set(NAV_W));
-    NAV_RESTING.with(|r| r.set(false));
-    NAV_WIDE.with(|w| w.set(false));
+    LIST_SHOWN.with(|n| n.set(NAV_W));
+    LIST_RESTING.with(|r| r.set(false));
+    LIST_WIDE.with(|w| w.set(false));
     if let Some(state) = state {
         for icon in state.icons {
             unsafe { DestroyIcon(icon) };
@@ -1027,7 +1045,7 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
         WM_REFRESH => update(hwnd),
         WM_COMMAND => on_command(hwnd, wp, lp),
         WM_TIMER if wp == TIMER_REFRESH => refresh(),
-        WM_TIMER if wp == TIMER_NAV => on_rested(hwnd),
+        WM_TIMER if wp == TIMER_LIST => on_rested(hwnd),
         control::WM_HOVER => on_hover(hwnd),
         WM_SIZE => {
             if wp as u32 != SIZE_MINIMIZED {

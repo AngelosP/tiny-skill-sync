@@ -135,13 +135,13 @@ fn edit_state(w: &World, change: impl FnOnce(&mut State)) {
     state.save(&w.state_file()).unwrap();
 }
 
-fn dirty(modified: &[&str], missing: &[&str], extra: &[&str]) -> LocalStatus {
+fn dirty(modified: &[&str], missing: &[&str]) -> LocalStatus {
     let list = |names: &[&str]| names.iter().map(|n| n.to_string()).collect();
-    LocalStatus::Checked(LocalState::Dirty(DirtyInfo { modified: list(modified), missing: list(missing), extra: list(extra) }))
+    LocalStatus::Checked(LocalState::Dirty(DirtyInfo { modified: list(modified), missing: list(missing) }))
 }
 
 fn edited_guide() -> LocalStatus {
-    dirty(&[GUIDE_IN_SKILL], &[], &[])
+    dirty(&[GUIDE_IN_SKILL], &[])
 }
 
 /// How many files were read. A quick check reads only the files whose fingerprint did not match; a full check reads every
@@ -261,7 +261,7 @@ fn a_longer_or_shorter_file_is_found() {
         beta.write_all(b"one more line\n").unwrap();
     });
     assert_eq!(status_of(&report.verify, "alpha"), edited_guide());
-    assert_eq!(status_of(&report.verify, "beta"), dirty(&["SKILL.md"], &[], &[]));
+    assert_eq!(status_of(&report.verify, "beta"), dirty(&["SKILL.md"], &[]));
     assert_eq!(status_of(&report.verify, "gamma"), clean());
     // Text of another size can still be the same text (other line breaks, blank lines), so the two files are read.
     assert_reads(&report.verify, 2, FILES);
@@ -337,8 +337,8 @@ fn each_skill_is_judged_on_its_own_when_several_things_happen_at_once() {
         fs::write(w.skills.join("gamma/notes.txt"), "mine\n").unwrap();
     });
     assert_eq!(status_of(&report.verify, "alpha"), edited_guide());
-    assert_eq!(status_of(&report.verify, "beta"), dirty(&[], &["SKILL.md"], &[]));
-    assert_eq!(status_of(&report.verify, "gamma"), dirty(&[], &[], &["notes.txt"]));
+    assert_eq!(status_of(&report.verify, "beta"), dirty(&[], &["SKILL.md"]));
+    assert_eq!(status_of(&report.verify, "gamma"), clean(), "a file the user added is theirs, not an edit of the skill");
     // Quick: only the forged file is read. Full: alpha's three files, nothing of beta (it is gone), gamma's one.
     assert_reads(&report.verify, 1, 4);
 }
@@ -389,7 +389,7 @@ fn edits_made_in_the_same_instant_as_the_check_before_them_are_all_found() {
         assert_clean_except(&look, &[]);
         overwrite_and_forge_every_timestamp(&path, edited.as_bytes());
         let found = s.engine.verify(&s.cfg, Access::Write).unwrap();
-        assert_eq!(status_of(&found, skill_name), dirty(&[file], &[], &[]), "round {round}: the edit of {skill_name}/{file} was missed");
+        assert_eq!(status_of(&found, skill_name), dirty(&[file], &[]), "round {round}: the edit of {skill_name}/{file} was missed");
         assert_clean_except(&found, &[skill_name]);
 
         overwrite_and_forge_every_timestamp(&path, original.as_bytes());

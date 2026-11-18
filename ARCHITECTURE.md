@@ -120,7 +120,10 @@ flowchart TD
 - **Downloads are pinned.** When something changed, the app reads the commit the branch points at and downloads each
   needed file from `raw.githubusercontent.com` at that commit. Every file is checked against the Git blob hash in the
   listing. If the branch moved during the download, a hash does not match, nothing is installed, and the check is
-  tried again a minute later.
+  tried again a minute later. A file the listing names that is not found at that commit (a push landed between the
+  two reads, or GitHub answered them from caches of different ages) is the same kind of failure (`Changed`, in
+  `engine.rs`, `missing_means_changed`), for a check, **Show changes** and an overwrite alike: it never reads as a
+  missing or private repository.
 - **The ETag is kept only when everything settled.** If anything was held, failed or was cancelled, the next check
   lists again instead of getting a 304, so unfinished work is never forgotten. A choice about a skill drops the ETag
   too. The tray checks such a repository once in each run, as soon as it sees it (see [Scheduling](#scheduling)). A
@@ -142,7 +145,7 @@ owns, and what is on disk. It is a pure function; every row below is a test.
 | Upstream | Record | Disk | Verdict |
 | --- | --- | --- | --- |
 | has it | not owned | no folder | **Install** |
-| has it | not owned | a folder, identical | **Adopt** (record it as owned, change nothing) |
+| has it | not owned | a folder holding every upstream file, the same | **Adopt** (record it as owned, change nothing) |
 | has it | not owned | a folder, different | **Hold**: it may be yours |
 | has it, same | owned | clean | In sync |
 | has it, changed | owned | clean | **Update** |
@@ -155,8 +158,12 @@ owns, and what is on disk. It is a pure function; every row below is a test.
 | any | owned by another repository | any | Skip: a name clash |
 | any | "keep mine" | any | Skip |
 
-Extra files in an owned folder count as an edit. If a listing has no skills at all while some are owned, every delete
-is held until you confirm (the **mass-deletion guard**): an empty listing is more often a mistake than a real removal.
+**What the user added is theirs.** Only the files GitHub put there (the record, or upstream's listing for a folder not
+owned yet) are looked at. A file the user added to an owned folder is never an edit, and a folder not owned is adopted
+when every upstream file is in it, the same, whatever else it holds; the rest stays the user's. So the app removes only
+what came from GitHub and was later removed there. An edit means a file GitHub put there was changed or deleted. If a
+listing has no skills at all while some are owned, every delete is held until you confirm (the **mass-deletion
+guard**): an empty listing is more often a mistake than a real removal.
 
 "Identical", "same" and "clean" all mean the same as `text.rs` says: two copies of a text file are the same when only
 their line endings, the line break at the end or blank lines differ. That holds for adopting a folder, for finding
@@ -173,12 +180,15 @@ the check of that repository before anything is decided.
 
 ```mermaid
 stateDiagram-v2
-    [*] --> Staged: download into stage-txn, check every hash
-    Staged --> Checked: Full check of the live folder
+    [*] --> Listed: the live folder can be listed
+    [*] --> Held: it cannot (a path too long, no access)
+    Listed --> Staged: download into stage-txn, check every hash
+    Staged --> Checked: Full check of the files GitHub put there
     Checked --> Held: edited meanwhile
     Checked --> Marked: pending marker saved in state.json
     Marked --> Swapped: old folder renamed out, new one renamed in
-    Swapped --> Audited: old folder checked once more
+    Swapped --> Carried: what the user added moved into the new folder
+    Carried --> Audited: old folder checked once more
     Audited --> RolledBack: a late edit slipped in
     Audited --> Done: final record saved, marker cleared
     RolledBack --> Held
@@ -189,12 +199,25 @@ stateDiagram-v2
 - The work folder (`.tss-work`) sits **beside** the skills folder, on the same drive. Copilot never sees a half-made
   skill, and the renames are atomic.
 - The swap uses renames, so the skills folder never holds half a skill.
-- A delete is the same without the download: Full check, marker, rename to `trash-txn`, audit, remove.
+- **What the user added moves with the skill.** After the swap, `carry` moves every entry of the old folder that the
+  old version did not list into the new folder, one at a time and never replacing anything. Something in the way of a
+  file of the new version (the user's file of the same name) stays in the old folder, which then becomes a backup.
+  `carry` returns those paths, so an update says `Applied::Displaced` and the engine adds a warning naming them and
+  the backup (Activity shows it, and so does `tss`); a recovery that finishes such an update says the same in its
+  note. An overwrite says nothing of its own, because it keeps the whole old folder and `resolve` reports that backup.
+  A folder that cannot be listed (with Windows long paths off, one of the user's whose path is over 260 characters)
+  holds the update before anything is downloaded, since what is in it could not be carried.
+- A delete is the same without the download: Full check, marker, rename to `trash-txn`, audit, remove. When the folder
+  holds anything else, an empty new version is swapped in instead, so the user's files are carried back and only the
+  files GitHub put there go; the folder itself is removed at the end only if it is then empty.
 - **A folder is deleted only after it was proven to equal a version the app installed** (equal as `text.rs` says, so a
-  copy that differs only in line endings or blank lines is replaced or deleted like the original). Anything else is
-  kept as `backup-<skill>-<txn>` in the work folder, and backups are never deleted automatically.
+  copy that differs only in line endings or blank lines is replaced or deleted like the original), and to hold nothing
+  else. Anything else is kept as `backup-<skill>-<txn>` in the work folder, and backups are never deleted
+  automatically.
 - If the app or the computer stops between two steps, `recover` reads the pending marker at the next start and
-  finishes or undoes the change. Tests stop the code at every step to prove it (`engine_lifecycle`, `apply` tests).
+  finishes or undoes the change. It finishes an update only when the new folder is a plain folder in place and the old
+  one is still clean; otherwise it moves the user's files back (`uncarry`) and puts the old folder back. Tests stop the
+  code at every step, including between two carried files, to prove it (`engine_lifecycle`, `apply` tests).
 
 ## Finding edits: quick and full checks
 
@@ -311,12 +334,17 @@ everything they show.
   measured through a `Fit` the window passes in), so every layout and sentence is tested without a screen.
 - **`window.rs`** is the main window: the band at the top, the repositories down the left, the page on the right.
   "Show changes" turns the whole window into the differences of one skill until Back (or Esc); the worker reads them
-  with `engine::diff`, which only reads, and `diff.rs` lines them up. The window is made when opened and destroyed when
+  with `engine::diff`, which only reads, and `diff.rs` lines them up from this PC (`−`) to GitHub (`+`), so they read
+  as what taking GitHub's version would do. Only upstream's files and the files the record says this repository put
+  there are compared; files the user added are never read or shown. The window is made when opened and destroyed when
   closed (its fonts and bitmap released, the memory trimmed), so it costs nothing while closed. Its size is saved in
   `window.txt` when you finish resizing it.
-- **The list on the left widens under the mouse** when a repository's name is cut (`page::nav_width`): after the
-  pointer has rested on it for 250 ms, up to half the window, taking the room from the page, whose own width is all
-  that changes. It narrows as soon as the pointer is anywhere else, and never in the diff view. Nothing polls: every
+- **The list on the left widens under the mouse** when a repository's name or a diff file's path or summary is cut
+  (`page::nav_width`, `page::diff_files_width`): after the pointer has rested on it for 250 ms, taking room from the
+  adjacent page or comparison. The repository list stops at half the window; the diff list at half the space shared
+  by its two cards, excluding the margins and gap. The cards, headers and contents use the same `DiffLayout`.
+  Selection, opened unchanged lines and scroll positions survive the resize. The list narrows when the pointer leaves;
+  entering or leaving the diff view resets the hover timer and width. Nothing polls: every
   control and panel posts `WM_HOVER` to the window when the pointer enters or leaves it (`control::track_hover`), and
   the window then asks Windows where the pointer is. One gap: leaving from the list's scroll bar straight across the
   window's border sends no message, so the list stays wide until the next mouse move over the window.
@@ -340,7 +368,8 @@ control or text-direction characters.
 ## Measuring
 
 When `TSS_BENCH_REPORT` names a file, the tray app appends timing marks to it (`src\win\ui\bench.rs`): the tray icon
-shown, each finished job (with how long it took), the window painted, the list on the left widened or narrowed (`nav`),
+shown, each finished job (with how long it took), the window painted, the list on the left widened or narrowed (`nav`
+for repositories, `files` for diff files),
 quit and exit. `scripts\bench.ps1` reads the marks together with Windows' process counters and compares them with the
 budgets. Without the variable, nothing is written. `scripts\e2e.ps1` and `scripts\soak.ps1` read the same marks to know
 when a job has finished; the first also reads and drives the real windows with Win32 messages and measures whether

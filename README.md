@@ -4,7 +4,8 @@ A tiny Windows tray app that keeps your user-level Copilot skills in sync with G
 
 You tell it which repositories (or which folder of a repository) hold skills. It installs them into your Copilot skills
 folder, checks GitHub on a schedule, and installs, updates and removes skills as they change upstream. It never
-touches a skill it did not install, and it never overwrites or deletes a skill you edited.
+touches a skill it did not install, and it never overwrites or deletes a skill you edited. It removes from your PC only
+what came from GitHub and was later removed there; files you add are yours, and the app does not even show them.
 
 - **Small and quiet.** One exe of 0.9 MiB, no runtime to install. It starts in about 8 ms, uses about 1 MiB of
   memory while idle, and does no work at all between checks: no CPU, no disk, no network.
@@ -22,12 +23,18 @@ Windows 10 and 11, x64. Version 0.1: there is no installer yet, and the exe is n
 
 These are the rules the app follows. Each one is covered by tests (see [CONTRIBUTING.md](CONTRIBUTING.md)).
 
-1. **Your own skills are yours.** A folder in the skills folder that the app did not install is never changed or
-   deleted, even if a repository has a skill with the same name. If its content is identical to upstream, the app takes
-   it over; if not, it asks you.
-2. **Your edits win.** If you change a skill the app installed and upstream changes too, the app changes nothing and
-   asks you what to do. If you delete one, it does not put it back unless you ask. Other line endings and added or
-   removed blank lines are not edits (see [What counts as the same](#what-counts-as-the-same)).
+1. **What you add is yours.** A folder in the skills folder that the app did not install is never changed or deleted,
+   even if a repository has a skill with the same name. If every file upstream has is in it, the same, the app takes it
+   over (anything else in it stays yours); if not, it asks you. A file you add inside a skill the app installed is
+   yours too: it is never changed or deleted, never counted as an edit and never shown, and it stays when the skill is
+   updated. The app removes only what came from GitHub and was later removed there: when upstream drops a skill, the
+   files it installed go and the files you added stay. If upstream later adds a file with the same name as one of
+   yours, GitHub's file goes in, yours is kept as a backup, and Activity says which file it was and where the backup
+   is.
+2. **Your edits win.** If you change or delete a file the app installed and upstream changes that skill too, the app
+   changes nothing and asks you what to do. If you delete a whole skill, it does not put it back unless you ask. Other
+   line endings and added or removed blank lines are not edits (see
+   [What counts as the same](#what-counts-as-the-same)).
 3. **A failure is never a deletion.** No network, a wrong token, a missing repository, a rate limit or a strange answer
    from GitHub only means "could not check". Skills are removed only when GitHub returned a complete listing in which
    they are gone. If a repository suddenly lists no skills at all, nothing is deleted until you confirm.
@@ -119,15 +126,21 @@ room from the page beside it, and narrows again when the mouse leaves.
   - **Keep in sync** off pauses it: it is not checked, and nothing in its skills is changed.
   - The **More** button holds **Sync this repository**, **Open on GitHub**, **Open skills folder** and **Remove
     repository…**. Removing asks whether to leave its skills installed (they become yours) or to delete them too
-    (skills you edited are kept).
+    (skills you edited are kept, and files you added stay where they are).
 - **Its skills,** each with its state. A skill that needs you is open already; click any other to open it. An open
   skill says what is going on, and offers the choices that make sense (see below), **Show changes** and **Open folder**.
 - **Show changes** turns the window into the differences between the GitHub version of the skill and the copy on this
-  PC. Nothing changes until you choose.
-  - The files are listed on the left, each marked "Only on GitHub", "Only on this PC", "Changed · 3 added, 1 removed",
-    "Only invisible changes" (only a byte order mark is different) or "Different (not text)". Line endings and blank
-    lines don't count here either: a file that differs only in them is not listed, and blank lines are not shown.
-  - The chosen file's lines are on the right: `−` on red for a line only on GitHub, `+` on green for a line only on this
+  PC, shown as what taking the GitHub version would do to the copy on this PC. Nothing changes until you choose.
+  - The files are listed on the left, each marked "Only on GitHub" (`+`, it would be added), "Only on this PC" (`−`,
+    GitHub removed it since it was installed, so it would go), "Changed · 3 added, 1 removed", "Only invisible changes"
+    (only a byte order mark is different) or "Different (not text)". Line endings and blank lines don't count here
+    either: a file that differs only in them is not listed, and blank lines are not shown.
+  - Only GitHub's files and the files the app installed are compared. Files you added are never listed: they are yours,
+    and taking the GitHub version leaves them where they are.
+  - Rest the mouse on the file list for a quarter of a second to widen it for long paths. It takes room from the
+    comparison, without resizing the window, and narrows when the mouse leaves. Your selected file and scroll
+    positions stay put.
+  - The chosen file's lines are on the right: `+` on green for a line only on GitHub, `−` on red for a line only on this
     PC, with three lines around each change. Long unchanged stretches are folded.
   - The skill's choices are at the top. **Back** (or Esc) returns.
   - Only the files whose hash differs are read or downloaded, and nothing is written. A file over 1 MiB, files beyond
@@ -151,7 +164,7 @@ opens and destroyed when it closes, so it costs nothing while closed.
 
 | Choice | What it does |
 | --- | --- |
-| Use the GitHub version | Install upstream's version. What is in the folder now is kept as a backup. |
+| Use the GitHub version | Install upstream's version. The files it replaces are kept as a backup; files you added stay. |
 | Restore | Bring back a skill you deleted. |
 | Keep my version | The folder is yours: the app never changes or removes it again. |
 | Leave it deleted | A skill you deleted stays deleted. |
@@ -218,7 +231,7 @@ was interrupted.
 
 The skills folder contains only skill folders; the app keeps its own files elsewhere so Copilot never sees them. A
 damaged `state.json` is kept as `state.json.damaged-*` and the app starts over with an empty record (it then takes over
-skills that are identical to upstream and asks about the rest).
+skills that hold every upstream file unchanged and asks about the rest).
 
 Pointing the app at another skills folder (`skills_dir`, or `TSS_SKILLS_DIR`) moves nothing. The new folder gets its own
 copies at the next check, which the tray runs at once when the settings change; the skills in the old folder stay as
@@ -274,7 +287,8 @@ Environment variables, mainly for tests and scripts:
 
 When the app installs a skill, it records the Git hash of every file (and for a text file a hash of its lines that
 count, see below) and what Windows reports about it: its file id, size, times and NTFS change number (USN). The change
-number moves whenever a file's content changes, even if the size and every time stamp are put back.
+number moves whenever a file's content changes, even if the size and every time stamp are put back. Only those files
+are looked at: a file you add to a skill is never counted as an edit.
 
 - **On NTFS with a change journal** (the normal case for `C:`), the app compares these facts when it starts, when
   something in the skills folder changes while it runs, and when upstream has changed. An unchanged install is
@@ -310,14 +324,14 @@ Measured with `scripts\bench.ps1` on a Ryzen 7 5800X3D with Windows 11, files in
 | Measure | 442 files | 1,555 files | Budget |
 | --- | --- | --- | --- |
 | Start to tray icon | 8.4 ms | 8.6 ms | 30 ms median |
-| Start-up check of every installed file | 24 ms | 105 ms | 75 µs per file |
+| Start-up check of every installed file | 21 ms | 105 ms | 75 µs per file |
 | Idle for 10 s: CPU, disk, page faults | 0, 0, 0 | 0, 0, 0 | 0 |
-| Idle memory: trimmed working set / private | 1.0 / 1.8 MiB | 1.2 / 2.6 MiB | 2 / 4 MiB |
-| Window: open to painted (median) | 40 ms | 43 ms | 100 ms |
+| Idle memory: trimmed working set / private | 1.0 / 1.9 MiB | 1.2 / 2.6 MiB | 2 / 4 MiB |
+| Window: open to painted (median) | 41 ms | 43 ms | 100 ms |
 | Window open: working set | 13.5 MiB | 14.4 MiB | 40 MiB |
 | Window closed: working set (trimmed) | 1.5 MiB | 1.5 MiB | 2 MiB |
 | Unchanged check: CPU, file reads and writes | 31 ms, 0, 0 | 16 ms, 0, 0 | 50 ms, 0 |
-| Exe size | 0.89 MiB | 0.89 MiB | 1 MiB |
+| Exe size | 0.91 MiB | 0.91 MiB | 1 MiB |
 
 Windows counts a process's CPU time in ticks of 15.6 ms, so an unchanged check shows as one to three ticks (16 to
 47 ms) from run to run. The exe is built for size: built for speed it would be 1.01 MiB, over its budget, and hash
@@ -341,7 +355,10 @@ ended at 3.2 MiB of private memory. Each change reached the disk within one inte
 - A short network failure turns the icon red until the next successful check.
 - `gh` is found only on the `PATH`; with several `gh` accounts, the active one is used.
 - When Windows long paths are off, a folder you add inside a skill whose path is longer than 260 characters cannot be
-  listed, so that skill counts as edited and is left alone.
+  read by the app, so the files you added could not be kept with the skill. That skill is then not updated or removed:
+  it is held, with "the skill folder could not be read".
+- When upstream adds a file with the same name as one you added, the update goes ahead without asking. Your file is in
+  the backup of that update, and Activity (and `tss check`) names it and the backup.
 - Skills that were refused as unsafe are announced by the check that reads the repository's listing (the first check,
   each time the repository has changed, and `tss check --full-listing`). The app does not remember them: a later check
   that finds nothing new says "Up to date", and the window forgets a refusal when the app restarts. Nothing is
@@ -349,7 +366,9 @@ ended at 3.2 MiB of private memory. Each change reached the disk within one inte
   the same name are different: until that is settled, the repository is read in full at every check, and once
   straight after the app starts, so the window always shows them.
 - GitHub's servers can answer for up to a minute with a version of a public repository that is one change old. When
-  two of its answers disagree, the check stops with "Changed while checking" and changes nothing; the next check works.
+  two of its answers disagree (a file the listing names is different or cannot be found), the check stops with
+  "Changed while checking" and changes nothing, and **Show changes** and **Use the GitHub version** say "the
+  repository changed on GitHub while (the file) was being read; try again". The next try works.
 - One check downloads at most 512 MiB (the rest waits for the next check), and a file over 64 MiB or a skill with more
   than 10,000 files is refused. There is no limit on what all the installed skills add up to.
 - The window opens at 980 by 680 at 100% scale (smaller if the screen has less room) and can be made as small as 640

@@ -6,32 +6,37 @@
 //!    the line break at the end and blank lines don't count).
 //! 3. Write a note (the pending marker) in the state file saying what is about to happen.
 //! 4. Swap with renames. A rename is atomic, so the skills folder never holds half a skill.
-//! 5. Look at the old folder once more, now that nobody can reach it by its old name. If a late edit slipped in,
-//!    put the old folder back and hold the update.
+//! 5. Move every file the user added to the skill into the new folder, one by one, never replacing anything (a file in
+//!    the way of one of GitHub's stays with the old folder). Then look at the old folder once more, now that nobody can
+//!    reach it by its old name. If a late edit slipped in, put the user's files and the old folder back and hold the
+//!    update.
 //! 6. Write the final state and clear the marker.
+//!
+//! A removal follows the same pattern with an empty new version when the user added files to the skill, so that only
+//! what GitHub put there goes.
 //!
 //! A crash between any two steps is understood by `recover` the next time the app starts: it finishes the change or
 //! undoes it, and never loses a file.
 //!
-//! The rule behind all of it: **a folder is deleted only after it has been proven to be a version the app installed**,
-//! with only differences that don't count. Anything else is kept, as `backup-*` in the work folder, and is never
-//! deleted automatically.
+//! The rule behind all of it: **a folder is deleted only after it has been proven to hold exactly a version the app
+//! installed and nothing else**, with only differences that don't count. Anything else is kept, as `backup-*` in the
+//! work folder, and is never deleted automatically.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use crate::fsx::{exists_no_follow, join_rel, remove_dir_all_retry, rename_retry, unique_suffix};
+use crate::fsx::{exists_no_follow, join_rel, move_no_replace_retry, remove_dir_all_retry, rename_retry, unique_suffix};
 use crate::github::{FailureKind, RemoteError};
 use crate::hash::BlobHasher;
-use crate::pathsafe;
-use crate::reconcile::{DirtyInfo, LocalState};
+use crate::pathsafe::{self, fold};
+use crate::reconcile::LocalState;
 use crate::state::{ManagedFile, OwnedSkill, Pending, State};
 use crate::tree::{Skill, SkillFile};
-use crate::verify::{self, Check, Likeness};
-use crate::win::fs::{FileHasher, volume_id};
+use crate::verify::{self, Check, Likeness, Spot, Spots, Stats};
+use crate::win::fs::{FileHasher, Kind, kind_at, list_entries, volume_id};
 
 const EMPTY_BLOB: &str = "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391";
 const ERROR_DIR_NOT_EMPTY: i32 = 145;
@@ -51,6 +56,8 @@ pub enum Step {
     OldMoved,
     /// The new folder is in place.
     NewInPlace,
+    /// One file the user added has been moved from the old folder into the new one.
+    Carried,
     /// The old folder has been audited and removed (or kept as a backup); the final state is not yet saved.
     Settled,
 }
@@ -66,8 +73,27 @@ pub enum Mode {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Applied {
     Done,
+    /// Done, but files the user had added were where the new version has files of its own (`paths`, sorted). They are
+    /// kept in `backup`, with the rest of the replaced folder. Only an update in [`Mode::Normal`] says so: an overwrite
+    /// keeps the whole folder it replaced, and its caller reports that backup.
+    Displaced {
+        paths: Vec<String>,
+        backup: PathBuf,
+    },
     /// Nothing the user owns was changed. The sentence says why, for the user.
     Held(String),
+}
+
+/// Tells the user that files they had added were where GitHub's new version has its own, and where they are now.
+pub fn displaced_text(paths: &[String], backup: &Path) -> String {
+    let list = match paths {
+        [one] => one.clone(),
+        [first @ .., last] if paths.len() <= 3 => format!("{} and {last}", first.join(", ")),
+        [a, b, rest @ ..] => format!("{a}, {b} and {} more", rest.len()),
+        [] => String::new(),
+    };
+    let (thing, were) = if paths.len() == 1 { ("the one", "was") } else { ("the ones", "were") };
+    format!("GitHub's new version has its own {list}, so {thing} you had added {were} moved to {}", backup.display())
 }
 
 /// What recovery did about one interrupted change.
@@ -175,10 +201,79 @@ pub fn preflight(skills_dir: &Path, work_dir: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// The folded paths of `files`, and of every folder on their way.
+fn paths_and_folders(files: &[ManagedFile]) -> (HashSet<String>, HashSet<String>) {
+    let mut paths = HashSet::new();
+    let mut folders = HashSet::new();
+    for f in files {
+        let key = fold(&f.path);
+        for (at, _) in key.match_indices('/') {
+            folders.insert(key[..at].to_string());
+        }
+        paths.insert(key);
+    }
+    (paths, folders)
+}
+
+/// Whether `dir` is a plain folder that holds `files` and nothing else: no other file, link or empty folder.
+fn holds_only(dir: &Path, files: &[ManagedFile]) -> bool {
+    let (paths, _) = paths_and_folders(files);
+    list_entries(dir).is_ok_and(|entries| entries.len() == paths.len() && entries.iter().all(|e| e.kind == Kind::File && paths.contains(&fold(&e.rel))))
+}
+
+/// Makes each folder on the way to `rel` below `root`, one at a time, so that nothing is ever made through a link.
+/// False when something other than a plain folder is in the way.
+fn make_way(root: &Path, rel: &str) -> io::Result<bool> {
+    let mut at = root.to_path_buf();
+    let Some((folders, _)) = rel.rsplit_once('/') else { return Ok(true) };
+    for part in folders.split('/') {
+        at.push(part);
+        if kind_at(&at)?.is_none() {
+            match fs::create_dir(&at) {
+                Err(e) if e.kind() != io::ErrorKind::AlreadyExists => return Err(e),
+                _ => {}
+            }
+        }
+        if kind_at(&at)? != Some(Kind::Dir) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// Removes the folders on the way to `rel` below `root` that are now empty, deepest first. `root` itself stays.
+fn prune(root: &Path, rel: &str) {
+    let mut rest = rel;
+    while let Some((parent, _)) = rest.rsplit_once('/') {
+        if fs::remove_dir(join_rel(root, parent)).is_err() {
+            return;
+        }
+        rest = parent;
+    }
+}
+
+/// Moves one entry from below `from` to the same place below `to`, never replacing anything and never through a link.
+/// False when it was not moved because something is in the way or it is gone.
+fn move_entry(from: &Path, to: &Path, rel: &str) -> Result<bool, RemoteError> {
+    let cannot = |e: &io::Error| io_err(&format!("cannot move {rel}"), e);
+    if !make_way(to, rel).map_err(|e| cannot(&e))? {
+        return Ok(false);
+    }
+    match move_no_replace_retry(&join_rel(from, rel), &join_rel(to, rel)) {
+        Ok(()) => {
+            prune(from, rel);
+            Ok(true)
+        }
+        Err(e) if matches!(e.kind(), io::ErrorKind::NotFound | io::ErrorKind::AlreadyExists) => Ok(false),
+        Err(e) => Err(cannot(&e)),
+    }
+}
+
 enum Retired {
     Gone,
     Deleted,
-    Kept,
+    /// Kept as this backup.
+    Kept(PathBuf),
 }
 
 impl Applier {
@@ -213,6 +308,11 @@ impl Applier {
         self.work_dir.join(format!("trash-{txn}"))
     }
 
+    /// Where a new version goes while a change is being undone.
+    fn new_dir(&self, txn: &str) -> PathBuf {
+        self.work_dir.join(format!("new-{txn}"))
+    }
+
     fn fresh_backup(&self, name: &str, txn: &str) -> PathBuf {
         let base = self.work_dir.join(format!("backup-{name}-{txn}"));
         let mut candidate = base.clone();
@@ -241,30 +341,128 @@ impl Applier {
         }
     }
 
+    /// Whether every one of `files` in `dir` is as recorded. Anything else in the folder is not looked at.
+    fn is_clean(&mut self, dir: &Path, files: &[ManagedFile]) -> bool {
+        verify::verify_files(dir, files, Check::Full, &mut self.hasher).local == LocalState::Clean
+    }
+
+    /// Whether `dir` is exactly `files`, as recorded, with nothing else in it: only then may it be deleted.
+    fn exactly(&mut self, dir: &Path, files: &[ManagedFile]) -> bool {
+        holds_only(dir, files) && self.is_clean(dir, files)
+    }
+
     /// Deletes `dir` only if it is exactly `files`. Anything else is kept as a backup and reported as `Kept`.
     fn retire(&mut self, dir: &Path, files: &[ManagedFile], name: &str, txn: &str) -> Result<Retired, RemoteError> {
         if !exists_no_follow(dir) {
             return Ok(Retired::Gone);
         }
-        match verify::verify_files(dir, files, Check::Full, &mut self.hasher).local {
-            LocalState::FolderMissing => Ok(Retired::Gone),
-            LocalState::Clean => {
-                self.discard(dir);
-                Ok(Retired::Deleted)
-            }
-            LocalState::Dirty(_) => {
-                let keep = self.fresh_backup(name, txn);
-                rename_retry(dir, &keep).map_err(|e| io_err(&format!("cannot move {} aside", dir.display()), &e))?;
-                Ok(Retired::Kept)
-            }
+        if self.exactly(dir, files) {
+            self.discard(dir);
+            return Ok(Retired::Deleted);
+        }
+        let keep = self.fresh_backup(name, txn);
+        match rename_retry(dir, &keep) {
+            Ok(()) => Ok(Retired::Kept(keep)),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Retired::Gone),
+            Err(e) => Err(io_err(&format!("cannot move {} aside", dir.display()), &e)),
         }
     }
 
-    /// Puts the old folder back in place of a new one: the new tree goes (or is kept aside if it is not what
-    /// was downloaded), then the old tree takes its place.
+    /// Puts the old folder back in place of a new one: the new tree is moved out of the skills folder first, so the
+    /// old one can always go back, and is then deleted (or kept aside if it is not exactly what was downloaded).
     fn roll_back_swap(&mut self, live: &Path, old: &Path, new_files: &[ManagedFile], name: &str, txn: &str) -> Result<(), RemoteError> {
-        self.retire(live, new_files, name, txn)?;
-        rename_retry(old, live).map_err(|e| io_err(&format!("cannot put {} back", live.display()), &e))
+        let new = self.new_dir(txn);
+        if exists_no_follow(live) {
+            rename_retry(live, &new).map_err(|e| io_err(&format!("cannot move {} aside", live.display()), &e))?;
+        }
+        if let Err(e) = rename_retry(old, live) {
+            let _ = rename_retry(&new, live);
+            return Err(io_err(&format!("cannot put {} back", live.display()), &e));
+        }
+        self.retire(&new, new_files, name, txn)?;
+        Ok(())
+    }
+
+    /// Moves everything the user added to the old folder (all that is not one of the `known` files GitHub put there)
+    /// into the new one, one entry at a time and never replacing anything. What is in the way of a file of the new
+    /// version stays behind, so that it is kept with the old folder; those paths are returned, sorted, so the user can
+    /// be told.
+    fn carry(&mut self, old: &Path, live: &Path, known: &[ManagedFile], new_files: &[ManagedFile]) -> Result<Vec<String>, RemoteError> {
+        let cannot = |what: &Path, e: &io::Error| io_err(&format!("cannot look at {}", what.display()), e);
+        match kind_at(old) {
+            Ok(Some(Kind::Dir)) => {}
+            Ok(_) => return Ok(Vec::new()),
+            Err(e) => return Err(cannot(old, &e)),
+        }
+        match kind_at(live) {
+            Ok(Some(Kind::Dir)) => {}
+            Ok(_) => return Err(local(format!("{} is not a plain folder", live.display()))),
+            Err(e) => return Err(cannot(live, &e)),
+        }
+        let entries = list_entries(old).map_err(|e| cannot(old, &e))?;
+        let (known_paths, known_folders) = paths_and_folders(known);
+        let (new_paths, new_folders) = paths_and_folders(new_files);
+        let mut in_the_way = Vec::new();
+        for entry in entries {
+            let key = fold(&entry.rel);
+            if known_paths.contains(&key) {
+                continue;
+            }
+            if entry.kind == Kind::Dir {
+                if new_folders.contains(&key) {
+                    // The new version has this folder already; an empty copy of it is nothing to keep.
+                    if fs::remove_dir(join_rel(old, &entry.rel)).is_ok() {
+                        prune(old, &entry.rel);
+                    }
+                    continue;
+                }
+                if known_folders.contains(&key) {
+                    continue;
+                }
+            }
+            let below_a_new_file = key.match_indices('/').any(|(at, _)| new_paths.contains(&key[..at]));
+            if new_paths.contains(&key) || new_folders.contains(&key) || below_a_new_file {
+                in_the_way.push(entry.rel);
+                continue;
+            }
+            if move_entry(old, live, &entry.rel)? {
+                self.at(Step::Carried)?;
+            }
+        }
+        in_the_way.sort_by_key(|rel| fold(rel));
+        Ok(in_the_way)
+    }
+
+    /// The reverse of [`Applier::carry`], for a change that is undone: everything in the new folder that is not a file
+    /// of the new version goes back to the old one.
+    fn uncarry(&mut self, live: &Path, old: &Path, new_files: &[ManagedFile]) -> Result<(), RemoteError> {
+        if kind_at(live).ok().flatten() != Some(Kind::Dir) || kind_at(old).ok().flatten() != Some(Kind::Dir) {
+            return Ok(());
+        }
+        let entries = list_entries(live).map_err(|e| io_err(&format!("cannot look at {}", live.display()), &e))?;
+        let (new_paths, new_folders) = paths_and_folders(new_files);
+        for entry in entries {
+            let key = fold(&entry.rel);
+            if new_paths.contains(&key) || (entry.kind == Kind::Dir && new_folders.contains(&key)) {
+                continue;
+            }
+            move_entry(live, old, &entry.rel)?;
+        }
+        Ok(())
+    }
+
+    /// Records the end of a change: the new version, or no record at all once a removal is done. A folder emptied by a
+    /// removal goes too; one that still holds files the user added stays.
+    fn finish(&mut self, state: &mut State, repo: &str, name: &str, commit: &str, new_files: &[ManagedFile]) {
+        if new_files.is_empty() {
+            state.repo_mut(repo).remove_skill(name);
+            let live = self.live(name);
+            if kind_at(&live).ok().flatten() == Some(Kind::Dir) {
+                let _ = fs::remove_dir(&live);
+            }
+        } else {
+            self.commit_new(state, repo, name, commit, new_files.to_vec());
+        }
     }
 
     /// Records a finished install or update: fingerprints are taken now, at the final location.
@@ -303,6 +501,13 @@ impl Applier {
         if before.is_none() && mode == Mode::Normal && exists_no_follow(&live) {
             return Ok(Applied::Held("a folder with this name appeared; it was left alone".into()));
         }
+        // What the user added moves along with the skill, so a folder that cannot be listed (a path too long, no access)
+        // is not touched, and nothing is downloaded for it.
+        if (before.is_some() || mode == Mode::Overwrite) && kind_at(&live).ok().flatten() == Some(Kind::Dir) {
+            if let Err(e) = list_entries(&live) {
+                return Ok(Applied::Held(format!("the skill folder could not be read ({e}); it was not replaced")));
+            }
+        }
         self.ensure_dirs()?;
         let txn = unique_suffix();
         let stage = self.stage_dir(&txn);
@@ -322,7 +527,7 @@ impl Applier {
         }
         self.at(Step::Staged)?;
 
-        // The check that matters most: right before the swap, is the folder still exactly what was installed?
+        // The check that matters most: right before the swap, is every file GitHub put in the folder still as installed?
         if let (Mode::Normal, Some(old)) = (mode, &before) {
             match verify::verify_files(&live, &old.files, Check::Full, &mut self.hasher).local {
                 LocalState::Clean => {}
@@ -338,22 +543,44 @@ impl Applier {
         }
 
         let new_files: Vec<ManagedFile> = skill.files.iter().map(ManagedFile::from).collect();
-        let mut record = before.clone().unwrap_or_else(|| OwnedSkill { name: skill.name.clone(), commit: String::new(), files: Vec::new(), pending: None });
-        record.pending = Some(Pending::Update { txn: txn.clone(), commit: commit.to_string(), files: new_files.clone() });
+        self.swap_in(state, repo_id, &skill.name, &before, mode, &txn, commit, &new_files)
+    }
+
+    /// Puts the staged folder in place of the skill's folder (steps 3 to 6 of the module's pattern). The files the user
+    /// added move into the new folder. An empty `new_files` removes the skill: what GitHub put there goes and only the
+    /// user's files stay.
+    #[allow(clippy::too_many_arguments)]
+    fn swap_in(
+        &mut self,
+        state: &mut State,
+        repo_id: &str,
+        name: &str,
+        before: &Option<OwnedSkill>,
+        mode: Mode,
+        txn: &str,
+        commit: &str,
+        new_files: &[ManagedFile],
+    ) -> Result<Applied, RemoteError> {
+        let removing = new_files.is_empty();
+        let live = self.live(name);
+        let stage = self.stage_dir(txn);
+        let mut record = before.clone().unwrap_or_else(|| OwnedSkill { name: name.to_string(), commit: String::new(), files: Vec::new(), pending: None });
+        record.pending = Some(Pending::Update { txn: txn.to_string(), commit: commit.to_string(), files: new_files.to_vec() });
         state.repo_mut(repo_id).upsert_skill(record);
         if let Err(e) = self.save(state) {
-            restore_record(state, repo_id, &skill.name, &before);
+            restore_record(state, repo_id, name, before);
             self.discard_stage(&stage);
             return Err(e);
         }
         self.at(Step::Marked)?;
 
-        let old = self.old_dir(&txn);
+        let old = self.old_dir(txn);
         let mut moved_old = false;
         if (before.is_some() || mode == Mode::Overwrite) && exists_no_follow(&live) {
             if let Err(e) = rename_retry(&live, &old) {
-                self.abandon(state, repo_id, &skill.name, &before, Some(&stage));
-                return Ok(Applied::Held(format!("the skill folder is in use by another program, so it was not replaced ({e}); it will be tried again")));
+                self.abandon(state, repo_id, name, before, Some(&stage));
+                let not_done = if removing { "removed" } else { "replaced" };
+                return Ok(Applied::Held(format!("the skill folder is in use by another program, so it was not {not_done} ({e}); it will be tried again")));
             }
             moved_old = true;
         }
@@ -368,7 +595,7 @@ impl Applier {
                     )));
                 }
             }
-            self.abandon(state, repo_id, &skill.name, &before, Some(&stage));
+            self.abandon(state, repo_id, name, before, Some(&stage));
             let busy = e.kind() == io::ErrorKind::AlreadyExists || e.raw_os_error() == Some(ERROR_DIR_NOT_EMPTY);
             return if busy {
                 Ok(Applied::Held("a folder with this name appeared; it was left alone".into()))
@@ -378,35 +605,54 @@ impl Applier {
         }
         self.at(Step::NewInPlace)?;
 
+        let mut displaced = None;
         if moved_old {
-            // Nobody can reach the old folder by its old name any more, so what is in it now is final.
-            let audit = match &before {
-                Some(o) => verify::verify_files(&old, &o.files, Check::Full, &mut self.hasher).local,
-                None => LocalState::Dirty(DirtyInfo { modified: vec!["(not installed by this app)".to_string()], ..DirtyInfo::default() }),
-            };
-            match (audit, mode) {
-                (LocalState::Clean, _) => self.discard(&old),
-                (_, Mode::Overwrite) => {
-                    let keep = self.fresh_backup(&skill.name, &txn);
-                    rename_retry(&old, &keep).map_err(|e| io_err("cannot keep a backup of the replaced folder", &e))?;
+            let known = before.as_ref().map_or(&[][..], |o| o.files.as_slice());
+            let in_the_way = match self.carry(&old, &live, known, new_files) {
+                Ok(paths) => paths,
+                Err(e) => {
+                    return Err(local(format!(
+                        "could not move a file you added into the new version ({}); it is kept in {} and the change will be finished at the next check",
+                        e.message,
+                        old.display()
+                    )));
                 }
-                (dirty, Mode::Normal) => {
-                    self.roll_back_swap(&live, &old, &new_files, &skill.name, &txn)?;
-                    restore_record(state, repo_id, &skill.name, &before);
-                    self.save(state)?;
-                    let what = if let LocalState::Dirty(info) = dirty { format!(" ({info})") } else { String::new() };
-                    return Ok(Applied::Held(format!("edited locally while the update was being made{what}; your version was kept and the update was held")));
+            };
+            // Nobody can reach the old folder by its old name any more, so what is in it now is final.
+            let only = holds_only(&old, known);
+            let audit = verify::verify_files(&old, known, Check::Full, &mut self.hasher).local;
+            let clean = audit == LocalState::Clean;
+            if !clean && mode == Mode::Normal {
+                self.uncarry(&live, &old, new_files)?;
+                self.roll_back_swap(&live, &old, new_files, name, txn)?;
+                restore_record(state, repo_id, name, before);
+                self.save(state)?;
+                let what = if let LocalState::Dirty(info) = audit { format!(" ({info})") } else { String::new() };
+                return Ok(Applied::Held(if removing {
+                    format!("edited locally while it was being removed{what}; your version was kept")
+                } else {
+                    format!("edited locally while the update was being made{what}; your version was kept and the update was held")
+                }));
+            }
+            if only && clean {
+                self.discard(&old);
+            } else {
+                let keep = self.fresh_backup(name, txn);
+                rename_retry(&old, &keep).map_err(|e| io_err("cannot keep a backup of the replaced folder", &e))?;
+                if !in_the_way.is_empty() && mode == Mode::Normal {
+                    displaced = Some(Applied::Displaced { paths: in_the_way, backup: keep });
                 }
             }
         }
         self.at(Step::Settled)?;
 
-        self.commit_new(state, repo_id, &skill.name, commit, new_files);
+        self.finish(state, repo_id, name, commit, new_files);
         self.save(state)?;
-        Ok(Applied::Done)
+        Ok(displaced.unwrap_or(Applied::Done))
     }
 
-    /// Removes an owned skill that is gone upstream, after proving it is untouched.
+    /// Removes an owned skill that is gone upstream, after proving that what GitHub put there is untouched. Files the
+    /// user added to the folder stay where they are.
     pub fn delete(&mut self, state: &mut State, repo_id: &str, name: &str) -> Result<Applied, RemoteError> {
         let Some(owned) = state.repo(repo_id).and_then(|r| r.skill(name)).cloned() else { return Ok(Applied::Done) };
         if owned.pending.is_some() {
@@ -421,10 +667,23 @@ impl Applier {
                 return Ok(Applied::Done);
             }
         }
+        let entries = match list_entries(&live) {
+            Ok(entries) => entries,
+            Err(e) => return Ok(Applied::Held(format!("the skill folder could not be read ({e}); it was not removed"))),
+        };
         self.ensure_dirs()?;
         let txn = unique_suffix();
-        let trash = self.trash_dir(&txn);
         let before = Some(owned.clone());
+        let (known, _) = paths_and_folders(&owned.files);
+        if entries.iter().any(|e| e.kind != Kind::File || !known.contains(&fold(&e.rel))) {
+            // The user added something: swap in an empty folder, and move what they added into it.
+            let stage = self.stage_dir(&txn);
+            fs::create_dir_all(&stage).map_err(|e| io_err("cannot create the stage folder", &e))?;
+            self.at(Step::Staged)?;
+            return self.swap_in(state, repo_id, &owned.name, &before, Mode::Normal, &txn, &owned.commit, &[]);
+        }
+
+        let trash = self.trash_dir(&txn);
         state.repo_mut(repo_id).upsert_skill(OwnedSkill { pending: Some(Pending::Delete { txn: txn.clone() }), ..owned.clone() });
         if let Err(e) = self.save(state) {
             restore_record(state, repo_id, &owned.name, &before);
@@ -438,7 +697,7 @@ impl Applier {
         }
         self.at(Step::OldMoved)?;
 
-        if verify::verify_files(&trash, &owned.files, Check::Full, &mut self.hasher).local != LocalState::Clean {
+        if !self.exactly(&trash, &owned.files) {
             rename_retry(&trash, &live).map_err(|e| io_err(&format!("cannot put {} back", live.display()), &e))?;
             restore_record(state, repo_id, &owned.name, &before);
             self.save(state)?;
@@ -500,49 +759,85 @@ impl Applier {
         let old = self.old_dir(txn);
         self.discard_stage(&self.stage_dir(txn));
         let known_before = !owned.files.is_empty();
-        let sums_up =
-            |this: &mut Applier, dir: &Path, files: &[ManagedFile]| verify::verify_files(dir, files, Check::Full, &mut this.hasher).local == LocalState::Clean;
+        // An empty list of new files is a removal that keeps the files the user added.
+        let removing = new_files.is_empty();
+        let what = if removing { "a removal" } else { "an update" };
 
-        match (exists_no_follow(&old), exists_no_follow(&live)) {
+        let text = match (exists_no_follow(&old), exists_no_follow(&live)) {
             (true, true) => {
-                if known_before && sums_up(self, &old, &owned.files) {
-                    self.commit_new(state, repo, &owned.name, commit, new_files);
-                    self.discard(&old);
-                    "finished an update that was interrupted".to_string()
+                // A folder put back by hand stays; a link there is never followed, so the change is undone.
+                let plain = kind_at(&live).ok().flatten() == Some(Kind::Dir);
+                if known_before && plain && self.is_clean(&old, &owned.files) {
+                    let done = self
+                        .carry(&old, &live, &owned.files, &new_files)
+                        .and_then(|in_the_way| Ok((in_the_way, self.retire(&old, &owned.files, &owned.name, txn)?)));
+                    match done {
+                        Ok((in_the_way, retired)) => {
+                            self.finish(state, repo, &owned.name, commit, &new_files);
+                            match retired {
+                                Retired::Kept(backup) if !in_the_way.is_empty() => {
+                                    format!("finished {what} that was interrupted; {}", displaced_text(&in_the_way, &backup))
+                                }
+                                _ => format!("finished {what} that was interrupted"),
+                            }
+                        }
+                        Err(e) => format!("could not finish {what} that was interrupted yet ({}); it will be tried again at the next check", e.message),
+                    }
                 } else {
-                    match self.roll_back_swap(&live, &old, &new_files, &owned.name, txn) {
+                    match self.uncarry(&live, &old, &new_files).and_then(|()| self.roll_back_swap(&live, &old, &new_files, &owned.name, txn)) {
                         Ok(()) => {
                             settle(state, repo, owned);
-                            "undid an update that was interrupted, because the folder had local changes".to_string()
+                            format!("undid {what} that was interrupted, because the folder had local changes")
                         }
-                        Err(e) => format!("could not undo an interrupted update yet ({e}); it will be tried again at the next start"),
+                        Err(e) => format!("could not undo {what} that was interrupted yet ({}); it will be tried again at the next start", e.message),
                     }
                 }
             }
             (true, false) => match rename_retry(&old, &live) {
                 Ok(()) => {
                     settle(state, repo, owned);
-                    "undid an update that was interrupted; the previous version is back".to_string()
+                    if removing {
+                        "undid a removal that was interrupted; the skill is back".to_string()
+                    } else {
+                        "undid an update that was interrupted; the previous version is back".to_string()
+                    }
                 }
                 Err(e) => format!("could not restore the previous version yet ({e}); it will be tried again at the next start"),
             },
             (false, true) => {
-                if sums_up(self, &live, &new_files) {
-                    self.commit_new(state, repo, &owned.name, commit, new_files);
-                    "finished an update that was interrupted".to_string()
-                } else if known_before && sums_up(self, &live, &owned.files) {
+                // A file that only the old version had must be gone, or nothing proves the change was made: an empty
+                // list of new files is met by any folder.
+                let (new_paths, _) = paths_and_folders(&new_files);
+                let mut spots = Spots::new(&live);
+                let mut stats = Stats::default();
+                let left_over =
+                    owned.files.iter().filter(|f| !new_paths.contains(&fold(&f.path))).any(|f| !matches!(spots.find(&f.path, &mut stats), Spot::Missing));
+                if !left_over && self.is_clean(&live, &new_files) {
+                    self.finish(state, repo, &owned.name, commit, &new_files);
+                    format!("finished {what} that was interrupted")
+                } else if known_before && self.is_clean(&live, &owned.files) {
                     settle(state, repo, owned);
-                    "an update was interrupted before it changed anything".to_string()
+                    format!("{what} was interrupted before it changed anything")
                 } else {
                     settle(state, repo, owned);
-                    "an update was interrupted and the folder does not match any known version; it was left as it is".to_string()
+                    format!("{what} was interrupted and the folder does not match any known version; it was left as it is")
                 }
+            }
+            (false, false) if removing => {
+                state.repo_mut(repo).remove_skill(&owned.name);
+                "a removal was interrupted and had already finished".to_string()
             }
             (false, false) => {
                 settle(state, repo, owned);
                 "an update was interrupted and the folder is gone".to_string()
             }
+        };
+        // An undo that was itself interrupted can leave the new version aside.
+        let new = self.new_dir(txn);
+        if exists_no_follow(&new) {
+            let _ = self.retire(&new, &new_files, &owned.name, txn);
         }
+        text
     }
 
     fn recover_delete(&mut self, state: &mut State, repo: &str, owned: &OwnedSkill, txn: &str) -> String {
@@ -564,7 +859,7 @@ impl Applier {
                 "a removal was interrupted before it changed anything".to_string()
             }
             (false, true) => {
-                if verify::verify_files(&trash, &owned.files, Check::Full, &mut self.hasher).local == LocalState::Clean {
+                if self.exactly(&trash, &owned.files) {
                     self.discard(&trash);
                     state.repo_mut(repo).remove_skill(&owned.name);
                     "finished a removal that was interrupted".to_string()
@@ -626,7 +921,7 @@ mod tests {
     use super::*;
     use crate::hash::blob_hex;
     use crate::verify::verify_skill;
-    use crate::win::fs::{list_files, probe};
+    use crate::win::fs::{Kind, list_entries, list_files, probe};
     use std::collections::BTreeMap;
     use std::os::windows::fs::OpenOptionsExt;
     use std::sync::{Arc, Mutex};
@@ -721,6 +1016,53 @@ mod tests {
         files.iter().map(|(p, c)| (p.to_string(), c.to_string())).collect()
     }
 
+    const DIR: &str = "<folder>";
+    const LINK: &str = "<link>";
+    /// Files the user added to a skill: at the top, deep inside a folder the skill has, and in a folder of their own.
+    const MINE: Files = &[("notes.txt", "my notes"), ("references/deep/mine.md", "deep"), ("mine/x.md", "x")];
+
+    /// Everything in a folder, looked at without following a link: each file's text, `DIR` for an empty folder and
+    /// `LINK` for a link.
+    fn entries_of(dir: &Path) -> BTreeMap<String, String> {
+        let what = |f: &crate::win::fs::Found| match f.kind {
+            Kind::File => fs::read_to_string(join_rel(dir, &f.rel)).unwrap(),
+            Kind::Dir => DIR.to_string(),
+            Kind::Link => LINK.to_string(),
+        };
+        list_entries(dir).unwrap().iter().map(|f| (f.rel.clone(), what(f))).collect()
+    }
+
+    /// `files` and `more` together.
+    fn with(files: Files, more: Files) -> BTreeMap<String, String> {
+        let mut all = expected(files);
+        all.extend(expected(more));
+        all
+    }
+
+    fn add(dir: &Path, files: Files) {
+        write_files(dir, &files.iter().map(|(p, c)| (p.to_string(), c.to_string())).collect::<Vec<_>>());
+    }
+
+    fn junction(link: &Path, target: &Path) {
+        let made = std::process::Command::new("cmd").args(["/C", "mklink", "/J"]).arg(link).arg(target).output().unwrap().status.success();
+        assert!(made, "creating a junction needs no privileges");
+    }
+
+    fn work_dir_starting(work: &Path, prefix: &str) -> PathBuf {
+        fs::read_dir(work).unwrap().flatten().find(|e| e.file_name().to_string_lossy().starts_with(prefix)).unwrap().path()
+    }
+
+    /// Each file the user added is in the skill's folder, as it was, and nowhere else: not in a backup, not left in the
+    /// work folder.
+    fn mine_is_only_in_the_skill(env: &Env, label: &str) {
+        let mut homes = vec![env.live("alpha")];
+        homes.extend(env.work_entries().into_iter().map(|n| env.work.join(n)));
+        for (rel, content) in MINE {
+            let copies: Vec<&PathBuf> = homes.iter().filter(|h| fs::read_to_string(join_rel(h, rel)).is_ok_and(|t| t == *content)).collect();
+            assert_eq!(copies, [&env.live("alpha")], "{label}: {rel}");
+        }
+    }
+
     fn crash_at(a: &mut Applier, step: Step) {
         a.hook = Some(Box::new(move |s| if s == step { Err(local(format!("simulated crash after {s:?}"))) } else { Ok(()) }));
     }
@@ -746,7 +1088,7 @@ mod tests {
     fn held_reason(r: Result<Applied, RemoteError>) -> String {
         match r.unwrap() {
             Applied::Held(why) => why,
-            Applied::Done => panic!("expected the change to be held"),
+            done => panic!("expected the change to be held: {done:?}"),
         }
     }
 
@@ -828,14 +1170,62 @@ mod tests {
 
         // Every other kind of local deviation holds the update the same way.
         fs::write(env.live("alpha").join("SKILL.md"), V1[0].1).unwrap();
-        fs::write(env.live("alpha").join("notes.txt"), "mine").unwrap();
-        assert!(held_early(&mut a, &mut state).contains("extra: notes.txt"));
-        fs::remove_file(env.live("alpha").join("notes.txt")).unwrap();
         fs::remove_file(env.live("alpha").join("references").join("a.md")).unwrap();
         assert!(held_early(&mut a, &mut state).contains("missing: references/a.md"));
         remove_dir_all_retry(&env.live("alpha")).unwrap();
         assert!(held_early(&mut a, &mut state).contains("deleted locally"));
         assert!(!env.live("alpha").exists(), "a skill the user deleted is not brought back silently");
+    }
+
+    #[test]
+    fn files_the_user_added_move_into_the_new_version() {
+        let env = Env::new("carry");
+        let (mut a, mut state) = installed_v1(&env);
+        let live = env.live("alpha");
+        let outside = env.root.join("outside");
+        add(&outside, &[("theirs.md", "not in the skill")]);
+        add(&live, MINE);
+        fs::create_dir_all(live.join("drafts")).unwrap();
+        junction(&live.join("linked"), &outside);
+
+        assert_eq!(install(&mut a, &mut state, "alpha", V2, C2, Mode::Normal).unwrap(), Applied::Done);
+
+        let mut want = with(V2, MINE);
+        want.insert("drafts".into(), DIR.into());
+        want.insert("linked".into(), LINK.into());
+        assert_eq!(entries_of(&live), want, "GitHub's files are the new version and the user's are where they were");
+        assert_eq!(entries_of(&outside), expected(&[("theirs.md", "not in the skill")]), "the link was moved, not what it points to");
+        let recorded: Vec<&str> = record(&state, "alpha").files.iter().map(|f| f.path.as_str()).collect();
+        assert_eq!(recorded, V2.iter().map(|(p, _)| *p).collect::<Vec<_>>(), "only GitHub's files are recorded");
+        assert_eq!(local_state(&mut a, &env, &state, "alpha"), LocalState::Clean);
+        assert!(env.work_entries().is_empty(), "the old version was exactly V1 once the user's files were out: {:?}", env.work_entries());
+    }
+
+    #[test]
+    fn a_file_the_user_added_where_github_now_has_one_is_kept_as_a_backup() {
+        let env = Env::new("carry-clash");
+        let (mut a, mut state) = installed_v1(&env);
+        let live = env.live("alpha");
+        const NEW: Files = &[("SKILL.md", "# alpha v3\n"), ("tools/run.md", "run\n"), ("notes", "github's notes\n"), ("references/b.md", "ref b\n")];
+        // The same path as a new file, a file where a folder is needed, and a file below a path that is now a file.
+        const CLASHING: Files = &[("references/b.md", "my b"), ("tools", "my tools file"), ("notes/x.md", "my x")];
+        add(&live, CLASHING);
+        add(&live, &[("keep.md", "mine")]);
+
+        let applied = install(&mut a, &mut state, "alpha", NEW, C2, Mode::Normal).unwrap();
+
+        assert_eq!(entries_of(&live), with(NEW, &[("keep.md", "mine")]), "GitHub's files win and the rest of the user's stay");
+        let backups = env.work_dirs_starting("backup-alpha-");
+        assert_eq!(backups.len(), 1, "{:?}", env.work_entries());
+        assert_eq!(env.work_entries().len(), 1, "{:?}", env.work_entries());
+        let paths = ["notes/x.md", "references/b.md", "tools"].map(String::from).to_vec();
+        assert_eq!(applied, Applied::Displaced { paths, backup: backups[0].clone() }, "the user is told what had to go, and where it is");
+        let kept = entries_of(&backups[0]);
+        for (rel, content) in CLASHING {
+            assert_eq!(kept.get(*rel).map(String::as_str), Some(*content), "{rel}: {kept:?}");
+        }
+        assert!(!kept.contains_key("keep.md"), "{kept:?}");
+        assert_eq!(local_state(&mut a, &env, &state, "alpha"), LocalState::Clean);
     }
 
     #[test]
@@ -970,12 +1360,12 @@ mod tests {
         edit_skill_file(&env);
         fs::write(env.live("alpha").join("notes.txt"), "my notes").unwrap();
         assert_eq!(install(&mut a, &mut state, "alpha", V2, C2, Mode::Overwrite).unwrap(), Applied::Done);
-        assert_eq!(tree_of(&env.live("alpha")), expected(V2));
+        assert_eq!(entries_of(&env.live("alpha")), with(V2, &[("notes.txt", "my notes")]), "the file the user added stays where it is");
         assert_eq!(local_state(&mut a, &env, &state, "alpha"), LocalState::Clean);
         let backups = env.work_dirs_starting("backup-alpha-");
         assert_eq!(backups.len(), 1, "{:?}", env.work_entries());
         assert_eq!(fs::read_to_string(backups[0].join("SKILL.md")).unwrap(), EDITED);
-        assert_eq!(fs::read_to_string(backups[0].join("notes.txt")).unwrap(), "my notes");
+        assert!(!backups[0].join("notes.txt").exists());
         assert_eq!(env.work_entries().len(), 1, "only the backup remains: {:?}", env.work_entries());
         a.sweep(&state);
         assert_eq!(env.work_dirs_starting("backup-alpha-").len(), 1, "backups are never swept");
@@ -987,8 +1377,9 @@ mod tests {
         let (mut a, mut state) = env.restart();
         fs::create_dir_all(env.live("alpha")).unwrap();
         fs::write(env.live("alpha").join("SKILL.md"), EDITED).unwrap();
+        fs::write(env.live("alpha").join("notes.txt"), "my notes").unwrap();
         assert_eq!(install(&mut a, &mut state, "alpha", V1, C1, Mode::Overwrite).unwrap(), Applied::Done);
-        assert_eq!(tree_of(&env.live("alpha")), expected(V1));
+        assert_eq!(entries_of(&env.live("alpha")), with(V1, &[("notes.txt", "my notes")]), "only what GitHub has was replaced");
         assert!(edited_copy_survives(&env));
         assert_eq!(local_state(&mut a, &env, &state, "alpha"), LocalState::Clean);
     }
@@ -1014,19 +1405,21 @@ mod tests {
     fn an_edit_that_lands_during_the_swap_is_put_back_and_held() {
         let env = Env::new("race");
         let (mut a, mut state) = installed_v1(&env);
+        add(&env.live("alpha"), MINE);
         let before = state.clone();
         let work = env.work.clone();
         a.hook = Some(Box::new(move |step| {
             if step == Step::NewInPlace {
                 // The user saves a file through a handle that was already open on the old folder.
-                let old = fs::read_dir(&work).unwrap().flatten().find(|e| e.file_name().to_string_lossy().starts_with("old-")).unwrap().path();
-                fs::write(old.join("SKILL.md"), EDITED).unwrap();
+                fs::write(work_dir_starting(&work, "old-").join("SKILL.md"), EDITED).unwrap();
             }
             Ok(())
         }));
         let why = held_reason(install(&mut a, &mut state, "alpha", V2, C2, Mode::Normal));
         assert!(why.contains("edited locally") && why.contains("kept"), "{why}");
-        assert_eq!(fs::read_to_string(env.live("alpha").join("SKILL.md")).unwrap(), EDITED, "the user's version is back in place");
+        let mut v1_edited = with(V1, MINE);
+        v1_edited.insert("SKILL.md".into(), EDITED.into());
+        assert_eq!(entries_of(&env.live("alpha")), v1_edited, "the user's version is back in place, with the files they added");
         assert_eq!(state, before);
         assert_eq!(State::load(&env.state).unwrap().state, before);
         assert!(env.work_entries().is_empty(), "{:?}", env.work_entries());
@@ -1073,12 +1466,186 @@ mod tests {
         assert!(held_reason(a.delete(&mut state, REPO, "alpha")).contains("edited locally"));
         assert_eq!(fs::read_to_string(env.live("alpha").join("SKILL.md")).unwrap(), EDITED);
         assert_eq!(state, before);
-
-        fs::write(env.live("alpha").join("SKILL.md"), V1[0].1).unwrap();
-        fs::write(env.live("alpha").join("mine.txt"), "mine").unwrap();
-        assert!(held_reason(a.delete(&mut state, REPO, "alpha")).contains("extra: mine.txt"));
-        assert!(env.live("alpha").join("mine.txt").exists());
         assert!(env.work_entries().is_empty());
+    }
+
+    #[test]
+    fn removing_a_skill_keeps_the_files_the_user_added() {
+        let env = Env::new("delete-keeps-mine");
+        let (mut a, mut state) = installed_v1(&env);
+        let live = env.live("alpha");
+        add(&live, MINE);
+        fs::create_dir_all(live.join("drafts")).unwrap();
+        assert_eq!(a.delete(&mut state, REPO, "alpha").unwrap(), Applied::Done);
+        let mut want = expected(MINE);
+        want.insert("drafts".into(), DIR.into());
+        assert_eq!(entries_of(&live), want, "only what came from GitHub was removed");
+        assert!(state.repo(REPO).unwrap().skill("alpha").is_none(), "what is left is the user's");
+        assert_eq!(State::load(&env.state).unwrap().state, state);
+        assert!(env.work_entries().is_empty(), "{:?}", env.work_entries());
+
+        // An empty folder the user made is theirs too, even if it is all they added.
+        let env = Env::new("delete-keeps-folder");
+        let (mut a, mut state) = installed_v1(&env);
+        fs::create_dir_all(env.live("alpha").join("references").join("empty")).unwrap();
+        assert_eq!(a.delete(&mut state, REPO, "alpha").unwrap(), Applied::Done);
+        assert_eq!(entries_of(&env.live("alpha")), BTreeMap::from([("references/empty".to_string(), DIR.to_string())]));
+        assert!(env.work_entries().is_empty(), "{:?}", env.work_entries());
+    }
+
+    #[test]
+    fn an_edit_that_lands_while_removing_a_skill_with_added_files_puts_everything_back() {
+        let env = Env::new("delete-mine-race");
+        let (mut a, mut state) = installed_v1(&env);
+        add(&env.live("alpha"), MINE);
+        let before = state.clone();
+        let work = env.work.clone();
+        a.hook = Some(Box::new(move |step| {
+            if step == Step::NewInPlace {
+                fs::write(work_dir_starting(&work, "old-").join("SKILL.md"), EDITED).unwrap();
+            }
+            Ok(())
+        }));
+        let why = held_reason(a.delete(&mut state, REPO, "alpha"));
+        assert!(why.contains("edited locally") && why.contains("kept"), "{why}");
+        let mut v1_edited = with(V1, MINE);
+        v1_edited.insert("SKILL.md".into(), EDITED.into());
+        assert_eq!(entries_of(&env.live("alpha")), v1_edited);
+        assert_eq!(state, before);
+        assert_eq!(State::load(&env.state).unwrap().state, before);
+        assert!(env.work_entries().is_empty(), "{:?}", env.work_entries());
+    }
+
+    #[test]
+    fn a_file_added_while_a_skill_is_being_removed_is_never_deleted_with_it() {
+        let env = Env::new("delete-added-late");
+        let (mut a, mut state) = installed_v1(&env);
+        let work = env.work.clone();
+        a.hook = Some(Box::new(move |step| {
+            if step == Step::OldMoved {
+                fs::write(work_dir_starting(&work, "trash-").join("notes.txt"), "my notes").unwrap();
+            }
+            Ok(())
+        }));
+        assert!(held_reason(a.delete(&mut state, REPO, "alpha")).contains("kept"));
+        assert_eq!(entries_of(&env.live("alpha")), with(V1, &[("notes.txt", "my notes")]));
+        a.hook = None;
+        assert_eq!(a.delete(&mut state, REPO, "alpha").unwrap(), Applied::Done, "the next try removes what came from GitHub");
+        assert_eq!(entries_of(&env.live("alpha")), expected(&[("notes.txt", "my notes")]));
+
+        // The same, with the app stopped dead right after the file appeared.
+        let env = Env::new("delete-added-crash");
+        let (mut a, mut state) = installed_v1(&env);
+        let work = env.work.clone();
+        a.hook = Some(Box::new(move |step| {
+            if step == Step::OldMoved {
+                fs::write(work_dir_starting(&work, "trash-").join("notes.txt"), "my notes").unwrap();
+                return Err(local("simulated crash"));
+            }
+            Ok(())
+        }));
+        assert!(a.delete(&mut state, REPO, "alpha").is_err());
+        drop((a, state));
+        let (mut a, mut state) = env.restart();
+        let notes = a.recover(&mut state).unwrap();
+        assert!(notes[0].text.contains("undid"), "{notes:?}");
+        assert_eq!(entries_of(&env.live("alpha")), with(V1, &[("notes.txt", "my notes")]));
+        assert!(env.work_entries().is_empty(), "{:?}", env.work_entries());
+    }
+
+    #[test]
+    fn a_file_written_into_the_new_version_during_the_swap_is_never_replaced_by_one_carried_over() {
+        let env = Env::new("carry-no-replace");
+        let (mut a, mut state) = installed_v1(&env);
+        add(&env.live("alpha"), &[("notes.txt", "my notes")]);
+        let live = env.live("alpha");
+        a.hook = Some(Box::new(move |step| {
+            if step == Step::NewInPlace {
+                fs::write(live.join("notes.txt"), "written meanwhile").unwrap();
+            }
+            Ok(())
+        }));
+        assert_eq!(install(&mut a, &mut state, "alpha", V2, C2, Mode::Normal).unwrap(), Applied::Done);
+        assert_eq!(entries_of(&env.live("alpha")), with(V2, &[("notes.txt", "written meanwhile")]));
+        let backups = env.work_dirs_starting("backup-");
+        assert_eq!(backups.len(), 1, "{:?}", env.work_entries());
+        assert_eq!(fs::read_to_string(backups[0].join("notes.txt")).unwrap(), "my notes");
+    }
+
+    #[test]
+    fn a_removal_whose_added_files_are_gone_by_the_end_leaves_no_empty_folder() {
+        // The file goes while the folder is being swapped.
+        let env = Env::new("delete-mine-gone");
+        let (mut a, mut state) = installed_v1(&env);
+        add(&env.live("alpha"), &[("notes.txt", "my notes")]);
+        let work = env.work.clone();
+        a.hook = Some(Box::new(move |step| {
+            if step == Step::NewInPlace {
+                fs::remove_file(work_dir_starting(&work, "old-").join("notes.txt")).unwrap();
+            }
+            Ok(())
+        }));
+        assert_eq!(a.delete(&mut state, REPO, "alpha").unwrap(), Applied::Done);
+        assert!(!exists_no_follow(&env.live("alpha")));
+        assert!(state.repo(REPO).unwrap().skills.is_empty());
+
+        // The file goes after a crash, before the removal is finished at the next start.
+        let env = Env::new("delete-mine-gone-crash");
+        let (mut a, mut state) = installed_v1(&env);
+        add(&env.live("alpha"), &[("notes.txt", "my notes")]);
+        crash_at(&mut a, Step::Settled);
+        assert!(a.delete(&mut state, REPO, "alpha").is_err());
+        drop((a, state));
+        fs::remove_file(env.live("alpha").join("notes.txt")).unwrap();
+        let (mut a, mut state) = env.restart();
+        let notes = a.recover(&mut state).unwrap();
+        assert!(notes[0].text.contains("finished"), "{notes:?}");
+        assert!(!exists_no_follow(&env.live("alpha")));
+        assert!(state.repo(REPO).unwrap().skills.is_empty());
+        assert!(env.work_entries().is_empty(), "{:?}", env.work_entries());
+    }
+
+    /// Adds a folder of the user's to `skill` that this process cannot open: the path is too long, and tests are not
+    /// long-path aware. The skill's folder can then not be listed, so what the user added could not be moved along.
+    fn add_unlistable(skill: &Path) -> PathBuf {
+        let deep: PathBuf = ["node_modules", &"a".repeat(80), &"b".repeat(80), &"c".repeat(80)].iter().collect();
+        let deep = skill.join(deep).join("index.js");
+        fs::create_dir_all(deep.parent().unwrap()).unwrap();
+        fs::write(&deep, "mine").unwrap();
+        assert!(list_entries(skill).is_err(), "the test needs a folder that cannot be listed");
+        deep
+    }
+
+    #[test]
+    fn a_skill_whose_folder_cannot_be_listed_is_not_changed_and_nothing_the_user_added_is_moved() {
+        let env = Env::new("unlistable");
+        let (mut a, mut state) = installed_v1(&env);
+        let mine = add_unlistable(&env.live("alpha"));
+        let before = state.clone();
+        for mode in [Mode::Normal, Mode::Overwrite] {
+            let why = held_reason(install(&mut a, &mut state, "alpha", V2, C2, mode));
+            assert!(why.contains("could not be read"), "{mode:?}: {why}");
+            assert_eq!(state, before, "{mode:?}");
+            assert_eq!(fs::read_to_string(&mine).unwrap(), "mine", "{mode:?}");
+            assert_eq!(fs::read_to_string(env.live("alpha").join("SKILL.md")).unwrap(), "# alpha v1\n", "{mode:?}");
+            assert!(env.work_entries().is_empty(), "{mode:?}: {:?}", env.work_entries());
+        }
+        assert!(held_reason(a.delete(&mut state, REPO, "alpha")).contains("could not be read"));
+        assert_eq!(fs::read_to_string(&mine).unwrap(), "mine");
+        assert_eq!(fs::read_to_string(env.live("alpha").join("SKILL.md")).unwrap(), "# alpha v1\n");
+
+        // The same for a folder the app does not own, replaced at the user's request.
+        let env = Env::new("unlistable-unowned");
+        let (mut a, mut state) = env.restart();
+        let mine = add_unlistable(&env.live("alpha"));
+        fs::write(env.live("alpha").join("SKILL.md"), EDITED).unwrap();
+        let before = state.clone();
+        let why = held_reason(install(&mut a, &mut state, "alpha", V1, C1, Mode::Overwrite));
+        assert!(why.contains("could not be read"), "{why}");
+        assert_eq!(state, before);
+        assert_eq!(fs::read_to_string(&mine).unwrap(), "mine");
+        assert_eq!(fs::read_to_string(env.live("alpha").join("SKILL.md")).unwrap(), EDITED);
+        assert!(env.work_entries().is_empty(), "{:?}", env.work_entries());
     }
 
     #[test]
@@ -1146,13 +1713,22 @@ mod tests {
         fs::write(env.live("alpha").join("SKILL.md"), EDITED).unwrap();
         assert!(held_reason(a.adopt(&mut state, REPO, &skill("alpha", V1), C1, &HashMap::new())).contains("left alone"));
         assert!(state.repo(REPO).is_none_or(|r| r.skills.is_empty()));
+    }
 
-        // Every file of upstream is there as it is, but so is one more.
-        write_files(&env.live("alpha"), &V1.iter().map(|(p, c)| (p.to_string(), c.to_string())).collect::<Vec<_>>());
-        fs::write(env.live("alpha").join("notes.md"), "mine\n").unwrap();
-        assert!(held_reason(a.adopt(&mut state, REPO, &skill("alpha", V1), C1, &HashMap::new())).contains("left alone"));
-        assert!(state.repo(REPO).is_none_or(|r| r.skills.is_empty()));
-        assert_eq!(fs::read_to_string(env.live("alpha").join("notes.md")).unwrap(), "mine\n");
+    #[test]
+    fn a_folder_with_every_file_of_upstream_and_more_is_adopted_and_the_rest_stays_the_users() {
+        let env = Env::new("adopt-more");
+        let (mut a, mut state) = env.restart();
+        add(&env.live("alpha"), V1);
+        add(&env.live("alpha"), &[("notes.md", "mine\n")]);
+        assert_eq!(a.adopt(&mut state, REPO, &skill("alpha", V1), C1, &HashMap::new()).unwrap(), Applied::Done);
+        let recorded: Vec<&str> = record(&state, "alpha").files.iter().map(|f| f.path.as_str()).collect();
+        assert_eq!(recorded, V1.iter().map(|(p, _)| *p).collect::<Vec<_>>(), "only GitHub's files are owned");
+        assert_eq!(local_state(&mut a, &env, &state, "alpha"), LocalState::Clean);
+
+        assert_eq!(install(&mut a, &mut state, "alpha", V2, C2, Mode::Normal).unwrap(), Applied::Done);
+        assert_eq!(entries_of(&env.live("alpha")), with(V2, &[("notes.md", "mine\n")]));
+        assert!(env.work_entries().is_empty(), "{:?}", env.work_entries());
     }
 
     /// The files as a Windows editor might save them: other line breaks and a few blank lines more.
@@ -1236,7 +1812,7 @@ mod tests {
             fs::write(p, content).unwrap();
         }
         fs::write(copy.join("extra.txt"), "x").unwrap();
-        assert!(matches!(a.retire(&copy, &files, "alpha", "t1").unwrap(), Retired::Kept));
+        assert!(matches!(a.retire(&copy, &files, "alpha", "t1").unwrap(), Retired::Kept(_)));
         assert!(!copy.exists());
         assert_eq!(fs::read_to_string(env.work.join("backup-alpha-t1").join("extra.txt")).unwrap(), "x");
 
@@ -1244,7 +1820,7 @@ mod tests {
         let other = env.work.join("other");
         fs::create_dir_all(&other).unwrap();
         fs::write(other.join("SKILL.md"), "not ours").unwrap();
-        assert!(matches!(a.retire(&other, &files, "alpha", "t1").unwrap(), Retired::Kept));
+        assert!(matches!(a.retire(&other, &files, "alpha", "t1").unwrap(), Retired::Kept(_)));
         assert!(env.work.join("backup-alpha-t1-2").exists(), "a second backup for the same change gets its own name");
     }
 
@@ -1361,6 +1937,124 @@ mod tests {
     }
 
     #[test]
+    fn a_crash_at_any_step_never_loses_a_file_the_user_added() {
+        #[derive(Clone, Copy, Debug, PartialEq)]
+        enum Change {
+            Update,
+            Overwrite,
+            Removal,
+        }
+        let run = |change: Change, a: &mut Applier, state: &mut State| match change {
+            Change::Update => install(a, state, "alpha", V2, C2, Mode::Normal),
+            Change::Overwrite => install(a, state, "alpha", V2, C2, Mode::Overwrite),
+            Change::Removal => a.delete(state, REPO, "alpha"),
+        };
+        for change in [Change::Update, Change::Overwrite, Change::Removal] {
+            for step in [Step::Staged, Step::Marked, Step::OldMoved, Step::NewInPlace, Step::Carried, Step::Settled] {
+                let label = format!("{change:?} stopped at {step:?}");
+                let env = Env::new("crash-mine");
+                let (mut a, mut state) = installed_v1(&env);
+                add(&env.live("alpha"), MINE);
+                if change == Change::Overwrite {
+                    edit_skill_file(&env);
+                }
+                crash_at(&mut a, step);
+                let first = run(change, &mut a, &mut state);
+                assert!(first.is_err(), "{label}: {first:?}");
+                drop((a, state));
+
+                let (mut a, mut state) = env.restart();
+                a.recover(&mut state).unwrap();
+                assert!(a.recover(&mut state).unwrap().is_empty(), "{label}: recovery has nothing left to do");
+                a.sweep(&state);
+                assert_eq!(State::load(&env.state).unwrap().state, state, "{label}: recovery was saved");
+                let leftovers: Vec<String> = env.work_entries().into_iter().filter(|n| !n.starts_with("backup-")).collect();
+                assert!(leftovers.is_empty(), "{label}: {leftovers:?}");
+                mine_is_only_in_the_skill(&env, &format!("{label}, after recovery"));
+
+                let owned = state.repo(REPO).and_then(|r| r.skill("alpha")).cloned();
+                let done = match change {
+                    Change::Removal => owned.is_none(),
+                    _ => owned.as_ref().is_some_and(|o| o.commit == C2),
+                };
+                if !done {
+                    assert_eq!(run(change, &mut a, &mut state).unwrap(), Applied::Done, "{label}: the next try finishes the job");
+                }
+                mine_is_only_in_the_skill(&env, &format!("{label}, at the end"));
+                if change == Change::Removal {
+                    assert_eq!(entries_of(&env.live("alpha")), expected(MINE), "{label}");
+                    assert!(env.work_entries().is_empty(), "{label}: {:?}", env.work_entries());
+                } else {
+                    assert_eq!(entries_of(&env.live("alpha")), with(V2, MINE), "{label}");
+                    assert_eq!(local_state(&mut a, &env, &state, "alpha"), LocalState::Clean, "{label}");
+                }
+                if change == Change::Overwrite {
+                    assert!(edited_copy_survives(&env), "{label}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_file_the_user_added_that_a_program_holds_open_is_moved_at_the_next_check() {
+        let env = Env::new("carry-held-open");
+        let (mut a, mut state) = installed_v1(&env);
+        add(&env.live("alpha"), &[("notes.txt", "my notes")]);
+        let holder: Arc<Mutex<Option<fs::File>>> = Arc::default();
+        let (work, held) = (env.work.clone(), holder.clone());
+        a.hook = Some(Box::new(move |step| {
+            if step == Step::NewInPlace {
+                let notes = work_dir_starting(&work, "old-").join("notes.txt");
+                *held.lock().unwrap() = Some(OpenOptions::new().read(true).share_mode(1 | 2).open(notes).unwrap());
+            }
+            Ok(())
+        }));
+        let first = install(&mut a, &mut state, "alpha", V2, C2, Mode::Normal);
+        assert!(first.as_ref().is_err_and(|e| e.message.contains("next check")), "{first:?}");
+        *holder.lock().unwrap() = None;
+        drop((a, state));
+
+        let (mut a, mut state) = env.restart();
+        let notes = a.recover(&mut state).unwrap();
+        assert!(notes[0].text.contains("finished"), "{notes:?}");
+        a.sweep(&state);
+        assert_eq!(entries_of(&env.live("alpha")), with(V2, &[("notes.txt", "my notes")]));
+        assert_eq!(record(&state, "alpha").commit, C2);
+        assert!(env.work_entries().is_empty(), "{:?}", env.work_entries());
+    }
+
+    #[test]
+    fn an_update_finished_after_a_crash_names_what_the_user_added_that_was_in_the_way() {
+        let env = Env::new("crash-clash");
+        let (mut a, mut state) = installed_v1(&env);
+        add(&env.live("alpha"), &[("references/b.md", "my b"), ("keep.md", "mine")]);
+        crash_at(&mut a, Step::NewInPlace);
+        assert!(install(&mut a, &mut state, "alpha", V2, C2, Mode::Normal).is_err());
+        drop((a, state));
+
+        let (mut a, mut state) = env.restart();
+        let notes = a.recover(&mut state).unwrap();
+
+        assert_eq!(entries_of(&env.live("alpha")), with(V2, &[("keep.md", "mine")]));
+        let backups = env.work_dirs_starting("backup-alpha-");
+        assert_eq!(backups.len(), 1, "{:?}", env.work_entries());
+        assert_eq!(fs::read_to_string(backups[0].join("references").join("b.md")).unwrap(), "my b");
+        let text = &notes[0].text;
+        assert!(text.contains("finished") && text.contains("references/b.md") && text.contains(&backups[0].display().to_string()), "{text}");
+        assert!(!text.contains("keep.md"), "{text}");
+    }
+
+    #[test]
+    fn the_user_is_told_which_of_their_files_were_in_the_way_without_a_long_list() {
+        let backup = Path::new(r"C:\w\backup-alpha-1");
+        let say = |paths: &[&str]| displaced_text(&paths.iter().map(|p| p.to_string()).collect::<Vec<_>>(), backup);
+        assert_eq!(say(&["a.md"]), r"GitHub's new version has its own a.md, so the one you had added was moved to C:\w\backup-alpha-1");
+        assert_eq!(say(&["a.md", "b.md"]), r"GitHub's new version has its own a.md and b.md, so the ones you had added were moved to C:\w\backup-alpha-1");
+        assert!(say(&["a.md", "b.md", "c.md"]).contains(" own a.md, b.md and c.md, so the ones "));
+        assert!(say(&["a.md", "b.md", "c.md", "d.md"]).contains(" own a.md, b.md and 2 more, so the ones "));
+    }
+
+    #[test]
     fn a_crash_after_a_late_edit_during_a_swap_puts_the_edited_folder_back() {
         let env = Env::new("crash-late-edit");
         let (mut a, mut state) = installed_v1(&env);
@@ -1385,6 +2079,30 @@ mod tests {
         a.sweep(&state);
         assert!(env.work_entries().is_empty(), "{:?}", env.work_entries());
         assert!(matches!(local_state(&mut a, &env, &state, "alpha"), LocalState::Dirty(_)), "the edit keeps holding future updates");
+    }
+
+    #[test]
+    fn a_link_put_where_an_interrupted_update_left_no_folder_is_never_followed_and_the_skill_comes_back() {
+        let env = Env::new("crash-link-put-back");
+        let (mut a, mut state) = installed_v1(&env);
+        add(&env.live("alpha"), MINE);
+        crash_at(&mut a, Step::OldMoved);
+        assert!(install(&mut a, &mut state, "alpha", V2, C2, Mode::Normal).is_err());
+        drop((a, state));
+        let outside = env.root.join("outside");
+        add(&outside, V2);
+        junction(&env.live("alpha"), &outside);
+
+        let (mut a, mut state) = env.restart();
+        let notes = a.recover(&mut state).unwrap();
+
+        assert!(notes[0].text.contains("undid"), "{notes:?}");
+        assert_eq!(entries_of(&env.live("alpha")), with(V1, MINE), "the skill and the files the user added are back");
+        assert_eq!(record(&state, "alpha").commit, C1);
+        assert!(record(&state, "alpha").pending.is_none());
+        assert_eq!(entries_of(&outside), expected(V2), "what the link points to is not touched");
+        let kept: Vec<Option<Kind>> = env.work_entries().iter().map(|n| kind_at(&env.work.join(n)).unwrap()).collect();
+        assert_eq!(kept, [Some(Kind::Link)], "the link itself is kept aside");
     }
 
     #[test]

@@ -25,6 +25,7 @@ public static class TssLive {
     [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
     [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr hwnd, IntPtr after, int x, int y, int cx, int cy, uint flags);
     [DllImport("user32.dll")] public static extern uint GetDpiForWindow(IntPtr hwnd);
+    [DllImport("user32.dll")] public static extern int GetScrollPos(IntPtr hwnd, int bar);
     [DllImport("kernel32.dll")] public static extern bool QueryProcessCycleTime(IntPtr process, out ulong cycles);
 
     [StructLayout(LayoutKind.Sequential)] struct RECT { public int Left, Top, Right, Bottom; }
@@ -489,6 +490,28 @@ function Get-UpstreamFiles([string]$Repo, [string]$Ref, [string]$Path = '') {
     $map = [ordered]@{}
     foreach ($e in $tree.tree) { if ($e.type -eq 'blob') { $map[[string]$e.path] = @{ Id = $e.sha; Mode = $e.mode } } }
     $map
+}
+
+# What a public repository's folder lists for anyone without a token, asked exactly as the app asks it. GitHub's servers
+# may keep that answer for up to a minute after a push, so a scenario whose repository is read without a token waits
+# for this one, not for the signed-in listing. Paths are relative to the folder. At most a few calls: the limit
+# without a token is 60 an hour.
+function Get-PublicFiles([string]$Repo, [string]$Ref, [string]$Path) {
+    $spec = [uri]::EscapeDataString("${Ref}:${Path}")
+    $headers = @{ 'Accept' = 'application/vnd.github+json'; 'X-GitHub-Api-Version' = '2022-11-28'; 'User-Agent' = 'tss-e2e' }
+    $tree = Invoke-RestMethod -UseBasicParsing -Headers $headers -Uri "https://api.github.com/repos/$Repo/git/trees/${spec}?recursive=1"
+    if ($tree.truncated) { throw 'the listing is truncated' }
+    $map = [ordered]@{}
+    foreach ($e in $tree.tree) { if ($e.type -eq 'blob') { $map[[string]$e.path] = $e.sha } }
+    $map
+}
+
+# The commit a public branch points to for anyone without a token, asked exactly as the app asks it (it may lag the
+# listing above, since GitHub's servers keep each answer on its own).
+function Get-PublicCommit([string]$Repo, [string]$Ref) {
+    $headers = @{ 'Accept' = 'application/vnd.github.sha'; 'X-GitHub-Api-Version' = '2022-11-28'; 'User-Agent' = 'tss-e2e' }
+    $r = Invoke-WebRequest -UseBasicParsing -Headers $headers -Uri "https://api.github.com/repos/$Repo/commits/$([uri]::EscapeDataString($Ref))"
+    [Text.Encoding]::ASCII.GetString($r.RawContentStream.ToArray()).Trim().ToLowerInvariant()
 }
 
 # Which files a check installs from a listing of the folder: every immediate child folder that has a SKILL.md at

@@ -966,8 +966,8 @@ fn verify_tells_clean_edited_and_missing_skills_apart() {
     s.w.remove("beta");
     let report = s.engine.verify(&s.cfg, Access::ReadOnly).unwrap();
 
-    let expected = DirtyInfo { modified: vec!["SKILL.md".into()], missing: Vec::new(), extra: vec!["extra.txt".into()] };
-    assert_eq!(status_of(&report, "alpha"), LocalStatus::Checked(LocalState::Dirty(expected)));
+    let expected = DirtyInfo { modified: vec!["SKILL.md".into()], missing: Vec::new() };
+    assert_eq!(status_of(&report, "alpha"), LocalStatus::Checked(LocalState::Dirty(expected)), "a file the user added is not an edit");
     assert_eq!(status_of(&report, "beta"), LocalStatus::Checked(LocalState::FolderMissing));
     assert_eq!(status_of(&report, "gamma"), clean());
 }

@@ -19,7 +19,7 @@ use windows_sys::Win32::Storage::FileSystem::{
     BY_HANDLE_FILE_INFORMATION, CreateFileW, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_BASIC_INFO, FILE_FLAG_BACKUP_SEMANTICS,
     FILE_FLAG_OPEN_REPARSE_POINT, FILE_FLAG_SEQUENTIAL_SCAN, FILE_FULL_DIR_INFO, FILE_ID_INFO, FILE_INFO_BY_HANDLE_CLASS, FILE_LIST_DIRECTORY,
     FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_STANDARD_INFO, FileBasicInfo, FileFullDirectoryInfo,
-    FileFullDirectoryRestartInfo, FileIdInfo, FileStandardInfo, GetFileInformationByHandle, GetFileInformationByHandleEx, OPEN_EXISTING,
+    FileFullDirectoryRestartInfo, FileIdInfo, FileStandardInfo, GetFileInformationByHandle, GetFileInformationByHandleEx, MoveFileExW, OPEN_EXISTING,
 };
 use windows_sys::Win32::System::IO::DeviceIoControl;
 use windows_sys::Win32::System::Ioctl::{FSCTL_QUERY_USN_JOURNAL, FSCTL_READ_FILE_USN_DATA};
@@ -123,6 +123,24 @@ pub fn probe(path: &Path) -> io::Result<Option<Probe>> {
     }))
 }
 
+/// What a path is, looked at without following a link and without reading anything else about it. Returns `None`
+/// when the path (or a parent) does not exist.
+pub fn kind_at(path: &Path) -> io::Result<Option<Kind>> {
+    let h = match open(path, FILE_READ_ATTRIBUTES, NO_FOLLOW) {
+        Ok(h) => h,
+        Err(e) if is_missing(&e) => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    Ok(Some(kind_of(info::<FILE_BASIC_INFO>(&h, FileBasicInfo)?.FileAttributes)))
+}
+
+/// Moves a file, a folder or a link (as the link itself) to `to` on the same drive. Fails with `AlreadyExists` rather
+/// than replace anything that is already there.
+pub fn move_no_replace(from: &Path, to: &Path) -> io::Result<()> {
+    let (from, to) = (wide_os(from.as_os_str()), wide_os(to.as_os_str()));
+    if unsafe { MoveFileExW(from.as_ptr(), to.as_ptr(), 0) } == 0 { Err(io::Error::last_os_error()) } else { Ok(()) }
+}
+
 /// Identity of the volume that holds `dir` and of its change journal (0 when there is none or it cannot be queried).
 /// A stored USN means something only while both numbers are unchanged.
 pub fn volume_id(dir: &Path) -> io::Result<VolumeId> {
@@ -218,7 +236,8 @@ impl FileHasher {
 pub struct Found {
     /// Path below the walked folder, separated by `/`.
     pub rel: String,
-    /// `File` or `Link`; folders are walked, never listed.
+    /// `File` or `Link`, or `Dir` for an empty folder (only from [`list_entries`]); other folders are walked, never
+    /// listed.
     pub kind: Kind,
 }
 
@@ -226,7 +245,16 @@ pub struct Found {
 /// plain folder.
 pub fn list_files(root: &Path) -> io::Result<Vec<Found>> {
     match Folder::open(root)? {
-        Some(folder) => folder.list_files(),
+        Some(folder) => folder.list(false),
+        None => Err(io::ErrorKind::NotFound.into()),
+    }
+}
+
+/// Like [`list_files`], but every empty folder below `root` is reported too, so that everything in the folder can be
+/// accounted for. The files of a folder come before what is in its sub-folders.
+pub fn list_entries(root: &Path) -> io::Result<Vec<Found>> {
+    match Folder::open(root)? {
+        Some(folder) => folder.list(true),
         None => Err(io::ErrorKind::NotFound.into()),
     }
 }
@@ -255,13 +283,17 @@ impl Folder {
     /// Lists every file below the folder without following links. Empty folders are not reported. Fails for
     /// anything that is not a plain folder.
     pub fn list_files(&self) -> io::Result<Vec<Found>> {
+        self.list(false)
+    }
+
+    fn list(&self, empty_dirs: bool) -> io::Result<Vec<Found>> {
         if self.kind != Kind::Dir {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("{} is not a plain folder", self.path.display())));
         }
         let mut out = Vec::new();
         // Holds many entries per call; u64 keeps it aligned as the entries need.
         let mut buf = vec![0u64; 2048];
-        walk(&self.h, &self.path, "", &mut buf, &mut out)?;
+        walk(&self.h, &self.path, "", &mut buf, &mut out, empty_dirs)?;
         Ok(out)
     }
 }
@@ -284,9 +316,10 @@ fn listing_ended(code: Option<i32>, first: bool) -> bool {
     code == Some(ERROR_NO_MORE_FILES as i32) || (first && code == Some(ERROR_FILE_NOT_FOUND as i32))
 }
 
-fn walk(h: &Handle, dir: &Path, prefix: &str, buf: &mut [u64], out: &mut Vec<Found>) -> io::Result<()> {
+fn walk(h: &Handle, dir: &Path, prefix: &str, buf: &mut [u64], out: &mut Vec<Found>, empty_dirs: bool) -> io::Result<()> {
     let mut folders = Vec::new();
     let mut first = true;
+    let mut empty = true;
     loop {
         // The handle keeps its place in the listing, so the first query starts again from the beginning.
         let class = if first { FileFullDirectoryRestartInfo } else { FileFullDirectoryInfo };
@@ -309,6 +342,7 @@ fn walk(h: &Handle, dir: &Path, prefix: &str, buf: &mut [u64], out: &mut Vec<Fou
             let len = read_u32(entry, offset_of!(FILE_FULL_DIR_INFO, FileNameLength))? as usize;
             let name: Vec<u16> = entry.get(NAME_AT..NAME_AT + len).ok_or_else(garbled)?.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
             if name != [DOT] && name != [DOT, DOT] {
+                empty = false;
                 let name = OsString::from_wide(&name);
                 let text = name.to_string_lossy();
                 let rel = if prefix.is_empty() { text.into_owned() } else { format!("{prefix}/{text}") };
@@ -323,12 +357,15 @@ fn walk(h: &Handle, dir: &Path, prefix: &str, buf: &mut [u64], out: &mut Vec<Fou
             at += next;
         }
     }
+    if empty_dirs && empty && !prefix.is_empty() {
+        out.push(Found { rel: prefix.to_string(), kind: Kind::Dir });
+    }
     for (name, rel) in folders {
         let path = dir.join(&name);
         let sub = open(&path, FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES, NO_FOLLOW)?;
         // It was a plain folder when it was listed; if it has become a link since, it is reported, never followed.
         match kind_of(info::<FILE_BASIC_INFO>(&sub, FileBasicInfo)?.FileAttributes) {
-            Kind::Dir => walk(&sub, &path, &rel, buf, out)?,
+            Kind::Dir => walk(&sub, &path, &rel, buf, out, empty_dirs)?,
             kind => out.push(Found { rel, kind }),
         }
     }
@@ -492,6 +529,71 @@ mod tests {
         assert_eq!(found, vec![Found { rel: "f.txt".into(), kind: Kind::File }, Found { rel: "junction".into(), kind: Kind::Link }]);
 
         fs::remove_dir(&junction).unwrap();
+        assert!(outside.join("secret.txt").exists());
+        fs::remove_dir_all(dir).unwrap();
+        fs::remove_dir_all(outside).unwrap();
+    }
+
+    #[test]
+    fn listing_entries_also_reports_empty_folders_but_never_the_folder_itself() {
+        let dir = temp("entries");
+        fs::create_dir_all(dir.join("a").join("b")).unwrap();
+        fs::create_dir_all(dir.join("a").join("c")).unwrap();
+        fs::create_dir_all(dir.join("empty")).unwrap();
+        fs::write(dir.join("top.md"), b"1").unwrap();
+        fs::write(dir.join("a").join("b").join("deep.md"), b"2").unwrap();
+        let outside = temp("entries-outside");
+        let made = std::process::Command::new("cmd").args(["/C", "mklink", "/J"]).arg(dir.join("junction")).arg(&outside).output().unwrap().status.success();
+        assert!(made);
+
+        let mut found = list_entries(&dir).unwrap();
+        found.sort_by(|a, b| a.rel.cmp(&b.rel));
+        assert_eq!(
+            found,
+            vec![
+                Found { rel: "a/b/deep.md".into(), kind: Kind::File },
+                Found { rel: "a/c".into(), kind: Kind::Dir },
+                Found { rel: "empty".into(), kind: Kind::Dir },
+                Found { rel: "junction".into(), kind: Kind::Link },
+                Found { rel: "top.md".into(), kind: Kind::File },
+            ]
+        );
+        assert!(list_entries(&dir.join("empty")).unwrap().is_empty());
+        assert!(list_entries(&dir.join("junction")).is_err(), "a link is never listed");
+        assert_eq!(kind_at(&dir.join("junction")).unwrap(), Some(Kind::Link));
+        assert_eq!(kind_at(&dir.join("empty")).unwrap(), Some(Kind::Dir));
+        assert_eq!(kind_at(&dir.join("top.md")).unwrap(), Some(Kind::File));
+        assert_eq!(kind_at(&dir.join("absent")).unwrap(), None);
+        fs::remove_dir(dir.join("junction")).unwrap();
+        fs::remove_dir_all(dir).unwrap();
+        fs::remove_dir_all(outside).unwrap();
+    }
+
+    #[test]
+    fn a_move_never_replaces_anything_and_moves_a_link_as_a_link() {
+        let dir = temp("move");
+        fs::write(dir.join("a.md"), b"a").unwrap();
+        fs::write(dir.join("b.md"), b"b").unwrap();
+        assert_eq!(move_no_replace(&dir.join("a.md"), &dir.join("b.md")).unwrap_err().kind(), io::ErrorKind::AlreadyExists);
+        fs::create_dir_all(dir.join("sub")).unwrap();
+        assert_eq!(move_no_replace(&dir.join("a.md"), &dir.join("sub")).unwrap_err().kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(fs::read(dir.join("a.md")).unwrap(), b"a");
+        assert_eq!(fs::read(dir.join("b.md")).unwrap(), b"b");
+        assert_eq!(move_no_replace(&dir.join("absent"), &dir.join("c.md")).unwrap_err().kind(), io::ErrorKind::NotFound);
+
+        move_no_replace(&dir.join("a.md"), &dir.join("sub").join("a.md")).unwrap();
+        assert_eq!(fs::read(dir.join("sub").join("a.md")).unwrap(), b"a");
+        move_no_replace(&dir.join("sub"), &dir.join("moved")).unwrap();
+        assert_eq!(fs::read(dir.join("moved").join("a.md")).unwrap(), b"a");
+
+        let outside = temp("move-outside");
+        fs::write(outside.join("secret.txt"), b"s").unwrap();
+        let made = std::process::Command::new("cmd").args(["/C", "mklink", "/J"]).arg(dir.join("link")).arg(&outside).output().unwrap().status.success();
+        assert!(made);
+        move_no_replace(&dir.join("link"), &dir.join("moved").join("link")).unwrap();
+        assert_eq!(kind_at(&dir.join("moved").join("link")).unwrap(), Some(Kind::Link));
+        assert_eq!(fs::read_dir(&outside).unwrap().count(), 1, "the folder the link points to is not touched");
+        fs::remove_dir(dir.join("moved").join("link")).unwrap();
         assert!(outside.join("secret.txt").exists());
         fs::remove_dir_all(dir).unwrap();
         fs::remove_dir_all(outside).unwrap();

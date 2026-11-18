@@ -393,10 +393,14 @@ pub fn nav(views: &[RepoView], page: &Page, w: i32, h: i32, fit: Fit) -> Surface
 /// repository, with room for a scroll bar of `bar` DIPs, but never more than half the window `w`. Never narrower than
 /// [`NAV_W`], so names that fit leave it as it is.
 pub fn nav_width(views: &[RepoView], w: i32, bar: i32, fit: Fit) -> i32 {
-    let text = views.iter().map(|v| fit(&printable(&v.label), Font::Body, 0).0.max(fit(&nav_sub(v), Font::Caption, 0).0)).max().unwrap_or(0);
+    let text = views.iter().map(|v| nav_text_width(&v.label, &nav_sub(v), fit)).max().unwrap_or(0);
     // An entry is 8 DIPs in from each side, and draws its lines from 40 DIPs in to 8 before its end; 2 more for rounding.
     let wanted = text + 16 + 40 + 8 + 2 + bar;
     wanted.min(w / 2).max(NAV_W)
+}
+
+fn nav_text_width(label: &str, sub: &str, fit: Fit) -> i32 {
+    fit(&printable(label), Font::Body, 0).0.max(fit(sub, Font::Caption, 0).0)
 }
 
 /// The page when no repository is set up yet.
@@ -806,19 +810,28 @@ pub struct DiffLayout {
 
 const DIFF_TOP: i32 = 70;
 const CARD_HEAD: i32 = 41;
+pub const DIFF_FILES_W: i32 = 236;
 
-pub fn diff_layout(w: i32, h: i32) -> DiffLayout {
+pub fn diff_layout(w: i32, h: i32, files_w: i32) -> DiffLayout {
     let ch = (h - DIFF_TOP - 16).max(CARD_HEAD + 2);
-    let files_card = [20, DIFF_TOP, 236, ch];
-    let code_card = [268, DIFF_TOP, (w - 288).max(2), ch];
+    let files_card = [20, DIFF_TOP, files_w, ch];
+    let code_card = [32 + files_w, DIFF_TOP, (w - files_w - 52).max(2), ch];
     let inner = (ch - CARD_HEAD - 1).max(0);
     DiffLayout {
         head: [0, 0, w, DIFF_TOP + CARD_HEAD],
         files_card,
         code_card,
-        files: [21, DIFF_TOP + CARD_HEAD, 234, inner],
+        files: [21, DIFF_TOP + CARD_HEAD, files_w - 2, inner],
         code: [code_card[0] + 1, DIFF_TOP + CARD_HEAD, code_card[2] - 2, inner],
     }
+}
+
+/// Fits both lines of each file entry, while leaving at least half the cards' available width for the comparison.
+pub fn diff_files_width(v: &DiffView, w: i32, bar: i32, fit: Fit) -> i32 {
+    let text = v.files().iter().map(|f| nav_text_width(&f.path, &file_summary(f).2, fit)).max().unwrap_or(0);
+    // Card borders, entry insets, the icon and text padding, plus 2 DIPs for rounding.
+    let wanted = text + 2 + 8 + 40 + 8 + 2 + bar;
+    wanted.min((w - 52) / 2).max(DIFF_FILES_W)
 }
 
 pub fn diff_backdrop(l: &DiffLayout, w: i32, h: i32) -> Vec<Deco> {
@@ -874,12 +887,13 @@ pub fn diff_sub(v: &DiffView) -> String {
         Report::Ready(r) if r.files.is_empty() => "The copy on this PC is the same as GitHub.".to_string(),
         Report::Ready(r) if !r.here => "Its folder is not on this PC, so every file shows as only on GitHub.".to_string(),
         Report::Ready(r) if !r.on_github => "GitHub no longer lists it, so every file shows as only on this PC.".to_string(),
-        Report::Ready(_) => "What is different between GitHub and the copy on this PC. Nothing changes until you choose.".to_string(),
+        Report::Ready(_) => "How the copy on this PC would change to match GitHub. Nothing changes until you choose.".to_string(),
     }
 }
 
 /// The header: Back, which skill, its choices, and the headers of the two cards.
-pub fn diff_head(v: &DiffView, w: i32, fit: Fit) -> Surface {
+pub fn diff_head(v: &DiffView, l: &DiffLayout, fit: Fit) -> Surface {
+    let w = l.head[2];
     let mut o = Out::new(fit);
     o.item(id::BACK, [12, 10, 32, 32], "Back", Look::Button { kind: Kind::Icon, glyph: Some(glyph::BACK) }, true);
     // From the right: the first choice, which takes GitHub's version, ends the row.
@@ -907,7 +921,6 @@ pub fn diff_head(v: &DiffView, w: i32, fit: Fit) -> Surface {
     let sx = 56 + repo_w + 28;
     o.label(id::TITLE, [sx, 12, (right - 8 - sx).max(0), 28], skill, Font::Title, Role::Text);
     o.label(id::SUB, [56, 42, (w - 56 - 24).max(0), 20], diff_sub(v), Font::Caption, Role::Text2);
-    let l = diff_layout(w, 0);
     let files = v.files();
     if !files.is_empty() {
         let count = if files.len() == 1 { "1 file is different".to_string() } else { format!("{} files are different", files.len()) };
@@ -917,8 +930,11 @@ pub fn diff_head(v: &DiffView, w: i32, fit: Fit) -> Surface {
         let [cx, _, cw, _] = l.code_card;
         let mut lx = cx + cw - 14;
         if matches!(change.body, Body::Text(_)) {
-            for (sign, ink, text, bg) in [("+", Role::Ok, "Only on this PC", Role::AddBg), ("−", Role::Err, "Only on GitHub", Role::DelBg)] {
+            for (sign, ink, text, bg) in [("+", Role::Ok, "Only on GitHub", Role::AddBg), ("−", Role::Err, "Only on this PC", Role::DelBg)] {
                 let lw = 8 + 8 + 6 + o.width(text, Font::Caption) + 2 + 8;
+                if lx - lw < cx + 14 {
+                    break;
+                }
                 lx -= lw;
                 o.fill([lx, DIFF_TOP + 9, lw, 22], 4, bg, Role::None);
                 o.text([lx + 8, DIFF_TOP + 9, 8, 22], sign, Font::CaptionStrong, ink, ONE_LINE);
@@ -934,8 +950,8 @@ pub fn diff_head(v: &DiffView, w: i32, fit: Fit) -> Surface {
 /// The mark, its colour and the second line of a file in the list.
 pub fn file_summary(change: &FileChange) -> (char, Role, String) {
     match (change.presence, &change.body) {
-        (Presence::OnlyHere, _) => (glyph::ADD, Role::Ok, "Only on this PC".to_string()),
-        (Presence::OnlyOnGitHub, _) => (glyph::REMOVE, Role::Err, "Only on GitHub".to_string()),
+        (Presence::OnlyHere, _) => (glyph::REMOVE, Role::Err, "Only on this PC".to_string()),
+        (Presence::OnlyOnGitHub, _) => (glyph::ADD, Role::Ok, "Only on GitHub".to_string()),
         (Presence::Both, Body::Text(t)) if t.only_invisible() => (glyph::EDIT, Role::Warn, "Only invisible changes".to_string()),
         (Presence::Both, Body::Text(t)) => (glyph::EDIT, Role::Warn, format!("Changed · {} added, {} removed", t.added, t.removed)),
         (Presence::Both, Body::NotText) => (glyph::BINARY, Role::Text2, "Different (not text)".to_string()),
@@ -1452,14 +1468,15 @@ mod tests {
             ("crlf.md".to_string(), bytes("l\r\nm\r\n\r\n")),
             ("logo.png".to_string(), bytes("\0gif")),
         ];
-        let summaries: Vec<(String, String)> = compare(github, here).iter().map(|c| (c.path.clone(), file_summary(c).2)).collect();
-        let find = |p: &str| summaries.iter().find(|(path, _)| path == p).map(|(_, s)| s.as_str());
-        assert_eq!(find("SKILL.md"), Some("Changed · 2 added, 1 removed"));
-        assert_eq!(find("new.md"), Some("Only on this PC"));
-        assert_eq!(find("gone.md"), Some("Only on GitHub"));
-        assert_eq!(find("bom.md"), Some("Only invisible changes"));
+        let changes = compare(github, here);
+        let summary = |p: &str| changes.iter().find(|c| c.path == p).map(file_summary);
+        let find = |p: &str| summary(p).map(|(_, _, s)| s);
+        assert_eq!(find("SKILL.md").as_deref(), Some("Changed · 1 added, 2 removed"), "GitHub's line comes in, this PC's two go");
+        assert_eq!(summary("new.md"), Some((glyph::REMOVE, Role::Err, "Only on this PC".to_string())));
+        assert_eq!(summary("gone.md"), Some((glyph::ADD, Role::Ok, "Only on GitHub".to_string())));
+        assert_eq!(find("bom.md").as_deref(), Some("Only invisible changes"));
         assert_eq!(find("crlf.md"), None, "line breaks and blank lines don't count");
-        assert_eq!(find("logo.png"), Some("Different (not text)"));
+        assert_eq!(find("logo.png").as_deref(), Some("Different (not text)"));
         let hidden = FileChange { path: "big".to_string(), presence: Presence::Both, body: Body::Hidden("it is too big to show".to_string()) };
         assert_eq!(file_summary(&hidden).2, "Not shown");
     }
@@ -1474,6 +1491,75 @@ mod tests {
             report: Report::Ready(DiffReport { on_github: true, here: true, files: vec![change] }),
             file: 0,
             gaps: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn the_diff_list_fits_whole_paths_and_summaries_without_taking_the_comparisons_half() {
+        let mut v = diff_of("", "new\n");
+        let Report::Ready(r) = &mut v.report else { unreachable!() };
+        r.files[0].presence = Presence::OnlyOnGitHub;
+        assert_eq!(diff_files_width(&v, 1400, 0, &fit), DIFF_FILES_W);
+
+        let path = "references/library/component-with-a-long-name\u{202e}.md";
+        let Report::Ready(r) = &mut v.report else { unreachable!() };
+        r.files[0].path = path.to_string();
+        let width = diff_files_width(&v, 1400, 0, &fit);
+        assert!(width > DIFF_FILES_W && width < 674);
+        for bar in [0, 17] {
+            let wide = diff_files_width(&v, 1400, bar, &fit);
+            assert_eq!(wide, width + bar);
+            let s = diff_files(&v, wide - 2 - bar, &fit);
+            let entry = item(&s, id::FILE);
+            assert!(entry.at[2] - 48 >= fit(&printable(path), Font::Body, 0).0, "escaped paths must fit too");
+            fits_in(&s, wide - 2 - bar);
+        }
+        assert_eq!(diff_files_width(&v, 640, 17, &fit), (640 - 52) / 2);
+
+        let summary = diff_of("old\n", "new\n");
+        let width = diff_files_width(&summary, 1400, 0, &fit);
+        let s = diff_files(&summary, width - 2, &fit);
+        assert!(item(&s, id::FILE).at[2] - 48 >= fit(&file_summary(&summary.files()[0]).2, Font::Caption, 0).0);
+        for report in [Report::Loading, Report::Failed("No connection".to_string()), Report::Ready(DiffReport { on_github: true, here: true, files: vec![] })] {
+            assert_eq!(diff_files_width(&DiffView { report, ..v.clone() }, 980, 17, &fit), DIFF_FILES_W);
+        }
+    }
+
+    #[test]
+    fn the_diff_cards_headers_and_contents_move_together_without_losing_the_selected_file_or_open_lines() {
+        let old: String = (1..=30).map(|n| format!("line {n}\n")).collect();
+        let mut v = diff_of(&old, &old.replace("line 15\n", "line fifteen\n"));
+        let Report::Ready(r) = &mut v.report else { unreachable!() };
+        r.files.push(FileChange { path: "references/library/long-component-name.md".to_string(), ..r.files[0].clone() });
+        v.file = 1;
+        v.gaps.push(0);
+        for w in [640, 980, 1400] {
+            let narrow = diff_layout(w, 680, DIFF_FILES_W);
+            let wide = diff_layout(w, 680, diff_files_width(&v, w, 17, &fit));
+            let delta = wide.files[2] - narrow.files[2];
+            assert!(delta > 0);
+            assert_eq!(wide.code[2], narrow.code[2] - delta);
+            assert_eq!(wide.code[0], narrow.code[0] + delta);
+            assert_eq!(wide.code_card[0] + wide.code_card[2], w - 20);
+            assert!(wide.code_card[2] >= wide.files_card[2]);
+            for l in [narrow, wide, narrow] {
+                for (card, content) in [(l.files_card, l.files), (l.code_card, l.code)] {
+                    assert_eq!(content[0], card[0] + 1);
+                    assert_eq!(content[2], card[2] - 2);
+                }
+                let head = diff_head(&v, &l, &fit);
+                let path = head.decos.iter().find(|d| deco_text(d) == v.files()[1].path).unwrap();
+                assert_eq!(deco_at(path)[0], l.code_card[0] + 14);
+                for d in head.decos.iter().filter(|d| deco_at(d)[1] >= DIFF_TOP) {
+                    let [x, _, width, _] = deco_at(d);
+                    let card = if deco_text(d).ends_with("files are different") { l.files_card } else { l.code_card };
+                    assert!(x >= card[0] && x + width <= card[0] + card[2], "{d:?}");
+                }
+                let files = diff_files(&v, l.files[2] - 17, &fit);
+                assert!(matches!(item(&files, id::FILE + 1).look, Look::Nav { selected: true, .. }));
+                let code = diff_code(&v, l.code[2], &fit);
+                assert!(code.decos.iter().any(|d| deco_text(d) == "line 2"), "the opened unchanged lines stay open");
+            }
         }
     }
 
@@ -1526,13 +1612,19 @@ mod tests {
     #[test]
     fn the_diff_header_offers_the_skills_choices_with_the_github_version_accented() {
         let v = diff_of("a\n", "b\n");
-        let s = diff_head(&v, 900, &fit);
+        let s = diff_head(&v, &diff_layout(900, 600, DIFF_FILES_W), &fit);
         assert_eq!(item(&s, id::DIFF_ACTION).look, Look::Button { kind: Kind::Accent, glyph: None });
         assert_eq!(item(&s, id::DIFF_ACTION + 1).text, "Keep my version");
         assert!(item(&s, id::DIFF_ACTION).at[0] > item(&s, id::DIFF_ACTION + 1).at[0], "the accented choice is last");
         assert_eq!(hit(id::DIFF_ACTION + 1), Hit::DiffAction(1));
         assert_eq!(item(&s, id::TITLE).text, "beta");
         fits_in(&s, 900);
+        // The legend reads from this PC to GitHub, each sign beside its words.
+        let x_of = |text: &str| s.decos.iter().find(|d| deco_text(d) == text).map(|d| deco_at(d)[0]).unwrap();
+        assert_eq!(x_of("−") + 14, x_of("Only on this PC"));
+        assert_eq!(x_of("+") + 14, x_of("Only on GitHub"));
+        assert!(x_of("Only on this PC") < x_of("+"));
+        assert!(diff_sub(&v).starts_with("How the copy on this PC would change to match GitHub."), "{}", diff_sub(&v));
         let gone = DiffView { report: Report::Ready(DiffReport { on_github: true, here: true, files: Vec::new() }), ..v };
         assert_eq!(diff_sub(&gone), "The copy on this PC is the same as GitHub.");
     }

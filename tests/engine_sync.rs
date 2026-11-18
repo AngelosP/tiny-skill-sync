@@ -142,12 +142,12 @@ fn overwrite_takes_the_upstream_version_and_keeps_the_edited_copy() {
     let report = s.engine.resolve(&s.cfg, "fx", "alpha", Resolution::Overwrite, &cancel_flag()).expect("overwrite works");
 
     assert_eq!(s.w.read("alpha/SKILL.md"), ALPHA_V2);
-    assert!(!s.w.exists("alpha/mine.txt"), "the folder is exactly upstream's again");
+    assert_eq!(s.w.read("alpha/mine.txt"), "only mine\n", "a file the user added is theirs and stays where it is");
     let backups = s.w.backups();
     assert_eq!(backups.len(), 1, "{backups:?}");
     assert_eq!(report.backups, backups);
     assert_eq!(fs::read_to_string(backups[0].join("SKILL.md")).unwrap(), "my own words\n");
-    assert_eq!(fs::read_to_string(backups[0].join("mine.txt")).unwrap(), "only mine\n");
+    assert!(!backups[0].join("mine.txt").exists());
 
     // And it is managed normally again.
     let report = s.sync();
@@ -293,6 +293,54 @@ fn a_skill_removed_upstream_is_deleted_only_when_it_is_untouched() {
     assert!(state.repo("fx").unwrap().skill("gamma").is_none());
     assert!(state.repo("fx").unwrap().skill("beta").is_some(), "still recorded, still protected");
     assert!(s.w.work_leftovers().is_empty(), "{:?}", s.w.work_leftovers());
+}
+
+#[test]
+fn a_skill_removed_upstream_takes_only_its_own_files_and_leaves_the_ones_the_user_added() {
+    let mut s = Setup::installed("removed-keeps-mine");
+    s.w.write("alpha/notes/mine.md", "my notes\n");
+    s.w.write("alpha/references/more.md", "more\n");
+    s.remote.remove(REPO, "skills/alpha");
+
+    let report = s.sync();
+    let repo = only(&report);
+    assert_eq!(skill(repo, "alpha").verdict, Verdict::Delete);
+    assert_eq!(skill(repo, "alpha").result, ApplyResult::Done);
+    let left: Vec<(String, String)> = s.w.files_of("alpha").into_iter().collect();
+    assert_eq!(left, [("notes/mine.md".to_string(), "my notes\n".to_string()), ("references/more.md".to_string(), "more\n".to_string())]);
+    assert!(s.w.state().repo("fx").unwrap().skill("alpha").is_none(), "what is left is the user's, not the app's");
+    assert!(s.w.work_leftovers().is_empty(), "{:?}", s.w.work_leftovers());
+
+    // From now on the folder is the user's: nothing reports it or touches it.
+    let report = sync_with(&mut s.engine, &s.cfg, SyncOptions { ignore_etag: true, ..SyncOptions::default() });
+    assert!(only(&report).skills.iter().all(|k| k.name != "alpha"), "{:?}", only(&report).skills);
+    assert_eq!(s.w.files_of("alpha").len(), 2);
+}
+
+#[test]
+fn a_file_the_user_added_that_github_now_has_too_is_kept_aside_and_the_user_is_told() {
+    let mut s = Setup::installed("clash-told");
+    s.w.write("alpha/notes.md", "my notes\n");
+    s.w.write("alpha/mine.md", "mine\n");
+    s.remote.put(REPO, "skills/alpha/notes.md", "github's notes\n");
+
+    let report = s.sync();
+
+    let repo = only(&report);
+    assert_eq!((&skill(repo, "alpha").verdict, &skill(repo, "alpha").result), (&Verdict::Update, &ApplyResult::Done));
+    assert_eq!(s.w.read("alpha/notes.md"), "github's notes\n");
+    assert_eq!(s.w.read("alpha/mine.md"), "mine\n");
+    let backups = s.w.backups();
+    assert_eq!(backups.len(), 1, "{:?}", s.w.work_leftovers());
+    assert_eq!(fs::read_to_string(backups[0].join("notes.md")).unwrap(), "my notes\n");
+    assert_eq!(report.warnings.len(), 1, "{:?}", report.warnings);
+    let told = &report.warnings[0];
+    assert!(told.starts_with("alpha: ") && told.contains("notes.md") && told.contains(&backups[0].display().to_string()), "{told}");
+    assert!(!told.contains("mine.md"), "{told}");
+
+    // Said once: the next check has nothing to tell.
+    let report = sync_with(&mut s.engine, &s.cfg, SyncOptions { ignore_etag: true, ..SyncOptions::default() });
+    assert!(report.warnings.is_empty(), "{:?}", report.warnings);
 }
 
 #[test]
@@ -564,21 +612,39 @@ fn show_changes_downloads_only_the_files_that_differ_and_changes_nothing() {
     let mut s = Setup::installed("diff");
     s.w.write("alpha/SKILL.md", &ALPHA_V1.replace("v1", "mine"));
     s.w.write("alpha/notes.md", "my notes\n");
-    s.w.remove("alpha/scripts/hello.ps1");
+    s.remote.put(REPO, "skills/alpha/new.md", "new\n");
+    s.remote.remove(REPO, "skills/alpha/scripts/hello.ps1");
     let before = s.w.snapshot();
 
     let report = diff(&mut s, "alpha");
 
     assert!(report.on_github && report.here);
-    assert_eq!(shown(&report), [("notes.md", Presence::OnlyHere), ("scripts/hello.ps1", Presence::OnlyOnGitHub), ("SKILL.md", Presence::Both)]);
+    assert_eq!(
+        shown(&report),
+        [("new.md", Presence::OnlyOnGitHub), ("scripts/hello.ps1", Presence::OnlyHere), ("SKILL.md", Presence::Both)],
+        "a file the user added is theirs, so it is not shown"
+    );
     let changed = ALPHA_V1.lines().filter(|l| l.contains("v1")).count();
     assert_eq!(lines(&report.files[2]), (changed, changed));
-    assert_eq!(lines(&report.files[0]), (0, 1));
-    assert_eq!(lines(&report.files[1]), (1, 0));
+    assert_eq!(lines(&report.files[0]), (0, 1), "a file only on GitHub would come");
+    assert_eq!(lines(&report.files[1]), (1, 0), "a file GitHub removed would go");
     // The guide is the same on both sides, so it is not downloaded.
     assert_eq!(s.remote.calls(), Calls { tree: 1, conditional: 0, commit: 1, file: 2 });
     assert!(!s.remote.log().iter().any(|l| l.contains("guide.md")), "{:?}", s.remote.log());
     assert_eq!(s.w.snapshot(), before, "showing changes writes nothing, not even state.json");
+}
+
+#[test]
+fn show_changes_of_a_folder_nobody_owns_shows_only_what_github_has() {
+    let mut s = Setup::fresh("diff-unowned");
+    s.w.write("alpha/SKILL.md", "my own alpha\n");
+    s.w.write("alpha/mine.md", "mine\n");
+    s.sync();
+
+    let report = diff(&mut s, "alpha");
+
+    assert!(report.on_github && report.here);
+    assert_eq!(shown(&report), [("references/guide.md", Presence::OnlyOnGitHub), ("scripts/hello.ps1", Presence::OnlyOnGitHub), ("SKILL.md", Presence::Both)]);
 }
 
 #[test]
@@ -590,10 +656,11 @@ fn show_changes_of_a_skill_deleted_here_or_gone_from_github() {
     assert_eq!(shown(&report), [("SKILL.md", Presence::OnlyOnGitHub)]);
 
     s.remote.remove(REPO, "skills/gamma");
+    s.w.write("gamma/mine.md", "mine\n");
     s.remote.reset();
     let report = diff(&mut s, "Gamma");
     assert!(!report.on_github && report.here);
-    assert_eq!(shown(&report), [("SKILL.md", Presence::OnlyHere)]);
+    assert_eq!(shown(&report), [("SKILL.md", Presence::OnlyHere)], "the file the user added would stay, so it is not shown");
     assert_eq!(s.remote.calls(), Calls { tree: 1, conditional: 0, commit: 0, file: 0 }, "nothing to download");
 
     s.remote.reset();
@@ -637,6 +704,15 @@ fn show_changes_fails_as_a_whole_and_changes_nothing_when_github_fails() {
     s.remote.lie_about(REPO, "skills/alpha/SKILL.md", &ALPHA_V1.repeat(2));
     let err = s.engine.diff(&s.cfg, "fx", "alpha", &cancel_flag()).unwrap_err();
     assert!(err.to_string().contains("changed on GitHub"), "nor one longer than listed: {err}");
+    // What GitHub's servers say when the listing is newer than the commit the files are read at.
+    s.remote.lie_about(REPO, "skills/alpha/SKILL.md", ALPHA_V1);
+    s.remote.fail_file(REPO, "skills/alpha/SKILL.md", Some(RemoteError::new(FailureKind::NotFound, "GitHub could not find it: it may be private")));
+    let err = s.engine.diff(&s.cfg, "fx", "alpha", &cancel_flag()).unwrap_err();
+    assert!(
+        err.to_string().contains("changed on GitHub while SKILL.md was being read") && !err.to_string().contains("private"),
+        "a file the listing names is there: {err}"
+    );
+    s.remote.fail_file(REPO, "skills/alpha/SKILL.md", None);
 
     s.remote.make_private(REPO, "secret");
     let err = s.engine.diff(&s.cfg, "fx", "alpha", &cancel_flag()).unwrap_err();
@@ -655,35 +731,49 @@ fn show_changes_names_what_it_does_not_read_and_never_follows_a_link() {
     s.remote.put_bytes(REPO, "skills/alpha/same.bin", &big);
     s.remote.put_bytes(REPO, "skills/alpha/changed.bin", &big);
     s.sync();
+    s.remote.remove(REPO, "skills/alpha/references/guide.md");
+    let alpha = s.w.skills.join("alpha");
     let mut mine = big.clone();
     mine[0] = b'y';
-    fs::write(s.w.skills.join("alpha").join("changed.bin"), &mine).unwrap();
+    fs::write(alpha.join("changed.bin"), &mine).unwrap();
     let outside = s.w.root.join("outside");
     fs::create_dir_all(&outside).unwrap();
     fs::write(outside.join("SKILL.md"), "not in the skill\n").unwrap();
-    let link = s.w.skills.join("alpha").join("linked");
-    let made = std::process::Command::new("cmd").args(["/C", "mklink", "/J"]).arg(&link).arg(&outside).output().unwrap().status.success();
-    assert!(made, "creating a junction needs no privileges");
+    let junction = |link: &std::path::Path| {
+        let made = std::process::Command::new("cmd").args(["/C", "mklink", "/J"]).arg(link).arg(&outside).output().unwrap().status.success();
+        assert!(made, "creating a junction needs no privileges");
+    };
+    // A file the app installed, now a link; and a link the user added, which is theirs and not shown.
+    let guide = alpha.join("references").join("guide.md");
+    fs::remove_file(&guide).unwrap();
+    junction(&guide);
+    junction(&alpha.join("linked"));
+    // A folder on the way to a file, now a link to a folder where that file is the same: it is not looked into.
+    fs::remove_dir_all(alpha.join("scripts")).unwrap();
+    fs::write(outside.join("hello.ps1"), "Write-Output 'hello'\n").unwrap();
+    junction(&alpha.join("scripts"));
     s.remote.reset();
 
     let report = diff(&mut s, "alpha");
 
     let bodies: Vec<(&str, &Body)> = report.files.iter().map(|f| (f.path.as_str(), &f.body)).collect();
-    assert_eq!(bodies.len(), 2, "the big file that is the same is left out: {bodies:?}");
+    assert_eq!(bodies.len(), 3, "the big file that is the same is left out: {bodies:?}");
     assert_eq!(bodies[0].0, "changed.bin");
     assert!(matches!(bodies[0].1, Body::Hidden(why) if why.contains("too big")), "{bodies:?}");
-    assert_eq!(bodies[1].0, "linked");
+    assert_eq!(bodies[1].0, "references/guide.md");
     assert!(matches!(bodies[1].1, Body::Hidden(why) if why.contains("never followed")), "{bodies:?}");
+    assert_eq!(bodies[2].0, "scripts/hello.ps1");
+    assert!(matches!(bodies[2].1, Body::Hidden(why) if why.contains("never followed")), "{bodies:?}");
     assert_eq!(s.remote.calls().file, 0, "a file too big to show is not downloaded");
-    fs::remove_dir(&link).unwrap();
+    fs::remove_dir(&guide).unwrap();
+    fs::remove_dir(alpha.join("linked")).unwrap();
+    fs::remove_dir(alpha.join("scripts")).unwrap();
 
-    let skill = s.w.skills.join("alpha");
-    fs::remove_dir_all(&skill).unwrap();
-    let made = std::process::Command::new("cmd").args(["/C", "mklink", "/J"]).arg(&skill).arg(&outside).output().unwrap().status.success();
-    assert!(made);
+    fs::remove_dir_all(&alpha).unwrap();
+    junction(&alpha);
     let err = s.engine.diff(&s.cfg, "fx", "alpha", &cancel_flag()).unwrap_err();
     assert!(err.to_string().contains("link"), "{err}");
-    fs::remove_dir(&skill).unwrap();
+    fs::remove_dir(&alpha).unwrap();
 }
 
 #[test]
@@ -709,12 +799,13 @@ fn show_changes_reads_at_most_a_few_megabytes_from_each_side_not_counting_files_
     for i in 1..=5 {
         s.remote.put_bytes(REPO, &format!("skills/alpha/a-same-{i}.bin"), &mib);
         s.remote.put_bytes(REPO, &format!("skills/alpha/up-{i}.bin"), &mib);
+        s.remote.put_bytes(REPO, &format!("skills/alpha/here-{i}.bin"), &mib);
     }
     s.sync();
     let alpha = s.w.skills.join("alpha");
     for i in 1..=5 {
         fs::remove_file(alpha.join(format!("up-{i}.bin"))).unwrap();
-        fs::write(alpha.join(format!("here-{i}.bin")), &mib).unwrap();
+        s.remote.remove(REPO, &format!("skills/alpha/here-{i}.bin"));
     }
     s.remote.reset();
 

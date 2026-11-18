@@ -1,7 +1,8 @@
 //! What is different between the GitHub copy of a skill and the copy on this PC, for the "Show changes" view. Pure: the
-//! engine reads both sides and hands the bytes in. GitHub is the old side (`-`), this PC the new one (`+`). Line breaks
-//! and blank lines do not count here either ([`crate::text`]): files that differ only in them are left out, and blank
-//! lines are not shown.
+//! engine reads both sides and hands the bytes in. It reads as what taking GitHub's version would do here: this PC is
+//! the old side (`-`), GitHub the new one (`+`), so a file only on GitHub is all added lines. Line breaks and blank
+//! lines do not count here either ([`crate::text`]): files that differ only in them are left out, and blank lines are
+//! not shown.
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -30,9 +31,9 @@ const LIMITS: Limits = Limits { edits: 1_000, steps: 20_000_000 };
 pub enum Row {
     /// The same on both sides.
     Same { old: usize, new: usize },
-    /// Only on GitHub.
-    Removed { old: usize },
     /// Only on this PC.
+    Removed { old: usize },
+    /// Only on GitHub.
     Added { new: usize },
     /// `count` unchanged lines that are not shown, the first of them at these line numbers. [`TextDiff::folded`] gives
     /// the numbers of them all.
@@ -41,14 +42,14 @@ pub enum Row {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TextDiff {
-    /// The lines on GitHub, without their line breaks: line `n` is at `n - 1`.
+    /// The lines on this PC, without their line breaks: line `n` is at `n - 1`.
     pub old: Vec<String>,
-    /// The lines on this PC.
+    /// The lines on GitHub.
     pub new: Vec<String>,
     pub rows: Vec<Row>,
-    /// Lines only on this PC.
-    pub added: usize,
     /// Lines only on GitHub.
+    pub added: usize,
+    /// Lines only on this PC.
     pub removed: usize,
 }
 
@@ -113,13 +114,13 @@ pub fn compare(github: Vec<(String, Content)>, here: Vec<(String, Content)>) -> 
     let none = Content::Bytes(Vec::new());
     for (path, mine) in here {
         match theirs.remove(&fold(&path)) {
-            Some((_, Content::Bytes(old))) if matches!(&mine, Content::Bytes(new) if text::same(&old, new)) => {}
-            Some((name, old)) => out.push(FileChange { path: name, presence: Presence::Both, body: body(&old, &mine) }),
-            None => out.push(FileChange { path, presence: Presence::OnlyHere, body: body(&none, &mine) }),
+            Some((_, Content::Bytes(new))) if matches!(&mine, Content::Bytes(old) if text::same(old, &new)) => {}
+            Some((name, new)) => out.push(FileChange { path: name, presence: Presence::Both, body: body(&mine, &new) }),
+            None => out.push(FileChange { path, presence: Presence::OnlyHere, body: body(&mine, &none) }),
         }
     }
-    for (path, old) in theirs.into_values() {
-        out.push(FileChange { path, presence: Presence::OnlyOnGitHub, body: body(&old, &none) });
+    for (path, new) in theirs.into_values() {
+        out.push(FileChange { path, presence: Presence::OnlyOnGitHub, body: body(&none, &new) });
     }
     out.sort_by_cached_key(|change| fold(&change.path));
     out
@@ -127,7 +128,8 @@ pub fn compare(github: Vec<(String, Content)>, here: Vec<(String, Content)>) -> 
 
 fn body(old: &Content, new: &Content) -> Body {
     match (old, new) {
-        (Content::Hidden(why), _) | (_, Content::Hidden(why)) => Body::Hidden(why.clone()),
+        // GitHub's reason first, when neither side was read.
+        (_, Content::Hidden(why)) | (Content::Hidden(why), _) => Body::Hidden(why.clone()),
         (Content::Bytes(old), Content::Bytes(new)) => match (decode(old), decode(new)) {
             (Some(old), Some(new)) => Body::Text(text_diff(old, new)),
             _ => Body::NotText,
@@ -474,7 +476,7 @@ mod tests {
         assert_eq!(diff.rows, [same(1, 1), same(3, 2), Row::Removed { old: 4 }, Row::Added { new: 5 }]);
         assert_eq!((diff.old[3].as_str(), diff.new[4].as_str()), ("c", "x"));
 
-        // Every other line is blank on GitHub; here the blank lines are gone and line 10 changed.
+        // Every other line is blank on this PC; on GitHub the blank lines are gone and line 10 changed.
         let old: String = numbered(20).iter().map(|line| format!("{line}\n\n")).collect();
         let mut new = numbered(20);
         new[9] = "changed".to_string();
@@ -488,10 +490,14 @@ mod tests {
 
     #[test]
     fn files_are_matched_whatever_their_case_and_files_that_are_the_same_are_left_out() {
-        let github =
-            bytes(&[("SKILL.md", b"name: x\nold\n"), ("same.txt", b"same\n"), ("gone.md", b"only upstream\n"), ("logo.png", &[0x89, b'P', b'N', b'G', 0, 1])]);
+        let github = bytes(&[
+            ("SKILL.md", b"name: x\nupstream\n"),
+            ("same.txt", b"same\n"),
+            ("gone.md", b"only upstream\n"),
+            ("logo.png", &[0x89, b'P', b'N', b'G', 0, 1]),
+        ]);
         let here =
-            bytes(&[("skill.md", b"name: x\nnew\n"), ("Same.txt", b"same\n"), ("notes/mine.md", b"a\nb\n"), ("LOGO.png", &[0x89, b'P', b'N', b'G', 0, 2])]);
+            bytes(&[("skill.md", b"name: x\nlocal\n"), ("Same.txt", b"same\n"), ("notes/mine.md", b"a\nb\n"), ("LOGO.png", &[0x89, b'P', b'N', b'G', 0, 2])]);
         let files = compare(github, here);
         let shown: Vec<(&str, Presence)> = files.iter().map(|f| (f.path.as_str(), f.presence)).collect();
         assert_eq!(
@@ -500,11 +506,14 @@ mod tests {
         );
         let file = |path: &str| files.iter().find(|f| f.path == path).unwrap();
         assert_eq!(file("logo.png").body, Body::NotText, "not text: only said to be different");
+        // Read as what taking GitHub's version would do here: GitHub's lines come in, this PC's go.
         let gone = text_of(file("gone.md"));
-        assert_eq!((gone.added, gone.removed, &gone.rows), (0, 1, &vec![Row::Removed { old: 1 }]));
+        assert_eq!((gone.added, gone.removed, &gone.rows), (1, 0, &vec![Row::Added { new: 1 }]), "only on GitHub: added");
         let mine = text_of(file("notes/mine.md"));
-        assert_eq!((mine.added, mine.removed), (2, 0));
-        assert_eq!(text_of(file("SKILL.md")).rows, [same(1, 1), Row::Removed { old: 2 }, Row::Added { new: 2 }]);
+        assert_eq!((mine.added, mine.removed), (0, 2), "only on this PC: removed");
+        let skill = text_of(file("SKILL.md"));
+        assert_eq!(skill.rows, [same(1, 1), Row::Removed { old: 2 }, Row::Added { new: 2 }]);
+        assert_eq!((skill.old[1].as_str(), skill.new[1].as_str()), ("local", "upstream"));
     }
 
     #[test]
@@ -516,8 +525,14 @@ mod tests {
     #[test]
     fn a_file_not_read_on_either_side_is_shown_with_the_reason() {
         let hidden = |why: &str| Content::Hidden(why.to_string());
-        let github = vec![("big.bin".to_string(), hidden("too big")), ("a.md".to_string(), Content::Bytes(b"x\n".to_vec()))];
-        let here = vec![("BIG.bin".to_string(), Content::Bytes(b"x\n".to_vec())), ("a.md".to_string(), hidden("a link")), ("l".to_string(), hidden("a link"))];
+        let github =
+            vec![("big.bin".to_string(), hidden("too big")), ("a.md".to_string(), Content::Bytes(b"x\n".to_vec())), ("both.md".to_string(), hidden("too big"))];
+        let here = vec![
+            ("BIG.bin".to_string(), Content::Bytes(b"x\n".to_vec())),
+            ("a.md".to_string(), hidden("a link")),
+            ("l".to_string(), hidden("a link")),
+            ("both.md".to_string(), hidden("a link")),
+        ];
         let files = compare(github, here);
         let shown: Vec<(&str, Presence, &Body)> = files.iter().map(|f| (f.path.as_str(), f.presence, &f.body)).collect();
         assert_eq!(
@@ -525,6 +540,7 @@ mod tests {
             [
                 ("a.md", Presence::Both, &Body::Hidden("a link".into())),
                 ("big.bin", Presence::Both, &Body::Hidden("too big".into())),
+                ("both.md", Presence::Both, &Body::Hidden("too big".into())),
                 ("l", Presence::OnlyHere, &Body::Hidden("a link".into())),
             ]
         );

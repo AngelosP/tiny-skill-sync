@@ -5,7 +5,8 @@
 //!
 //! Rules in one place:
 //! * Delete or update only skills we own, and only when their folder is verified clean.
-//! * Any local deviation (edited, missing file, extra file, missing folder) HOLDs the change: nothing is touched.
+//! * Any local deviation in the files that came from GitHub (edited, missing, replaced, or the whole folder missing)
+//!   HOLDs the change: nothing is touched. Files the user added are theirs and are not a deviation.
 //! * A skill that is absent upstream is deleted only from a complete, valid snapshot. Errors never reach this code.
 //! * A skill that exists upstream but fails validation is kept as it is.
 //! * A listing with no skills at all, while we own some, is held for confirmation before anything is deleted.
@@ -21,19 +22,18 @@ use crate::tree::{Rejected, Skill};
 pub struct DirtyInfo {
     pub modified: Vec<String>,
     pub missing: Vec<String>,
-    pub extra: Vec<String>,
 }
 
 impl DirtyInfo {
     pub fn is_empty(&self) -> bool {
-        self.modified.is_empty() && self.missing.is_empty() && self.extra.is_empty()
+        self.modified.is_empty() && self.missing.is_empty()
     }
 }
 
 impl fmt::Display for DirtyInfo {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut parts = Vec::new();
-        for (label, list) in [("changed", &self.modified), ("missing", &self.missing), ("extra", &self.extra)] {
+        for (label, list) in [("changed", &self.modified), ("missing", &self.missing)] {
             if list.is_empty() {
                 continue;
             }
@@ -56,7 +56,8 @@ pub enum LocalState {
 /// A folder with the same name as an upstream skill that nobody owns.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum UnmanagedState {
-    /// Every file matches upstream and nothing else is in it: safe to start managing without writing a byte.
+    /// Every file upstream has is here and matches; anything else in the folder is the user's and stays. Safe to start
+    /// managing without writing a byte.
     Identical,
     Different,
 }
@@ -469,7 +470,7 @@ mod tests {
 
     #[test]
     fn messages_are_plain_and_mention_the_files() {
-        let info = DirtyInfo { modified: vec!["a".into(), "b".into(), "c".into(), "d".into()], missing: vec!["m".into()], extra: vec![] };
+        let info = DirtyInfo { modified: vec!["a".into(), "b".into(), "c".into(), "d".into()], missing: vec!["m".into()] };
         let text = Verdict::Held(Hold::UpdateBlocked(info)).message();
         assert!(text.contains("changed: a, b, c and 1 more"), "{text}");
         assert!(text.contains("missing: m"), "{text}");

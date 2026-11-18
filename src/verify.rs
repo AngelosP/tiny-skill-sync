@@ -10,8 +10,11 @@
 //! Either way, a file that does not match its fingerprint is read and compared: a file that was only touched is clean,
 //! and only a real difference counts as an edit. Text is compared as [`crate::text`] says, so a copy saved with other
 //! line breaks or blank lines is clean too. When in doubt a file counts as edited, never as clean.
+//!
+//! Only the files that came from GitHub are looked at. Whatever the user added to a skill's folder is theirs: it is
+//! never read, never counts as an edit and never holds a change.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::io;
 use std::path::Path;
 
@@ -21,10 +24,9 @@ use crate::reconcile::{DirtyInfo, LocalState};
 use crate::state::{Fingerprint, ManagedFile, OwnedSkill, VolumeId};
 use crate::text::{self, TEXT_LIMIT};
 use crate::tree::Skill;
-use crate::win::fs::{FileHasher, Folder, Kind, probe};
+use crate::win::fs::{FileHasher, Kind, Probe, kind_at, probe};
 
 const THE_FOLDER_ITSELF: &str = "(the folder itself)";
-const CANNOT_LIST: &str = "(the folder cannot be listed)";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Check {
@@ -107,41 +109,98 @@ fn compare_file(path: &Path, file: &ManagedFile, hasher: &mut FileHasher) -> io:
     Ok(if same_text { Content::Same(None) } else { Content::Differs })
 }
 
+/// What is at a path below a folder.
+#[derive(Clone, Copy, Debug)]
+pub enum Spot {
+    Missing,
+    /// A folder on the way is a link or a file, so the path is not looked at.
+    Blocked,
+    Unreadable,
+    Found(Probe),
+}
+
+/// Looks at paths below one folder without following a link anywhere on the way. Windows follows a link in every part
+/// of a path but the last, so each folder on the way is looked at first, once, from the top.
+pub struct Spots<'a> {
+    dir: &'a Path,
+    /// By folded path: `None` for a plain folder, otherwise why nothing below it can be looked at.
+    ways: HashMap<String, Option<Spot>>,
+}
+
+impl<'a> Spots<'a> {
+    pub fn new(dir: &'a Path) -> Spots<'a> {
+        Spots { dir, ways: HashMap::new() }
+    }
+
+    pub fn find(&mut self, rel: &str, stats: &mut Stats) -> Spot {
+        for (at, _) in rel.match_indices('/') {
+            let folder = &rel[..at];
+            let way = match self.ways.get(&fold(folder)) {
+                Some(way) => *way,
+                None => {
+                    stats.probed += 1;
+                    let way = match kind_at(&join_rel(self.dir, folder)) {
+                        Ok(Some(Kind::Dir)) => None,
+                        Ok(Some(_)) => Some(Spot::Blocked),
+                        Ok(None) => Some(Spot::Missing),
+                        Err(_) => Some(Spot::Unreadable),
+                    };
+                    self.ways.insert(fold(folder), way);
+                    way
+                }
+            };
+            if let Some(spot) = way {
+                return spot;
+            }
+        }
+        stats.probed += 1;
+        match probe(&join_rel(self.dir, rel)) {
+            Ok(Some(p)) => Spot::Found(p),
+            Ok(None) => Spot::Missing,
+            Err(_) => Spot::Unreadable,
+        }
+    }
+}
+
 /// Compares the folder at `dir` with what was installed (`skill.files`).
 pub fn verify_skill(dir: &Path, skill: &OwnedSkill, check: Check, hasher: &mut FileHasher) -> Outcome {
     verify_files(dir, &skill.files, check, hasher)
 }
 
-/// Compares the folder at `dir` with a list of files, which need not belong to a recorded skill.
+/// Compares the folder at `dir` with a list of files, which need not belong to a recorded skill. Nothing else in the
+/// folder is looked at.
 pub fn verify_files(dir: &Path, files: &[ManagedFile], check: Check, hasher: &mut FileHasher) -> Outcome {
     let mut stats = Stats::default();
     stats.probed += 1;
-    // One handle serves to check the folder and, at the end, to list it.
-    let folder = match Folder::open(dir) {
+    match kind_at(dir) {
         Ok(None) => return Outcome { local: LocalState::FolderMissing, refreshed: Vec::new(), stats },
-        Ok(Some(f)) if f.kind != Kind::Dir => {
+        Ok(Some(Kind::Dir)) => {}
+        Ok(Some(_)) => {
             let info = DirtyInfo { modified: vec![THE_FOLDER_ITSELF.to_string()], ..DirtyInfo::default() };
             return dirty(info, Vec::new(), stats);
         }
-        Ok(Some(f)) => f,
         Err(_) => {
             let info = DirtyInfo { modified: vec![format!("{THE_FOLDER_ITSELF} (cannot be read)")], ..DirtyInfo::default() };
             return dirty(info, Vec::new(), stats);
         }
-    };
+    }
 
     let mut info = DirtyInfo::default();
     let mut refreshed = Vec::new();
+    let mut spots = Spots::new(dir);
     for file in files {
         let path = join_rel(dir, &file.path);
-        stats.probed += 1;
-        let first = match probe(&path) {
-            Ok(Some(p)) => p,
-            Ok(None) => {
+        let first = match spots.find(&file.path, &mut stats) {
+            Spot::Found(p) => p,
+            Spot::Missing => {
                 info.missing.push(file.path.clone());
                 continue;
             }
-            Err(_) => {
+            Spot::Blocked => {
+                info.modified.push(format!("{} (a folder on its way is a link or a file)", file.path));
+                continue;
+            }
+            Spot::Unreadable => {
                 info.modified.push(format!("{} (cannot be read)", file.path));
                 continue;
             }
@@ -177,16 +236,8 @@ pub fn verify_files(dir: &Path, files: &[ManagedFile], check: Check, hasher: &mu
         }
     }
 
-    match folder.list_files() {
-        Ok(found) => {
-            let known: HashSet<String> = files.iter().map(|f| fold(&f.path)).collect();
-            info.extra.extend(found.into_iter().filter(|f| !known.contains(&fold(&f.rel))).map(|f| f.rel));
-        }
-        Err(_) => info.modified.push(CANNOT_LIST.to_string()),
-    }
     info.modified.sort();
     info.missing.sort();
-    info.extra.sort();
     dirty(info, refreshed, stats)
 }
 
@@ -242,19 +293,18 @@ pub enum Likeness {
 }
 
 /// Is an existing folder that nobody owns the same as upstream? Only then may it be adopted: the files are the user's,
-/// and adopting changes no byte of them. `theirs` holds what the copies on GitHub of some files are compared by
-/// ([`text::canon`]), by path.
+/// and adopting changes no byte of them. Only upstream's files are compared; anything else in the folder is the user's
+/// and stays as it is. `theirs` holds what the copies on GitHub of some files are compared by ([`text::canon`]), by path.
 pub fn compare_unmanaged(dir: &Path, skill: &Skill, theirs: &HashMap<String, String>, hasher: &mut FileHasher) -> Likeness {
-    let Ok(Some(folder)) = Folder::open(dir) else { return Likeness::Different };
-    let Ok(found) = folder.list_files() else { return Likeness::Different };
-    let wanted: HashSet<String> = skill.files.iter().map(|f| fold(&f.path)).collect();
-    if found.len() != skill.files.len() || found.iter().any(|f| f.kind != Kind::File || !wanted.contains(&fold(&f.rel))) {
+    if !matches!(kind_at(dir), Ok(Some(Kind::Dir))) {
         return Likeness::Different;
     }
+    let mut spots = Spots::new(dir);
+    let mut stats = Stats::default();
     let mut needs = Vec::new();
     for file in &skill.files {
         let path = join_rel(dir, &file.path);
-        let Ok(Some(p)) = probe(&path) else { return Likeness::Different };
+        let Spot::Found(p) = spots.find(&file.path, &mut stats) else { return Likeness::Different };
         let may_be_text = file.size <= TEXT_LIMIT && p.fp.size <= TEXT_LIMIT;
         if p.kind != Kind::File || (p.fp.size != file.size && !may_be_text) {
             return Likeness::Different;
@@ -398,21 +448,39 @@ mod tests {
     }
 
     #[test]
-    fn extra_files_are_reported_wherever_they_are_and_any_case() {
-        let dir = temp("extra");
+    fn files_the_user_added_are_not_an_edit() {
+        let dir = temp("added");
         let skill = install(&dir, &FILES);
         write(&dir, "notes.txt", "mine");
         write(&dir, "scripts/deep/er/more.txt", "mine too");
-        let o = verify(&dir, &skill, Check::Quick);
-        assert_eq!(info(&o).extra, vec!["notes.txt".to_string(), "scripts/deep/er/more.txt".to_string()]);
-        assert_eq!(o.stats.hashed, 0, "extras are found by listing, not by reading");
-
-        fs::remove_file(dir.join("notes.txt")).unwrap();
-        fs::remove_dir_all(dir.join("scripts").join("deep")).unwrap();
-        assert_eq!(verify(&dir, &skill, Check::Quick).local, LocalState::Clean);
         fs::create_dir_all(dir.join("an-empty-folder")).unwrap();
-        assert_eq!(verify(&dir, &skill, Check::Quick).local, LocalState::Clean, "an empty folder holds nothing of anyone's");
+        for check in [Check::Quick, Check::Full] {
+            let o = verify(&dir, &skill, check);
+            assert_eq!(o.local, LocalState::Clean, "{check:?}: only what came from GitHub is compared");
+            assert_eq!(o.stats.hashed, if check == Check::Quick { 0 } else { 3 }, "{check:?}: an added file is never read");
+        }
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_subfolder_replaced_by_a_link_is_an_edit_and_is_not_read_through() {
+        let dir = temp("sub-link");
+        let skill = install(&dir, &FILES);
+        let outside = temp("sub-link-outside");
+        write(&outside, "a.md", "reference\n");
+        fs::remove_dir_all(dir.join("refs")).unwrap();
+        let made = std::process::Command::new("cmd").args(["/C", "mklink", "/J"]).arg(dir.join("refs")).arg(&outside).output().unwrap().status.success();
+        assert!(made);
+        for check in [Check::Quick, Check::Full] {
+            let o = verify(&dir, &skill, check);
+            assert_eq!(info(&o).modified, vec!["refs/a.md (a folder on its way is a link or a file)".to_string()], "{check:?}");
+            assert_eq!(o.stats.hashed, if check == Check::Quick { 0 } else { 2 }, "{check:?}: nothing is read through the link");
+        }
+        fs::remove_dir(dir.join("refs")).unwrap();
+        write(&dir, "refs", "a file where the folder was");
+        assert_eq!(info(&verify(&dir, &skill, Check::Full)).modified, vec!["refs/a.md (a folder on its way is a link or a file)".to_string()]);
+        fs::remove_dir_all(dir).unwrap();
+        fs::remove_dir_all(outside).unwrap();
     }
 
     #[test]
@@ -604,8 +672,18 @@ mod tests {
         assert_eq!(compare_unmanaged(&dir, &up, &none, &mut h), Likeness::Same);
 
         write(&dir, "extra.txt", "x");
-        assert_eq!(compare_unmanaged(&dir, &up, &none, &mut h), Likeness::Different, "an extra file");
-        fs::remove_file(dir.join("extra.txt")).unwrap();
+        write(&dir, "refs/deeper/mine.md", "x");
+        assert_eq!(compare_unmanaged(&dir, &up, &none, &mut h), Likeness::Same, "files the user added are not compared");
+
+        let outside = temp("unmanaged-outside");
+        write(&outside, "a.md", "reference\n");
+        fs::rename(dir.join("refs"), dir.join("refs-real")).unwrap();
+        let made = std::process::Command::new("cmd").args(["/C", "mklink", "/J"]).arg(dir.join("refs")).arg(&outside).output().unwrap().status.success();
+        assert!(made);
+        assert_eq!(compare_unmanaged(&dir, &up, &none, &mut h), Likeness::Different, "a file reached through a link is not in the folder");
+        fs::remove_dir(dir.join("refs")).unwrap();
+        fs::rename(dir.join("refs-real"), dir.join("refs")).unwrap();
+        fs::remove_dir_all(outside).unwrap();
 
         write(&dir, "SKILL.md", "# ALPHA\n");
         assert_eq!(compare_unmanaged(&dir, &up, &HashMap::from([("SKILL.md".into(), text::canon(b"# alpha\n"))]), &mut h), Likeness::Different);

@@ -26,11 +26,15 @@ Do not weaken any of these. Each one has tests; if a change makes one of them fa
 
 1. **A failure is never a deletion.** Any error from the network, the token or GitHub ends the check of that repository
    before `reconcile` runs. Only a complete listing (`truncated` false) can remove a skill.
-2. **Only proven copies are deleted.** `apply` deletes or replaces a folder only after a full check proved it equals a
-   version the app installed. Anything else becomes `backup-*`, and backups are never deleted automatically.
-3. **Unmanaged folders are never changed.** A skill folder the record does not own is adopted only when identical to
-   upstream; otherwise it is held.
-4. **Edits hold.** An edited managed skill is never updated or deleted without the user's choice.
+2. **Only proven copies are deleted.** `apply` deletes or replaces files only after a full check proved they equal a
+   version the app installed, and a folder only when nothing else is in it. Anything else becomes `backup-*`, and
+   backups are never deleted automatically.
+3. **What the user added is theirs.** A skill folder the record does not own is adopted only when every file upstream
+   has is there and the same; otherwise it is held. A file the user added to a skill is never changed, deleted,
+   reported or shown: an update or a removal moves it along (`carry`), and when GitHub adds a file with the same name,
+   the user's goes to `backup-*`.
+4. **Edits hold.** An edited managed skill (a file GitHub put there changed or deleted) is never updated or deleted
+   without the user's choice.
 5. **The mass-deletion guard.** A listing with no skills at all deletes nothing unless the user confirmed.
 6. **Destructive steps use the full check.** The quick (fingerprint) check is for status only.
 7. **Links inside the skills folder are never followed** (`win::fs` opens every path with `FILE_FLAG_OPEN_REPARSE_POINT`),

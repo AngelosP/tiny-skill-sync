@@ -143,12 +143,18 @@ fn a_listing_that_github_cut_short_is_never_trusted() {
 #[test]
 fn an_overwrite_that_goes_wrong_leaves_the_edited_skill_as_it_was() {
     type Break = fn(&FakeRemote);
-    let cases: [(&str, Break, &str); 5] = [
+    let cases: [(&str, Break, &str); 6] = [
         ("cut-short", |r| r.set_truncated(REPO, true), "cut the listing short"),
         ("listing-error", |r| r.fail_tree(REPO, Some(error(FailureKind::Network))), "Network"),
         ("gone-upstream", |r| r.remove(REPO, "skills/alpha"), "cannot be installed"),
         ("no-commit", |r| r.fail_commit(REPO, Some(error(FailureKind::Server))), "Server"),
         ("file-fails", |r| r.fail_file(REPO, "skills/alpha/references/guide.md", Some(error(FailureKind::Network))), "Network"),
+        // The listing names a file the commit being read does not have: a push landed in between.
+        (
+            "listed-not-there",
+            |r| r.fail_file(REPO, "skills/alpha/references/guide.md", Some(error(FailureKind::NotFound))),
+            "changed on GitHub while references/guide.md was being read",
+        ),
     ];
     for (name, break_it, words) in cases {
         let mut s = Setup::installed(&format!("overwrite-{name}"));
@@ -269,6 +275,43 @@ fn a_file_that_does_not_match_the_listing_is_never_installed() {
     let report = s.sync();
     assert!(matches!(only(&report).outcome, Outcome::Synced), "{:?}", only(&report).outcome);
     assert_eq!(s.w.read("alpha/references/guide.md"), "tampered\n");
+}
+
+#[test]
+fn a_file_the_listing_names_that_is_not_in_the_commit_is_a_change_on_github_not_a_missing_repository() {
+    let mut s = Setup::fresh("listed-not-there");
+    // A push lands between the listing and the look-up of the commit (without a token GitHub can also answer the two
+    // from caches of different ages): the commit the files are read at has no such file.
+    let fake = Arc::clone(&s.remote);
+    let mut pushed = false;
+    s.remote.on_call(move |line| {
+        if line.starts_with("commit ") && !pushed {
+            pushed = true;
+            fake.remove(REPO, "skills/alpha/references/guide.md");
+        }
+    });
+
+    let report = s.sync();
+
+    let f = failure(only(&report));
+    assert_eq!(f.kind, FailureKind::Changed, "{}", f.message);
+    assert!(f.message.contains("references/guide.md") && f.message.contains("changed on GitHub") && !f.message.contains("private"), "{}", f.message);
+    // Shown as a sentence (first letter capitalized), the message must still name the file as GitHub does.
+    let shown = tiny_skill_sync::board::capitalized(&f.message);
+    assert!(shown.contains("references/guide.md"), "{shown}");
+    assert!(s.w.skill_names().is_empty(), "{:?}", s.w.skill_names());
+    assert!(s.w.work_leftovers().is_empty(), "{:?}", s.w.work_leftovers());
+    assert_eq!(s.engine.schedule().retry_of("fx").unwrap().not_before, T0 + 60, "retried soon, like any change under way");
+
+    s.remote.clear_hook();
+    s.advance(60);
+    let report = s.sync();
+    assert!(matches!(only(&report).outcome, Outcome::Synced), "{:?}", only(&report).outcome);
+    assert_eq!(names(&s.w.files_of("alpha")), ["SKILL.md", "scripts/hello.ps1"]);
+}
+
+fn names(map: &std::collections::BTreeMap<String, String>) -> Vec<&str> {
+    map.keys().map(String::as_str).collect()
 }
 
 // ---------------------------------------------------------------------------------------------------------------------

@@ -295,10 +295,25 @@ impl State {
     }
 
     /// Forgets a repository's records, for this folder and for the folders used before. Says whether there were any.
+    /// A change that is not finished keeps its record, so that recovery can still finish or undo it (an unfinished
+    /// change can hold files the user added in the work folder); the repository is then shown as one no longer in the
+    /// settings until it is done.
     pub fn drop_repo(&mut self, id: &str) -> bool {
-        let mut found = self.repos.remove(id).is_some();
+        fn forget(repos: &mut BTreeMap<String, RepoState>, id: &str) -> bool {
+            let Some(repo) = repos.get_mut(id) else { return false };
+            let unfinished: Vec<OwnedSkill> = repo.skills.iter().filter(|s| s.pending.is_some()).cloned().collect();
+            if unfinished.is_empty() {
+                repos.remove(id);
+                return true;
+            }
+            let kept = RepoState { skills: unfinished, ..RepoState::default() };
+            let changed = *repo != kept;
+            *repo = kept;
+            changed
+        }
+        let mut found = forget(&mut self.repos, id);
         for a in &mut self.set_aside {
-            found |= a.repos.remove(id).is_some();
+            found |= forget(&mut a.repos, id);
         }
         self.set_aside.retain(|a| !a.repos.is_empty());
         found
@@ -658,5 +673,24 @@ mod tests {
         assert!(st.set_aside.is_empty(), "records left with nothing in them are not kept");
         assert!(st.repos.contains_key("other"));
         assert!(!st.drop_repo("r"));
+    }
+
+    #[test]
+    fn forgetting_a_repository_keeps_the_changes_that_are_not_finished() {
+        let mut st = State::default();
+        let half = OwnedSkill { pending: Some(Pending::Update { txn: "t1".into(), commit: "d".repeat(40), files: Vec::new() }), ..skill("half") };
+        st.repo_mut("r").upsert_skill(skill("done"));
+        st.repo_mut("r").upsert_skill(half.clone());
+        st.repo_mut("r").ignored.push("mine".into());
+        let mut before = RepoState::default();
+        before.upsert_skill(OwnedSkill { pending: Some(Pending::Delete { txn: "t2".into() }), ..skill("elsewhere") });
+        before.upsert_skill(skill("gone"));
+        st.set_aside.push(SetAside { skills_dir: r"D:\skills".to_string(), volume: None, repos: BTreeMap::from([("r".to_string(), before)]) });
+
+        assert!(st.drop_repo("r"));
+        assert_eq!(st.repos["r"], RepoState { skills: vec![half], ..RepoState::default() }, "recovery needs the marker to finish or undo the change");
+        let names: Vec<&str> = st.set_aside[0].repos["r"].skills.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, ["elsewhere"]);
+        assert!(!st.drop_repo("r"), "nothing more can be forgotten");
     }
 }
