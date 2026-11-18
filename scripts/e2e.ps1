@@ -584,21 +584,72 @@ function Test-Unmanaged {
         New-Item -ItemType Directory -Force (Join-Path $c.Skills 'beta') | Out-Null
         [IO.File]::WriteAllText((Join-Path $c.Skills 'beta\SKILL.md'), "my own beta, not the repository's`n")
         # gamma: a copy that is exactly what upstream has, so it may be taken over, with a file of my own beside it.
-        $sha = Invoke-Gh @('api', "repos/$($c.Repo)/git/ref/heads/$($c.Branch)", '--jq', '.object.sha')
+        $sha = Wait-Live { try { Get-PublicCommit $c.Repo $c.Branch } catch { $null } } 'the public fixture branch' 90
         $raw = "https://raw.githubusercontent.com/$($c.Repo)/$sha/skills/gamma/SKILL.md"
         $bytes = (Invoke-WebRequest -UseBasicParsing -Uri $raw).Content
         if ($bytes -is [string]) { $bytes = [Text.Encoding]::UTF8.GetBytes($bytes) }
         New-Item -ItemType Directory -Force (Join-Path $c.Skills 'gamma') | Out-Null
         [IO.File]::WriteAllBytes((Join-Path $c.Skills 'gamma\SKILL.md'), $bytes)
         [IO.File]::WriteAllText((Join-Path $c.Skills 'gamma\my-extra.md'), "my extra`n")
+        # A whole old copy, an edited old copy, and more history than one quick slice can search.
+        [void](Push-Upstream $c.Repo $c.Branch @(
+            @{ Path = 'skills/older-edited/SKILL.md'; Text = "old edited fixture`n" },
+            @{ Path = 'skills/slow/SKILL.md'; Text = "old slow fixture`n" }
+        ) 'live: historical copies')
+        New-Item -ItemType Directory -Force (Join-Path $c.Skills 'older-edited'), (Join-Path $c.Skills 'slow') | Out-Null
+        [IO.File]::WriteAllText((Join-Path $c.Skills 'older-edited\SKILL.md'), "old edited fixture`nmy edit`n")
+        [IO.File]::WriteAllText((Join-Path $c.Skills 'slow\SKILL.md'), "old slow fixture`n")
+        $newGamma = "---`nname: gamma`ndescription: historical gamma`n---`n"
+        $head = Push-Upstream $c.Repo $c.Branch @(
+            @{ Path = 'skills/gamma/SKILL.md'; Text = $newGamma },
+            @{ Path = 'skills/older-edited/SKILL.md'; Text = "new edited fixture`n" },
+            @{ Path = 'skills/slow/SKILL.md'; Text = "slow version 1`n" }
+        ) 'live: advance historical copies'
+        for ($version = 2; $version -le 9; $version++) {
+            $head = Push-Upstream $c.Repo $c.Branch @(@{ Path = 'skills/slow/SKILL.md'; Text = "slow version $version`n" }) "live: history $version"
+        }
+        $wantGamma = (Get-UpstreamFiles $c.Repo $head 'skills')['gamma/SKILL.md'].Id
+        [void](Wait-Live {
+            try { (Get-PublicCommit $c.Repo $c.Branch) -eq $head -and (Get-PublicFiles $c.Repo $c.Branch 'skills')['gamma/SKILL.md'] -eq $wantGamma }
+            catch { $false }
+        } 'public history and current files' 120 5000)
         $before = @{ mine = Get-BlobId (Join-Path $mine 'SKILL.md'); stray = Get-BlobId (Join-Path $c.Skills 'stray.txt'); beta = Get-BlobId (Join-Path $c.Skills 'beta\SKILL.md'); extra = Get-BlobId (Join-Path $c.Skills 'gamma\my-extra.md') }
 
         Add-Repo $c
+        $historyClock = [Diagnostics.Stopwatch]::StartNew()
         $r = Tss $c @('check')
         Check 'a skill that was not there is installed (alpha)' ((Compare-Skill $c 'alpha').Count -eq 0 -and (Test-Path -LiteralPath (Join-Path $c.Skills 'alpha\SKILL.md')))
+        $historyClock.Stop()
+        Note "Historical quick slice and initial install: $($historyClock.ElapsedMilliseconds) ms (eight historical candidates at most)."
         Check 'my own skill and my loose file are untouched' ((Get-BlobId (Join-Path $mine 'SKILL.md')) -eq $before.mine -and (Get-BlobId (Join-Path $c.Skills 'stray.txt')) -eq $before.stray)
         Check 'a different folder with an upstream name is not overwritten (beta)' ((Get-BlobId (Join-Path $c.Skills 'beta\SKILL.md')) -eq $before.beta -and $r.Text -match 'beta') ''
         Check 'the check says so (attention)' ($r.Code -eq 1) "exit $($r.Code)"
+        Check 'a whole older GitHub copy is adopted and updated explicitly (gamma)' ((Read-Skill $c 'gamma\SKILL.md') -eq $newGamma -and $r.Text -match 'older GitHub copy of gamma')
+        Check 'verified old upstream files need no backup' (@(Get-ChildItem (Join-Path $c.Root '.tss-work') -Directory -Filter 'backup-*' -ErrorAction SilentlyContinue).Count -eq 0)
+        Check 'an edited old copy is held' ((Read-Skill $c 'older-edited\SKILL.md') -eq "old edited fixture`nmy edit`n")
+        Check 'a longer search yields and honestly reports saved work without a tray' ($r.Text -match 'History work is saved' -and (Read-Skill $c 'slow\SKILL.md') -eq "old slow fixture`n")
+        $pause = Tss $c @('resolve', $c.Id, 'slow', 'pause')
+        Check 'Cancel pauses this search persistently' ($pause.Code -eq 0)
+        $paused = Tss $c @('check')
+        Check 'a new process leaves the search paused' ($paused.Text -match 'search paused' -and (Read-Skill $c 'slow\SKILL.md') -eq "old slow fixture`n")
+        [void](Start-Tray $c)
+        [void](Wait-Live { (Get-MarkCount $c.Report 'job-startup') -ge 1 } 'the history startup' 60)
+        $second = Start-LiveTray $c.Root
+        [void]$second.WaitForExit(5000)
+        $win = Wait-Live { $w = Find-LiveWindow $c.Tray.Id $WINDOW_CLASS -Visible; if ($w -ne [IntPtr]::Zero) { $w } } 'the history window' 10
+        [void][TssLive]::SetWindowPos($win, [IntPtr](-1), 0, 0, 0, 0, 0x13)
+        Start-Sleep -Milliseconds 500
+        Check 'the window shows the paused search and its choices' ((Read-Panel $win $UiPanel.Page) -match 'Resume search')
+        [void][TssLive]::SendMessageW([TssLive]::GetDlgItem($win, $UiPanel.Page), 0x115, [IntPtr]7, [IntPtr]::Zero)
+        Start-Sleep -Milliseconds 300
+        [void](Save-Shot $win 'unmanaged-history-paused')
+        Test-Layout $win 'paused history'
+        Stop-LiveTray $c.Tray
+        $c.Tray = $null
+        $replace = Tss $c @('resolve', $c.Id, 'slow', 'replace')
+        Check 'Use GitHub supersedes the search with a backup' ($replace.Code -eq 0 -and $replace.Text -match 'Backup:' -and (Read-Skill $c 'slow\SKILL.md') -eq "slow version 9`n")
+        [void](Tss $c @('check'))
+        Check 'no stale search undoes the override' ((Read-Skill $c 'slow\SKILL.md') -eq "slow version 9`n")
 
         [void](Push-Upstream $c.Repo $c.Branch @(@{ Path = 'skills/gamma/SKILL.md'; Text = "---`nname: gamma`ndescription: gamma once adopted`n---`n" }) 'live: gamma changes')
         $tries = 0

@@ -48,7 +48,7 @@ case by case. Code that talks to Windows is kept in `src\win\`.
 | `verify` | Is a skill folder on disk still what was installed? | file I/O |
 | `apply` | The only module that moves or deletes anything in the skills folder. | file I/O |
 | `engine` | Puts it together: lock, load, ask GitHub, reconcile, apply, save. | uses all |
-| `github` | Three kinds of request: list a folder, pin the commit, download a file. | network |
+| `github` | List a folder, pin the commit, download a file, page through path history and read complete historical subtrees. | network |
 | `hash` | SHA-1 and Git blob hashes, in plain Rust. | yes |
 | `cli` | `tss`. | uses engine |
 | `win::fs` | File facts `std` does not give: file id, USN, volume, links; one-handle folder listing. | Windows |
@@ -136,8 +136,9 @@ flowchart TD
   two reads, or GitHub answered them from caches of different ages) is the same kind of failure (`Changed`, in
   `engine.rs`, `missing_means_changed`), for a check, **Show changes** and an overwrite alike: it never reads as a
   missing or private repository.
-- **The ETag is kept only when everything settled.** If anything was held, failed or was cancelled, the next check
-  lists again instead of getting a 304, so unfinished work is never forgotten. A choice about a skill drops the ETag
+- **The ETag is kept only when everything settled or a completed/paused comparison is recorded.** If other work was held, failed or was cancelled, the next check
+  lists again instead of getting a 304, so unfinished work is never forgotten. Historical comparison evidence is
+  checked before reusing a comparison: a changed relevant local path or source requires a fresh listing. A choice about a skill drops the ETag
   too. The tray checks such a repository once in each run, as soon as it sees it (see [Scheduling](#scheduling)). A
   304 says nothing new about the skills, so its report carries over what the record knew: a repository whose last
   listing had no skills still reports so.
@@ -158,6 +159,8 @@ owns, and what is on disk. It is a pure function; every row below is a test.
 | --- | --- | --- | --- |
 | has it | not owned | no folder | **Install** |
 | has it | not owned | a folder holding every upstream file, the same | **Adopt** (record it as owned, change nothing) |
+| has it | not owned | every file of one whole historical version matches | **Adopt historical**, then **Update** |
+| has it | not owned | history search still active or paused | Hold only this skill; show search controls |
 | has it | not owned | a folder, different | **Hold**: it may be yours |
 | has it, same | owned | clean | In sync |
 | has it, changed | owned | clean | **Update** |
@@ -170,10 +173,12 @@ owns, and what is on disk. It is a pure function; every row below is a test.
 | any | owned by another repository | any | Skip: a name clash |
 | any | "keep mine" | any | Skip |
 
-**What the user added is theirs.** Only the files GitHub put there (the record, or upstream's listing for a folder not
-owned yet) are looked at. A file the user added to an owned folder is never an edit, and a folder not owned is adopted
-when every upstream file is in it, the same, whatever else it holds; the rest stays the user's. So the app removes only
-what came from GitHub and was later removed there. An edit means a file GitHub put there was changed or deleted. If a
+**What the user added is theirs.** A skill folder the record does not own is adopted only when every file in the
+current upstream version, or in one single past version from the configured branch's history, is present and the
+same under the existing text comparison rules. A folder matching a past version may then be updated automatically;
+otherwise it is held. A file the user added to a skill is never changed, deleted, reported or shown: an update or a
+removal moves it along (`carry`), and when GitHub adds a file with the same name, the user's goes to `backup-*`.
+An edit means a file GitHub put there was changed or deleted. If a
 listing has no skills at all while some are owned, every delete is held until you confirm (the **mass-deletion
 guard**): an empty listing is more often a mistake than a real removal.
 
@@ -185,6 +190,45 @@ byte against the Git blob hash.
 **A failure never reaches this table.** `github::FailureKind` separates authentication, not found, rate limited, server
 error, redirect, protocol, network, too large, cancelled, changed during download and local errors. Any of them ends
 the check of that repository before anything is decided.
+
+### Recognising older copies
+
+`compare_unmanaged` compares the current version first. For a different copy, `Remote::history` requests commits
+touching that skill's path, pinned to the configured branch's commit, in pages of 100. The pin's configured tree must
+match the current listing. `Remote::historical_tree` walks complete parent trees and reads the skill subtree:
+missing paths must be proven by a parent listing, never inferred from a 404. Truncated, malformed or unsafe trees
+and failed downloads abort the repository before reconciliation. Downloads still prove their Git blob hashes.
+
+The quick budget is **eight historical candidates per repository check**, shared across its unowned skills.
+Remaining candidates continue in the same bounded slices, at least 30 seconds apart, on the existing worker. It is
+not a total-depth limit: pages continue until a whole version matches or the actual history is exhausted. An active
+slice is work, not an unchanged poll. A comparison that reaches the download limit is an error, never a no-match.
+User resolutions run before queued checks; the shell cancels an ongoing check with a flag belonging to that order
+alone, so cancellation before starting or just after finishing cannot cancel the following resolution.
+
+`RepoState::searches` saves the source, current tree, pin, page/cursor, candidates checked, pause/completion flags,
+volume/journal identity and local evidence for the union of paths actually compared. File fingerprints include the
+USN; missing paths are probed again through `Spots`, including their parent paths. This detects repairs and nested
+edits without reading unrelated extras. Without a trusted journal, content hashes are used instead. Root changes
+follow the ordinary set-aside records. Source/tree changes or invalid evidence restart comparisons; none of this
+cached evidence authorizes a file change. Completed/paused unchanged polls make one branch-commit request and
+write nothing; last-check times remain lazy. Failures are not cached as no-match, and active-search retry times
+survive restart. Pauses persist until Resume, even across a source change.
+The eight-candidate quick budget took 11.4 seconds in the live unmanaged fixture check, including the initial
+install and an older-copy update. It bounds candidates, not wall time; network latency still varies. The worker
+checks cancellation before swapping a staged version, and retains the search until a historical update succeeds,
+so a late Cancel can still pause the already adopted old baseline without losing its proof.
+
+The branch-commit probe is needed even when the current tree is unchanged: a push followed by a revert can add a
+matching past version without changing the tree's ETag. Ordinary owned-only polls still use the conditional tree
+request. Both unchanged paths cost one request, zero file content reads and zero writes on NTFS.
+
+Only a full matching version creates `UnmanagedState::Historical` and the distinct pure
+`Verdict::AdoptHistorical`. The context keeps that old version and its text proof. `Applier::adopt` fully rechecks and
+records **the old baseline**, then the ordinary update transaction stages the current version and rechecks again.
+A stop after adoption leaves a valid owned old baseline. No unconditional backup is made; extras and collision
+backups use the normal carry/recovery path. UI, CLI and Activity report historical update success only when apply
+succeeds. Force/keep remove or supersede saved searches; no queued continuation has independent installation authority.
 
 ## Changing the skills folder
 
@@ -222,7 +266,8 @@ stateDiagram-v2
 - A delete is the same without the download: Full check, marker, rename to `trash-txn`, audit, remove. When the folder
   holds anything else, an empty new version is swapped in instead, so the user's files are carried back and only the
   files GitHub put there go; the folder itself is removed at the end only if it is then empty.
-- **A folder is deleted only after it was proven to equal a version the app installed** (equal as `text.rs` says, so a
+- **A folder is deleted only after it was proven to equal a version the app installed or fully verified and adopted
+  from upstream history** (equal as `text.rs` says, so a
   copy that differs only in line endings or blank lines is replaced or deleted like the original), and to hold nothing
   else. Anything else is kept as `backup-<skill>-<txn>` in the work folder, and backups are never deleted
   automatically.
@@ -285,6 +330,8 @@ tests in `tests\downtime.rs`.
 - After a failure: 5 minutes, then 10, 20, 40 and so on, never later than the repository's own interval. A rate limit
   waits for the time GitHub named.
 - Nothing runs more often than every 5 minutes. A month is a calendar month, clamped to the end of a shorter month.
+- Active historical work is the exception: a bounded slice every 30 seconds, with normal failure backoff and saved
+  rate-limit waits. Paused and completed searches use the ordinary repository interval.
 - A last-check time in the future (the clock was set back) counts as now.
 - The tray re-plans the timer when the clock changes (`WM_TIMECHANGE`) and when the computer wakes from sleep.
 
@@ -302,7 +349,8 @@ flowchart TD
 - `config.json` is meant to be read and edited by hand. The tray reloads it when it changes.
 - `state.json` holds, per repository: the ETag of the last fully applied listing, the last check time, whether the last
   listing had no skills in it at all, the "keep mine" list, and per owned skill its commit, its files (path, Git blob
-  hash, size, fingerprint, and `canon`, the hash of the lines that count) and an optional pending marker. It is written
+  hash, size, fingerprint, and `canon`, the hash of the lines that count) and an optional pending marker. It also
+  keeps resumable historical searches and their local evidence (above). It is written
   only when something changed, through a temporary file and a rename. A damaged one is kept as `state.json.damaged-*`;
   one written by a newer version is not touched.
 - `state.json` also names the skills folder its records describe (`skills_dir`). Every call compares it with the folder

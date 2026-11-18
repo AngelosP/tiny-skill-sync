@@ -40,7 +40,7 @@ fn the_first_check_installs_every_skill_and_nothing_else() {
     let head = s.remote.head(REPO);
     assert!(rs.skills.iter().all(|k| k.commit == head && k.pending.is_none()));
     // One listing, one lookup of the commit for the whole check (not one per skill), and each of the five files once.
-    assert_eq!(s.remote.calls(), Calls { tree: 1, conditional: 0, commit: 1, file: 5 });
+    assert_eq!(s.remote.calls(), Calls { tree: 1, conditional: 0, commit: 1, file: 5, ..Calls::default() });
 }
 
 #[test]
@@ -53,7 +53,7 @@ fn a_check_that_finds_nothing_new_is_one_request_and_changes_no_file() {
     let repo = only(&report);
 
     assert!(matches!(repo.outcome, Outcome::Unchanged), "{:?}", repo.outcome);
-    assert_eq!(s.remote.calls(), Calls { tree: 1, conditional: 1, commit: 0, file: 0 });
+    assert_eq!(s.remote.calls(), Calls { tree: 1, conditional: 1, commit: 0, file: 0, ..Calls::default() });
     assert_eq!(s.w.snapshot(), before, "not one file was created, changed or removed, not even state.json");
     assert_eq!(s.engine.last_check("fx"), Some(T0 + 3600), "the check is remembered in memory");
 }
@@ -229,7 +229,7 @@ fn what_the_user_did_to_a_skill_is_a_status_not_pending_work_so_polls_stay_cheap
     fn next_check_is_not_modified(s: &mut Setup) -> bool {
         s.remote.reset();
         let report = s.sync();
-        only(&report).skills.is_empty() && s.remote.calls() == Calls { tree: 1, conditional: 1, commit: 0, file: 0 }
+        only(&report).skills.is_empty() && s.remote.calls() == Calls { tree: 1, conditional: 1, commit: 0, file: 0, ..Calls::default() }
     }
 
     let mut s = Setup::installed("cheap-edited");
@@ -458,7 +458,7 @@ fn reading_files_from_github_to_compare_them_counts_toward_the_download_limit() 
     let mut s = Setup::fresh("adopt-text-limit");
     write_windows_copy(&s.w, "alpha");
     let report = sync_with(&mut s.engine, &s.cfg, SyncOptions { max_download_bytes: 10, ..SyncOptions::default() });
-    assert_eq!(skill(only(&report), "alpha").verdict, Verdict::Held(Hold::UnmanagedDiffers));
+    assert!(matches!(only(&report).outcome, Outcome::Failed(_)), "a comparison limit is not a no-match result");
     assert_eq!(s.remote.calls().file, 0);
 
     let report = s.sync();
@@ -629,7 +629,7 @@ fn show_changes_downloads_only_the_files_that_differ_and_changes_nothing() {
     assert_eq!(lines(&report.files[0]), (0, 1), "a file only on GitHub would come");
     assert_eq!(lines(&report.files[1]), (1, 0), "a file GitHub removed would go");
     // The guide is the same on both sides, so it is not downloaded.
-    assert_eq!(s.remote.calls(), Calls { tree: 1, conditional: 0, commit: 1, file: 2 });
+    assert_eq!(s.remote.calls(), Calls { tree: 1, conditional: 0, commit: 1, file: 2, ..Calls::default() });
     assert!(!s.remote.log().iter().any(|l| l.contains("guide.md")), "{:?}", s.remote.log());
     assert_eq!(s.w.snapshot(), before, "showing changes writes nothing, not even state.json");
 }
@@ -661,11 +661,11 @@ fn show_changes_of_a_skill_deleted_here_or_gone_from_github() {
     let report = diff(&mut s, "Gamma");
     assert!(!report.on_github && report.here);
     assert_eq!(shown(&report), [("SKILL.md", Presence::OnlyHere)], "the file the user added would stay, so it is not shown");
-    assert_eq!(s.remote.calls(), Calls { tree: 1, conditional: 0, commit: 0, file: 0 }, "nothing to download");
+    assert_eq!(s.remote.calls(), Calls { tree: 1, conditional: 0, commit: 0, file: 0, ..Calls::default() }, "nothing to download");
 
     s.remote.reset();
     assert!(diff(&mut s, "alpha").files.is_empty(), "a skill that is the same on both sides has nothing to show");
-    assert_eq!(s.remote.calls(), Calls { tree: 1, conditional: 0, commit: 0, file: 0 });
+    assert_eq!(s.remote.calls(), Calls { tree: 1, conditional: 0, commit: 0, file: 0, ..Calls::default() });
 }
 
 #[test]
@@ -817,4 +817,136 @@ fn show_changes_reads_at_most_a_few_megabytes_from_each_side_not_counting_files_
     assert_eq!(hidden.len(), 2, "four files from each side are shown and the fifth is only named: {hidden:?}");
     assert!(hidden.iter().any(|p| p.starts_with("up-")) && hidden.iter().any(|p| p.starts_with("here-")), "{hidden:?}");
     assert_eq!(s.remote.calls().file, 4);
+}
+#[test]
+fn historical_whole_copy_is_updated_without_backup_and_extras_are_carried() {
+    let w = World::new("historical-old");
+    let remote = FakeRemote::new();
+    remote.seed(REPO, &[("skills/alpha/SKILL.md", "old\n"), ("skills/alpha/refs/a.md", "guide\n")]);
+    w.write("alpha/SKILL.md", "\r\nold\r\n\r\n");
+    w.write("alpha/refs/a.md", "guide");
+    w.write("alpha/mine.txt", "mine");
+    remote.seed(REPO, &[("skills/alpha/SKILL.md", "new\n"), ("skills/alpha/new.txt", "new file")]);
+    let report = sync_all(&mut w.engine(&remote), &standard_config());
+    assert_eq!(w.read("alpha/SKILL.md"), "new\n", "{report:?}");
+    assert_eq!(w.read("alpha/mine.txt"), "mine");
+    assert_eq!(w.read("alpha/new.txt"), "new file");
+    assert!(w.backups().is_empty());
+    assert_eq!(skill(only(&report), "alpha").result, ApplyResult::Done);
+}
+
+#[test]
+fn historical_search_yields_and_resumes_after_restart_beyond_one_page() {
+    let w = World::new("historical-paging");
+    let remote = FakeRemote::new();
+    remote.put(REPO, "skills/alpha/SKILL.md", "old");
+    w.write("alpha/SKILL.md", "old");
+    for n in 0..105 {
+        remote.put(REPO, "skills/alpha/SKILL.md", &format!("version {n}"));
+    }
+    remote.put(REPO, "skills/beta/SKILL.md", "another skill");
+    let (mut engine, clock) = w.engine_at(&remote, &FakeTokens::none());
+    let first = sync_all(&mut engine, &standard_config());
+    assert_eq!(skill(only(&first), "alpha").verdict, Verdict::Held(Hold::HistorySearching));
+    assert!(w.exists("beta/SKILL.md"), "only the searching skill waits");
+    assert_eq!(engine.next_wake(&standard_config()), Some(T0 + 30), "search must continue before the ordinary interval");
+    drop(engine);
+    let mut engine = w.engine(&remote);
+    for _ in 0..20 {
+        sync_all(&mut engine, &standard_config());
+        if w.read("alpha/SKILL.md") == "version 104" {
+            break;
+        }
+    }
+    assert_eq!(w.read("alpha/SKILL.md"), "version 104");
+    assert!(remote.log().iter().any(|l| l.contains("page 2")), "all history pages must be searched");
+    assert!(w.backups().is_empty());
+    drop(clock);
+}
+
+#[test]
+fn historical_completed_mismatch_is_quiet_but_nested_repair_invalidates_it() {
+    let w = World::new("historical-cache");
+    let remote = FakeRemote::new();
+    remote.seed(REPO, &[("skills/alpha/SKILL.md", "old"), ("skills/alpha/refs/a", "old guide")]);
+    remote.seed(REPO, &[("skills/alpha/SKILL.md", "new"), ("skills/alpha/refs/a", "new guide")]);
+    w.write("alpha/SKILL.md", "old");
+    w.write("alpha/refs/a", "my guide");
+    let mut engine = w.engine(&remote);
+    let cfg = standard_config();
+    let report = sync_all(&mut engine, &cfg);
+    assert_eq!(skill(only(&report), "alpha").verdict, Verdict::Held(Hold::UnmanagedDiffers));
+    let before = tiny_skill_sync::engine::stamp_of(&w.state_file());
+    remote.reset();
+    sync_all(&mut engine, &cfg);
+    assert_eq!(remote.calls(), Calls { commit: 1, ..Calls::default() });
+    assert_eq!(tiny_skill_sync::engine::stamp_of(&w.state_file()), before);
+    w.write("alpha/refs/a", "old guide");
+    sync_all(&mut engine, &cfg);
+    assert_eq!(w.read("alpha/SKILL.md"), "new");
+}
+
+#[test]
+fn historical_subset_preserves_extras_and_backs_up_only_collisions() {
+    let w = World::new("historical-subset");
+    let remote = FakeRemote::new();
+    remote.put(REPO, "skills/alpha/SKILL.md", "old");
+    w.write("alpha/SKILL.md", "old");
+    w.write("alpha/new.txt", "my collision");
+    w.write("alpha/notes.txt", "mine");
+    remote.seed(REPO, &[("skills/alpha/SKILL.md", "new"), ("skills/alpha/new.txt", "upstream")]);
+    let report = sync_all(&mut w.engine(&remote), &standard_config());
+    assert_eq!(skill(only(&report), "alpha").verdict, Verdict::AdoptHistorical);
+    assert_eq!(w.read("alpha/SKILL.md"), "new");
+    assert_eq!(w.read("alpha/notes.txt"), "mine");
+    assert_eq!(w.read("alpha/new.txt"), "upstream");
+    assert_eq!(w.backups().len(), 1);
+    assert_eq!(std::fs::read_to_string(w.backups()[0].join("new.txt")).unwrap(), "my collision");
+}
+
+#[test]
+fn historical_mixed_versions_never_supply_a_whole_version_match() {
+    let w = World::new("historical-mixed");
+    let remote = FakeRemote::new();
+    remote.seed(REPO, &[("skills/alpha/SKILL.md", "old"), ("skills/alpha/a", "old guide")]);
+    remote.seed(REPO, &[("skills/alpha/SKILL.md", "new"), ("skills/alpha/a", "new guide")]);
+    w.write("alpha/SKILL.md", "old");
+    w.write("alpha/a", "new guide");
+    let before = w.skills_snapshot();
+    let report = sync_all(&mut w.engine(&remote), &standard_config());
+    assert_eq!(skill(only(&report), "alpha").verdict, Verdict::Held(Hold::UnmanagedDiffers));
+    assert_eq!(w.skills_snapshot(), before);
+    assert!(w.state().repo("fx").unwrap().skills.is_empty());
+}
+
+#[test]
+fn historical_deleted_and_recreated_path_and_single_skill_source_are_searched() {
+    for single in [false, true] {
+        let w = World::new("historical-recreated");
+        let remote = FakeRemote::new();
+        remote.seed(REPO, &[("README.md", "readme"), ("skills/alpha/SKILL.md", "old")]);
+        remote.remove(REPO, "skills/alpha");
+        remote.put(REPO, "skills/alpha/SKILL.md", "new");
+        w.write("alpha/SKILL.md", "old");
+        let cfg = config(vec![repo("fx", REPO, if single { "skills/alpha" } else { "skills" })]);
+        let report = sync_all(&mut w.engine(&remote), &cfg);
+        assert_eq!(skill(only(&report), "alpha").verdict, Verdict::AdoptHistorical);
+        assert_eq!(w.read("alpha/SKILL.md"), "new");
+    }
+}
+
+#[test]
+fn historical_new_history_invalidates_no_match_even_when_the_current_tree_returns_to_the_same_bytes() {
+    let w = World::new("historical-revert");
+    let remote = FakeRemote::new();
+    remote.put(REPO, "skills/alpha/SKILL.md", "current");
+    w.write("alpha/SKILL.md", "future historical copy");
+    let cfg = standard_config();
+    let mut engine = w.engine(&remote);
+    sync_all(&mut engine, &cfg);
+    remote.put(REPO, "skills/alpha/SKILL.md", "future historical copy");
+    remote.put(REPO, "skills/alpha/SKILL.md", "current");
+    let report = sync_all(&mut engine, &cfg);
+    assert_eq!(w.read("alpha/SKILL.md"), "current", "{report:?}");
+    assert_eq!(skill(only(&report), "alpha").verdict, Verdict::AdoptHistorical);
 }

@@ -9,7 +9,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::config::RepoConfig;
 use crate::secret::Secret;
-use crate::tree::{Snapshot, parse_snapshot};
+use crate::tree::{EntryKind, Snapshot, parse_snapshot};
 use crate::win::cred;
 use crate::win::http::{Client, HttpError, Request, Response, Url, percent_encode, percent_encode_path};
 use crate::win::proc;
@@ -112,6 +112,12 @@ pub trait Remote: Send + Sync {
 
     /// The commit the branch points to now, to pin file downloads to one consistent version.
     fn commit(&self, repo: &RepoRef, token: Option<&Secret>, cancel: &AtomicBool) -> Result<String, RemoteError>;
+
+    /// Commits touching `rel`, newest first, pinned to `pin`. An empty page proves exhaustion.
+    fn history(&self, repo: &RepoRef, pin: &str, rel: &str, page: u32, token: Option<&Secret>, cancel: &AtomicBool) -> Result<Vec<String>, RemoteError>;
+
+    /// A complete historical subtree. Absence must be proven by a complete parent listing, never by a 404.
+    fn historical_tree(&self, repo: &RepoRef, commit: &str, rel: &str, token: Option<&Secret>, cancel: &AtomicBool) -> Result<Option<Snapshot>, RemoteError>;
 
     /// Streams one file (`rel` is relative to the repository folder) as it was at `commit`.
     #[allow(clippy::too_many_arguments)]
@@ -246,6 +252,24 @@ impl GitHubRemote {
         let text = format!("{}/repos/{}/{}/{tail}", self.api, percent_encode(repo.owner), percent_encode(repo.name));
         Url::parse(&text).map_err(from_http)
     }
+
+    fn tree_at(&self, repo: &RepoRef, reference: &str, recursive: bool, token: Option<&Secret>, cancel: &AtomicBool) -> Result<Snapshot, RemoteError> {
+        let query = if recursive { "?recursive=1" } else { "" };
+        let url = self.api_url(repo, &format!("git/trees/{}{query}", percent_encode(reference)))?;
+        let request = Request { url, headers: api_headers("application/vnd.github+json"), bearer: token, max_body: MAX_TREE_BYTES };
+        let (resp, body) = self.client.get_bytes(&request, cancel).map_err(from_http)?;
+        if resp.status != 200 {
+            return Err(failure(&resp, &repo.label(), token.is_some(), now_epoch()));
+        }
+        let snapshot = parse_snapshot(&body).map_err(|why| RemoteError::new(FailureKind::Protocol, why))?;
+        if !is_commit_sha(&snapshot.sha) || snapshot.entries.iter().any(|e| !is_commit_sha(&e.sha)) {
+            return Err(RemoteError::new(FailureKind::Protocol, "GitHub returned an invalid historical tree id"));
+        }
+        if snapshot.truncated {
+            return Err(RemoteError::new(FailureKind::TooLarge, "GitHub cut a historical listing short; nothing was changed"));
+        }
+        Ok(snapshot)
+    }
 }
 
 impl Default for GitHubRemote {
@@ -259,6 +283,53 @@ fn api_headers(accept: &str) -> Vec<(&'static str, String)> {
 }
 
 impl Remote for GitHubRemote {
+    fn history(&self, repo: &RepoRef, pin: &str, rel: &str, page: u32, token: Option<&Secret>, cancel: &AtomicBool) -> Result<Vec<String>, RemoteError> {
+        if !is_commit_sha(pin) || page == 0 {
+            return Err(RemoteError::new(FailureKind::Protocol, "history was requested without a pinned commit or page"));
+        }
+        let path = if rel.is_empty() { repo.path.to_string() } else { join_repo_path(repo.path, rel) };
+        let url = self.api_url(repo, &format!("commits?sha={pin}&path={}&per_page=100&page={page}", percent_encode(&path)))?;
+        let request = Request { url, headers: api_headers("application/vnd.github+json"), bearer: token, max_body: MAX_TREE_BYTES };
+        let (resp, body) = self.client.get_bytes(&request, cancel).map_err(from_http)?;
+        if resp.status != 200 {
+            return Err(failure(&resp, &repo.label(), token.is_some(), now_epoch()));
+        }
+        #[derive(serde::Deserialize)]
+        struct Commit {
+            sha: String,
+        }
+        let commits: Vec<Commit> =
+            serde_json::from_slice(&body).map_err(|_| RemoteError::new(FailureKind::Protocol, "GitHub returned an incomplete history page"))?;
+        let mut seen = std::collections::HashSet::new();
+        if commits.len() > 100 || commits.iter().any(|c| !is_commit_sha(&c.sha) || !seen.insert(c.sha.to_ascii_lowercase())) {
+            return Err(RemoteError::new(FailureKind::Protocol, "GitHub returned an invalid history page"));
+        }
+        Ok(commits.into_iter().map(|c| c.sha.to_ascii_lowercase()).collect())
+    }
+
+    fn historical_tree(&self, repo: &RepoRef, commit: &str, rel: &str, token: Option<&Secret>, cancel: &AtomicBool) -> Result<Option<Snapshot>, RemoteError> {
+        if !is_commit_sha(commit) {
+            return Err(RemoteError::new(FailureKind::Protocol, "a historical listing was requested without a pinned commit"));
+        }
+        let path = if rel.is_empty() { repo.path.to_string() } else { join_repo_path(repo.path, rel) };
+        let mut reference = commit.to_string();
+        for component in path.split('/').filter(|p| !p.is_empty()) {
+            let parent = self.tree_at(repo, &reference, false, token, cancel)?;
+            let mut seen = std::collections::HashSet::new();
+            for entry in &parent.entries {
+                if crate::pathsafe::check_component(&entry.path).is_err() || !seen.insert(crate::pathsafe::fold(&entry.path)) || !is_commit_sha(&entry.sha) {
+                    return Err(RemoteError::new(FailureKind::Protocol, "GitHub returned an unsafe historical parent listing"));
+                }
+            }
+            let Some(entry) = parent.entries.iter().find(|e| e.path == component) else { return Ok(None) };
+            if entry.kind != EntryKind::Tree || entry.mode != "040000" {
+                return Err(RemoteError::new(FailureKind::Protocol, "a historical folder is not a plain tree"));
+            }
+            reference = entry.sha.clone();
+        }
+        self.tree_at(repo, &reference, true, token, cancel).map(Some)
+    }
+
     fn tree(&self, repo: &RepoRef, etag: Option<&str>, token: Option<&Secret>, cancel: &AtomicBool) -> Result<TreeReply, RemoteError> {
         // The whole "ref:path" is one encoded segment; GitHub accepts it for any branch name and nested folder.
         let spec = format!("{}:{}", repo.reference(), repo.path);

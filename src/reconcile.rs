@@ -59,6 +59,9 @@ pub enum UnmanagedState {
     /// Every file upstream has is here and matches; anything else in the folder is the user's and stays. Safe to start
     /// managing without writing a byte.
     Identical,
+    Historical,
+    Searching,
+    Paused,
     Different,
 }
 
@@ -90,6 +93,8 @@ pub enum Hold {
     UpdateBlockedMissing,
     DeleteBlocked(DirtyInfo),
     UnmanagedDiffers,
+    HistorySearching,
+    HistoryPaused,
     MassDeletion,
     Interrupted,
 }
@@ -108,6 +113,7 @@ pub enum Verdict {
     Update,
     /// Start managing an identical existing folder.
     Adopt,
+    AdoptHistorical,
     Delete,
     /// We own it, it is gone locally and gone upstream: just drop the record.
     Forget,
@@ -127,7 +133,7 @@ pub struct Decision {
 impl Verdict {
     /// True when this verdict changes files or the ownership record.
     pub fn is_action(&self) -> bool {
-        matches!(self, Verdict::Install | Verdict::Update | Verdict::Adopt | Verdict::Delete | Verdict::Forget)
+        matches!(self, Verdict::Install | Verdict::Update | Verdict::Adopt | Verdict::AdoptHistorical | Verdict::Delete | Verdict::Forget)
     }
 
     /// True when the skill needs the user's attention.
@@ -148,6 +154,7 @@ impl Verdict {
             Verdict::Install => "New: will be installed".to_string(),
             Verdict::Update => "Update available".to_string(),
             Verdict::Adopt => "Already installed and identical: now managed".to_string(),
+            Verdict::AdoptHistorical => "An older copy from GitHub: will be adopted and updated".to_string(),
             Verdict::Delete => "Removed upstream: will be deleted".to_string(),
             Verdict::Forget => "Removed upstream and locally".to_string(),
             Verdict::ModifiedLocally(info) => format!("Edited locally ({info})"),
@@ -156,6 +163,10 @@ impl Verdict {
             Verdict::Held(Hold::UpdateBlockedMissing) => "Update held: the folder was deleted locally".to_string(),
             Verdict::Held(Hold::DeleteBlocked(info)) => format!("Removal held: edited locally ({info})"),
             Verdict::Held(Hold::UnmanagedDiffers) => "Held: a folder with this name already exists and differs from upstream".to_string(),
+            Verdict::Held(Hold::HistorySearching) => {
+                "Searching earlier versions from GitHub; only this skill waits. Cancel to pause, or choose a version".to_string()
+            }
+            Verdict::Held(Hold::HistoryPaused) => "Earlier-version search paused; Resume to continue, or choose a version".to_string(),
             Verdict::Held(Hold::MassDeletion) => "Removal held: upstream lists no skills at all".to_string(),
             Verdict::Held(Hold::Interrupted) => "Held: an earlier change was interrupted and is not sorted out yet".to_string(),
             Verdict::Skipped(Skip::Ignored) => "Kept as yours".to_string(),
@@ -184,11 +195,16 @@ pub fn plan(input: &Input) -> Vec<Decision> {
             Verdict::Skipped(Skip::Ignored)
         } else if let Some(owner) = input.other_owners.get(&key) {
             Verdict::Skipped(Skip::Collision { owner: owner.clone() })
+        } else if input.unmanaged.get(&key) == Some(&UnmanagedState::Paused) {
+            Verdict::Held(Hold::HistoryPaused)
         } else if let Some(owned) = owned_by_key.get(&key) {
             owned_verdict(skill, owned)
         } else {
             match input.unmanaged.get(&key) {
                 Some(UnmanagedState::Identical) => Verdict::Adopt,
+                Some(UnmanagedState::Historical) => Verdict::AdoptHistorical,
+                Some(UnmanagedState::Searching) => Verdict::Held(Hold::HistorySearching),
+                Some(UnmanagedState::Paused) => Verdict::Held(Hold::HistoryPaused),
                 Some(UnmanagedState::Different) => Verdict::Held(Hold::UnmanagedDiffers),
                 None => Verdict::Install,
             }
@@ -196,10 +212,16 @@ pub fn plan(input: &Input) -> Vec<Decision> {
         out.push(Decision { name: skill.name.clone(), verdict });
     }
 
+    for (name, state) in input.unmanaged {
+        if *state == UnmanagedState::Paused && !desired_keys.contains(name) {
+            out.push(Decision { name: name.clone(), verdict: Verdict::Held(Hold::HistoryPaused) });
+        }
+    }
+
     let hold_all_deletions = input.desired.is_empty() && input.rejected.is_empty() && !input.owned.is_empty() && !input.confirm_mass_delete;
     for owned in input.owned {
         let key = fold(&owned.skill.name);
-        if desired_keys.contains(&key) {
+        if desired_keys.contains(&key) || input.unmanaged.get(&key) == Some(&UnmanagedState::Paused) {
             continue;
         }
         let verdict = if let Some(r) = rejected_by_key.get(&key) {
@@ -327,6 +349,22 @@ mod tests {
         assert!(Verdict::Held(Hold::Interrupted).message().contains("interrupted"));
         assert!(Verdict::Held(Hold::Interrupted).needs_attention());
         assert!(!Verdict::Held(Hold::Interrupted).is_action());
+    }
+
+    #[test]
+    fn historical_match_is_an_action_but_never_overrides_user_or_ownership() {
+        let mut c = Case::new();
+        c.desired = vec![up("alpha", "new")];
+        c.unmanaged.insert("alpha".into(), UnmanagedState::Historical);
+        assert_eq!(c.only(), Verdict::AdoptHistorical);
+        assert!(c.only().is_action());
+        c.ignored.insert("alpha".into());
+        assert_eq!(c.only(), Verdict::Skipped(Skip::Ignored));
+        c.ignored.clear();
+        c.other.insert("alpha".into(), "other".into());
+        assert_eq!(c.only(), Verdict::Skipped(Skip::Collision { owner: "other".into() }));
+        c.interrupted.push("alpha".into());
+        assert_eq!(c.only(), Verdict::Held(Hold::Interrupted));
     }
 
     #[test]

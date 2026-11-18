@@ -14,6 +14,34 @@ use tiny_skill_sync::reconcile::Verdict;
 
 const DAY: i64 = 24 * 60 * 60;
 
+#[test]
+fn historical_search_rows_and_timer_survive_restart_and_pause() {
+    let w = World::new("historical-app");
+    let remote = FakeRemote::new();
+    remote.put(REPO, "skills/alpha/SKILL.md", "old");
+    for n in 0..25 {
+        remote.put(REPO, "skills/alpha/SKILL.md", &format!("new {n}"));
+    }
+    w.write("alpha/SKILL.md", "old");
+    let cfg = standard_config();
+    let (mut engine, _) = w.engine_at(&remote, &FakeTokens::none());
+    let mut app = App::new(cfg.clone(), w.skills.clone());
+    run(&mut app, &mut engine, T0);
+    app.want(Job::Check(None));
+    run(&mut app, &mut engine, T0);
+    assert_eq!(row(&app, "alpha").tag, "Searching history");
+    assert_eq!(app.arm(T0), Some(T0 + 30));
+    app.on_timer(T0);
+    assert!(app.queued().is_empty());
+    app.want(Job::Resolve { repo: fx(), skill: "alpha".into(), how: Resolution::PauseHistory });
+    run(&mut app, &mut engine, T0);
+    let (mut engine, _) = w.engine_at(&remote, &FakeTokens::none());
+    let mut app = App::new(cfg, w.skills.clone());
+    run(&mut app, &mut engine, T0);
+    assert_eq!(row(&app, "alpha").tag, "Search paused");
+    assert_eq!(row(&app, "alpha").actions, [Action::ResumeHistory, Action::Overwrite, Action::KeepMine]);
+}
+
 /// Runs every waiting job to the end. Returns what each one settled.
 fn run(app: &mut App, engine: &mut Engine, now: i64) -> Vec<(Job, Settled)> {
     let mut out = Vec::new();
@@ -144,7 +172,7 @@ fn a_job_that_is_already_waiting_covers_a_smaller_one() {
     assert!(!app.want(Job::Plan), "every job works out when to wake up");
     let keep = Job::Resolve { repo: fx(), skill: "alpha".to_string(), how: Resolution::KeepMine };
     assert!(app.want(keep.clone()), "a choice the user made is never covered");
-    assert_eq!(app.queued(), &[Job::Startup, Job::Check(None), keep]);
+    assert_eq!(app.queued(), &[Job::Startup, keep, Job::Check(None)]);
 
     let mut app = bare();
     app.next_order();

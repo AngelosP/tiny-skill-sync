@@ -102,6 +102,39 @@ pub struct RepoState {
     /// start. Learned by the app; the user never sets it.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub needs_token: bool,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub source: String,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub searches: BTreeMap<String, HistorySearch>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub history_retry_at: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub history_head: Option<String>,
+}
+
+/// Progress, not authority to replace anything. Adoption always reads the complete matched version again.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HistorySearch {
+    pub name: String,
+    pub source: String,
+    pub tree: String,
+    pub pin: String,
+    pub page: u32,
+    pub commits: Vec<String>,
+    pub offset: usize,
+    pub checked: u64,
+    pub complete: bool,
+    pub paused: bool,
+    pub volume: Option<VolumeId>,
+    pub evidence: BTreeMap<String, LocalEvidence>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LocalEvidence {
+    Missing,
+    File(Fingerprint),
+    Content { fp: Fingerprint, blob: String },
+    Other,
 }
 
 impl RepoState {
@@ -281,7 +314,7 @@ impl State {
         let old = SetAside { skills_dir: from.clone(), volume: self.volume.take(), repos: std::mem::take(&mut self.repos) };
         let own = self.set_aside.iter().position(|a| folder_key(&a.skills_dir) == key).map(|i| self.set_aside.remove(i));
         self.set_aside.retain(|a| folder_key(&a.skills_dir) != from_key);
-        if old.repos.values().any(|r| !r.skills.is_empty() || !r.ignored.is_empty()) {
+        if old.repos.values().any(|r| !r.skills.is_empty() || !r.ignored.is_empty() || !r.searches.is_empty()) {
             self.set_aside.insert(0, old);
             self.set_aside.truncate(MAX_SET_ASIDE);
         }
@@ -326,6 +359,15 @@ impl State {
         let mut notes = Vec::new();
         let all = self.repos.iter_mut().chain(self.set_aside.iter_mut().flat_map(|a| a.repos.iter_mut()));
         for (repo_id, repo) in all {
+            repo.searches.retain(|key, h| {
+                pathsafe::check_component(&h.name).is_ok()
+                    && *key == pathsafe::fold(&h.name)
+                    && h.page > 0
+                    && h.offset <= h.commits.len()
+                    && h.commits.len() <= 100
+                    && h.evidence.keys().all(|p| pathsafe::check_rel_path(p).is_ok())
+                    && std::iter::once(&h.pin).chain(&h.commits).all(|c| c.len() == 40 && c.bytes().all(|b| b.is_ascii_hexdigit()))
+            });
             repo.skills.retain(|s| match check_record(s) {
                 Ok(()) => true,
                 Err(why) => {

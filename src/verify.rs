@@ -14,14 +14,14 @@
 //! Only the files that came from GitHub are looked at. Whatever the user added to a skill's folder is theirs: it is
 //! never read, never counts as an edit and never holds a change.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io;
 use std::path::Path;
 
 use crate::fsx::join_rel;
 use crate::pathsafe::fold;
 use crate::reconcile::{DirtyInfo, LocalState};
-use crate::state::{Fingerprint, ManagedFile, OwnedSkill, VolumeId};
+use crate::state::{Fingerprint, LocalEvidence, ManagedFile, OwnedSkill, VolumeId};
 use crate::text::{self, TEXT_LIMIT};
 use crate::tree::Skill;
 use crate::win::fs::{FileHasher, Kind, Probe, kind_at, probe};
@@ -292,9 +292,39 @@ pub enum Likeness {
     NeedsText(Vec<String>),
 }
 
-/// Is an existing folder that nobody owns the same as upstream? Only then may it be adopted: the files are the user's,
-/// and adopting changes no byte of them. Only upstream's files are compared; anything else in the folder is the user's
-/// and stays as it is. `theirs` holds what the copies on GitHub of some files are compared by ([`text::canon`]), by path.
+/// Evidence for negative or unfinished comparisons, never authority to replace anything.
+/// Only paths named by upstream are inspected.
+pub fn history_evidence<'a>(dir: &Path, paths: impl Iterator<Item = &'a str>, quick: bool, hasher: &mut FileHasher) -> BTreeMap<String, LocalEvidence> {
+    let plain = matches!(kind_at(dir), Ok(Some(Kind::Dir)));
+    let mut spots = Spots::new(dir);
+    let mut stats = Stats::default();
+    paths
+        .map(|path| {
+            let evidence = if !plain {
+                LocalEvidence::Other
+            } else {
+                match spots.find(path, &mut stats) {
+                    Spot::Missing => LocalEvidence::Missing,
+                    Spot::Found(p) if p.kind == Kind::File => {
+                        if quick && p.fp.usn != 0 {
+                            LocalEvidence::File(p.fp)
+                        } else {
+                            match hasher.read(&join_rel(dir, path), 0, u64::MAX) {
+                                Ok(read) => LocalEvidence::Content { fp: p.fp, blob: read.blob },
+                                Err(_) => LocalEvidence::Other,
+                            }
+                        }
+                    }
+                    _ => LocalEvidence::Other,
+                }
+            };
+            (path.to_string(), evidence)
+        })
+        .collect()
+}
+
+/// Is an existing folder that nobody owns the same as upstream? Only upstream's files are compared;
+/// anything else stays the user's. `theirs` holds upstream's text comparison hashes, by path.
 pub fn compare_unmanaged(dir: &Path, skill: &Skill, theirs: &HashMap<String, String>, hasher: &mut FileHasher) -> Likeness {
     if !matches!(kind_at(dir), Ok(Some(Kind::Dir))) {
         return Likeness::Different;

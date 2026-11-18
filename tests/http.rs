@@ -278,6 +278,36 @@ fn serve(stream: TcpStream, connection: usize, handler: &Handler, seen: &Mutex<V
 
 const SHA: &str = "0123456789abcdef0123456789abcdef01234567";
 
+#[test]
+fn historical_pages_are_pinned_and_invalid_pages_are_not_exhaustion() {
+    let server = FakeServer::start(|req| {
+        if req.target.ends_with("page=2") { answer(200, json!([{"sha": SHA}]).to_string()) } else { answer(200, r#"[{"sha":"not a commit"}]"#) }
+    });
+    let remote = server.remote();
+    assert_eq!(remote.history(&at("other", "my skills"), SHA, "alpha", 2, None, &go()).unwrap(), [SHA]);
+    assert_eq!(server.seen()[0].target, format!("/api/repos/o/n/commits?sha={SHA}&path=my%20skills%2Falpha&per_page=100&page=2"));
+    assert_eq!(remote.history(&at("", ""), SHA, "alpha", 1, None, &go()).unwrap_err().kind, FailureKind::Protocol);
+}
+
+#[test]
+fn historical_absence_needs_a_complete_parent_and_404_is_never_absence() {
+    for (status, body, absent) in [
+        (200, json!({"sha":SHA,"tree":[],"truncated":false}).to_string(), true),
+        (404, "{}".into(), false),
+        (200, json!({"sha":SHA,"tree":[],"truncated":true}).to_string(), false),
+        (200, json!({"sha":SHA}).to_string(), false),
+        (200, json!({"sha":SHA,"tree":[{"path":"../escape","mode":"040000","type":"tree","sha":SHA}],"truncated":false}).to_string(), false),
+    ] {
+        let server = FakeServer::start(move |_| answer(status, body.clone()));
+        let got = server.remote().historical_tree(&at("", "skills"), SHA, "alpha", None, &go());
+        if absent {
+            assert!(got.unwrap().is_none());
+        } else {
+            assert!(got.is_err(), "{got:?}");
+        }
+    }
+}
+
 /// A small listing in GitHub's format: one skill folder with its `SKILL.md`.
 const LISTING: &str = r#"{"sha":"abc","url":"u","tree":[
     {"path":"alpha","mode":"040000","type":"tree","sha":"11","url":"u"},

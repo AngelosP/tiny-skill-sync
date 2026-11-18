@@ -64,6 +64,8 @@ pub enum Action {
     LeaveRemoved,
     /// Undo "keep mine".
     ManageAgain,
+    PauseHistory,
+    ResumeHistory,
     /// Upstream lists no skills at all: delete the skills that are gone from it. This is a check with the
     /// mass-deletion confirmation, not a `Resolution`.
     RemoveThem,
@@ -77,6 +79,8 @@ impl Action {
             Action::KeepMine => "Keep my version",
             Action::LeaveRemoved => "Leave it deleted",
             Action::ManageAgain => "Manage again",
+            Action::PauseHistory => "Cancel search",
+            Action::ResumeHistory => "Resume search",
             Action::RemoveThem => "Delete them",
         }
     }
@@ -87,6 +91,8 @@ impl Action {
             Action::Overwrite | Action::Restore => Some(Resolution::Overwrite),
             Action::KeepMine | Action::LeaveRemoved => Some(Resolution::KeepMine),
             Action::ManageAgain => Some(Resolution::ManageAgain),
+            Action::PauseHistory => Some(Resolution::PauseHistory),
+            Action::ResumeHistory => Some(Resolution::ResumeHistory),
             Action::RemoveThem => None,
         }
     }
@@ -150,6 +156,10 @@ enum Fact {
     Removed,
     /// An identical folder exists and will be taken over.
     Adopting,
+    Historical(bool),
+    Searching,
+    HistoryWaiting,
+    Paused,
     /// A different folder with this name already exists.
     NameTaken,
     /// Upstream lists no skills at all, so nothing was deleted.
@@ -211,10 +221,13 @@ fn fact_of(verdict: &Verdict, done: bool) -> Option<Fact> {
         Verdict::Update => Fact::Newer,
         Verdict::Adopt if done => Fact::InSync,
         Verdict::Adopt => Fact::Adopting,
+        Verdict::AdoptHistorical => Fact::Historical(done),
         Verdict::Delete | Verdict::Forget => Fact::Removed,
         Verdict::Held(Hold::UpdateBlocked(_) | Hold::UpdateBlockedMissing) => Fact::Newer,
         Verdict::Held(Hold::DeleteBlocked(_)) => Fact::Removed,
         Verdict::Held(Hold::UnmanagedDiffers) => Fact::NameTaken,
+        Verdict::Held(Hold::HistorySearching) => Fact::Searching,
+        Verdict::Held(Hold::HistoryPaused) => Fact::Paused,
         Verdict::Held(Hold::MassDeletion) => Fact::EmptyListing,
         Verdict::Held(Hold::Interrupted) => return None,
         Verdict::Skipped(Skip::Ignored) => Fact::Kept,
@@ -310,6 +323,20 @@ fn present(local: Option<&LocalStatus>, fact: Option<&Fact>) -> Shown {
         },
         Some(Fact::New) => shown(Verdict::Install.message(), NEW_TAG, Ok, &[]),
         Some(Fact::Adopting) => shown("Already installed and identical: will be managed at the next check", "Will be managed", Ok, &[]),
+        Some(Fact::Historical(true)) => shown("An older copy from GitHub was verified, adopted and updated", "Older copy updated", Ok, &[]),
+        Some(Fact::Historical(false)) => shown(Verdict::AdoptHistorical.message(), "Older GitHub copy", Ok, &[]),
+        Some(Fact::Searching) => {
+            shown(Verdict::Held(Hold::HistorySearching).message(), "Searching history", Attention, &[Action::PauseHistory, Action::Overwrite, Action::KeepMine])
+        }
+        Some(Fact::HistoryWaiting) => shown(
+            "Earlier-version search is waiting before retrying GitHub; only this skill waits",
+            "Search waiting",
+            Attention,
+            &[Action::PauseHistory, Action::Overwrite, Action::KeepMine],
+        ),
+        Some(Fact::Paused) => {
+            shown(Verdict::Held(Hold::HistoryPaused).message(), "Search paused", Attention, &[Action::ResumeHistory, Action::Overwrite, Action::KeepMine])
+        }
         Some(Fact::NameTaken) => shown(Verdict::Held(Hold::UnmanagedDiffers).message(), DIFFERENT_TAG, Attention, &EDITED),
         Some(Fact::EmptyListing) => shown(Verdict::Held(Hold::MassDeletion).message(), LISTS_NOTHING_TAG, Attention, &[Action::RemoveThem, Action::KeepMine]),
         Some(Fact::Kept) => shown(Verdict::Skipped(Skip::Ignored).message(), KEPT_TAG, Ok, &[Action::ManageAgain]),
@@ -396,6 +423,17 @@ impl Board {
             let repo = self.repos.entry(found.repo_id.clone()).or_default();
             let skill = repo.skills.entry(fold(&found.name)).or_insert_with(|| SkillBoard { name: found.name.clone(), local: None, fact: None });
             skill.local = Some(found.status.clone());
+            if let LocalStatus::History { paused, complete, waiting } = found.status {
+                skill.fact = Some(if paused {
+                    Fact::Paused
+                } else if complete {
+                    Fact::NameTaken
+                } else if waiting {
+                    Fact::HistoryWaiting
+                } else {
+                    Fact::Searching
+                });
+            }
         }
         for repo in self.repos.values_mut() {
             repo.skills.retain(|_, skill| skill.local.is_some() || skill.fact.as_ref().is_some_and(|fact| !fact.needs_ownership()));
@@ -428,7 +466,7 @@ impl Board {
     /// One message for each kind of change a check made on this PC. Up to three skills are named, more are counted.
     fn tell_changes(&mut self, now: UnixSecs, report: &RepoReport) {
         let from = repo_name(&report.label);
-        for verdict in [Verdict::Install, Verdict::Update, Verdict::Delete, Verdict::Adopt] {
+        for verdict in [Verdict::Install, Verdict::Update, Verdict::Delete, Verdict::Adopt, Verdict::AdoptHistorical] {
             let names: Vec<&str> = report.skills.iter().filter(|s| s.result == ApplyResult::Done && s.verdict == verdict).map(|s| s.name.as_str()).collect();
             let what = match names.as_slice() {
                 [] => continue,
@@ -442,6 +480,7 @@ impl Board {
                 Verdict::Install => format!("Installed {what} from {from}"),
                 Verdict::Update => format!("Updated {what} from {from}"),
                 Verdict::Delete => format!("Deleted {what}: {from} no longer has {them}"),
+                Verdict::AdoptHistorical => format!("Verified and adopted an older GitHub copy of {what}, then updated {them} from {from}"),
                 _ => format!("{what} on this PC matched {from}, so {they} now kept in sync"),
             };
             self.say(now, Level::Ok, text);
@@ -457,6 +496,8 @@ impl Board {
             Resolution::Overwrite => (Fact::InSync, None),
             Resolution::KeepMine => (Fact::Kept, None),
             Resolution::ManageAgain => (Fact::Waiting, None),
+            Resolution::PauseHistory => (Fact::Paused, None),
+            Resolution::ResumeHistory => (Fact::Searching, None),
         };
         repo.skills.insert(key, SkillBoard { name, local, fact: Some(fact) });
     }
@@ -1542,6 +1583,9 @@ mod tests {
             skill("old", Verdict::Update, ApplyResult::Done),
             skill("gone", Verdict::Delete, ApplyResult::Done),
             skill("same", Verdict::Adopt, ApplyResult::Done),
+            skill("historical", Verdict::AdoptHistorical, ApplyResult::Done),
+            skill("history-held", Verdict::AdoptHistorical, ApplyResult::Held("edited".to_string())),
+            skill("history-trial", Verdict::AdoptHistorical, ApplyResult::DryRun),
             skill("record", Verdict::Forget, ApplyResult::Done),
             skill("held", Verdict::Update, ApplyResult::Held("edited".to_string())),
             skill("trial", Verdict::Install, ApplyResult::DryRun),
@@ -1558,8 +1602,12 @@ mod tests {
                 (Level::Ok, "Updated old from owner/a"),
                 (Level::Ok, "Deleted gone: owner/a no longer has it"),
                 (Level::Ok, "same on this PC matched owner/a, so it is now kept in sync"),
+                (Level::Ok, "Verified and adopted an older GitHub copy of historical, then updated it from owner/a"),
             ]
         );
+        assert_eq!(row(&board, "historical").tag, "Older copy updated");
+        assert_ne!(row(&board, "history-held").tag, "Older copy updated");
+        assert_ne!(row(&board, "history-trial").tag, "Older copy updated");
 
         // Many at once are counted, so they never push everything else out of the log.
         let done = |names: &[&str], verdict: Verdict| names.iter().map(|n| skill(n, verdict.clone(), ApplyResult::Done)).collect::<Vec<_>>();

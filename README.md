@@ -7,7 +7,7 @@ folder, checks GitHub on a schedule, and installs, updates and removes skills as
 touches a skill it did not install, and it never overwrites or deletes a skill you edited. It removes from your PC only
 what came from GitHub and was later removed there; files you add are yours, and the app does not even show them.
 
-- **Small and quiet.** One exe of 0.9 MiB, no runtime to install. It starts in about 8 ms, uses about 1 MiB of
+- **Small and quiet.** One exe under 1 MiB, no runtime to install. It starts in about 8 ms, uses about 1 MiB of
   memory while idle, and does no work at all between checks: no CPU, no disk, no network.
 - **Starts with Windows, without slowing it down.** Turn on **Start with Windows** (the app offers it when you add your
   first repository). At sign-in it goes straight to the tray and waits 30 seconds before it looks at your skills or
@@ -26,9 +26,11 @@ Windows 10 and 11, x64. There is no installer yet, and the exes are not signed.
 
 These are the rules the app follows. Each one is covered by tests (see [CONTRIBUTING.md](CONTRIBUTING.md)).
 
-1. **What you add is yours.** A folder in the skills folder that the app did not install is never changed or deleted,
-   even if a repository has a skill with the same name. If every file upstream has is in it, the same, the app takes it
-   over (anything else in it stays yours); if not, it asks you. A file you add inside a skill the app installed is
+1. **What you add is yours.** A folder the app does not own is adopted only when every file in the current upstream
+   version, or in one single past version from the configured branch's history, is present and the same under the
+   existing text comparison rules. A folder matching a past version may then be updated automatically; otherwise it
+   is held. That past version may have fewer files than today's version; anything else in the folder stays yours.
+   A file you add inside a skill the app installed is
    yours too: it is never changed or deleted, never counted as an edit and never shown, and it stays when the skill is
    updated. The app removes only what came from GitHub and was later removed there: when upstream drops a skill, the
    files it installed go and the files you added stay. If upstream later adds a file with the same name as one of
@@ -46,6 +48,26 @@ These are the rules the app follows. Each one is covered by tests (see [CONTRIBU
    set aside something you might want, it keeps it as a backup and never deletes it.
 5. **Edits made while the app was not running are found.** See [How edits are found](#how-edits-are-found).
 6. **Downloads are never run.** Skills often contain scripts. The app only copies them.
+
+### Copies installed before the app
+
+The app compares today's version first, then makes a small quick search through the skill's earlier versions on
+the configured branch. One complete matching version is required: mixing files from different versions never counts.
+A proven old copy is adopted at that old version and then updated with the normal full checks. No backup is needed
+for those proven upstream files; your extra files still move with the skill, and a name collision keeps yours in a backup.
+The window, command line and Activity say an older copy was adopted and updated only after the update succeeds.
+
+Longer histories continue automatically in small pieces on the tray's existing worker, with **Searching history**
+shown beside the skill. There is no total-history cutoff. Only that skill waits; other safe changes can proceed.
+**Cancel search** pauses that skill persistently, even after restarting the app. **Resume search** continues it.
+**Use the GitHub version** stops the search and replaces the copy with a backup; **Keep my version** stops the search
+and leaves your copy alone. Network and sign-in failures stop the repository check, never count as a failed match,
+and are retried after a wait.
+
+Active searches resume after restarting. Finished or paused searches make no extra history requests while unchanged.
+`tss check` does one piece of work and exits: it does not start a hidden background process. If the tray is not running,
+run `tss check` again to continue. Removing a repository leaves its unowned copies alone; explicitly adding it again
+allows the same current-or-historical adoption checks.
 
 ## Quick start
 
@@ -193,6 +215,8 @@ opens and destroyed when it closes, so it costs nothing while closed.
 | Leave it deleted | A skill you deleted stays deleted. |
 | Manage again | Undo **Keep my version**. |
 | Delete them | Upstream now lists no skills at all: remove the ones the app installed. |
+| Cancel search | Pause this skill's earlier-version search until you choose Resume search. |
+| Resume search | Continue the saved search, rechecking local evidence first. |
 
 Backups are folders named `backup-<skill>-<number>` in the work folder (**Backups** in Settings opens it). The app never
 deletes them; delete them yourself when you no longer need them.
@@ -225,7 +249,7 @@ tss status                                   what is installed and what needs at
 tss check [REPO] [--dry-run]                 check GitHub now and apply what is safe
 tss add OWNER/NAME|URL [--every 6h] [--use-token]
 tss remove REPO [--delete-skills]
-tss resolve REPO SKILL replace|restore|keep|leave|manage
+tss resolve REPO SKILL replace|restore|keep|leave|manage|pause|resume
 tss token [status|set|clear]                 gh auth token | tss token set
 tss startup [status|on|off]                  start the tray app when you sign in
 ```
@@ -258,7 +282,7 @@ was interrupted.
 
 The skills folder contains only skill folders; the app keeps its own files elsewhere so Copilot never sees them. A
 damaged `state.json` is kept as `state.json.damaged-*` and the app starts over with an empty record (it then takes over
-skills that hold every upstream file unchanged and asks about the rest).
+skills that match a whole current or historical upstream version and asks about the rest).
 
 Pointing the app at another skills folder (`skills_dir`, or `TSS_SKILLS_DIR`) moves nothing. The new folder gets its own
 copies at the next check, which the tray runs at once when the settings change; the skills in the old folder stay as
@@ -312,6 +336,7 @@ Environment variables, mainly for tests and scripts:
 | `TSS_HOME` | Use this folder instead of `%LOCALAPPDATA%\tiny-skill-sync`. One copy of the tray runs per folder. Such a copy keeps its Start with Windows entry under `HKCU\Software\tiny-skill-sync-test`, which Windows does not read. |
 | `TSS_SKILLS_DIR` | Use this skills folder, whatever the settings say. |
 | `TSS_BENCH_REPORT` | Write timing marks to this file (used by `scripts\bench.ps1`). |
+| `TSS_NO_SAVED_TOKEN` | Skip reading the saved app token (isolated live tests); GitHub CLI sign-in still works. |
 | `TSS_API_BASE`, `TSS_RAW_BASE` | Other GitHub addresses (used by the HTTP tests). |
 
 ## How edits are found
@@ -350,24 +375,30 @@ updating and removing a skill, taking over a folder of yours, and **Show changes
 
 Measured with `scripts\bench.ps1` on a Ryzen 7 5800X3D with Windows 11, files in the cache, real installs of
 [anthropics/skills](https://github.com/anthropics/skills) (19 skills, 442 files) and
-[github/awesome-copilot](https://github.com/github/awesome-copilot) (463 skills, 1,555 files).
+[github/awesome-copilot](https://github.com/github/awesome-copilot) (463 skills, 1,555 files). The 442-file run includes
+historical adoption; the larger install is an earlier baseline.
 
-| Measure | 442 files | 1,555 files | Budget |
+| Measure | 442 files, current | 1,555 files, earlier | Budget |
 | --- | --- | --- | --- |
-| Start to tray icon | 8.4 ms | 8.6 ms | 30 ms median |
+| Start to tray icon | 7.8 ms | 8.6 ms | 30 ms median |
 | Start-up check of every installed file | 21 ms | 105 ms | 75 µs per file |
-| Start at sign-in, its first 3 s: CPU, file I/O | 16 ms, 241 bytes | under 16 ms, 251 bytes | 300 ms, 300 KB |
+| Start at sign-in, its first 3 s: CPU, file I/O | 7.8 ms, 241 bytes | under 16 ms, 251 bytes | 300 ms, 300 KB |
 | Idle for 10 s: CPU, disk, page faults | 0, 0, 0 | 0, 0, 0 | 0 |
 | Idle memory: trimmed working set / private | 1.0 / 1.9 MiB | 1.2 / 2.6 MiB | 2 / 4 MiB |
-| Window: open to painted (median) | 41 ms | 43 ms | 100 ms |
-| Window open: working set | 13.5 MiB | 14.4 MiB | 40 MiB |
+| Window: open to painted (median) | 38.1 ms | 43 ms | 100 ms |
+| Window open: working set | 13.4 MiB | 14.4 MiB | 40 MiB |
 | Window closed: working set (trimmed) | 1.5 MiB | 1.5 MiB | 2 MiB |
-| Unchanged check: CPU, file reads and writes | 31 ms, 0, 0 | 16 ms, 0, 0 | 50 ms, 0 |
-| Exe size | 0.93 MiB | 0.93 MiB | 1 MiB |
+| Unchanged check: CPU, file reads and writes | 15.6 ms, 0, 0 | 16 ms, 0, 0 | 50 ms, 0 |
+| Exe size | 1,045,504 bytes | 0.93 MiB | 1 MiB |
+
+Every budget row passed. The current startup check took 47.5 microseconds per file; an unchanged poll took 227 ms
+wall time and changed no files. The eight-candidate historical quick slice took 11.4 seconds in the live fixture
+check, including an initial install and an older-copy update; its time depends on the network.
 
 Windows counts a process's CPU time in ticks of 15.6 ms, so an unchanged check shows as one to three ticks (16 to
-47 ms) from run to run. The exe is built for size: built for speed it would be 1.01 MiB, over its budget, and hash
-files about 13% faster (384 instead of 339 MB/s). A list of 463 skills opens almost as fast as one of 19, because only
+47 ms) from run to run. The exe is built for size: in the earlier comparison, building for speed made it 1.01 MiB,
+over its budget, and hashed files about 13% faster (384 instead of 339 MB/s). A list of 463 skills opens almost as fast
+as one of 19, because only
 the rows within about two screens of what is shown are made at first; the rest are made as you scroll (with a row made
 for every skill, it took 120 ms). Widening the list of repositories under the mouse takes 18 ms with those 463 skills
 on the page.
@@ -414,9 +445,9 @@ ended at 3.2 MiB of private memory. Each change reached the disk within one inte
 - Skills that were refused as unsafe are announced by the check that reads the repository's listing (the first check,
   each time the repository has changed, and `tss check --full-listing`). The app does not remember them: a later check
   that finds nothing new says "Up to date", and the window forgets a refusal when the app restarts. Nothing is
-  installed or changed in the meantime. Folders of yours that were held because they differ from an upstream skill of
-  the same name are different: until that is settled, the repository is read in full at every check, and once
-  straight after the app starts, so the window always shows them.
+  installed or changed in the meantime. Completed or paused earlier-version searches are remembered and shown
+  after restarting without repeating the history requests. Relevant local edits or a changed upstream listing
+  invalidate completed comparisons; an active search continues in small pieces.
 - GitHub's servers can answer for up to a minute with a version of a public repository that is one change old. When
   two of its answers disagree (a file the listing names is different or cannot be found), the check stops with
   "Changed while checking" and changes nothing, and **Show changes** and **Use the GitHub version** say "the

@@ -239,6 +239,17 @@ impl App {
     /// the way the app starts, so the change is recorded, and the user told, at once rather than at the next check.
     pub fn set_cfg(&mut self, cfg: Config, skills_dir: PathBuf) {
         let moved = skills_dir != self.skills_dir;
+        self.queue.retain(|job| match job {
+            Job::Resolve { repo, .. } | Job::Diff { repo, .. } | Job::Remove { repo, .. } | Job::Check(Some(repo)) | Job::DeleteGone(repo) => {
+                !moved
+                    && self
+                        .cfg
+                        .find(repo)
+                        .zip(cfg.find(repo))
+                        .is_some_and(|(old, new)| old.repo == new.repo && old.branch == new.branch && old.path == new.path)
+            }
+            _ => true,
+        });
         self.cfg = cfg;
         self.skills_dir = skills_dir;
         if moved {
@@ -309,6 +320,9 @@ impl App {
             self.sign_in_wait = false;
             self.board.set_waiting(false);
             self.queue.push_front(job);
+        } else if matches!(job, Job::Resolve { .. } | Job::Remove { .. }) {
+            let at = self.queue.iter().position(|j| !matches!(j, Job::Startup | Job::Resolve { .. } | Job::Remove { .. })).unwrap_or(self.queue.len());
+            self.queue.insert(at, job);
         } else {
             self.queue.push_back(job);
         }
@@ -601,6 +615,17 @@ mod tests {
         let waits: Vec<UnixSecs> = (1..=7).map(backoff).collect();
         assert_eq!(waits, [300, 600, 1200, 2400, 3600, 3600, 3600]);
         assert_eq!(backoff(u32::MAX), MAX_FAILURE_BACKOFF);
+    }
+
+    #[test]
+    fn historical_choices_run_before_queued_checks() {
+        let mut app = App::new(Config::default(), PathBuf::from("skills"));
+        app.queue.clear();
+        app.want(Job::Check(None));
+        let choice = Job::Resolve { repo: "r".into(), skill: "alpha".into(), how: Resolution::PauseHistory };
+        app.want(choice.clone());
+        assert_eq!(app.next_order().unwrap().job, choice);
+        assert!(app.next_order().is_none(), "only one worker owns the engine");
     }
 
     #[test]

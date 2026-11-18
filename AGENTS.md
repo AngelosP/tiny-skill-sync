@@ -32,12 +32,13 @@ Do not weaken any of these. Each one has tests; if a change makes one of them fa
 1. **A failure is never a deletion.** Any error from the network, the token or GitHub ends the check of that repository
    before `reconcile` runs. Only a complete listing (`truncated` false) can remove a skill.
 2. **Only proven copies are deleted.** `apply` deletes or replaces files only after a full check proved they equal a
-   version the app installed, and a folder only when nothing else is in it. Anything else becomes `backup-*`, and
+   version the app installed or fully verified and adopted from upstream history, and a folder only when nothing else is in it. Anything else becomes `backup-*`, and
    backups are never deleted automatically.
-3. **What the user added is theirs.** A skill folder the record does not own is adopted only when every file upstream
-   has is there and the same; otherwise it is held. A file the user added to a skill is never changed, deleted,
-   reported or shown: an update or a removal moves it along (`carry`), and when GitHub adds a file with the same name,
-   the user's goes to `backup-*`.
+3. **What the user added is theirs.** A skill folder the record does not own is adopted only when every file in the
+   current upstream version, or in one single past version from the configured branch's history, is present and the
+   same under the existing text comparison rules. A folder matching a past version may then be updated automatically;
+   otherwise it is held. A file the user added to a skill is never changed, deleted, reported or shown: an update or a
+   removal moves it along (`carry`), and when GitHub adds a file with the same name, the user's goes to `backup-*`.
 4. **Edits hold.** An edited managed skill (a file GitHub put there changed or deleted) is never updated or deleted
    without the user's choice.
 5. **The mass-deletion guard.** A listing with no skills at all deletes nothing unless the user confirmed.

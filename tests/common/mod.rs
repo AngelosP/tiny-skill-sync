@@ -234,6 +234,8 @@ pub struct Calls {
     pub conditional: usize,
     pub commit: usize,
     pub file: usize,
+    pub history: usize,
+    pub historical_tree: usize,
 }
 
 #[derive(Default)]
@@ -247,6 +249,8 @@ struct FakeRepo {
     anonymous_error: Option<RemoteError>,
     tree_error: Option<RemoteError>,
     commit_error: Option<RemoteError>,
+    history_error: Option<RemoteError>,
+    historical_error: Option<RemoteError>,
     file_errors: BTreeMap<String, RemoteError>,
     lies: BTreeMap<String, Vec<u8>>,
     truncated: bool,
@@ -402,6 +406,14 @@ impl FakeRemote {
         self.with(repo, |r| r.commit_error = error);
     }
 
+    pub fn fail_history(&self, repo: &str, error: Option<RemoteError>) {
+        self.with(repo, |r| r.history_error = error);
+    }
+
+    pub fn fail_historical_tree(&self, repo: &str, error: Option<RemoteError>) {
+        self.with(repo, |r| r.historical_error = error);
+    }
+
     /// `path` is the path in the repository, for example `skills/alpha/SKILL.md`.
     pub fn fail_file(&self, repo: &str, path: &str, error: Option<RemoteError>) {
         self.with(repo, |r| match error {
@@ -487,6 +499,61 @@ impl FakeRemote {
 }
 
 impl Remote for Client {
+    fn history(&self, repo: &RepoRef, pin: &str, rel: &str, page: u32, token: Option<&Secret>, cancel: &AtomicBool) -> Result<Vec<String>, RemoteError> {
+        let fake = &self.0;
+        fake.note("history", format!("history {}@{pin}:{}:{rel} page {page}", repo.label(), repo.path), token, |c| c.history += 1);
+        if cancel.load(Ordering::Relaxed) {
+            return Err(RemoteError::new(FailureKind::Cancelled, "cancelled"));
+        }
+        let g = fake.inner.lock().unwrap();
+        let r = g.repos.get(&key(repo)).ok_or_else(|| not_found(&repo.label()))?;
+        check_access(r, token, &repo.label())?;
+        if let Some(e) = &r.history_error {
+            return Err(e.clone());
+        }
+        let end = r.commits.iter().position(|c| c == pin).ok_or_else(|| not_found(pin))?;
+        let path = if rel.is_empty() {
+            repo.path.to_string()
+        } else if repo.path.is_empty() {
+            rel.into()
+        } else {
+            format!("{}/{rel}", repo.path)
+        };
+        let mut previous = None;
+        let mut touched = Vec::new();
+        for id in &r.commits[..=end] {
+            let tree = listing(&r.history[id], &path);
+            if tree != previous {
+                touched.push(id.clone());
+                previous = tree;
+            }
+        }
+        Ok(touched.into_iter().rev().skip((page as usize - 1) * 100).take(100).collect())
+    }
+
+    fn historical_tree(&self, repo: &RepoRef, commit: &str, rel: &str, token: Option<&Secret>, cancel: &AtomicBool) -> Result<Option<Snapshot>, RemoteError> {
+        let fake = &self.0;
+        fake.note("historical_tree", format!("historical_tree {}@{commit}:{}:{rel}", repo.label(), repo.path), token, |c| c.historical_tree += 1);
+        if cancel.load(Ordering::Relaxed) {
+            return Err(RemoteError::new(FailureKind::Cancelled, "cancelled"));
+        }
+        let g = fake.inner.lock().unwrap();
+        let r = g.repos.get(&key(repo)).ok_or_else(|| not_found(&repo.label()))?;
+        check_access(r, token, &repo.label())?;
+        if let Some(e) = &r.historical_error {
+            return Err(e.clone());
+        }
+        let files = r.history.get(commit).ok_or_else(|| not_found(commit))?;
+        let path = if rel.is_empty() {
+            repo.path.to_string()
+        } else if repo.path.is_empty() {
+            rel.into()
+        } else {
+            format!("{}/{rel}", repo.path)
+        };
+        Ok(listing(files, &path).map(|entries| Snapshot { sha: etag_of(&entries), truncated: r.truncated, entries }))
+    }
+
     fn tree(&self, repo: &RepoRef, etag: Option<&str>, token: Option<&Secret>, cancel: &AtomicBool) -> Result<TreeReply, RemoteError> {
         let fake = &self.0;
         fake.note("tree", format!("tree {}/{}@{}:{}", repo.owner, repo.name, repo.branch, repo.path), token, |c| {

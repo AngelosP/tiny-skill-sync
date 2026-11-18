@@ -542,6 +542,10 @@ impl Applier {
             }
         }
 
+        if cancel.load(Ordering::Relaxed) {
+            self.discard_stage(&stage);
+            return Err(RemoteError::new(FailureKind::Cancelled, "cancelled"));
+        }
         let new_files: Vec<ManagedFile> = skill.files.iter().map(ManagedFile::from).collect();
         self.swap_in(state, repo_id, &skill.name, &before, mode, &txn, commit, &new_files)
     }

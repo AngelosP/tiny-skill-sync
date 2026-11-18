@@ -70,6 +70,10 @@ fn delete(target: &str) -> io::Result<bool> {
 }
 
 pub fn read_token() -> Option<Secret> {
+    // Live validation may use the GitHub CLI sign-in, but must never read the owner's saved app credential.
+    if std::env::var_os("TSS_NO_SAVED_TOKEN").is_some() {
+        return None;
+    }
     read(TOKEN_TARGET)
 }
 

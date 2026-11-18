@@ -422,6 +422,7 @@ function New-LiveStartInfo($Root, [string]$Exe, [string[]]$AppArgs, [hashtable]$
     $psi.UseShellExecute = $false
     $psi.EnvironmentVariables['TSS_HOME'] = Join-Path $Root 'home'
     $psi.EnvironmentVariables['TSS_SKILLS_DIR'] = Join-Path $Root 'skills'
+    $psi.EnvironmentVariables['TSS_NO_SAVED_TOKEN'] = '1'
     # A $null value removes the variable.
     foreach ($key in @($Env.Keys)) {
         if ($null -eq $Env[$key]) { $psi.EnvironmentVariables.Remove($key) } else { $psi.EnvironmentVariables[$key] = [string]$Env[$key] }

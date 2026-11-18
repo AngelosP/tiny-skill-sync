@@ -47,7 +47,7 @@ scripts\dev.ps1 test
 ```
 
 This runs `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings` and `cargo test --no-fail-fast`. All three
-must pass. There are 506 tests (327 in the library, 179 integration tests); the whole gate takes about 40 seconds when
+must pass. There are 526 tests (329 in the library, 197 integration tests); the whole gate takes about 40 seconds when
 the code is already built.
 
 If the change can affect speed, memory or disk use (startup, verification, the poll, the tray, the window),
@@ -84,6 +84,9 @@ ends up on disk, what the app says and what it leaves alone.
 
 - **It needs** the network, a signed-in GitHub CLI (`gh auth login`) that may push to the two fixture repositories, and a
   release build (it makes one unless you pass `-SkipBuild`).
+- Live copies receive `TSS_NO_SAVED_TOKEN=1`, which prevents any read of the owner's saved app credential, including
+  from Settings. They use the GitHub CLI sign-in when authentication is needed. The bench can be run with the same
+  variable; it does not change production credential behaviour unless explicitly set.
 - **It changes** only folders in `%TEMP%`, keys under `HKCU\Software\tiny-skill-sync-test` (which Windows never reads),
   and branches of the fixture repositories named `e2e-<time>-<scenario>` or `soak-<time>`, which it deletes afterwards.
   It refuses to touch any other branch, so `main` is never pushed to. It never touches the real skills folder, the real
@@ -107,7 +110,7 @@ ends up on disk, what the app says and what it leaves alone.
 | `local-edit` | An edit made while the app runs, then an upstream change to the same skill. |
 | `edit-stopped` | Edits made while the app was not running, including ones that keep a file's size and time; a file added meanwhile is not reported and stays. |
 | `holds` | A skill deleted locally; a skill deleted upstream after being edited; every skill deleted upstream, where only the files GitHub put there go and a file the user added stays. |
-| `unmanaged` | Folders and files that were there before the app: left alone, or adopted only when every upstream file is in them, the same; the user's extra file survives the adoption, an update and the removal. |
+| `unmanaged` | Current and whole historical copies, an edited old copy, a longer saved search, persistent pause (including a window screenshot) and overwrite with a backup. The user's extra file survives adoption, update and removal. Makes ten small history commits only on its own fixture branch. |
 | `private` | A private repository with the token and without it; the token never shows in anything the app writes or says. |
 | `hostile` | A branch full of hostile shapes: nothing may be written outside the skills folder. |
 | `names` | Upstream names with control and direction characters are shown escaped, and can still be selected. |
@@ -190,8 +193,9 @@ The latest results are in [README.md](README.md#measured-cost).
 
 `Cargo.toml` and `.cargo\config.toml` set the release profile: `opt-level = "z"`, fat LTO, one codegen unit,
 `panic = "abort"`, stripped symbols and a static C runtime (no Visual C++ redistributable needed). `opt-level = "z"`
-keeps the tray exe at 0.93 MiB, under its 1 MiB budget (`opt-level = "s"` made it 1.01 MiB, `opt-level = 3` larger
-still). It costs about 12% of SHA-1 speed (339 MB/s instead of 384) and nothing the bench can see. `build.rs` embeds
+keeps the tray exe at 1,045,504 bytes, under its 1 MiB budget (in the earlier comparison, `opt-level = "s"` made it
+1.01 MiB, `opt-level = 3` larger still). It costs about 12% of SHA-1 speed (339 MB/s instead of 384) and nothing the
+bench can see. `build.rs` embeds
 `app.manifest` (common controls 6, per-monitor DPI, long paths, UTF-8) and a version resource: the name and version
 Windows shows for each exe, as in Task Manager's startup apps (about 1 KiB).
 

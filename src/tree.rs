@@ -41,9 +41,7 @@ pub struct Snapshot {
 struct RawTree {
     #[serde(default)]
     sha: String,
-    #[serde(default)]
     tree: Vec<RawEntry>,
-    #[serde(default)]
     truncated: bool,
 }
 

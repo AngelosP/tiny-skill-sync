@@ -36,7 +36,7 @@ use crate::pathsafe::{self, fold};
 use crate::reconcile::{self, Decision, DirtyInfo, Input, LocalState, OwnedView, Skip, UnmanagedState, Verdict};
 use crate::scheduler::Schedule;
 use crate::secret::Secret;
-use crate::state::{Fingerprint, Folder, OwnedSkill, Pending, State, VolumeId};
+use crate::state::{Fingerprint, Folder, HistorySearch, LocalEvidence, OwnedSkill, Pending, State, VolumeId};
 use crate::text;
 use crate::tree::{self, Discovery, Rejected, SkillFile};
 use crate::verify::{self, Check, Likeness, Spot, Spots, Stats, check_for_volume};
@@ -46,6 +46,8 @@ const LOCK_FILE: &str = "engine.lock";
 const DEFAULT_LOCK_WAIT: Duration = Duration::from_secs(3);
 /// The most one check downloads. A skill that would go past it waits for the next check.
 pub const DEFAULT_MAX_DOWNLOAD: u64 = 512 * 1024 * 1024;
+/// A quick attempt, then the same small slices on the existing worker. This is not a total-history limit.
+pub const HISTORY_SLICE: usize = 8;
 /// Added to 'not found' when there is no token to try: the repository may be private.
 const SIGN_IN: &str = "To read a private repository, sign in with the GitHub CLI (gh auth login) or save a token in Settings";
 /// "Show changes" reads and downloads files of at most this size, and at most `DIFF_TOTAL_BYTES` from each side; it
@@ -98,6 +100,8 @@ pub enum Resolution {
     KeepMine,
     /// Undo `KeepMine`: the next check handles the skill like any other.
     ManageAgain,
+    PauseHistory,
+    ResumeHistory,
 }
 
 #[derive(Debug)]
@@ -225,6 +229,11 @@ pub enum LocalStatus {
     Checked(LocalState),
     /// An earlier change was interrupted and is not sorted out yet.
     Interrupted,
+    History {
+        paused: bool,
+        complete: bool,
+        waiting: bool,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -576,6 +585,27 @@ struct Ctx<'a> {
     /// What the copies on GitHub of files read to compare a folder nobody owns are compared by: folded skill name,
     /// then path.
     theirs: HashMap<String, HashMap<String, String>>,
+    historical: HashMap<String, HistoricalProof>,
+    tree: String,
+}
+
+struct HistoricalProof {
+    skill: tree::Skill,
+    commit: String,
+    theirs: HashMap<String, String>,
+}
+
+fn source_key(repo: &RepoConfig) -> String {
+    format!("{}\n{}\n{}", repo.repo, repo.branch, repo.path)
+}
+
+fn evidence_valid(s: &mut Session, h: &HistorySearch) -> bool {
+    let vol = s.volume();
+    if h.volume != vol.current || h.evidence.is_empty() || h.evidence.values().any(|e| *e == LocalEvidence::Other) {
+        return false;
+    }
+    let dir = s.applier.skills_dir.join(&h.name);
+    verify::history_evidence(&dir, h.evidence.keys().map(String::as_str), vol.current.is_some_and(|v| v.journal != 0), &mut s.applier.hasher) == h.evidence
 }
 
 impl Ctx<'_> {
@@ -919,10 +949,19 @@ impl Engine {
                 let interval = repo.effective_interval(cfg.default_interval);
                 match &report.outcome {
                     Outcome::Failed(f) => {
-                        self.schedule.on_failure(&id, f.kind, f.retry_at, interval, self.now());
+                        let at = self.schedule.on_failure(&id, f.kind, f.retry_at, interval, self.now());
+                        if let Some(rs) = s.state.repos.get_mut(&id).filter(|r| r.searches.values().any(|h| !h.paused && !h.complete)) {
+                            rs.history_retry_at = Some(at);
+                            s.must_save = true;
+                        }
                     }
                     Outcome::Cancelled => {}
-                    _ => self.schedule.on_success(&id),
+                    _ => {
+                        self.schedule.on_success(&id);
+                        if let Some(rs) = s.state.repos.get_mut(&id) {
+                            s.must_save |= rs.history_retry_at.take().is_some();
+                        }
+                    }
                 }
                 if s.must_save {
                     // A failed save is recorded as a warning and reported with the rest.
@@ -984,6 +1023,18 @@ impl Engine {
         }
     }
 
+    fn history_head(&self, s: &mut Session, repo: &RepoConfig, reference: &RepoRef, cancel: &AtomicBool) -> Result<String, RemoteError> {
+        let authenticated = repo.use_token || s.state.repo(&repo.id).is_some_and(|r| r.needs_token);
+        let token = if authenticated { Some(s.token(self.tokens.as_ref()).map_err(|why| RemoteError::new(FailureKind::Auth, why))?) } else { None };
+        match self.remote.commit(reference, token.as_deref(), cancel) {
+            Err(e) if token.is_none() && matches!(e.kind, FailureKind::NotFound | FailureKind::RateLimited) => match s.token(self.tokens.as_ref()) {
+                Ok(token) => self.remote.commit(reference, Some(&token), cancel),
+                Err(_) => Err(e),
+            },
+            answer => answer,
+        }
+    }
+
     fn sync_repo(&self, s: &mut Session, repo: &RepoConfig, opts: &SyncOptions, cancel: &AtomicBool) -> RepoReport {
         let report = RepoReport::new(repo);
         let problems = repo.problems();
@@ -994,7 +1045,36 @@ impl Engine {
             Ok(r) => r,
             Err(why) => return report.fail(Failure { kind: FailureKind::Local, message: why, retry_at: None }),
         };
-        let stored_etag = if opts.ignore_etag { None } else { s.state.repo(&repo.id).and_then(|r| r.etag.clone()) };
+        let source = source_key(repo);
+        let searches = s.state.repo(&repo.id).map(|r| r.searches.clone()).unwrap_or_default();
+        let cache_valid = searches.values().all(|h| h.paused || (h.complete && h.source == source && evidence_valid(s, h)));
+        let same_source = s.state.repo(&repo.id).is_none_or(|r| r.source.is_empty() || r.source == source);
+        let mut commit = if searches.is_empty() {
+            None
+        } else {
+            match self.history_head(s, repo, &repo_ref, cancel) {
+                Ok(head) => Some(head),
+                Err(e) if e.kind == FailureKind::Cancelled => return RepoReport { outcome: Outcome::Cancelled, ..report },
+                Err(e) => return report.fail(e),
+            }
+        };
+        if commit.is_some()
+            && cache_valid
+            && same_source
+            && !opts.ignore_etag
+            && s.state.repo(&repo.id).is_some_and(|r| r.etag.is_some() && r.history_head == commit)
+        {
+            let mut report = report;
+            report.lists_nothing = s.state.repo(&repo.id).is_some_and(|r| r.lists_nothing);
+            if !opts.dry_run {
+                s.touch_check(&repo.id, self.now());
+            }
+            return report;
+        }
+        // A tree can return to exactly the same bytes after new history was added. A cached comparison therefore
+        // polls the branch commit, not the tree ETag; it still costs just one request when unchanged.
+        let stored_etag =
+            if opts.ignore_etag || !cache_valid || !same_source || !searches.is_empty() { None } else { s.state.repo(&repo.id).and_then(|r| r.etag.clone()) };
         let (reply, token) = match self.list(s, repo, &repo_ref, stored_etag.as_deref(), !opts.dry_run, cancel) {
             Ok(r) => r,
             // Whatever went wrong, it ends here: no decision is ever made from an error.
@@ -1023,14 +1103,15 @@ impl Engine {
 
         let single = tree::is_single_skill(&snapshot.entries);
         let discovery = tree::discover(&snapshot.entries, &repo.single_skill_name(), root_len(&s.applier));
-        let mut cx = Ctx { repo, repo_ref, token, single, opts, cancel, theirs: HashMap::new() };
-        let mut commit = None;
+        let before_state = s.state.repo(&repo.id).cloned().unwrap_or_default();
+        let mut cx = Ctx { repo, repo_ref, token, single, opts, cancel, theirs: HashMap::new(), historical: HashMap::new(), tree: snapshot.sha };
         let unmanaged = match self.compare_unmanaged(s, &mut cx, &discovery, &mut commit) {
             Ok(u) => u,
             Err(e) if e.kind == FailureKind::Cancelled => return RepoReport { outcome: Outcome::Cancelled, ..report },
             Err(e) => return report.fail(e),
         };
         let decisions = plan_repo(s, repo, &discovery, unmanaged, opts.confirm_mass_delete);
+        let head = commit.clone();
         let run = self.apply_all(s, &cx, &discovery, &decisions, commit);
 
         let mut report = report;
@@ -1046,10 +1127,18 @@ impl Engine {
             // The ETag is kept only when everything is settled; otherwise the next check must look again.
             rs.etag = if settled { new_etag } else { None };
             rs.lists_nothing = report.lists_nothing;
+            rs.source = source;
+            rs.history_head = if rs.searches.is_empty() { None } else { head };
             if run.stopped.is_none() && !run.cancelled {
                 rs.last_check = Some(now);
             }
-            s.must_save = true;
+            let mut comparable = rs.clone();
+            comparable.last_check = before_state.last_check;
+            if comparable != before_state {
+                s.must_save = true;
+            } else if run.stopped.is_none() && !run.cancelled {
+                s.touch_check(&repo.id, now);
+            }
         }
         report.outcome = classify(&decisions, &run, opts.dry_run);
         report.skills = decisions.into_iter().zip(run.results).map(|(d, result)| SkillReport { name: d.name, verdict: d.verdict, result }).collect();
@@ -1070,36 +1159,208 @@ impl Engine {
         let ignored: HashSet<String> = repo_state.map(|r| r.ignored.iter().map(|n| fold(n)).collect()).unwrap_or_default();
         let other_owners = s.state.names_owned_elsewhere(&cx.repo.id);
         let mut out = HashMap::new();
+        let mut searches = s.state.repo(&cx.repo.id).map(|r| r.searches.clone()).unwrap_or_default();
+        let mut left = HISTORY_SLICE;
+        searches.retain(|key, h| {
+            (h.paused || discovery.skills.iter().any(|k| fold(&k.name) == *key))
+                && (h.paused || !owned.contains(key))
+                && !ignored.contains(key)
+                && !other_owners.contains_key(key)
+        });
+        for (key, h) in &searches {
+            if h.paused {
+                out.insert(key.clone(), UnmanagedState::Paused);
+            }
+        }
         for skill in &discovery.skills {
             let key = fold(&skill.name);
             let dir = s.applier.skills_dir.join(&skill.name);
-            if owned.contains(&key) || ignored.contains(&key) || other_owners.contains_key(&key) || !exists_no_follow(&dir) {
+            if owned.contains(&key) || ignored.contains(&key) || other_owners.contains_key(&key) {
                 continue;
             }
-            let mut likeness = verify::compare_unmanaged(&dir, skill, &HashMap::new(), &mut s.applier.hasher);
-            if let Likeness::NeedsText(paths) = &likeness {
-                let wanted: Vec<&SkillFile> = skill.files.iter().filter(|f| paths.contains(&f.path)).collect();
-                let size: u64 = wanted.iter().map(|f| f.size).sum();
-                likeness = Likeness::Different;
-                if s.downloaded + size <= cx.opts.max_download_bytes {
-                    if commit.is_none() {
-                        *commit = Some(self.remote.commit(&cx.repo_ref, cx.token.as_deref(), cx.cancel)?);
-                    }
-                    let mut theirs = HashMap::new();
-                    for file in wanted {
-                        let rel = cx.rel(&skill.name, &file.path);
-                        let bytes =
-                            download(self.remote.as_ref(), &cx.repo_ref, commit.as_deref().unwrap_or_default(), &rel, file, cx.token.as_deref(), cx.cancel)?;
-                        s.downloaded += file.size;
-                        theirs.insert(file.path.clone(), text::canon(&bytes));
-                    }
-                    likeness = verify::compare_unmanaged(&dir, skill, &theirs, &mut s.applier.hasher);
-                    cx.theirs.insert(key.clone(), theirs);
-                }
+            if searches.get(&key).is_some_and(|h| h.paused) {
+                out.insert(key, UnmanagedState::Paused);
+                continue;
             }
-            out.insert(key, if likeness == Likeness::Same { UnmanagedState::Identical } else { UnmanagedState::Different });
+            if !exists_no_follow(&dir) {
+                searches.remove(&key);
+                continue;
+            }
+            let source = source_key(cx.repo);
+            let valid = searches.get(&key).is_some_and(|h| h.source == source && h.tree == cx.tree && Some(&h.pin) == commit.as_ref() && evidence_valid(s, h));
+            if valid && searches[&key].complete {
+                out.insert(key, UnmanagedState::Different);
+                continue;
+            }
+            let vol = s.volume();
+            let initial =
+                verify::history_evidence(&dir, skill.files.iter().map(|f| f.path.as_str()), vol.current.is_some_and(|v| v.journal != 0), &mut s.applier.hasher);
+            if !valid {
+                let (same, theirs) = self.compare_version(s, cx, skill, commit)?;
+                if same {
+                    cx.theirs.insert(key.clone(), theirs);
+                    searches.remove(&key);
+                    out.insert(key, UnmanagedState::Identical);
+                    continue;
+                }
+                self.pin_listing(cx, commit)?;
+                searches.insert(
+                    key.clone(),
+                    HistorySearch {
+                        name: skill.name.clone(),
+                        source,
+                        tree: cx.tree.clone(),
+                        pin: commit.clone().unwrap_or_default(),
+                        page: 1,
+                        commits: Vec::new(),
+                        offset: 0,
+                        checked: 0,
+                        complete: false,
+                        paused: false,
+                        volume: vol.current,
+                        evidence: initial,
+                    },
+                );
+            }
+            let h = searches.get_mut(&key).expect("a search was created");
+            let matched = self.search_history(s, cx, h, &mut left)?;
+            let state = if let Some(proof) = matched {
+                cx.historical.insert(key.clone(), proof);
+                UnmanagedState::Historical
+            } else if h.complete {
+                UnmanagedState::Different
+            } else {
+                UnmanagedState::Searching
+            };
+            if !evidence_valid(s, h) {
+                // A changing folder supplies no reusable conclusion. It is still never adopted without full reads.
+                h.page = 1;
+                h.commits.clear();
+                h.offset = 0;
+                h.checked = 0;
+                h.complete = false;
+                h.evidence = verify::history_evidence(
+                    &dir,
+                    skill.files.iter().map(|f| f.path.as_str()),
+                    vol.current.is_some_and(|v| v.journal != 0),
+                    &mut s.applier.hasher,
+                );
+                out.insert(key, UnmanagedState::Searching);
+            } else {
+                out.insert(key, state);
+            }
+        }
+        if s.state.repo(&cx.repo.id).is_none_or(|r| r.searches != searches) {
+            s.state.repo_mut(&cx.repo.id).searches = searches;
+            s.must_save = true;
         }
         Ok(out)
+    }
+
+    fn pin_listing(&self, cx: &Ctx, commit: &mut Option<String>) -> Result<(), RemoteError> {
+        if commit.is_none() {
+            *commit = Some(self.remote.commit(&cx.repo_ref, cx.token.as_deref(), cx.cancel)?);
+        }
+        let pinned = self.remote.historical_tree(&cx.repo_ref, commit.as_deref().unwrap_or_default(), "", cx.token.as_deref(), cx.cancel)?;
+        if pinned.is_none_or(|t| t.truncated || t.sha != cx.tree) {
+            return Err(changed_on_github(&cx.repo.path));
+        }
+        Ok(())
+    }
+
+    fn compare_version(
+        &self,
+        s: &mut Session,
+        cx: &Ctx,
+        skill: &tree::Skill,
+        commit: &mut Option<String>,
+    ) -> Result<(bool, HashMap<String, String>), RemoteError> {
+        let dir = s.applier.skills_dir.join(&skill.name);
+        let mut theirs = HashMap::new();
+        let mut likeness = verify::compare_unmanaged(&dir, skill, &theirs, &mut s.applier.hasher);
+        if let Likeness::NeedsText(paths) = &likeness {
+            for file in skill.files.iter().filter(|f| paths.contains(&f.path)) {
+                if cx.cancel.load(Ordering::Relaxed) {
+                    return Err(RemoteError::new(FailureKind::Cancelled, "earlier-version search stopped"));
+                }
+                if s.downloaded.saturating_add(file.size) > cx.opts.max_download_bytes {
+                    return Err(RemoteError::new(FailureKind::TooLarge, "the comparison reached this check's download limit; it is not a no-match result"));
+                }
+                if commit.is_none() {
+                    *commit = Some(self.remote.commit(&cx.repo_ref, cx.token.as_deref(), cx.cancel)?);
+                }
+                let bytes = download(
+                    self.remote.as_ref(),
+                    &cx.repo_ref,
+                    commit.as_deref().unwrap_or_default(),
+                    &cx.rel(&skill.name, &file.path),
+                    file,
+                    cx.token.as_deref(),
+                    cx.cancel,
+                )?;
+                s.downloaded += file.size;
+                theirs.insert(file.path.clone(), text::canon(&bytes));
+            }
+            likeness = verify::compare_unmanaged(&dir, skill, &theirs, &mut s.applier.hasher);
+        }
+        Ok((likeness == Likeness::Same, theirs))
+    }
+
+    fn search_history(&self, s: &mut Session, cx: &Ctx, h: &mut HistorySearch, left: &mut usize) -> Result<Option<HistoricalProof>, RemoteError> {
+        let rel = if cx.single { "" } else { h.name.as_str() };
+        while *left > 0 && !h.complete {
+            if cx.cancel.load(Ordering::Relaxed) {
+                return Err(RemoteError::new(FailureKind::Cancelled, "earlier-version search stopped"));
+            }
+            if h.offset == h.commits.len() {
+                let page = self.remote.history(&cx.repo_ref, &h.pin, rel, h.page, cx.token.as_deref(), cx.cancel)?;
+                if page.is_empty() {
+                    h.complete = true;
+                    break;
+                }
+                if page.len() > 100 || page.iter().any(|id| id.len() != 40 || !id.bytes().all(|b| b.is_ascii_hexdigit()) || h.commits.contains(id)) {
+                    return Err(RemoteError::new(FailureKind::Protocol, "GitHub returned an invalid or repeated history page"));
+                }
+                h.commits = page;
+                h.offset = 0;
+                h.page = h.page.checked_add(1).ok_or_else(|| RemoteError::new(FailureKind::Protocol, "history page overflow"))?;
+            }
+            let id = h.commits[h.offset].clone();
+            *left -= 1;
+            if let Some(snapshot) = self.remote.historical_tree(&cx.repo_ref, &id, rel, cx.token.as_deref(), cx.cancel)? {
+                if snapshot.truncated {
+                    return Err(RemoteError::new(FailureKind::TooLarge, "GitHub cut a historical listing short"));
+                }
+                let found = tree::discover(&snapshot.entries, &h.name, root_len(&s.applier));
+                if !found.rejected.is_empty() {
+                    return Err(RemoteError::new(FailureKind::Protocol, "an earlier version has unsafe paths or files; it was not used as proof"));
+                }
+                if tree::is_single_skill(&snapshot.entries) {
+                    if let Some(old) = found.skills.into_iter().find(|k| k.name == h.name) {
+                        let dir = s.applier.skills_dir.join(&h.name);
+                        let quick = s.volume().current.is_some_and(|v| v.journal != 0);
+                        let evidence = verify::history_evidence(&dir, old.files.iter().map(|f| f.path.as_str()), quick, &mut s.applier.hasher);
+                        for (path, seen) in evidence {
+                            if h.evidence.get(&path).is_some_and(|before| *before != seen) {
+                                return Err(RemoteError::new(FailureKind::Local, "the local copy changed during the earlier-version search; check again"));
+                            }
+                            h.evidence.insert(path, seen);
+                        }
+                        let (same, theirs) = self.compare_version(s, cx, &old, &mut Some(id.clone()))?;
+                        if same {
+                            return Ok(Some(HistoricalProof { skill: old, commit: id, theirs }));
+                        }
+                    }
+                }
+            }
+            h.offset += 1;
+            h.checked += 1;
+            // A short validated page is the end. A full page always asks for the next page, even beyond 100 versions.
+            if h.offset == h.commits.len() && h.commits.len() < 100 {
+                h.complete = true;
+            }
+        }
+        Ok(None)
     }
 
     fn apply_all(&self, s: &mut Session, cx: &Ctx, discovery: &Discovery, decisions: &[Decision], mut commit: Option<String>) -> Run {
@@ -1164,7 +1425,7 @@ impl Engine {
                 let applied = s.applier.delete(&mut s.state, id, &d.name)?;
                 Ok(result(applied, &mut s.warnings))
             }
-            Verdict::Install | Verdict::Update | Verdict::Adopt => {
+            Verdict::Install | Verdict::Update | Verdict::Adopt | Verdict::AdoptHistorical => {
                 let skill = discovery
                     .skills
                     .iter()
@@ -1186,6 +1447,17 @@ impl Engine {
                     *commit = Some(self.remote.commit(&cx.repo_ref, cx.token.as_deref(), cx.cancel)?);
                 }
                 let commit = commit.as_deref().unwrap_or_default();
+                if d.verdict == Verdict::AdoptHistorical {
+                    let proof = cx
+                        .historical
+                        .get(&fold(&skill.name))
+                        .ok_or_else(|| RemoteError::new(FailureKind::Local, "historical adoption has no full-version proof"))?;
+                    let adopted = s.applier.adopt(&mut s.state, id, &proof.skill, &proof.commit, &proof.theirs)?;
+                    if let Applied::Held(why) = adopted {
+                        return Ok(ApplyResult::Held(why));
+                    }
+                    s.must_save = true;
+                }
                 if !downloads {
                     let theirs = cx.theirs.get(&fold(&skill.name)).cloned().unwrap_or_default();
                     let applied = s.applier.adopt(&mut s.state, id, skill, commit, &theirs)?;
@@ -1203,7 +1475,11 @@ impl Engine {
                 };
                 let applied = s.applier.install(&mut s.state, id, skill, commit, Mode::Normal, &mut fetch, cx.cancel);
                 s.downloaded += bytes.get();
-                Ok(result(applied?, &mut s.warnings))
+                let result = result(applied?, &mut s.warnings);
+                if result == ApplyResult::Done && s.state.repo_mut(id).searches.remove(&fold(&skill.name)).is_some() {
+                    s.must_save = true;
+                }
+                Ok(result)
             }
             _ => Ok(ApplyResult::NotApplicable),
         }
@@ -1220,8 +1496,21 @@ impl Engine {
     fn resolve_in(&self, s: &mut Session, repo: &RepoConfig, skill: &str, how: Resolution, cancel: &AtomicBool) -> Result<ResolveReport, EngineError> {
         let key = fold(skill);
         match how {
+            Resolution::PauseHistory | Resolution::ResumeHistory => {
+                let rs = s.state.repo_mut(&repo.id);
+                if how == Resolution::PauseHistory && !rs.searches.contains_key(&key) {
+                    return Ok(ResolveReport { message: format!("No earlier-version search remains for '{skill}'; nothing was changed"), backups: Vec::new() });
+                }
+                let search = rs.searches.get_mut(&key).ok_or_else(|| failed(format!("'{skill}' has no earlier-version search")))?;
+                search.paused = how == Resolution::PauseHistory;
+                rs.etag = None;
+                s.must_save = true;
+                let action = if how == Resolution::PauseHistory { "paused until you choose Resume" } else { "resumed; the next check continues it" };
+                Ok(ResolveReport { message: format!("Earlier-version search for '{skill}' {action}"), backups: Vec::new() })
+            }
             Resolution::KeepMine => {
                 let rs = s.state.repo_mut(&repo.id);
+                rs.searches.remove(&key);
                 rs.remove_skill(skill);
                 if !rs.is_ignored(skill) {
                     rs.ignored.push(skill.to_string());
@@ -1232,12 +1521,17 @@ impl Engine {
             }
             Resolution::ManageAgain => {
                 let rs = s.state.repo_mut(&repo.id);
+                rs.searches.remove(&key);
                 rs.ignored.retain(|n| fold(n) != key);
                 rs.etag = None;
                 s.must_save = true;
                 Ok(ResolveReport { message: format!("'{skill}' will be handled like any other skill at the next check"), backups: Vec::new() })
             }
             Resolution::Overwrite => {
+                if let Some(search) = s.state.repo_mut(&repo.id).searches.get_mut(&key) {
+                    search.paused = true;
+                    s.must_save = true;
+                }
                 if s.state.repo(&repo.id).is_some_and(|r| r.is_ignored(skill)) {
                     return Err(failed(format!("'{skill}' is marked as yours; choose 'manage again' first")));
                 }
@@ -1283,6 +1577,7 @@ impl Engine {
                 match applied {
                     // An overwrite never reports what was in the way: every backup is reported below.
                     Applied::Done | Applied::Displaced { .. } => {
+                        s.state.repo_mut(&repo.id).searches.remove(&key);
                         s.state.repo_mut(&repo.id).etag = None;
                         s.must_save = true;
                         let kept = if backups.is_empty() { String::new() } else { "; what was there is kept in the backups folder".to_string() };
@@ -1403,6 +1698,10 @@ fn verify_repo(s: &mut Session, repo_id: &str) -> Vec<(String, LocalStatus)> {
             out.push((skill.name.clone(), LocalStatus::Interrupted));
             continue;
         }
+        if repo.searches.get(&fold(&skill.name)).is_some_and(|h| h.paused) {
+            out.push((skill.name.clone(), LocalStatus::History { paused: true, complete: false, waiting: false }));
+            continue;
+        }
         let dir = applier.skills_dir.join(&skill.name);
         let outcome = verify::verify_skill(&dir, skill, check, &mut applier.hasher);
         stats.add(outcome.stats);
@@ -1410,6 +1709,9 @@ fn verify_repo(s: &mut Session, repo_id: &str) -> Vec<(String, LocalStatus)> {
             *must_save = true;
         }
         out.push((skill.name.clone(), LocalStatus::Checked(outcome.local)));
+    }
+    for search in repo.searches.values().filter(|h| repo.skill(&h.name).is_none() && !repo.is_ignored(&h.name)) {
+        out.push((search.name.clone(), LocalStatus::History { paused: search.paused, complete: search.complete, waiting: repo.history_retry_at.is_some() }));
     }
     out
 }
@@ -1427,7 +1729,7 @@ fn plan_repo(
         .into_iter()
         .filter_map(|(name, status)| match status {
             LocalStatus::Checked(local) => Some((fold(&name), local)),
-            LocalStatus::Interrupted => None,
+            LocalStatus::Interrupted | LocalStatus::History { .. } => None,
         })
         .collect();
     let repo_state = s.state.repo(&repo.id);
@@ -1460,7 +1762,8 @@ fn is_settled(verdict: &Verdict, result: &ApplyResult) -> bool {
         Verdict::InSync | Verdict::ModifiedLocally(_) | Verdict::MissingLocally | Verdict::Skipped(Skip::Ignored) | Verdict::Skipped(Skip::Rejected { .. }) => {
             true
         }
-        Verdict::Install | Verdict::Update | Verdict::Adopt | Verdict::Delete | Verdict::Forget => *result == ApplyResult::Done,
+        Verdict::Install | Verdict::Update | Verdict::Adopt | Verdict::AdoptHistorical | Verdict::Delete | Verdict::Forget => *result == ApplyResult::Done,
+        Verdict::Held(reconcile::Hold::UnmanagedDiffers | reconcile::Hold::HistoryPaused) => true,
         Verdict::Held(_) | Verdict::Skipped(Skip::Collision { .. }) => false,
     }
 }

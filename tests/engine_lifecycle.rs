@@ -24,8 +24,196 @@ fn dry_run() -> SyncOptions {
     SyncOptions { dry_run: true, ..SyncOptions::default() }
 }
 
+#[test]
+fn historical_pause_survives_restart_resume_and_choices_supersede_search() {
+    for choice in [Resolution::ResumeHistory, Resolution::KeepMine, Resolution::Overwrite] {
+        let w = World::new("historical-pause");
+        let remote = FakeRemote::new();
+        remote.put(REPO, "skills/alpha/SKILL.md", "old");
+        for n in 0..25 {
+            remote.put(REPO, "skills/alpha/SKILL.md", &format!("new {n}"));
+        }
+        w.write("alpha/SKILL.md", "old");
+        let cfg = standard_config();
+        let mut engine = w.engine(&remote);
+        sync_all(&mut engine, &cfg);
+        engine.resolve(&cfg, "fx", "alpha", Resolution::PauseHistory, &cancel_flag()).unwrap();
+        drop(engine);
+        let mut engine = w.engine(&remote);
+        let report = sync_all(&mut engine, &cfg);
+        assert_eq!(skill(only(&report), "alpha").verdict, Verdict::Held(Hold::HistoryPaused));
+        remote.reset();
+        let before = tiny_skill_sync::engine::stamp_of(&w.state_file());
+        sync_all(&mut engine, &cfg);
+        assert_eq!(remote.calls(), Calls { commit: 1, ..Calls::default() });
+        assert_eq!(tiny_skill_sync::engine::stamp_of(&w.state_file()), before);
+        engine.resolve(&cfg, "fx", "alpha", choice, &cancel_flag()).unwrap();
+        for _ in 0..5 {
+            sync_all(&mut engine, &cfg);
+        }
+        assert_eq!(w.read("alpha/SKILL.md"), if choice == Resolution::KeepMine { "old" } else { "new 24" });
+        assert_eq!(w.backups().len(), usize::from(choice == Resolution::Overwrite));
+        assert!(w.state().repo("fx").unwrap().searches.is_empty());
+    }
+}
+
+#[test]
+fn historical_old_baseline_survives_crashes_and_late_staging_edits_hold() {
+    for edit in [false, true] {
+        let w = World::new("historical-late");
+        let remote = FakeRemote::new();
+        remote.put(REPO, "skills/alpha/SKILL.md", "old");
+        let old_commit = remote.head(REPO);
+        remote.put(REPO, "skills/alpha/SKILL.md", "new");
+        w.write("alpha/SKILL.md", "old");
+        w.write("alpha/mine", "my extra");
+        let mut engine = w.engine(&remote);
+        let path = w.skills.join("alpha\\SKILL.md");
+        let marked = Arc::new(AtomicBool::new(false));
+        let seen = marked.clone();
+        engine.set_step_hook(move |step| {
+            if step == Step::Marked {
+                seen.store(true, Ordering::Relaxed);
+            }
+            if step == Step::Staged {
+                if edit {
+                    fs::write(&path, "edited at staging").unwrap();
+                } else {
+                    return Err(RemoteError::new(FailureKind::Local, "stop after adoption"));
+                }
+            }
+            Ok(())
+        });
+        let cfg = standard_config();
+        let report = sync_all(&mut engine, &cfg);
+        assert_ne!(skill(only(&report), "alpha").result, ApplyResult::Done);
+        assert!(!marked.load(Ordering::Relaxed), "late edits are held before any destructive transaction");
+        assert_eq!(w.state().repo("fx").unwrap().skill("alpha").unwrap().commit, old_commit);
+        drop(engine);
+        let mut engine = w.engine(&remote);
+        engine.startup(&cfg).unwrap();
+        sync_all(&mut engine, &cfg);
+        assert_eq!(w.read("alpha/SKILL.md"), if edit { "edited at staging" } else { "new" });
+        assert_eq!(w.read("alpha/mine"), "my extra");
+    }
+}
+
+#[test]
+fn historical_cancel_at_staging_can_still_pause_the_adopted_baseline() {
+    let w = World::new("historical-late-cancel");
+    let remote = FakeRemote::new();
+    remote.put(REPO, "skills/alpha/SKILL.md", "old");
+    let old = remote.head(REPO);
+    remote.put(REPO, "skills/alpha/SKILL.md", "new");
+    w.write("alpha/SKILL.md", "old");
+    let cfg = standard_config();
+    let mut engine = w.engine(&remote);
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let signal = cancelled.clone();
+    engine.set_step_hook(move |step| {
+        if step == Step::Staged {
+            signal.store(true, Ordering::Relaxed);
+        }
+        Ok(())
+    });
+    let result = engine.sync(&cfg, &Which::All, &SyncOptions::default(), &cancelled).unwrap();
+    assert!(matches!(only(&result).outcome, Outcome::Cancelled));
+    assert_eq!(w.read("alpha/SKILL.md"), "old");
+    assert_eq!(w.state().repo("fx").unwrap().skill("alpha").unwrap().commit, old);
+    engine.resolve(&cfg, "fx", "alpha", Resolution::PauseHistory, &cancel_flag()).unwrap();
+    drop(engine);
+    let mut engine = w.engine(&remote);
+    sync_all(&mut engine, &cfg);
+    assert_eq!(w.read("alpha/SKILL.md"), "old");
+    assert!(matches!(engine.startup(&cfg).unwrap().verify.skills[0].status, LocalStatus::History { paused: true, .. }));
+    engine.resolve(&cfg, "fx", "alpha", Resolution::ResumeHistory, &cancel_flag()).unwrap();
+    sync_all(&mut engine, &cfg);
+    assert_eq!(w.read("alpha/SKILL.md"), "new");
+    assert!(w.backups().is_empty());
+    // A click already queued when the update finishes must not resurrect the finished search.
+    engine.resolve(&cfg, "fx", "alpha", Resolution::PauseHistory, &cancel_flag()).unwrap();
+    assert!(w.state().repo("fx").unwrap().searches.is_empty());
+}
+
+#[test]
+fn historical_source_root_and_local_changes_invalidate_saved_progress() {
+    let w = World::new("historical-invalidation");
+    let remote = FakeRemote::new();
+    remote.put(REPO, "skills/alpha/SKILL.md", "old");
+    for n in 0..25 {
+        remote.put(REPO, "skills/alpha/SKILL.md", &format!("new {n}"));
+    }
+    w.write("alpha/SKILL.md", "old");
+    let cfg = standard_config();
+    let mut engine = w.engine(&remote);
+    sync_all(&mut engine, &cfg);
+    w.write("alpha/SKILL.md", "new 24");
+    let report = sync_all(&mut engine, &cfg);
+    assert_eq!(skill(only(&report), "alpha").verdict, Verdict::Adopt);
+    assert!(w.state().repo("fx").unwrap().searches.is_empty());
+    let second = w.root.join("second");
+    fs::create_dir_all(second.join("alpha")).unwrap();
+    fs::write(second.join("alpha\\SKILL.md"), "old").unwrap();
+    engine.set_skills_dir(second.clone());
+    sync_all(&mut engine, &cfg);
+    assert!(!w.state().repo("fx").unwrap().searches.is_empty());
+    let mut other = cfg.clone();
+    other.repos[0].path = "other".into();
+    remote.put(REPO, "other/alpha/SKILL.md", "unrelated");
+    sync_all(&mut engine, &other);
+    assert_eq!(fs::read_to_string(second.join("alpha\\SKILL.md")).unwrap(), "old");
+    assert!(w.state().repo("fx").unwrap().searches["alpha"].complete);
+}
+
 fn verdicts(repo: &RepoReport) -> Vec<(String, Verdict)> {
     repo.skills.iter().map(|k| (k.name.clone(), k.verdict.clone())).collect()
+}
+
+#[test]
+fn historical_rate_limit_wait_survives_restart_without_a_busy_loop() {
+    let w = World::new("historical-rate");
+    let remote = FakeRemote::new();
+    remote.put(REPO, "skills/alpha/SKILL.md", "old");
+    for n in 0..25 {
+        remote.put(REPO, "skills/alpha/SKILL.md", &format!("new {n}"));
+    }
+    w.write("alpha/SKILL.md", "old");
+    let cfg = standard_config();
+    let (mut engine, _) = w.engine_at(&remote, &FakeTokens::none());
+    sync_all(&mut engine, &cfg);
+    remote.fail_historical_tree(REPO, Some(RemoteError { kind: FailureKind::RateLimited, message: "wait".into(), retry_at: Some(T0 + 3600) }));
+    sync_all(&mut engine, &cfg);
+    drop(engine);
+    let (mut engine, _) = w.engine_at(&remote, &FakeTokens::none());
+    engine.startup(&cfg).unwrap();
+    assert_eq!(engine.next_wake(&cfg), Some(T0 + 3600));
+    remote.reset();
+    assert!(sync_which(&mut engine, &cfg, &Which::Due).repos.is_empty());
+    assert_eq!(remote.calls(), Calls::default());
+}
+
+#[test]
+fn historical_pause_still_holds_when_the_local_folder_is_removed() {
+    let w = World::new("historical-pause-missing");
+    let remote = FakeRemote::new();
+    remote.put(REPO, "skills/alpha/SKILL.md", "old");
+    for n in 0..10 {
+        remote.put(REPO, "skills/alpha/SKILL.md", &format!("new {n}"));
+    }
+    w.write("alpha/SKILL.md", "old");
+    let cfg = standard_config();
+    let mut engine = w.engine(&remote);
+    sync_all(&mut engine, &cfg);
+    engine.resolve(&cfg, "fx", "alpha", Resolution::PauseHistory, &cancel_flag()).unwrap();
+    w.remove("alpha");
+    sync_all(&mut engine, &cfg);
+    assert!(!w.exists("alpha"), "Cancel pauses the skill until an explicit Resume or overwrite");
+    remote.put(REPO, "skills/beta/SKILL.md", "beta");
+    remote.remove(REPO, "skills/alpha");
+    sync_all(&mut engine, &cfg);
+    remote.put(REPO, "skills/alpha/SKILL.md", "back");
+    sync_all(&mut engine, &cfg);
+    assert!(!w.exists("alpha"), "upstream removal and recreation must not silently resume a paused skill");
 }
 
 fn last_check_on_disk(w: &World) -> Option<i64> {
@@ -799,15 +987,15 @@ fn a_repository_removed_while_another_folder_is_used_leaves_its_skills_in_the_fi
     s.engine.remove_repo("fx", false).unwrap();
     assert!(s.w.state().set_aside.is_empty(), "{:?}", s.w.state().set_aside);
 
-    // The same repository added again, after going back to the first folder: its skills there are the user's now.
+    // Re-adding explicitly allows adoption again, but only when a whole current or historical version matches.
     s.remote.put(REPO, "skills/alpha/SKILL.md", ALPHA_V2);
     s.engine.set_skills_dir(home);
     let report = s.sync();
 
     let repo = only(&report);
-    assert_eq!(skill(repo, "alpha").verdict, Verdict::Held(Hold::UnmanagedDiffers));
+    assert_eq!(skill(repo, "alpha").verdict, Verdict::AdoptHistorical);
     assert_eq!(skill(repo, "beta").verdict, Verdict::Adopt);
-    assert_eq!(s.w.read("alpha/SKILL.md"), ALPHA_V1);
+    assert_eq!(s.w.read("alpha/SKILL.md"), ALPHA_V2);
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -893,7 +1081,7 @@ fn a_check_that_found_nothing_new_is_written_down_at_exit_not_before() {
 }
 
 #[test]
-fn a_repository_holding_a_skill_is_checked_once_more_after_a_restart_so_the_window_can_show_it() {
+fn a_completed_historical_hold_is_shown_after_restart_without_an_extra_check() {
     let mut s = Setup::fresh("held-restart");
     s.w.write("alpha/SKILL.md", "my own alpha\n");
     let report = sync_which(&mut s.engine, &s.cfg, &Which::Due);
@@ -901,11 +1089,11 @@ fn a_repository_holding_a_skill_is_checked_once_more_after_a_restart_so_the_wind
     assert!(sync_which(&mut s.engine, &s.cfg, &Which::Due).repos.is_empty(), "not again in the same run");
     s.engine.flush().unwrap();
 
-    // What was held lived only in the memory of the run that ended, so the next start looks again, once.
+    // Completed history comparisons are persisted, so the next start can show them without a network request.
     let mut restarted = s.restarted();
-    let report = sync_which(&mut restarted, &s.cfg, &Which::Due);
-    assert_eq!(skill(only(&report), "alpha").verdict, Verdict::Held(Hold::UnmanagedDiffers));
-    assert!(sync_which(&mut restarted, &s.cfg, &Which::Due).repos.is_empty(), "once per start");
+    let report = restarted.startup(&s.cfg).unwrap();
+    assert_eq!(status_of(&report.verify, "alpha"), LocalStatus::History { paused: false, complete: true, waiting: false });
+    assert!(sync_which(&mut restarted, &s.cfg, &Which::Due).repos.is_empty());
     assert_eq!(s.w.read("alpha/SKILL.md"), "my own alpha\n");
 }
 
@@ -914,7 +1102,7 @@ fn a_repository_holding_a_skill_is_checked_once_more_after_a_restart_so_the_wind
 // ---------------------------------------------------------------------------------------------------------------------
 
 #[test]
-fn removing_a_repository_and_keeping_its_skills_leaves_them_alone_for_good() {
+fn removing_a_repository_keeps_its_skills_and_readding_requires_upstream_proof() {
     let mut s = Setup::installed("remove-keep");
     let before = s.w.skills_snapshot();
 
@@ -925,15 +1113,15 @@ fn removing_a_repository_and_keeping_its_skills_leaves_them_alone_for_good() {
     assert_eq!(s.w.skills_snapshot(), before);
     assert!(s.w.state().repo("fx").is_none());
 
-    // They are the user's now. The same repository added again can neither replace nor delete them.
+    // Re-adding can adopt a proven old copy, but cannot delete an unowned skill that is gone upstream.
     s.remote.put(REPO, "skills/alpha/SKILL.md", ALPHA_V2);
     s.remote.remove(REPO, "skills/gamma");
     let again = config(vec![repo("again", REPO, "skills")]);
     let report = sync_all(&mut s.engine, &again);
     let repo = only(&report);
-    assert_eq!(skill(repo, "alpha").verdict, Verdict::Held(Hold::UnmanagedDiffers));
+    assert_eq!(skill(repo, "alpha").verdict, Verdict::AdoptHistorical);
     assert_eq!(skill(repo, "beta").verdict, Verdict::Adopt, "identical, so it is taken over without a download");
-    assert_eq!(s.w.read("alpha/SKILL.md"), ALPHA_V1);
+    assert_eq!(s.w.read("alpha/SKILL.md"), ALPHA_V2);
     assert!(s.w.exists("gamma"));
 }
 

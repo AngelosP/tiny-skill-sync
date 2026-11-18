@@ -26,6 +26,20 @@ const ALL_KINDS: [FailureKind; 10] = [
     FailureKind::Local,
 ];
 
+#[test]
+fn historical_unsafe_versions_are_errors_not_proof() {
+    let w = World::new("historical-unsafe");
+    let remote = FakeRemote::new();
+    remote.seed(REPO, &[("skills/alpha/SKILL.md", "old"), ("skills/alpha/CON", "bad")]);
+    remote.remove(REPO, "skills/alpha/CON");
+    remote.put(REPO, "skills/alpha/SKILL.md", "new");
+    w.write("alpha/SKILL.md", "edited");
+    let before = w.skills_snapshot();
+    let report = sync_all(&mut w.engine(&remote), &standard_config());
+    assert!(matches!(only(&report).outcome, Outcome::Failed(_)), "{report:?}");
+    assert_eq!(w.skills_snapshot(), before);
+}
+
 fn failure(repo: &RepoReport) -> &Failure {
     match &repo.outcome {
         Outcome::Failed(f) => f,
@@ -35,6 +49,42 @@ fn failure(repo: &RepoReport) -> &Failure {
 
 fn error(kind: FailureKind) -> RemoteError {
     RemoteError::new(kind, format!("{kind:?}, on purpose"))
+}
+
+#[test]
+fn historical_failures_abort_the_repository_before_any_deletion_and_are_retried() {
+    for kind in ALL_KINDS {
+        for tree_failure in [false, true] {
+            let w = World::new("historical-failure");
+            let remote = FakeRemote::new();
+            remote.seed(REPO, &[("skills/gone/SKILL.md", "gone"), ("skills/alpha/SKILL.md", "old")]);
+            let cfg = standard_config();
+            let mut engine = w.engine(&remote);
+            sync_all(&mut engine, &cfg);
+            // Forget alpha's ownership without a keep-mine choice, as an existing manually installed copy.
+            let mut state = w.state();
+            state.repo_mut("fx").remove_skill("alpha");
+            state.repo_mut("fx").etag = None;
+            state.save(&w.state_file()).unwrap();
+            remote.remove(REPO, "skills/gone");
+            remote.put(REPO, "skills/alpha/SKILL.md", "new");
+            if tree_failure {
+                remote.fail_historical_tree(REPO, Some(error(kind)));
+            } else {
+                remote.fail_history(REPO, Some(error(kind)));
+            }
+            let before = w.skills_snapshot();
+            let report = sync_all(&mut engine, &cfg);
+            assert!(matches!(only(&report).outcome, Outcome::Failed(_)), "{report:?}");
+            assert_eq!(w.skills_snapshot(), before, "{kind:?}");
+            assert!(w.state().repo("fx").unwrap().searches.is_empty(), "a failure is not cached as no match");
+            remote.fail_history(REPO, None);
+            remote.fail_historical_tree(REPO, None);
+            sync_all(&mut engine, &cfg);
+            assert!(!w.exists("gone"));
+            assert_eq!(w.read("alpha/SKILL.md"), "new");
+        }
+    }
 }
 
 /// A repository that is checked with the user's token.
@@ -643,6 +693,19 @@ fn a_check_stops_at_the_download_limit_and_the_rest_waits_for_the_next_one() {
 struct AlwaysNotModified;
 
 impl Remote for AlwaysNotModified {
+    fn history(&self, _: &RepoRef, _: &str, _: &str, _: u32, _: Option<&Secret>, _: &AtomicBool) -> Result<Vec<String>, RemoteError> {
+        unreachable!()
+    }
+    fn historical_tree(
+        &self,
+        _: &RepoRef,
+        _: &str,
+        _: &str,
+        _: Option<&Secret>,
+        _: &AtomicBool,
+    ) -> Result<Option<tiny_skill_sync::tree::Snapshot>, RemoteError> {
+        unreachable!()
+    }
     fn tree(&self, _: &RepoRef, _: Option<&str>, _: Option<&Secret>, _: &AtomicBool) -> Result<TreeReply, RemoteError> {
         Ok(TreeReply::NotModified)
     }

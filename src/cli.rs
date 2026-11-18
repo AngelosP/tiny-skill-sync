@@ -234,7 +234,7 @@ impl Flags {
 fn usage_of(command: &str) -> &'static str {
     match command {
         "check" => "tss check [REPO] [--dry-run] [--full-listing] [--delete-all]",
-        "resolve" => "tss resolve REPO SKILL replace|restore|keep|leave|manage",
+        "resolve" => "tss resolve REPO SKILL replace|restore|keep|leave|manage|pause|resume",
         "add" => "tss add OWNER/NAME [--every INTERVAL] [--use-token]",
         "remove" => "tss remove REPO [--delete-skills]",
         "token" => "tss token [status|set|clear]",
@@ -258,7 +258,9 @@ fn resolution(word: &str) -> Result<Resolution, String> {
         "replace" | "restore" => Ok(Resolution::Overwrite),
         "keep" | "leave" => Ok(Resolution::KeepMine),
         "manage" => Ok(Resolution::ManageAgain),
-        _ => Err(format!("'{word}' is not something resolve can do; use replace, restore, keep, leave or manage")),
+        "pause" | "cancel" => Ok(Resolution::PauseHistory),
+        "resume" => Ok(Resolution::ResumeHistory),
+        _ => Err(format!("'{word}' is not something resolve can do; use replace, restore, keep, leave, manage, pause or resume")),
     }
 }
 
@@ -270,6 +272,8 @@ fn word_for(action: Action) -> &'static str {
         Action::KeepMine => "keep",
         Action::LeaveRemoved => "leave",
         Action::ManageAgain => "manage",
+        Action::PauseHistory => "pause",
+        Action::ResumeHistory => "resume",
         Action::RemoveThem => "",
     }
 }
@@ -679,6 +683,8 @@ fn change(skill: &SkillReport) -> Option<String> {
         (Verdict::Update, false) => format!("Would update {name}"),
         (Verdict::Adopt, true) => format!("Now managing {name} (the installed copy matched upstream)"),
         (Verdict::Adopt, false) => format!("Would start managing {name} (the installed copy matches upstream)"),
+        (Verdict::AdoptHistorical, true) => format!("Verified and adopted an older GitHub copy of {name}, then updated it"),
+        (Verdict::AdoptHistorical, false) => format!("Would adopt and update {name} (a complete older GitHub version matches)"),
         (Verdict::Delete, true) => format!("Removed {name} (gone upstream)"),
         (Verdict::Delete, false) => format!("Would remove {name} (gone upstream)"),
         (Verdict::Forget, true) => format!("Stopped tracking {name} (gone upstream and already deleted here)"),
@@ -746,6 +752,9 @@ fn check(host: &dyn Host, out: &mut String, query: Option<&str>, dry_run: bool, 
             }
         }
         rows(out, &view.id, &view.skills, false);
+        if view.skills.iter().any(|r| r.actions.contains(&Action::PauseHistory)) {
+            say!(out, "  History work is saved. The running tray continues it; otherwise run tss check again to continue.");
+        }
         if repo_report.downloaded > 0 {
             say!(out, "  Downloaded {}.", size(repo_report.downloaded));
         }
@@ -765,7 +774,7 @@ fn resolve(host: &dyn Host, out: &mut String, query: &str, skill: &str, how: Res
     // The engine checks `replace` against upstream itself. The other two only change a list, so a typo would be
     // recorded as it is: the name is checked here.
     let name = match how {
-        Resolution::Overwrite => skill.to_string(),
+        Resolution::Overwrite | Resolution::PauseHistory | Resolution::ResumeHistory => skill.to_string(),
         Resolution::KeepMine => installed_name(host, &cfg, repo, skill)?,
         Resolution::ManageAgain => kept_name(host, &cfg, repo, skill)?,
     };

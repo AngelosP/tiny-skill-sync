@@ -90,7 +90,7 @@ impl Drop for Watch {
 struct Shell {
     app: App,
     home: PathBuf,
-    orders: Sender<Order>,
+    orders: Sender<(Order, Arc<AtomicBool>)>,
     done: Receiver<Done>,
     cancel: Arc<AtomicBool>,
     timer: HANDLE,
@@ -207,7 +207,7 @@ pub fn run() -> i32 {
     let (orders, inbox) = mpsc::channel();
     let (outbox, done) = mpsc::channel();
     let cancel = Arc::new(AtomicBool::new(false));
-    if let Err(e) = spawn_worker(engine, inbox, outbox, cancel.clone(), hwnd) {
+    if let Err(e) = spawn_worker(engine, inbox, outbox, hwnd) {
         message_box(&format!("The worker thread cannot be started: {e}"));
         return 2;
     }
@@ -289,10 +289,10 @@ fn message_box(text: &str) {
     unsafe { MessageBoxW(null_mut(), wide(text).as_ptr(), wide(APP_NAME).as_ptr(), MB_OK | MB_ICONERROR) };
 }
 
-fn spawn_worker(mut engine: Engine, orders: Receiver<Order>, done: Sender<Done>, cancel: Arc<AtomicBool>, hwnd: HWND) -> std::io::Result<()> {
+fn spawn_worker(mut engine: Engine, orders: Receiver<(Order, Arc<AtomicBool>)>, done: Sender<Done>, hwnd: HWND) -> std::io::Result<()> {
     let hwnd = hwnd as usize;
     std::thread::Builder::new().name("worker".into()).stack_size(1 << 20).spawn(move || {
-        for order in orders {
+        for (order, cancel) in orders {
             // Background work (a timed check, the first look after sign-in) runs at lower CPU, I/O and memory
             // priority, so it never gets in the way.
             let background = order.background;
@@ -327,7 +327,9 @@ impl Shell {
         if !paused {
             if let Some(order) = self.app.next_order() {
                 self.sent_at = Some(Instant::now());
-                if let Err(mpsc::SendError(order)) = self.orders.send(order) {
+                // A flag belongs to exactly one order. A late cancellation can never poison its successor.
+                self.cancel = Arc::new(AtomicBool::new(false));
+                if let Err(mpsc::SendError((order, _))) = self.orders.send((order, self.cancel.clone())) {
                     // Only if the worker died; the job fails like any other, so nothing waits for it forever.
                     let why = "the worker thread stopped; quit and start Tiny Skill Sync again".to_string();
                     let failed = Done {
@@ -418,6 +420,7 @@ impl Shell {
 
     /// Uses new settings. `tell` says what is wrong with them, for settings changed outside the app.
     fn apply_cfg(&mut self, cfg: Config, tell: bool) {
+        self.cancel.store(true, Ordering::Relaxed);
         if tell {
             let now = now_secs();
             for problem in cfg.problems() {
@@ -540,6 +543,9 @@ pub fn take_diff() -> Option<Shown> {
 pub fn want(job: Job) -> bool {
     let queued = with_shell(|s| {
         s.feedback = None;
+        if matches!(job, Job::Resolve { .. } | Job::Remove { .. }) && matches!(s.app.busy(), Some(Job::Poll | Job::Check(_) | Job::DeleteGone(_))) {
+            s.cancel.store(true, Ordering::Relaxed);
+        }
         s.app.want(job)
     });
     kick();
@@ -707,7 +713,7 @@ fn shutdown() {
         loop {
             if s.app.busy().is_none() {
                 let Some(order) = s.app.next_order() else { break };
-                if s.orders.send(order).is_err() {
+                if s.orders.send((order, Arc::new(AtomicBool::new(false)))).is_err() {
                     break;
                 }
             }

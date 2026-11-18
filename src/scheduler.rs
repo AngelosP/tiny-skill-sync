@@ -112,6 +112,15 @@ impl Schedule {
 
     fn due_of(&self, cfg: &Config, repo: &RepoConfig, state: &State, now: UnixSecs) -> UnixSecs {
         let recorded = state.repo(&repo.id);
+        if recorded.is_some_and(|r| r.searches.values().any(|h| !h.paused && !h.complete)) {
+            if let Some(retry) = self.retry.get(&repo.id) {
+                return retry.not_before;
+            }
+            if let Some(at) = recorded.and_then(|r| r.history_retry_at) {
+                return at.min(now + LONGEST_WAIT_SECS);
+            }
+            return recorded.and_then(|r| r.last_check).map_or(now, |at| at.min(now) + 30);
+        }
         let unsettled = recorded.is_some_and(|r| r.last_check.is_some() && r.etag.is_none());
         if unsettled && !self.checked.contains(&repo.id) {
             return now;
