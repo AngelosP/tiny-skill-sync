@@ -123,6 +123,12 @@ public static class TssLive {
     // Waits until the desktop has been composed again, so that what was just painted is on the screen.
     [DllImport("dwmapi.dll")] public static extern int DwmFlush();
 
+    [DllImport("user32.dll")] static extern bool RedrawWindow(IntPtr hwnd, IntPtr rect, IntPtr region, uint flags);
+
+    // Makes one control paint itself again at once, and nothing else: what a control does when the mouse comes onto it
+    // or it is clicked (control.rs, invalidate). RDW_INVALIDATE | RDW_UPDATENOW.
+    public static bool Repaint(IntPtr hwnd) { return RedrawWindow(hwnd, IntPtr.Zero, IntPtr.Zero, 0x0001 | 0x0100); }
+
     // How much a part of a picture varies: the largest difference in any one colour between two of its pixels. A part
     // that was drawn has text, a glyph or a border in it; one that was not is a single flat colour.
     public static int Contrast(string path, int x, int y, int w, int h) {
@@ -137,6 +143,23 @@ public static class TssLive {
                 }
             }
             return Math.Max(0, Math.Max(hi[0] - lo[0], Math.Max(hi[1] - lo[1], hi[2] - lo[2])));
+        }
+    }
+
+    // How many pixels of a part differ between two pictures of the same window by more than 16 in any one colour, or
+    // -1 when the pictures are not the same size.
+    public static int Differ(string pathA, string pathB, int x, int y, int w, int h) {
+        using (Bitmap a = new Bitmap(pathA))
+        using (Bitmap b = new Bitmap(pathB)) {
+            if (a.Width != b.Width || a.Height != b.Height) return -1;
+            int n = 0;
+            for (int j = Math.Max(0, y); j < Math.Min(a.Height, y + h); j++) {
+                for (int i = Math.Max(0, x); i < Math.Min(a.Width, x + w); i++) {
+                    Color p = a.GetPixel(i, j), q = b.GetPixel(i, j);
+                    if (Math.Abs(p.R - q.R) > 16 || Math.Abs(p.G - q.G) > 16 || Math.Abs(p.B - q.B) > 16) n++;
+                }
+            }
+            return n;
         }
     }
 

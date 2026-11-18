@@ -334,7 +334,9 @@ everything they show.
   id, so the focus, the hover and the scroll position survive a refresh. A window costs about 0.15 ms to make, so only
   the controls within about two screens of what is shown are made (`NEAR`); the others are made as the page scrolls to
   them, or when the window asks for one by id (`child`). 463 skills open in about 43 ms; with a control made for every
-  row it took 125 ms.
+  row it took 125 ms. The controls of a page never overlap: they are sibling windows that do not clip each other, so a
+  control that paints again by itself (under the mouse, on a click) would draw over the part of a neighbour it covers.
+  The `page.rs` tests and the e2e layout check enforce this.
 - **`paint.rs`** draws each paint into one off-screen bitmap and copies it to the screen at once, so nothing flickers.
   Rounded boxes are anti-aliased by hand (GDI cannot); text is drawn by GDI with ClearType. Positions are in DIPs and
   become pixels at the window's DPI. A control has no background of its own: it asks its parent to draw what is under

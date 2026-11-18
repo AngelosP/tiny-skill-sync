@@ -1004,13 +1004,29 @@ function Test-Painted($Shot, [IntPtr]$Window, [string]$State, [object[]]$Parts) 
     Check "${State}: the picture shows each control looked at drawn" ($bare.Count -eq 0) (($seen | ForEach-Object { "$($_.Name) varies by $($_.Contrast)" }) -join '; ')
 }
 
+# Whether a control (a pair of a panel and an id) looks the same in two pictures of the window, taken before and after
+# something else in the window painted again. Controls do not clip each other, so one that another covers loses the
+# part covered whenever that other one paints again by itself.
+function Test-Unchanged($Before, $After, [IntPtr]$Window, [string]$State, [object[]]$Part, [string]$What) {
+    if (-not $Before -or -not $After) { Check "${State}: pictures of the window were taken" $false; return }
+    if (-not ($Before.Screen -and $After.Screen)) { Note "${State}: $What was not compared, because something covered the window"; return }
+    $h = Find-Ui $Window $Part[0] $Part[1]
+    if ($h -eq [IntPtr]::Zero) { Check "${State}: $What is there" $false "no control $($Part[1]) on panel $($Part[0])"; return }
+    $w = ([TssLive]::Bounds($Window)) -split ','
+    $b = ([TssLive]::Bounds($h)) -split ','
+    $n = [TssLive]::Differ($Before.Path, $After.Path, [int]$b[0] - [int]$w[0], [int]$b[1] - [int]$w[1], [int]$b[2] - [int]$b[0], [int]$b[3] - [int]$b[1])
+    Check "${State}: $What looks the same as before" ($n -eq 0) $(if ($n -lt 0) { 'the two pictures are not the same size' } else { "$n pixels of $($Part[0])/$($Part[1]) changed" })
+}
+
 # Each part of the window shown is inside it and none is over another; inside each part, every control that can be
-# used is inside it from left to right (the pages scroll, so up and down is not checked), and none is over another.
-# Text that is not a control of its own may overlap a row on purpose, so only the controls Tab visits are looked at.
+# used is inside it from left to right (the pages scroll, so up and down is not checked), and no control, whether Tab
+# visits it or not, is over another. Controls are sibling windows that do not clip each other, so one that paints again
+# by itself (under the mouse, say) would draw over the part of another that it covers.
 function Test-Layout([IntPtr]$Window, [string]$State) {
     $name = { param($b) "$($b.Class)#$($b.Id) at $($b.X),$($b.Y) $($b.W)x$($b.H)" }
     $overlaps = {
         param($boxes)
+        $boxes = @($boxes | Where-Object { $_.W -gt 0 -and $_.H -gt 0 })
         for ($i = 0; $i -lt $boxes.Count; $i++) {
             for ($j = $i + 1; $j -lt $boxes.Count; $j++) {
                 $a = $boxes[$i]; $b = $boxes[$j]
@@ -1028,8 +1044,8 @@ function Test-Layout([IntPtr]$Window, [string]$State) {
     foreach ($o in @(& $overlaps $panels)) { $over.Add('panels: ' + $o) }
     foreach ($p in $panels) {
         $width = [int](([TssLive]::Client($p.Handle)) -split ',')[0]
-        $boxes = @(Get-Layout $p.Handle | Where-Object { $_.Shown -and $_.Tab })
-        foreach ($b in $boxes) { if ($b.X -lt 0 -or $b.X + $b.W -gt $width) { $outside.Add("in $($p.Id): " + (& $name $b)) } }
+        $boxes = @(Get-Layout $p.Handle | Where-Object { $_.Shown })
+        foreach ($b in @($boxes | Where-Object { $_.Tab })) { if ($b.X -lt 0 -or $b.X + $b.W -gt $width) { $outside.Add("in $($p.Id): " + (& $name $b)) } }
         foreach ($o in @(& $overlaps $boxes)) { $over.Add("in $($p.Id): " + $o) }
     }
     Check "${State}: every part and control is inside the window" ($outside.Count -eq 0) ($outside -join '; ')
@@ -1345,10 +1361,18 @@ function Test-Ui {
         if ($null -eq $edited) { return }
         $texts = @($edited.Buttons | ForEach-Object { $_.Text })
         Check 'its row opens by itself, says what changed (not my own file), and offers Show changes, Use the GitHub version and Keep my version' ($edited.Detail -match '^Edited locally' -and $edited.Detail -notmatch 'my-notes' -and $texts -contains 'Show changes' -and $texts -contains 'Use the GitHub version' -and $texts -contains 'Keep my version') ("$($edited.Detail) / " + ($texts -join ', '))
+        # The details paint themselves last, so this picture has them whole whatever order the window painted in (08b
+        # compares them with a picture taken after their row painted again).
+        [void][TssLive]::Repaint((Get-Ui $win $UiPanel.Page ($edited.Id + 1)))
         $pic = Save-Shot $win '08-skill-edited'
         Test-Painted $pic $win 'an edited skill' @(@($UiPanel.Hero, $UiId.HeroTitle), @($UiPanel.Page, $edited.Id), @($UiPanel.Page, ($edited.Id + 1)), @($UiPanel.Page, ($edited.Id + 2)))
         Test-Layout $win 'an edited skill'
         Test-TabOrder $win 'an edited skill'
+        # Its row paints again by itself, as it does when the mouse comes onto it or it is clicked: the details under it
+        # must stay whole (issue #1: their top was painted over until the whole page painted again).
+        [void][TssLive]::Repaint((Get-Ui $win $UiPanel.Page $edited.Id))
+        $again = Save-Shot $win '08b-skill-row-repainted'
+        Test-Unchanged $pic $again $win 'an edited skill whose row painted again' @($UiPanel.Page, ($edited.Id + 1)) 'the text under the row'
 
         # ---- Show changes, and back
         # Meanwhile GitHub gives alpha a library of 32 reference files and removes its guide; the edit holds that update.

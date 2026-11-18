@@ -616,7 +616,7 @@ fn skills(o: &mut Out, p: &RepoPage, x: i32, mut y: i32, cw: i32) -> i32 {
             continue;
         }
         let (dx, dw) = (x + 44, cw - 44 - 16);
-        y += o.para(base + 1, [dx, y - 6, dw], printable_lines(&row.text), Font::Caption, Role::Text2) - 6 + 10;
+        y += o.para(base + 1, [dx, y, dw], printable_lines(&row.text), Font::Caption, Role::Text2) + 10;
         let mut buttons = Vec::new();
         if row.can_compare() {
             let kind = if row.actions.contains(&Action::Overwrite) { Kind::Accent } else { Kind::Standard };
@@ -1265,11 +1265,22 @@ mod tests {
         s.items.iter().find(|i| i.id == n).unwrap_or_else(|| panic!("no control {n} in {:?}", texts(s)))
     }
 
+    /// Every control is inside 0..w from left to right, and none is over another: controls are sibling windows that do
+    /// not clip each other, so one that paints again by itself draws over any part of another that it covers.
     fn fits_in(s: &Surface, w: i32) {
-        for i in &s.items {
-            let [x, _, iw, _] = i.at;
+        let mut over = Vec::new();
+        for (k, i) in s.items.iter().enumerate() {
+            let [x, y, iw, ih] = i.at;
             assert!(x >= 0 && iw >= 0 && x + iw <= w, "{} ({:?}) is outside 0..{w}: {:?}", i.id, i.text, i.at);
+            for j in &s.items[k + 1..] {
+                let [jx, jy, jw, jh] = j.at;
+                let empty = iw <= 0 || ih <= 0 || jw <= 0 || jh <= 0;
+                if !empty && x < jx + jw && jx < x + iw && y < jy + jh && jy < y + ih {
+                    over.push(format!("{} ({:?}) at {:?} is over {} ({:?}) at {:?}", i.id, i.text, i.at, j.id, j.text, j.at));
+                }
+            }
         }
+        assert!(over.is_empty(), "controls overlap:\n{}", over.join("\n"));
     }
 
     #[test]
