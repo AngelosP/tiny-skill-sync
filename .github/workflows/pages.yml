@@ -1,7 +1,7 @@
 # Publishes the one-page site in site\ to GitHub Pages: https://angelosp.github.io/tiny-skill-sync/
-# Runs on a push to main that changes site\ or this file, and by hand (Actions, Pages, Run workflow). There is no build
-# step: site\ is published as it is. It needs Pages turned on once, with "GitHub Actions" as the source
-# (Settings, Pages). See CONTRIBUTING.md, "The web page".
+# Runs on a push to main that changes site\, the demo GIF or this file, and by hand (Actions, Pages, Run workflow).
+# There is no build step: site\ is published as it is, plus a copy of docs\demo.gif. It needs Pages turned on once,
+# with "GitHub Actions" as the source (Settings, Pages). See CONTRIBUTING.md, "The web page".
 name: Pages
 
 on:
@@ -9,6 +9,7 @@ on:
     branches: [main]
     paths:
       - 'site/**'
+      - 'docs/demo.gif'
       - '.github/workflows/pages.yml'
   workflow_dispatch:
 
@@ -35,6 +36,9 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+
+      - name: Add the demo GIF
+        run: cp docs/demo.gif site/demo.gif
 
       - name: Check the site's settings
         uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d # v6.0.0

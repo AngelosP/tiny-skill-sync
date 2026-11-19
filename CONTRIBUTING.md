@@ -172,6 +172,9 @@ commit and relative times change.
 
 Raw shots, `story.json`, decoded `frame-*.png` files and both encodings are left in `bench\out\demo-*`.
 Inspect every frame for clipped text, blank areas and private information before committing `docs\demo.gif`.
+The web page shows the same GIF: `.github\workflows\pages.yml` copies `docs\demo.gif` into the published site, so a new
+GIF reaches the page by itself on the next push to `main`. Keep the page's caption (`site\index.html`) and the
+README's caption the same.
 To re-encode those same captures without another live run:
 
 ```powershell
