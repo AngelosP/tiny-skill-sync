@@ -9,6 +9,8 @@ from PIL import Image, ImageDraw, ImageFont
 
 SIZE = (960, 760)
 MAX_BYTES = 5_000_000
+# The healthy tray icon, written from src\logo.rs by `scripts\dev.ps1 logo`.
+LOGO = Path(__file__).resolve().parent.parent / "assets" / "logo-48.png"
 
 
 def font(size, bold=False):
@@ -41,7 +43,9 @@ def compose(scene, source, index, count, stroke):
     draw.rounded_rectangle(box, radius=5, outline="#ffbd59", width=stroke)
 
     if scene["tray"]:
-        draw.ellipse((25, 719, 47, 741), fill="#2d7dd2")
+        with Image.open(LOGO) as logo:
+            icon = logo.convert("RGBA").resize((24, 24), Image.Resampling.LANCZOS)
+        image.paste(icon, (24, 718), icon)
     text(draw, (58 if scene["tray"] else 24, 716), scene["footer"], font(16), "#e0e8ef", 875)
     for step in range(count):
         start = 24 + step * 154

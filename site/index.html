@@ -13,11 +13,9 @@
   <meta property="og:title" content="Tiny Skill Sync">
   <meta property="og:description" content="A tiny Windows tray app that keeps your user-level Copilot skills in sync with GitHub repositories.">
   <meta property="og:url" content="https://angelosp.github.io/tiny-skill-sync/">
-  <!-- PLACEHOLDER(#6): add <meta property="og:image" content="https://angelosp.github.io/tiny-skill-sync/LOGO.png"> once the logo exists. -->
-  <!-- PLACEHOLDER(#6): favicon. Replace the empty icon below with the favicon from #6, for example
-       <link rel="icon" href="favicon.svg" type="image/svg+xml"> and <link rel="icon" href="favicon-32.png" sizes="32x32">.
-       The empty icon stops browsers asking for /favicon.ico, which is outside this site. -->
-  <link rel="icon" href="data:,">
+  <meta property="og:image" content="https://angelosp.github.io/tiny-skill-sync/logo-256.png">
+  <link rel="icon" href="logo.svg" type="image/svg+xml">
+  <link rel="icon" href="favicon.ico" sizes="16x16 32x32 48x48">
   <link rel="stylesheet" href="style.css">
 </head>
 <body>
@@ -25,9 +23,7 @@
 
   <header class="top">
     <div class="wrap bar">
-      <!-- PLACEHOLDER(#6): logo. Put the logo before the name, for example
-           <img src="logo.svg" alt="" width="32" height="32">. Keep alt empty: the name next to it says the same. -->
-      <a class="brand" href="./">Tiny Skill Sync</a>
+      <a class="brand" href="./"><img src="logo.svg" alt="" width="32" height="32">Tiny Skill Sync</a>
       <nav aria-label="On this page">
         <ul>
           <li><a href="#features">What it does</a></li>
@@ -153,9 +149,10 @@
         </li>
         <li>
           <p>Unzip it into a folder of your choice, for example
-            <code>%LOCALAPPDATA%\Programs\tiny-skill-sync</code>, and start <code>tiny-skill-sync.exe</code>. A round
-            icon appears in the notification area. The exes are not signed, so Windows may ask before the first start:
-            choose <strong>More info</strong>, then <strong>Run anyway</strong>.</p>
+            <code>%LOCALAPPDATA%\Programs\tiny-skill-sync</code>, and start <code>tiny-skill-sync.exe</code>. Its icon,
+            a blue tile with two sync arrows round a spark, appears in the notification area. The exes are not signed,
+            so Windows may ask before the first start: choose <strong>More info</strong>, then <strong>Run
+            anyway</strong>.</p>
         </li>
         <li>
           <p>Click the icon to open the window. Click <strong>Add repository</strong>, paste the address of a GitHub

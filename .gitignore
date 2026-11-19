@@ -6,8 +6,11 @@
 /spikes/out/
 /bench/out/
 
-# The site's copy of docs\demo.gif, made by the Pages workflow and for a local preview
+# The site's copies of docs\demo.gif and the logo files, made by the Pages workflow and for a local preview
 /site/demo.gif
+/site/logo.svg
+/site/logo-256.png
+/site/favicon.ico
 
 # Test artifacts
 /.tss-test/
