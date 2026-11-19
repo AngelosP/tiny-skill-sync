@@ -6,6 +6,9 @@
 /spikes/out/
 /bench/out/
 
+# The site's copy of docs\demo.gif, made by the Pages workflow and for a local preview
+/site/demo.gif
+
 # Test artifacts
 /.tss-test/
 *.tmp

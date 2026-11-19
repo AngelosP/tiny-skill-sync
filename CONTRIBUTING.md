@@ -274,6 +274,31 @@ release would build, without publishing anything: `gh workflow run release.yml`,
 The workflow uses the Rust version in its `RUSTUP_TOOLCHAIN`, so a new clippy lint cannot block a release. Raise it when
 you move to a newer Rust here.
 
+## The web page
+
+`site\` holds the project's one-page site, `https://angelosp.github.io/tiny-skill-sync/`: `index.html` and
+`style.css`, plain HTML and CSS with no build step. It follows the device's light or dark mode with the app's colours
+(`src\win\ui\theme.rs`). Keep its wording in step with the README and [docs/GUIDE.md](docs/GUIDE.md). It shows the
+README's demo, `docs\demo.gif`, which has no second copy in the repository. Comments marked `PLACEHOLDER` show where
+the logo and the favicon go.
+
+**Preview it** with any static server, then open `http://127.0.0.1:8765/`. Copy the GIF in first (git ignores the
+copy):
+
+```powershell
+Copy-Item docs\demo.gif site\demo.gif
+python -m http.server 8765 --bind 127.0.0.1 --directory site
+```
+
+Check it in light and dark mode, in a narrow and a wide window, and with the keyboard alone (Tab, Enter). Stop the
+server afterwards (Ctrl+C).
+
+**Publishing.** `.github\workflows\pages.yml` copies `docs\demo.gif` into `site\` and publishes `site\`, on every push
+to `main` that changes `site\`, the GIF or the workflow, and by hand (`gh workflow run pages.yml`). Only what is in
+`site\` is published, so any other picture the page shows must be in `site\`. Pages is turned on with **GitHub
+Actions** as the source (**Settings**, **Pages**, **Build and deployment**); on GitHub Free that needs a public
+repository. The site is public, and its download links work only while the releases are public.
+
 ## Spikes
 
 `examples\` and `spikes\` hold the experiments the design was based on. They are not part of the app and are built only
