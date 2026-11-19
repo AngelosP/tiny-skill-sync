@@ -1294,11 +1294,17 @@ function Test-SkillCard($c, [IntPtr]$Window) {
             $dpi = [int][TssLive]::GetDpiForWindow($Window)
             $px = { param([int]$Dips) [int][math]::Round($Dips * $dpi / 96) }
             $wb = ([TssLive]::Bounds($Window)) -split ','
-            $rb = ([TssLive]::Bounds($rowH)) -split ','
-            $cy = [int](([int]$rb[1] + [int]$rb[3]) / 2)
+            # The pointer can be resting on the repository list (Test-ListHover puts it back where it was), which is
+            # then wide and the page narrower, so the rows are lower. Moved away, the list narrows and the rows move up:
+            # where the row is, is read only after that.
+            $nav = [TssLive]::GetDlgItem($Window, $UiPanel.Nav)
             Move-Pointer ([TssLive]::GetDlgItem($Window, $UiPanel.Hero))
+            $narrow = Wait-Maybe { if ([math]::Abs((Get-Width $nav) - (& $px 248)) -le 1) { $true } } 3 25
             Start-Sleep -Milliseconds 300
             $away = Save-Shot $Window '05e-row-mouse-away'
+            $at = [TssLive]::Bounds($rowH)
+            $rb = $at -split ','
+            $cy = [int](([int]$rb[1] + [int]$rb[3]) / 2)
             # The status pill is as wide as its words, so its left edge is found in the picture. The button, 32 wide,
             # is 8 left of it: its middle is 24 left of the pill.
             $pill = if ($away) { [TssLive]::LeftEdge($away.Path, [int]$rb[2] - [int]$wb[0] - (& $px 8), $cy - [int]$wb[1]) } else { -1 }
@@ -1309,13 +1315,14 @@ function Test-SkillCard($c, [IntPtr]$Window) {
             [void][TssLive]::SetCursorPos($zx, $cy)
             Start-Sleep -Milliseconds 300
             $onButton = Save-Shot $Window '05g-row-mouse-on-folder-button'
+            $still = ([TssLive]::Bounds($rowH)) -eq $at
             $zone = @(($zx - [int]$wb[0] - (& $px 16)), ($cy - [int]$wb[1] - (& $px 16)), (& $px 32), (& $px 32))
             $name = @(([int]$rb[0] - [int]$wb[0] + (& $px 44)), ([int]$rb[1] - [int]$wb[1]), (& $px 120), ([int]$rb[3] - [int]$rb[1]))
-            $ok = $pill -gt 0 -and $away -and $onRow -and $onButton
+            $ok = $narrow -and $still -and $pill -gt 0 -and $away -and $onRow -and $onButton
             $shows = if ($ok) { [TssLive]::Differ($away.Path, $onRow.Path, $zone[0], $zone[1], $zone[2], $zone[3]) } else { -1 }
             $lit = if ($ok) { [TssLive]::Differ($onRow.Path, $onButton.Path, $zone[0], $zone[1], $zone[2], $zone[3]) } else { -1 }
             $calm = if ($ok) { [TssLive]::Differ($onRow.Path, $onButton.Path, $name[0], $name[1], $name[2], $name[3]) } else { -1 }
-            Check 'a row shows an Open folder button while the mouse is on it, and lights only that button under the mouse' ($shows -gt 0 -and $lit -gt 0 -and $calm -eq 0) "pill at x $pill; with the mouse on the row $shows pixels of the button appear; on the button $lit of them change, and $calm of the name"
+            Check 'a row shows an Open folder button while the mouse is on it, and lights only that button under the mouse' ($shows -gt 0 -and $lit -gt 0 -and $calm -eq 0) "list narrow: $($null -ne $narrow); row at $at, still there: $still; pill at x $pill; with the mouse on the row $shows pixels of the button appear; on the button $lit of them change, and $calm of the name"
             Test-Layout $Window 'the mouse on the folder button of a row'
             # Clicked, it opens the folder, and the row stays open.
             $target = [TssLive]::LongPath($path)
