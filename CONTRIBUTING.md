@@ -30,6 +30,7 @@ Start with `scripts\dev.ps1`; it runs the others.
 | `scripts\dev.ps1 soak` | Leave the release app running for 75 minutes against a repository that changes every 10 minutes, and sample its memory, handles, threads, CPU and file I/O. `-Minutes`, `-Every`, `-ChangeEveryMinutes`, `-Keep`. |
 | `scripts\dev.ps1 demo` | Make `docs\demo.gif` from the real app and disposable public fixture data. `-Python PATH`, `-SkipBuild`. See [Remaking the README demo](#remaking-the-readme-demo). |
 | `scripts\dev.ps1 clean` | Close the sandbox copy and any copy a live script left running, and delete the sandbox, test and live-script leftovers in `%TEMP%` and `bench\out`, and the test copies' Start with Windows keys (`HKCU\Software\tiny-skill-sync-test`). Keeps `target\`. |
+| `scripts\dev.ps1 logo` | Write the files in `assets\` again from `src\logo.rs`: `logo.svg`, `logo-16.png` to `logo-256.png`, `favicon.ico` and `tiny-skill-sync.ico` (the exes' icon). Run it after changing the logo, look at the files, and commit them with the change; a test fails while they differ from what the code draws. |
 
 The **sandbox** is `.tss-test\` in the repository (ignored by git): its own settings (`.tss-test\home`) and skills
 folder (`.tss-test\skills`), set through `TSS_HOME` and `TSS_SKILLS_DIR`. A sandbox copy of the tray runs beside a
@@ -48,7 +49,7 @@ scripts\dev.ps1 test
 ```
 
 This runs `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings` and `cargo test --no-fail-fast`. All three
-must pass. There are 526 tests (329 in the library, 197 integration tests); the whole gate takes about 40 seconds when
+must pass. There are 554 tests (351 in the library, 203 integration tests); the whole gate takes about 40 seconds when
 the code is already built.
 
 If the change can affect speed, memory or disk use (startup, verification, the poll, the tray, the window),
@@ -253,8 +254,9 @@ The recorded results and their test conditions are in [the user guide](docs/GUID
 keeps the tray exe at 1,045,504 bytes, under its 1 MiB budget (in the earlier comparison, `opt-level = "s"` made it
 1.01 MiB, `opt-level = 3` larger still). It costs about 12% of SHA-1 speed (339 MB/s instead of 384) and nothing the
 bench can see. `build.rs` embeds
-`app.manifest` (common controls 6, per-monitor DPI, long paths, UTF-8) and a version resource: the name and version
-Windows shows for each exe, as in Task Manager's startup apps (about 1 KiB).
+`app.manifest` (common controls 6, per-monitor DPI, long paths, UTF-8), a version resource: the name and version
+Windows shows for each exe, as in Task Manager's startup apps (about 1 KiB), and the icon, `assets\tiny-skill-sync.ico`
+(about 13 KB).
 
 ## Releases
 

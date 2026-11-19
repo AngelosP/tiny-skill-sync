@@ -1,19 +1,22 @@
-//! The notification-area icon: one picture per [`Health`], drawn at run time, and the tooltip.
+//! The notification-area icon: the logo in one look per [`Health`], drawn at run time for the taskbar's scale, and the
+//! tooltip.
 
 use std::cell::RefCell;
 use std::ffi::c_void;
 use std::mem::{size_of, zeroed};
-use std::ptr::null_mut;
+use std::ptr::{null, null_mut};
 
 use windows_sys::Win32::Foundation::HWND;
 use windows_sys::Win32::Graphics::Gdi::{BI_RGB, BITMAPINFO, BITMAPINFOHEADER, CreateBitmap, CreateDIBSection, DIB_RGB_COLORS, DeleteObject};
-use windows_sys::Win32::UI::HiDpi::{GetDpiForSystem, GetSystemMetricsForDpi};
+use windows_sys::Win32::UI::HiDpi::{GetDpiForSystem, GetDpiForWindow, GetSystemMetricsForDpi};
 use windows_sys::Win32::UI::Shell::{
     NIF_ICON, NIF_MESSAGE, NIF_SHOWTIP, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY, NIM_SETVERSION, NOTIFYICON_VERSION_4, NOTIFYICONDATAW, Shell_NotifyIconW,
 };
-use windows_sys::Win32::UI::WindowsAndMessaging::{CreateIconIndirect, DestroyIcon, HICON, ICONINFO, SM_CXSMICON, WM_APP};
+use windows_sys::Win32::UI::WindowsAndMessaging::{CreateIconIndirect, DestroyIcon, FindWindowW, HICON, ICONINFO, SM_CXSMICON, WM_APP};
 
 use crate::board::Health;
+use crate::logo::{self, Look};
+use crate::win::wide;
 
 /// Sent to the main window when the user does something with the icon.
 pub const WM_TRAY: u32 = WM_APP + 1;
@@ -46,8 +49,43 @@ thread_local! {
 
 /// Prepares the icon for `hwnd`. Nothing is shown until [`show`].
 pub fn init(hwnd: HWND) {
-    let size = unsafe { GetSystemMetricsForDpi(SM_CXSMICON, GetDpiForSystem()) }.max(16);
+    let size = taskbar_size();
     TRAY.with(|t| *t.borrow_mut() = Some(Tray { hwnd, size, icons: [null_mut(); 6], shown: None, want: None }));
+}
+
+/// The size of a notification-area icon at the taskbar's DPI. The app's own system DPI is fixed when it starts, so it
+/// would miss a change of scale made while it runs.
+fn taskbar_size() -> i32 {
+    unsafe {
+        let taskbar = FindWindowW(wide("Shell_TrayWnd").as_ptr(), null());
+        let dpi = if taskbar.is_null() { 0 } else { GetDpiForWindow(taskbar) };
+        let dpi = if dpi == 0 { GetDpiForSystem() } else { dpi };
+        GetSystemMetricsForDpi(SM_CXSMICON, dpi).max(16)
+    }
+}
+
+/// The display or its scale may have changed: draws the icon again if the taskbar now wants another size.
+pub fn rescale() {
+    let size = taskbar_size();
+    let old = TRAY.with(|t| {
+        let mut t = t.try_borrow_mut().ok()?;
+        let t = t.as_mut()?;
+        if t.size == size {
+            return None;
+        }
+        t.size = size;
+        // So that `show` updates it: adding it fails while it is there, and then it is modified.
+        t.shown = None;
+        Some((std::mem::replace(&mut t.icons, [null_mut(); 6]), t.want.clone()))
+    });
+    let Some((icons, want)) = old else { return };
+    if let Some((health, tip)) = want {
+        show(health, &tip);
+    }
+    // Only after the shell has the new icon: it may still be drawing the old one.
+    for icon in icons.into_iter().filter(|i| !i.is_null()) {
+        unsafe { DestroyIcon(icon) };
+    }
 }
 
 fn data(hwnd: HWND) -> NOTIFYICONDATAW {
@@ -132,58 +170,22 @@ pub fn remove() {
     }
 }
 
-const BLUE: u32 = 0x2D7DD2;
-const GREY: u32 = 0x8A8A8A;
-const AMBER: u32 = 0xD98C00;
-const RED: u32 = 0xD13438;
-const WHITE: u32 = 0xFFFFFF;
-
-/// Distance from `(x, y)` to the segment `a`–`b`, minus `half_width`: negative inside the stroke.
-fn segment(x: f32, y: f32, a: (f32, f32), b: (f32, f32), half_width: f32) -> f32 {
-    let (px, py, bx, by) = (x - a.0, y - a.1, b.0 - a.0, b.1 - a.1);
-    let h = ((px * bx + py * by) / (bx * bx + by * by)).clamp(0.0, 1.0);
-    (px - bx * h).hypot(py - by * h) - half_width
-}
-
-/// How much of a pixel a shape covers, from its signed distance in pixels.
-fn coverage(distance: f32) -> f32 {
-    (0.5 - distance).clamp(0.0, 1.0)
-}
-
-fn mix(a: u32, b: u32, t: f32) -> u32 {
-    let channel = |shift: u32| {
-        let (ca, cb) = (((a >> shift) & 0xFF) as f32, ((b >> shift) & 0xFF) as f32);
-        ((ca + (cb - ca) * t).round() as u32) << shift
-    };
-    channel(16) | channel(8) | channel(0)
-}
-
-/// The colour and coverage of one pixel, `(x, y)` measured from the centre, in an icon of radius `r`.
-fn pixel(health: Health, x: f32, y: f32, r: f32) -> (u32, f32) {
-    let disc = x.hypot(y) - r;
-    let ring = |colour| {
-        let thickness = (0.32 * r).max(1.6);
-        (colour, coverage((disc + thickness / 2.0).abs() - thickness / 2.0))
-    };
+/// How the logo shows each state: the colour says how things are, and a hollow logo says the app is busy or has nothing
+/// to do.
+fn look(health: Health) -> Look {
     match health {
-        Health::Ok => (BLUE, coverage(disc)),
-        Health::Working | Health::Waiting => ring(BLUE),
-        Health::NotConfigured => ring(GREY),
-        Health::Attention => {
-            let bar = segment(x, y, (0.0, -0.55 * r), (0.0, 0.1 * r), 0.14 * r);
-            let dot = x.hypot(y - 0.5 * r) - 0.15 * r;
-            (mix(AMBER, WHITE, coverage(bar.min(dot))), coverage(disc))
-        }
-        Health::Error => {
-            let d = 0.38 * r;
-            let cross = segment(x, y, (-d, -d), (d, d), 0.13 * r).min(segment(x, y, (-d, d), (d, -d), 0.13 * r));
-            (mix(RED, WHITE, coverage(cross)), coverage(disc))
-        }
+        Health::Ok => Look::Solid(logo::BLUE),
+        Health::Working | Health::Waiting => Look::Hollow(logo::BLUE),
+        Health::NotConfigured => Look::Hollow(logo::GREY),
+        Health::Attention => Look::Solid(logo::AMBER),
+        Health::Error => Look::Solid(logo::RED),
     }
 }
 
-/// A round, anti-aliased icon `size` pixels square. The caller destroys it.
+/// The logo in the look of `health`, `size` pixels square, drawn for that size. The caller destroys it.
 pub fn icon(health: Health, size: i32) -> HICON {
+    let size = size.max(1);
+    let drawn = logo::draw(look(health), size as u32);
     unsafe {
         let mut bmi: BITMAPINFO = zeroed();
         bmi.bmiHeader.biSize = size_of::<BITMAPINFOHEADER>() as u32;
@@ -197,17 +199,8 @@ pub fn icon(health: Health, size: i32) -> HICON {
         if color.is_null() || bits.is_null() {
             return null_mut();
         }
-        let pixels = std::slice::from_raw_parts_mut(bits.cast::<u32>(), (size * size) as usize);
-        let half = size as f32 / 2.0;
-        let r = half - 0.5;
-        for y in 0..size {
-            for x in 0..size {
-                let (colour, cover) = pixel(health, x as f32 + 0.5 - half, y as f32 + 0.5 - half, r);
-                // Icons take straight (not premultiplied) alpha.
-                let alpha = (cover * 255.0).round() as u32;
-                pixels[(y * size + x) as usize] = if alpha == 0 { 0 } else { (alpha << 24) | colour };
-            }
-        }
+        // Icons take straight (not premultiplied) alpha, which is what the logo is drawn in.
+        std::slice::from_raw_parts_mut(bits.cast::<u32>(), drawn.len()).copy_from_slice(&drawn);
         // All zero: with a 32-bit colour bitmap the alpha channel decides, not the mask.
         let mask_bits = vec![0u8; ((size + 15) / 16 * 2 * size) as usize];
         let mask = CreateBitmap(size, size, 1, 1, mask_bits.as_ptr().cast());
@@ -224,14 +217,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn glyphs_are_white_inside_the_disc_and_the_ring_is_hollow() {
-        let r = 15.5;
-        assert_eq!(pixel(Health::Attention, 0.0, -0.3 * r, r), (WHITE, 1.0));
-        assert_eq!(pixel(Health::Attention, 0.5 * r, 0.0, r), (AMBER, 1.0));
-        assert_eq!(pixel(Health::Error, 0.0, 0.0, r), (WHITE, 1.0));
-        assert_eq!(pixel(Health::Error, 0.0, 0.6 * r, r).0, RED);
-        assert_eq!(pixel(Health::Working, 0.0, 0.0, r).1, 0.0);
-        assert_eq!(pixel(Health::Working, 0.0, r - 1.0, r).1, 1.0);
-        assert_eq!(pixel(Health::Ok, 0.0, r + 1.0, r).1, 0.0);
+    fn each_state_the_readme_names_looks_different() {
+        assert_eq!(look(Health::Ok), Look::Solid(logo::BLUE));
+        assert_eq!(look(Health::Working), look(Health::Waiting), "both are 'busy, nothing wrong'");
+        assert!(matches!(look(Health::Working), Look::Hollow(_)), "working is hollow, so a glance tells it from fine");
+        let states = [Health::NotConfigured, Health::Ok, Health::Working, Health::Attention, Health::Error];
+        for (i, a) in states.iter().enumerate() {
+            for b in &states[i + 1..] {
+                assert_ne!(look(*a), look(*b), "{a:?} and {b:?}");
+            }
+        }
     }
 }

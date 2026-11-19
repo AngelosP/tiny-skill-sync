@@ -45,6 +45,7 @@ case by case. Code that talks to Windows is kept in `src\win\`.
 | `autostart` | Start with Windows: what the startup entry says, what it means, and which registry keys may be written. | yes |
 | `diff` | What is different between the GitHub copy of a skill and the copy on disk, line by line ("Show changes"), and a skill's files whole ("Preview"). | yes |
 | `text` | When two copies of a file are the same: line endings, the line break at the end and blank lines don't count. | yes |
+| `logo` | The app's logo: its shapes, drawn to pixels at any size (the tray and window icons) and as SVG (see [below](#the-tray-and-the-window)). | yes |
 | `state` | `state.json`, the ownership record: what the app installed, file by file. | file I/O |
 | `verify` | Is a skill folder on disk still what was installed? | file I/O |
 | `apply` | The only module that moves or deletes anything in the skills folder. | file I/O |
@@ -423,6 +424,20 @@ everything they show.
 - **`dialogs.rs`** asks questions in a small modal window drawn the same way, with a native edit box for typing. It is
   not `TaskDialogIndirect`, which lives only in comctl32 version 6; the test executables do not load that, so importing
   it would stop them from starting.
+- **The icons** are the logo, which `logo.rs` describes as three shapes in a square from -1 to 1: a rounded tile, two
+  sync arrows (a circle cut to two arcs, a round tail, a triangle head) and a four-point spark (four parabolas through
+  the centre). `logo::draw` decides each pixel from 16 samples (4 by 4) inside or outside the shapes, so the edges are
+  smooth at any size, and gives straight-alpha pixels, which `tray::icon` copies into a 32-bit icon. Nothing is scaled:
+  each icon is drawn at the exact size Windows asks for. The tray draws the icon at the small-icon size of the
+  taskbar's DPI, one picture per `Health` made the first time it is shown (solid blue, amber or red, or hollow blue
+  or grey: the colour says how things are), and draws them again when the display or its scale changes
+  (`tray::rescale`, on `WM_DISPLAYCHANGE`, `WM_DPICHANGED`, `WM_SETTINGCHANGE` and `TaskbarCreated`). The window
+  draws its big and small icons at its own DPI when it opens and when it moves to a screen with another scale. The
+  drawing uses no trigonometry (the arrows' directions are written out as numbers, checked by a test): with `atan2`,
+  `sin` and `cos` the tray exe was 16 KB larger. The files in `assets\` are made from the same code by a test-only PNG and
+  ICO writer (`src\logo\files.rs`): `logo.svg`, `logo-16.png` to `logo-256.png`, `favicon.ico` (16, 32 and 48) and
+  `tiny-skill-sync.ico` (16 to 256), which `build.rs` puts into both exes as their icon (about 13 KB). A test fails
+  when a file there is not what the code draws; `scripts\dev.ps1 logo` writes them again.
 
 A window procedure can be entered again while it runs (a control notifies its parent from inside the call that changed
 it). So the UI state lives in thread-local `RefCell`s borrowed only with `try_borrow_mut`, and no borrow is held across a
@@ -473,7 +488,8 @@ no case and in either form of this exe's path. `win\autorun.rs` reads and writes
 `--background` is all a start at sign-in changes: no window (unless `config.json` can't be read, which the window
 says), the 30-second wait described in [Threads and waking up](#threads-and-waking-up), and a second start while a copy
 runs ends at once with 0 instead of opening that copy's window. `build.rs` writes a version resource into both exes
-(about 1 KiB), so Task Manager names the entry "Tiny Skill Sync" rather than the exe's file name.
+(about 1 KiB), so Task Manager names the entry "Tiny Skill Sync" rather than the exe's file name, and the logo as their
+icon (`RT_ICON` and `RT_GROUP_ICON` from `assets\tiny-skill-sync.ico`), so Settings, Explorer and a taskbar pin show it.
 
 ## Measuring
 
@@ -500,3 +516,4 @@ text fits (`scripts\e2e-lib.ps1`). See [CONTRIBUTING.md](CONTRIBUTING.md#live-en
 | How two copies of a file are compared | `text.rs` (when they are the same), `diff.rs` (Show changes) |
 | The windows | `win\ui\window.rs`, `win\ui\tray.rs`, `win\ui\dialogs.rs` |
 | How the windows look | `win\ui\control.rs` (controls), `win\ui\paint.rs` (drawing), `win\ui\theme.rs` (colours) |
+| The logo and the icons | `logo.rs` (the shapes; then `scripts\dev.ps1 logo`), `win\ui\tray.rs` (the look of each state), `build.rs` (the exes' icon) |

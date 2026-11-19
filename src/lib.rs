@@ -15,6 +15,7 @@ pub mod fsx;
 pub mod github;
 pub mod hash;
 pub mod interval;
+pub mod logo;
 pub mod pathsafe;
 pub mod reconcile;
 pub mod scheduler;

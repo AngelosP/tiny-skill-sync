@@ -1,7 +1,8 @@
-//! Embeds `app.manifest` (visual styles, per-monitor DPI, UTF-8, long-path opt-in, no elevation) and a version resource
-//! (the name and version Windows shows for the program, as in Task Manager's startup apps) into the executables with
-//! the MSVC linker. No resource compiler or extra crate is needed: the version resource is written here as a `.res`
-//! file, which the linker takes as it is.
+//! Embeds `app.manifest` (visual styles, per-monitor DPI, UTF-8, long-path opt-in, no elevation), a version resource
+//! (the name and version Windows shows for the program, as in Task Manager's startup apps) and the icon
+//! (`assets\tiny-skill-sync.ico`, which Explorer, a taskbar pin and Settings show) into the executables with the MSVC
+//! linker. No resource compiler or extra crate is needed: the resources are written here as a `.res` file, which the
+//! linker takes as it is.
 
 use std::path::Path;
 
@@ -9,6 +10,10 @@ use std::path::Path;
 const PRODUCT: &str = "Tiny Skill Sync";
 /// Each executable, and the name Windows shows for it.
 const PROGRAMS: [(&str, &str); 2] = [("tiny-skill-sync", PRODUCT), ("tss", "Tiny Skill Sync command line")];
+/// Written by `scripts\dev.ps1 logo` from `src\logo.rs`; a test keeps it the same as what the app draws.
+const ICON: &str = "assets/tiny-skill-sync.ico";
+const RT_ICON: u16 = 3;
+const RT_GROUP_ICON: u16 = 14;
 const RT_VERSION: u16 = 16;
 /// US English, in Unicode: the language of the strings.
 const LANGUAGE: u16 = 0x0409;
@@ -17,6 +22,7 @@ const CODE_PAGE: u16 = 1200;
 fn main() {
     println!("cargo:rerun-if-changed=app.manifest");
     println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-changed={ICON}");
     if std::env::var("CARGO_CFG_TARGET_ENV").as_deref() != Ok("msvc") {
         return;
     }
@@ -26,12 +32,41 @@ fn main() {
         println!("cargo:rustc-link-arg-{kind}=/MANIFESTUAC:NO");
         println!("cargo:rustc-link-arg-{kind}=/MANIFESTINPUT:{dir}\\app.manifest");
     }
+    let icon = icon_res(&std::fs::read(Path::new(&dir).join(ICON)).expect("assets\\tiny-skill-sync.ico can be read"));
     let out = env("OUT_DIR");
     for (name, description) in PROGRAMS {
         let res = Path::new(&out).join(format!("{name}.res"));
-        std::fs::write(&res, version_res(name, description)).expect("the version resource can be written");
+        let mut data = version_res(name, description);
+        data.extend(&icon);
+        std::fs::write(&res, data).expect("the resources can be written");
         println!("cargo:rustc-link-arg-bin={name}={}", res.display());
     }
+}
+
+/// The resources of an icon file: each image as an `RT_ICON` numbered from 1, then the group (`RT_GROUP_ICON` 1) that
+/// lists them, which is the ICO file's directory with the image numbers in place of the file offsets.
+fn icon_res(ico: &[u8]) -> Vec<u8> {
+    let word = |at: usize| u16::from_le_bytes([ico[at], ico[at + 1]]);
+    let dword = |at: usize| u32::from_le_bytes([ico[at], ico[at + 1], ico[at + 2], ico[at + 3]]);
+    assert!(ico.len() >= 6 && word(0) == 0 && word(2) == 1, "{ICON} is an icon file");
+    let count = word(4);
+    let mut res = Vec::new();
+    let mut group = Vec::new();
+    for word in [0, 1, count] {
+        group.extend(word.to_le_bytes());
+    }
+    for i in 0..count {
+        let at = 6 + 16 * i as usize;
+        let (len, offset) = (dword(at + 8) as usize, dword(at + 12) as usize);
+        let image = ico.get(offset..offset + len).expect("an image inside the icon file");
+        // Moveable and discardable, as resource compilers write icons.
+        res.extend(entry(RT_ICON, i + 1, 0x1010, LANGUAGE, image));
+        // Width, height, colours, reserved, planes, bits and size are as in the file; then the image's number.
+        group.extend(&ico[at..at + 12]);
+        group.extend((i + 1).to_le_bytes());
+    }
+    res.extend(entry(RT_GROUP_ICON, 1, 0x1030, LANGUAGE, &group));
+    res
 }
 
 fn env(name: &str) -> String {

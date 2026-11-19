@@ -31,8 +31,8 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     GetWindowThreadProcessId, IDCANCEL, IsChild, IsDialogMessageW, KillTimer, MB_ICONERROR, MB_OK, MF_SEPARATOR, MF_STRING, MSG, MWMO_INPUTAVAILABLE,
     MessageBoxW, MsgWaitForMultipleObjectsEx, PBT_APMRESUMEAUTOMATIC, PM_REMOVE, PeekMessageW, PostMessageW, PostQuitMessage, QS_ALLINPUT,
     RegisterWindowMessageW, SetForegroundWindow, SetMenuDefaultItem, SetTimer, TPM_BOTTOMALIGN, TPM_RIGHTBUTTON, TrackPopupMenu, TranslateMessage, WM_APP,
-    WM_CLOSE, WM_COMMAND, WM_CONTEXTMENU, WM_DESTROY, WM_ENDSESSION, WM_NULL, WM_POWERBROADCAST, WM_QUERYENDSESSION, WM_QUIT, WM_TIMECHANGE, WM_TIMER,
-    WS_EX_TOOLWINDOW, WS_POPUP,
+    WM_CLOSE, WM_COMMAND, WM_CONTEXTMENU, WM_DESTROY, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_ENDSESSION, WM_NULL, WM_POWERBROADCAST, WM_QUERYENDSESSION, WM_QUIT,
+    WM_SETTINGCHANGE, WM_TIMECHANGE, WM_TIMER, WS_EX_TOOLWINDOW, WS_POPUP,
 };
 
 use super::page::{self, Note};
@@ -835,7 +835,15 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
             unsafe { DestroyWindow(hwnd) };
         }
         WM_DESTROY => unsafe { PostQuitMessage(0) },
-        _ if msg != 0 && msg == TASKBAR_CREATED.with(Cell::get) => tray::readd(),
+        // The scale or the display changed: the tray icon is drawn again if the taskbar wants another size.
+        WM_DISPLAYCHANGE | WM_DPICHANGED | WM_SETTINGCHANGE => {
+            tray::rescale();
+            return unsafe { DefWindowProcW(hwnd, msg, wp, lp) };
+        }
+        _ if msg != 0 && msg == TASKBAR_CREATED.with(Cell::get) => {
+            tray::rescale();
+            tray::readd();
+        }
         _ => return unsafe { DefWindowProcW(hwnd, msg, wp, lp) },
     }
     0

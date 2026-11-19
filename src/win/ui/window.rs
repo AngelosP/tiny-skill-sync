@@ -149,6 +149,17 @@ fn dpi_of(hwnd: HWND) -> u32 {
     }
 }
 
+/// Gives the window the logo drawn at the exact sizes of its big and small icons at `dpi`, and returns them; the
+/// caller destroys them once they are replaced or the window is gone.
+fn set_icons(hwnd: HWND, dpi: u32) -> [HICON; 2] {
+    let icons = [SM_CXICON, SM_CXSMICON].map(|metric| tray::icon(Health::Ok, unsafe { GetSystemMetricsForDpi(metric, dpi) }));
+    unsafe {
+        SendMessageW(hwnd, WM_SETICON, ICON_BIG as usize, icons[0] as isize);
+        SendMessageW(hwnd, WM_SETICON, ICON_SMALL as usize, icons[1] as isize);
+    }
+    icons
+}
+
 fn dips(px: i32, dpi: u32) -> i32 {
     px * 96 / dpi as i32
 }
@@ -241,11 +252,7 @@ pub fn open() {
     for panel in [p.head, p.files, p.code] {
         unsafe { ShowWindow(panel, SW_HIDE) };
     }
-    let icons = [SM_CXICON, SM_CXSMICON].map(|metric| tray::icon(Health::Ok, unsafe { GetSystemMetricsForDpi(metric, dpi) }));
-    unsafe {
-        SendMessageW(hwnd, WM_SETICON, ICON_BIG as usize, icons[0] as isize);
-        SendMessageW(hwnd, WM_SETICON, ICON_SMALL as usize, icons[1] as isize);
-    }
+    let icons = set_icons(hwnd, dpi);
     let state = Win {
         p,
         icons,
@@ -1183,6 +1190,11 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
         WM_DPICHANGED => {
             let rc = unsafe { &*(lp as *const RECT) };
             unsafe { SetWindowPos(hwnd, null_mut(), rc.left, rc.top, rc.right - rc.left, rc.bottom - rc.top, SWP_NOZORDER | SWP_NOACTIVATE) };
+            let icons = set_icons(hwnd, dpi_of(hwnd));
+            let old = STATE.with(|s| s.try_borrow_mut().ok().and_then(|mut s| s.as_mut().map(|s| std::mem::replace(&mut s.icons, icons))));
+            for icon in old.into_iter().flatten() {
+                unsafe { DestroyIcon(icon) };
+            }
             render(hwnd);
         }
         WM_SETTINGCHANGE | WM_THEMECHANGED | WM_SYSCOLORCHANGE => {

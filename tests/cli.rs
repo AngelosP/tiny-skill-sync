@@ -16,6 +16,7 @@ use tiny_skill_sync::board::APP_NAME;
 use tiny_skill_sync::cli::{self, Host};
 use tiny_skill_sync::config::{CONFIG_FILE, Config};
 use tiny_skill_sync::github::{FailureKind, Remote, RemoteError, TokenProvider};
+use tiny_skill_sync::logo;
 use tiny_skill_sync::win::{autorun, wide};
 use windows_sys::Win32::Foundation::ERROR_SUCCESS;
 use windows_sys::Win32::Storage::FileSystem::{GetFileVersionInfoSizeW, GetFileVersionInfoW, VS_FFI_SIGNATURE, VS_FIXEDFILEINFO, VerQueryValueW};
@@ -641,5 +642,57 @@ fn both_executables_tell_windows_their_name_and_version() {
         assert_eq!(info.text("FileVersion").as_deref(), Some(env!("CARGO_PKG_VERSION")));
         assert_eq!(info.text("ProductVersion").as_deref(), Some(env!("CARGO_PKG_VERSION")));
         assert_eq!(info.numbers(), Some(numbers), "{file}");
+    }
+}
+
+/// The pixels of an exe's icon at `size` as Windows decodes it from the exe's resources, as straight-alpha
+/// `0xAARRGGBB`, or `None` when it has no icon.
+fn exe_icon(exe: &str, size: i32) -> Option<Vec<u32>> {
+    use windows_sys::Win32::Foundation::FreeLibrary;
+    use windows_sys::Win32::Graphics::Gdi::{BI_RGB, BITMAPINFO, BITMAPINFOHEADER, DIB_RGB_COLORS, DeleteObject, GetDC, GetDIBits, ReleaseDC};
+    use windows_sys::Win32::System::LibraryLoader::{LOAD_LIBRARY_AS_DATAFILE, LOAD_LIBRARY_AS_IMAGE_RESOURCE, LoadLibraryExW};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{DestroyIcon, GetIconInfo, ICONINFO, IMAGE_ICON, LR_DEFAULTCOLOR, LoadImageW};
+    unsafe {
+        let module = LoadLibraryExW(wide(exe).as_ptr(), null_mut(), LOAD_LIBRARY_AS_DATAFILE | LOAD_LIBRARY_AS_IMAGE_RESOURCE);
+        assert!(!module.is_null(), "{exe} can be opened");
+        // The first icon group, which Explorer shows.
+        let icon = LoadImageW(module, 1 as _, IMAGE_ICON, size, size, LR_DEFAULTCOLOR);
+        FreeLibrary(module);
+        if icon.is_null() {
+            return None;
+        }
+        let mut info: ICONINFO = std::mem::zeroed();
+        assert_ne!(GetIconInfo(icon, &mut info), 0);
+        let mut bmi: BITMAPINFO = std::mem::zeroed();
+        bmi.bmiHeader.biSize = size_of::<BITMAPINFOHEADER>() as u32;
+        bmi.bmiHeader.biWidth = size;
+        bmi.bmiHeader.biHeight = -size;
+        bmi.bmiHeader.biPlanes = 1;
+        bmi.bmiHeader.biBitCount = 32;
+        bmi.bmiHeader.biCompression = BI_RGB;
+        let mut pixels = vec![0u32; (size * size) as usize];
+        let dc = GetDC(null_mut());
+        let rows = GetDIBits(dc, info.hbmColor, 0, size as u32, pixels.as_mut_ptr().cast(), &mut bmi, DIB_RGB_COLORS);
+        ReleaseDC(null_mut(), dc);
+        DeleteObject(info.hbmColor);
+        DeleteObject(info.hbmMask);
+        DestroyIcon(icon);
+        assert_eq!(rows, size, "the icon's pixels can be read");
+        Some(pixels)
+    }
+}
+
+#[test]
+fn both_executables_show_the_logo_as_their_icon() {
+    for exe in [env!("CARGO_BIN_EXE_tiny-skill-sync"), env!("CARGO_BIN_EXE_tss")] {
+        for size in [16, 20, 24, 32, 48, 256] {
+            let got = exe_icon(exe, size).unwrap_or_else(|| panic!("{exe} has no icon"));
+            let want = logo::draw(logo::Look::Solid(logo::BLUE), size as u32);
+            for (i, (g, w)) in got.iter().zip(&want).enumerate() {
+                // Windows decodes the PNG in the exe; allow it a rounding step.
+                let close = (0..4).all(|k| ((g >> (8 * k)) & 0xFF).abs_diff((w >> (8 * k)) & 0xFF) <= 2);
+                assert!(close || (g >> 24 == 0 && w >> 24 == 0), "{exe} at {size} px, pixel {i}: {g:08x} instead of {w:08x}");
+            }
+        }
     }
 }

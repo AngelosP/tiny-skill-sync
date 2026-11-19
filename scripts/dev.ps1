@@ -17,6 +17,7 @@
   clean    Close the sandbox copy and any copy a live script left running, delete the sandbox, test leftovers in %TEMP%,
            the test startup entries (HKCU\Software\tiny-skill-sync-test) and bench results. Keeps target\ (use
            'cargo clean' for that).
+  logo     Write the logo files in assets\ again from src\logo.rs (the exes' icon, the PNGs, the SVG, the favicon).
   help     This text.
 
   Nothing here touches the real skills folder, the real settings or the saved GitHub token.
@@ -85,8 +86,17 @@ switch ($Task) {
     { $_ -in 'help', '/?' } {
         Get-Help $PSCommandPath -Detailed | Out-Host
     }
+    'logo' {
+        # The test that compares assets\ with src\logo.rs writes them instead when TSS_WRITE_ASSETS is 1.
+        Push-Location $RepoRoot
+        $env:TSS_WRITE_ASSETS = '1'
+        try { cargo test --lib logo::tests::the_files_in_assets_are_what_the_code_draws }
+        finally { Remove-Item Env:TSS_WRITE_ASSETS; Pop-Location }
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+        Get-ChildItem (Join-Path $RepoRoot 'assets') | ForEach-Object { '{0,-24} {1,8:N0} bytes' -f $_.Name, $_.Length }
+    }
     default {
-        Write-Host "Unknown task '$Task'. Tasks: run, build, test, tss, dry-run, bench, e2e, soak, demo, clean, help" -ForegroundColor Red
+        Write-Host "Unknown task '$Task'. Tasks: run, build, test, tss, dry-run, bench, e2e, soak, demo, clean, logo, help" -ForegroundColor Red
         exit 3
     }
 }

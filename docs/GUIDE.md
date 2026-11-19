@@ -82,7 +82,8 @@ allows the same current-or-historical adoption checks.
    and of both exes. Or build them yourself (see [CONTRIBUTING.md](../CONTRIBUTING.md)): `scripts\dev.ps1 build` makes
    them in `target\release`.
 2. Put both exes, `tiny-skill-sync.exe` (the tray app) and `tss.exe` (the command line), in a folder of your choice, for
-   example `%LOCALAPPDATA%\Programs\tiny-skill-sync`, and start `tiny-skill-sync.exe`. A round icon appears in the
+   example `%LOCALAPPDATA%\Programs\tiny-skill-sync`, and start `tiny-skill-sync.exe`. Its icon, a blue tile with two
+   sync arrows round a spark, appears in the
    notification area. The first start of a new exe can take up to a second while Microsoft Defender scans it. The exes
    are not signed, so if a browser downloaded them, Windows may ask before the first start (**More info**, **Run
    anyway**).
@@ -140,13 +141,15 @@ check, each time the repository has changed, and `tss check --full-listing` (see
 
 ## The tray icon
 
+The icon is the app's logo; its colour and fill say how things are.
+
 | Icon | Meaning |
 | --- | --- |
-| Blue disc | All skills are up to date. |
-| Blue ring | Checking for updates, or, just after sign-in, waiting for Windows to finish starting. |
-| Grey ring | No repositories are set up. |
-| Amber disc with `!` | A skill needs you (see below). |
-| Red disc with `x` | A check failed. The tooltip and the window say why. |
+| Blue | All skills are up to date. |
+| Blue outline | Checking for updates, or, just after sign-in, waiting for Windows to finish starting. |
+| Grey outline | No repositories are set up. |
+| Amber | A skill needs you (see below). |
+| Red | A check failed. The tooltip and the window say why. |
 
 The tooltip says what the state is. Click the icon to open the window, or right-click for **Open Tiny Skill Sync**,
 **Sync now** and **Quit**. Starting `tiny-skill-sync.exe` again opens the window of the copy that already runs;
@@ -409,7 +412,7 @@ historical adoption; the larger install is an earlier baseline.
 | Window open: working set | 13.6 MiB | 14.4 MiB | 40 MiB |
 | Window closed: working set (trimmed) | 1.5 MiB | 1.5 MiB | 2 MiB |
 | Unchanged check: CPU, file reads and writes | 0 ms, 0, 0 | 16 ms, 0, 0 | 50 ms, 0 |
-| Exe size | 1,004,544 bytes | 0.93 MiB | 1 MiB |
+| Exe size | 1,015,808 bytes | 0.93 MiB | 1 MiB |
 
 Every budget row passed. The current startup check took 48.2 microseconds per file; an unchanged poll took 438 ms
 wall time and changed no files. The eight-candidate historical quick slice took 11.4 seconds in the live fixture
@@ -453,7 +456,8 @@ ended at 3.2 MiB of private memory. Each change reached the disk within one inte
   "medium" impact rather than "low" (see [Measured cost](#measured-cost)).
 - It is not checked yet whether a running Copilot session notices new or changed skills without a restart.
 - A repository that is renamed or moved on GitHub is reported as a failure; update its address yourself.
-- No icon in the exe file, and the tray icon is drawn for the screen scale at start.
+- A change of display scale while the app runs is followed by the tray icon (it is drawn again at the taskbar's new
+  size) but has not been tried on a real scale change.
 - It uses the Windows proxy settings (WinHTTP's automatic proxy), but it has not been tested behind a proxy.
 - A short network failure turns the icon red until the next successful check.
 - `gh` is found only on the `PATH`; with several `gh` accounts, the active one is used.
