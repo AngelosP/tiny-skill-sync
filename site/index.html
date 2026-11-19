@@ -1,0 +1,193 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <meta name="theme-color" content="#f3f3f3" media="(prefers-color-scheme: light)">
+  <meta name="theme-color" content="#202020" media="(prefers-color-scheme: dark)">
+  <title>Tiny Skill Sync: keep your Copilot skills in sync with GitHub</title>
+  <meta name="description" content="A tiny Windows tray app that keeps your user-level Copilot skills in sync with GitHub repositories, and never touches what you wrote yourself.">
+  <link rel="canonical" href="https://angelosp.github.io/tiny-skill-sync/">
+  <meta property="og:type" content="website">
+  <meta property="og:title" content="Tiny Skill Sync">
+  <meta property="og:description" content="A tiny Windows tray app that keeps your user-level Copilot skills in sync with GitHub repositories.">
+  <meta property="og:url" content="https://angelosp.github.io/tiny-skill-sync/">
+  <!-- PLACEHOLDER(#6): add <meta property="og:image" content="https://angelosp.github.io/tiny-skill-sync/LOGO.png"> once the logo exists. -->
+  <!-- PLACEHOLDER(#6): favicon. Replace the empty icon below with the favicon from #6, for example
+       <link rel="icon" href="favicon.svg" type="image/svg+xml"> and <link rel="icon" href="favicon-32.png" sizes="32x32">.
+       The empty icon stops browsers asking for /favicon.ico, which is outside this site. -->
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <a class="skip" href="#main">Skip to the content</a>
+
+  <header class="top">
+    <div class="wrap bar">
+      <!-- PLACEHOLDER(#6): logo. Put the logo before the name, for example
+           <img src="logo.svg" alt="" width="32" height="32">. Keep alt empty: the name next to it says the same. -->
+      <a class="brand" href="./">Tiny Skill Sync</a>
+      <nav aria-label="On this page">
+        <ul>
+          <li><a href="#features">What it does</a></li>
+          <li><a href="#safety">Safety</a></li>
+          <li><a href="#start">Get started</a></li>
+          <li><a href="https://github.com/AngelosP/tiny-skill-sync">GitHub</a></li>
+        </ul>
+      </nav>
+    </div>
+  </header>
+
+  <main id="main" tabindex="-1">
+    <section class="wrap hero" aria-labelledby="title">
+      <h1 id="title">Keep your Copilot skills in sync with GitHub</h1>
+      <p class="lead">Tiny Skill Sync is a tiny Windows tray app. Tell it which GitHub repositories, or which folder of
+        one, hold skills. It installs them into your Copilot skills folder, checks GitHub on a schedule, and installs,
+        updates and removes skills as they change there.</p>
+      <p>It never touches a skill it did not install, and it never overwrites or deletes a skill you edited. It removes
+        from your PC only what came from GitHub and was later removed there.</p>
+      <p class="actions">
+        <a class="button primary" href="https://github.com/AngelosP/tiny-skill-sync/releases/latest">Download the latest release</a>
+        <a class="button" href="https://github.com/AngelosP/tiny-skill-sync">See it on GitHub</a>
+      </p>
+      <p class="small">Windows 10 and 11, x64. No installer and no runtime: unzip it and start it. The exes are not signed.</p>
+    </section>
+
+    <!-- PLACEHOLDER(#4): the demo GIF and its caption from the README (docs\demo.gif). Replace the whole
+         <div class="placeholder"> with the image, for example
+         <img src="demo.gif" alt="WHAT THE GIF SHOWS" width="W" height="H">, and copy the README's caption into the
+         <figcaption>. If #4 also makes a still frame, show it to people who ask for less motion:
+         <picture><source srcset="demo.png" media="(prefers-reduced-motion: reduce)"><img src="demo.gif" ...></picture>.
+         The site is published from site\ only, so the workflow must copy the GIF in, or the GIF must live in site\. -->
+    <figure class="wrap demo">
+      <div class="placeholder" role="img" aria-label="Placeholder: a short demo of the app will be shown here.">
+        <p>Demo GIF from issue #4 goes here</p>
+      </div>
+      <figcaption>PLACEHOLDER(#4): the caption of the demo GIF goes here.</figcaption>
+    </figure>
+
+    <section id="features" class="wrap" aria-labelledby="features-title">
+      <h2 id="features-title">What it does</h2>
+      <ul class="cards" role="list">
+        <li class="card">
+          <h3>Small and quiet</h3>
+          <p>One exe under 1 MiB, with no runtime to install. It starts in about 8 ms, uses about 1 MiB of memory while
+            idle, and does no work at all between checks: no CPU, no disk, no network.</p>
+        </li>
+        <li class="card">
+          <h3>Starts with Windows, without slowing it down</h3>
+          <p>At sign-in it goes straight to the tray and waits 30 seconds before it looks at your skills or checks
+            GitHub, then does both at low priority. It asks before it turns this on.</p>
+        </li>
+        <li class="card">
+          <h3>Cheap checks</h3>
+          <p>An unchanged repository costs one small "has anything changed?" request to GitHub, which reads and writes
+            no files.</p>
+        </li>
+        <li class="card">
+          <h3>Public and private repositories</h3>
+          <p>Public ones need nothing. Private ones are read with your GitHub CLI sign-in (<code>gh auth login</code>)
+            or a token saved in Windows Credential Manager.</p>
+        </li>
+        <li class="card">
+          <h3>A tray icon and a window</h3>
+          <p>See every repository and skill, what needs you in plain words, and line by line what is different
+            between GitHub and your copy. It follows the Windows light or dark mode.</p>
+        </li>
+        <li class="card">
+          <h3>A command line too</h3>
+          <p><code>tss</code> does the same work, one command at a time.</p>
+        </li>
+      </ul>
+    </section>
+
+    <section id="safety" class="wrap" aria-labelledby="safety-title">
+      <h2 id="safety-title">Safety promises</h2>
+      <p>Your skills folder holds work you care about. These are the rules the app follows, and each one is covered by
+        tests.</p>
+      <ol class="promises" role="list">
+        <li>
+          <h3>What you add is yours</h3>
+          <p>The app takes over a skill folder it did not install only when that folder holds every file of one
+            version from GitHub, unchanged. Files you add inside a skill are never changed, deleted or even shown, and
+            they stay when the skill is updated or removed.</p>
+        </li>
+        <li>
+          <h3>Your edits win</h3>
+          <p>If you change or delete a file the app installed and the skill changes on GitHub too, the app changes
+            nothing and asks you what to do. If you delete a whole skill, it stays deleted unless you ask for it
+            back.</p>
+        </li>
+        <li>
+          <h3>A failure is never a deletion</h3>
+          <p>No network, a wrong token, a missing repository or a strange answer from GitHub only means "could not
+            check". Skills are removed only when GitHub's complete listing says they are gone. If a repository suddenly
+            lists no skills at all, nothing is deleted until you confirm.</p>
+        </li>
+        <li>
+          <h3>Nothing is lost</h3>
+          <p>A skill is downloaded and checked in full before it replaces the old one. If the app or the PC stops half
+            way, the next start finishes or undoes the change. Anything set aside is kept as a backup and never
+            deleted.</p>
+        </li>
+        <li>
+          <h3>Edits made while it was off are found</h3>
+          <p>The app records what each file it installs looks like, so an edit made while it was not running is still
+            found, even one that keeps the file's size and times. Before any update or removal it reads every file
+            again.</p>
+        </li>
+        <li>
+          <h3>Downloads are never run</h3>
+          <p>Skills often contain scripts. The app only copies them.</p>
+        </li>
+      </ol>
+      <p>The <a href="https://github.com/AngelosP/tiny-skill-sync#safety-promises">README</a> explains each rule in
+        full.</p>
+    </section>
+
+    <section id="start" class="wrap" aria-labelledby="start-title">
+      <h2 id="start-title">Get started</h2>
+      <ol class="steps">
+        <li>
+          <p>Download <code>tiny-skill-sync-VERSION-windows-x64.zip</code> from the
+            <a href="https://github.com/AngelosP/tiny-skill-sync/releases/latest">latest release</a>.
+            <code>SHA256SUMS.txt</code> next to it holds the SHA-256 of the zip and of both exes. Or let the GitHub CLI
+            fetch it:</p>
+          <pre><code>gh release download --repo AngelosP/tiny-skill-sync --pattern *</code></pre>
+        </li>
+        <li>
+          <p>Unzip it into a folder of your choice, for example
+            <code>%LOCALAPPDATA%\Programs\tiny-skill-sync</code>, and start <code>tiny-skill-sync.exe</code>. A round
+            icon appears in the notification area. The exes are not signed, so Windows may ask before the first start:
+            choose <strong>More info</strong>, then <strong>Run anyway</strong>.</p>
+        </li>
+        <li>
+          <p>Click the icon to open the window. Click <strong>Add repository</strong>, paste the address of a GitHub
+            folder that holds skills, and click <strong>Add</strong>. For example:</p>
+          <pre><code>https://github.com/anthropics/skills/tree/main/skills</code></pre>
+        </li>
+        <li>
+          <p>The app installs the skills at once, then checks once a day. It also asks whether to start with
+            Windows.</p>
+        </li>
+      </ol>
+      <p>To update, quit the app (right-click the icon, then <strong>Quit</strong>), replace both exes with the new
+        ones and start it again. Your settings stay in <code>%LOCALAPPDATA%\tiny-skill-sync</code>.</p>
+      <p>Want to build it yourself? <a href="https://github.com/AngelosP/tiny-skill-sync/blob/main/CONTRIBUTING.md">CONTRIBUTING.md</a>
+        says how.</p>
+    </section>
+  </main>
+
+  <footer class="foot">
+    <div class="wrap">
+      <ul class="links" role="list">
+        <li><a href="https://github.com/AngelosP/tiny-skill-sync#readme">Full documentation</a></li>
+        <li><a href="https://github.com/AngelosP/tiny-skill-sync/releases">All releases</a></li>
+        <li><a href="https://github.com/AngelosP/tiny-skill-sync/issues">Report a problem</a></li>
+        <li><a href="https://github.com/AngelosP/tiny-skill-sync">Source on GitHub</a></li>
+      </ul>
+    </div>
+  </footer>
+</body>
+</html>
