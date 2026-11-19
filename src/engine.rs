@@ -27,7 +27,7 @@ use std::time::{Duration, Instant};
 
 use crate::apply::{self, Applied, Applier, Mode, Note, Step};
 use crate::config::{Config, Paths, RepoConfig};
-use crate::diff::{self, Content, FileChange};
+use crate::diff::{self, Content, FileChange, Presence};
 use crate::fsx::{exists_no_follow, join_rel};
 use crate::github::{FailureKind, Remote, RemoteError, RepoRef, TokenProvider, TreeReply};
 use crate::hash::blob_hex;
@@ -300,6 +300,19 @@ pub struct DiffReport {
     pub files: Vec<FileChange>,
 }
 
+/// What the record says about a skill the app put in place, for the window. Nothing is read from disk to tell it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SkillFacts {
+    pub name: String,
+    /// The GitHub commit its files came from.
+    pub commit: String,
+    pub files: usize,
+    /// The size of its files as GitHub has them.
+    pub bytes: u64,
+    /// When the app last installed, updated or adopted it. `None` in records written before the app kept this.
+    pub updated: Option<UnixSecs>,
+}
+
 type StepHook = Box<dyn FnMut(Step) -> Result<(), RemoteError> + Send>;
 
 /// Tells which drive a folder is on and whether that drive keeps a change journal.
@@ -523,6 +536,35 @@ fn wanted_here(upstream: &[SkillFile], recorded: Option<&OwnedSkill>) -> Vec<Str
 /// The files on this PC that are different from GitHub, and the folded paths of the ones that are the same.
 type ReadHere = (Vec<(String, Content)>, HashSet<String>);
 
+/// Whether there is a plain file at `rel` in a skill's folder, or why it is not read. No link is followed.
+fn spot_file(spots: &mut Spots, rel: &str, stats: &mut Stats) -> Result<bool, &'static str> {
+    match spots.find(rel, stats) {
+        Spot::Missing => Ok(false),
+        Spot::Found(found) => match found.kind {
+            Kind::File => Ok(true),
+            Kind::Link => Err("it is a link, which is never followed"),
+            Kind::Dir => Err("it is a folder here, not a file"),
+        },
+        Spot::Blocked => Err("a folder on its way is a link or a file here, and a link is never followed"),
+        Spot::Unreadable => Err("it could not be read"),
+    }
+}
+
+/// A file read to be shown: its bytes while `budget` has room for them, or why it is not shown (`too_much` when there is
+/// no room left).
+fn shown_content(read: io::Result<winfs::FileRead>, budget: &mut u64, too_much: &str) -> Content {
+    match read {
+        Ok(winfs::FileRead { bytes: Some(bytes), len, .. }) => {
+            *budget -= len;
+            Content::Bytes(bytes)
+        }
+        Ok(read) if read.len > DIFF_FILE_BYTES => Content::Hidden(TOO_BIG.into()),
+        Ok(_) => Content::Hidden(too_much.into()),
+        Err(e) if e.kind() == io::ErrorKind::FileTooLarge => Content::Hidden(TOO_BIG.into()),
+        Err(e) => Content::Hidden(format!("it could not be read: {e}")),
+    }
+}
+
 /// Reads the files at `rels` on this PC for "Show changes", comparing each with its copy on GitHub (`theirs`, by folded
 /// path). A path with nothing there is left out. Bytes are kept only while there is room.
 fn read_here(dir: &Path, rels: Vec<String>, theirs: &HashMap<String, &SkillFile>, cancel: &AtomicBool) -> Result<ReadHere, EngineError> {
@@ -536,41 +578,68 @@ fn read_here(dir: &Path, rels: Vec<String>, theirs: &HashMap<String, &SkillFile>
         if cancel.load(Ordering::Relaxed) {
             return Err(failed("showing the changes was stopped"));
         }
-        let unread = match spots.find(&rel, &mut stats) {
-            Spot::Missing => continue,
-            Spot::Found(found) => match found.kind {
-                Kind::File => None,
-                Kind::Link => Some("it is a link, which is never followed"),
-                Kind::Dir => Some("it is a folder here, not a file"),
-            },
-            Spot::Blocked => Some("a folder on its way is a link or a file here, and a link is never followed"),
-            Spot::Unreadable => Some("it could not be read"),
-        };
-        if let Some(why) = unread {
-            different.push((rel, Content::Hidden(why.into())));
-            continue;
+        match spot_file(&mut spots, &rel, &mut stats) {
+            Ok(true) => {}
+            Ok(false) => continue,
+            Err(why) => {
+                different.push((rel, Content::Hidden(why.into())));
+                continue;
+            }
         }
         let key = fold(&rel);
         let upstream = theirs.get(&key);
         // A file too big to show that is larger than its copy on GitHub is different whatever it holds; it is not read.
         let limit = upstream.map_or(0, |t| t.size).max(DIFF_FILE_BYTES);
-        let content = match hasher.read(&join_rel(dir, &rel), DIFF_FILE_BYTES.min(budget), limit) {
-            Ok(read) if upstream.is_some_and(|t| t.blob == read.blob) => {
-                same.insert(key);
-                continue;
-            }
-            Ok(winfs::FileRead { bytes: Some(bytes), len, .. }) => {
-                budget -= len;
-                Content::Bytes(bytes)
-            }
-            Ok(read) if read.len > DIFF_FILE_BYTES => Content::Hidden(TOO_BIG.into()),
-            Ok(_) => Content::Hidden(TOO_MUCH.into()),
-            Err(e) if e.kind() == io::ErrorKind::FileTooLarge => Content::Hidden(TOO_BIG.into()),
-            Err(e) => Content::Hidden(format!("it could not be read: {e}")),
-        };
-        different.push((rel, content));
+        let read = hasher.read(&join_rel(dir, &rel), DIFF_FILE_BYTES.min(budget), limit);
+        if matches!(&read, Ok(read) if upstream.is_some_and(|t| t.blob == read.blob)) {
+            same.insert(key);
+            continue;
+        }
+        different.push((rel, shown_content(read, &mut budget, TOO_MUCH)));
     }
     Ok((different, same))
+}
+
+/// Reads the files at `rels` in a skill's folder for Preview, in order, each whole. A path with nothing there is named
+/// with the reason. Bytes are kept only while there is room.
+fn read_whole(dir: &Path, rels: Vec<String>, cancel: &AtomicBool) -> Result<Vec<(String, Content)>, EngineError> {
+    let mut hasher = FileHasher::default();
+    let mut spots = Spots::new(dir);
+    let mut stats = Stats::default();
+    let mut budget = DIFF_TOTAL_BYTES;
+    let mut out = Vec::new();
+    for rel in rels {
+        if cancel.load(Ordering::Relaxed) {
+            return Err(failed("showing the files was stopped"));
+        }
+        let content = match spot_file(&mut spots, &rel, &mut stats) {
+            Ok(true) => {
+                let read = hasher.read(&join_rel(dir, &rel), DIFF_FILE_BYTES.min(budget), DIFF_FILE_BYTES);
+                shown_content(read, &mut budget, "the files before it are already as much as can be shown")
+            }
+            Ok(false) => Content::Hidden("it is not on this PC".into()),
+            Err(why) => Content::Hidden(why.into()),
+        };
+        out.push((rel, content));
+    }
+    Ok(out)
+}
+
+/// What Preview shows of one skill: see [`Engine::preview`].
+fn preview_in(s: &Session, repo_id: &str, skill: &str, cancel: &AtomicBool) -> Result<DiffReport, EngineError> {
+    let owned = s.state.repo(repo_id).and_then(|r| r.skill(skill)).ok_or_else(|| failed(format!("'{skill}' was not installed by this app")))?;
+    if owned.pending.is_some() {
+        return Err(failed(format!("'{skill}' is in the middle of a change, which the next check finishes")));
+    }
+    let dir = s.applier.skills_dir.join(&owned.name);
+    if !here(&dir)? {
+        return Err(failed(format!("the folder of '{skill}' is not on this PC")));
+    }
+    let mut rels: Vec<String> = owned.files.iter().map(|f| f.path.clone()).collect();
+    rels.sort_by_cached_key(|rel| fold(rel));
+    let files = read_whole(&dir, rels, cancel)?;
+    let files = files.into_iter().map(|(path, content)| FileChange { path, presence: Presence::Both, body: diff::whole(content) }).collect();
+    Ok(DiffReport { on_github: true, here: true, files })
 }
 
 /// What one repository's check needs besides the session.
@@ -664,6 +733,23 @@ impl Engine {
     /// The skills of a repository the user keeps as their own, as of the last call.
     pub fn kept(&self, repo_id: &str) -> Vec<String> {
         self.cache.state.repo(repo_id).map(|r| r.ignored.clone()).unwrap_or_default()
+    }
+
+    /// What the record says about each skill of a repository the app put in place, as of the last call. A skill whose
+    /// last change was interrupted has nothing to tell until recovery sorts it out.
+    pub fn facts(&self, repo_id: &str) -> Vec<SkillFacts> {
+        let Some(repo) = self.cache.state.repo(repo_id) else { return Vec::new() };
+        repo.skills
+            .iter()
+            .filter(|k| k.pending.is_none())
+            .map(|k| SkillFacts {
+                name: k.name.clone(),
+                commit: k.commit.clone(),
+                files: k.files.len(),
+                bytes: k.files.iter().map(|f| f.size).sum(),
+                updated: k.updated,
+            })
+            .collect()
     }
 
     /// Whether the last listing read for a repository had no skills in it at all, as of the last call.
@@ -795,7 +881,7 @@ impl Engine {
             }
         }
 
-        let mut applier = Applier::new(self.paths.skills.clone(), self.paths.work_dir(), path);
+        let mut applier = Applier::new(self.paths.skills.clone(), self.paths.work_dir(), path, self.now());
         applier.hook = self.step_hook.take();
         let s = Session {
             _lock: lock,
@@ -1655,6 +1741,17 @@ impl Engine {
             theirs.push((file.path.clone(), content));
         }
         Ok(DiffReport { on_github: upstream.is_some(), here, files: diff::compare(theirs, ours) })
+    }
+
+    /// Preview: the files GitHub put in a skill, as they are on this PC. Only the files the record lists are read, so a
+    /// file the user added is never opened. Asks GitHub nothing and changes nothing.
+    pub fn preview(&mut self, cfg: &Config, repo_id: &str, skill: &str, cancel: &AtomicBool) -> Result<DiffReport, EngineError> {
+        cfg.find(repo_id).ok_or_else(|| failed(format!("no repository '{repo_id}' is set up")))?;
+        pathsafe::check_component(skill).map_err(|e| failed(format!("'{skill}' is not a skill name ({e})")))?;
+        let s = self.begin(Access::ReadOnly)?;
+        let result = preview_in(&s, repo_id, skill, cancel);
+        self.finish(s);
+        result
     }
 
     /// Stops managing a repository's skills. The caller removes the repository from the settings afterwards.

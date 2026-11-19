@@ -108,6 +108,10 @@ pub mod glyph {
     pub const BACK: char = '\u{E72B}';
     pub const REMOVE: char = '\u{E738}';
     pub const BINARY: char = '\u{EB9F}';
+    pub const VIEW: char = '\u{E890}';
+    pub const COPY: char = '\u{E8C8}';
+    pub const LINK: char = '\u{E71B}';
+    pub const GLOBE: char = '\u{E774}';
 }
 
 struct Canvas {

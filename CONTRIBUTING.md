@@ -97,8 +97,9 @@ ends up on disk, what the app says and what it leaves alone.
   GitHub fail in the ways the `failures` scenario needs.
 - **You will see** one tray icon per running copy of the app (Windows 11 keeps new ones in the overflow flyout), and the
   `ui` scenario opens, moves and photographs windows and the tray menu, keeping its throwaway window in front.
-  It also moves the mouse pointer onto the window for a moment, then puts it back. Leave the mouse and keyboard alone
-  while it runs.
+  It also moves the mouse pointer onto the window for a moment, then puts it back; puts text on the clipboard, then
+  puts back the text that was there; and opens a skill's folder in File Explorer, then closes it. Leave the mouse and
+  keyboard alone while it runs.
 - **The result** is in `bench\out\e2e-<time>.txt`: every check, PASS or FAIL, with what was seen, plus a table at the
   end. The `ui` screenshots are in `bench\out\shots-<time>\`. The exit code is 1 if a check failed.
 
@@ -117,7 +118,7 @@ ends up on disk, what the app says and what it leaves alone.
 | `failures` | A bad network, bad answers, a bad token: the skills folder must not change. |
 | `stale` | GitHub answering with a listing that is newer than its commit. |
 | `empty` | A repository added as a whole when its skills are in a subfolder. |
-| `ui` | The window, its questions and the tray menu, driven and read from outside: layout, tab order, painting, the text at the top for each kind of failure, a skill row opening, **Show changes** (after a push to its own branch, with a file the user added that must not be listed) and back, the repository and diff file lists widening under the mouse (with scroll positions kept), and a new size remembered. It runs in the light or dark mode Windows is in. |
+| `ui` | The window, its questions and the tray menu, driven and read from outside: layout, tab order, painting, the text at the top for each kind of failure, a skill row opening, an open skill's facts, **Copy path**, **Copy GitHub link** (read back from the clipboard) and **Preview** (with a file the user added that must not be listed), the folder button a row shows under the mouse (it opens File Explorer), **Show changes** (after a push to its own branch, with a file the user added that must not be listed) and back, the repository and diff file lists widening under the mouse (with scroll positions kept), and a new size remembered. It runs in the light or dark mode Windows is in. |
 | `signin` | Start with Windows: `tss startup` on, off, and switched off in Task Manager; the app started from its entry the way Windows starts it at sign-in: only the tray, nothing looked at or checked for 30 seconds, then the look and the check; started by hand during that wait, it looks at once; a second start; settings that cannot be read; copies in folders too deep for the entry (named by the short path, or not possible). |
 
 Run it when you change the engine's visible behaviour, the tray, the window or anything GitHub-facing, at least
@@ -138,11 +139,13 @@ passes on its first run is not yet proof that it tests anything. Check it with d
 
 1. Make one small wrong change in the code the test should guard (flip a condition, skip a step, return early).
 2. Run the tests. At least one must fail. If none does, the tests have a gap: add a test.
-3. Undo the change, and make sure the file is byte for byte as before (compare its hash).
+3. Undo the change, and make sure the file is byte for byte as before (compare its hash). If you undo it by copying a
+   saved copy back, give the file the current time afterwards (`(Get-Item FILE).LastWriteTime = Get-Date`): a copy
+   keeps the saved copy's older time, so cargo does not rebuild, and the next test run still runs the bug.
 
 This has been done for `apply`, the engine, the downtime tests, the board, the HTTP layer and the command line, the
-start at sign-in (`app`), and for the `places` scenario (a wrong default skills folder stops it before the app writes
-anything).
+start at sign-in (`app`), the preview of a skill's files (the engine and the window's page), and for the `places`
+scenario (a wrong default skills folder stops it before the app writes anything).
 
 ## Measuring
 

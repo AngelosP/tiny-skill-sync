@@ -82,8 +82,10 @@ pub mod id {
     pub const NOTE: i32 = 100_000;
     pub const FILE: i32 = 200_000;
     pub const GAP: i32 = 300_000;
-    /// Plus 8 per skill, plus the part: 0 the row, 1 its details, 2 Show changes, 3 Open folder, 4 and on its actions.
+    /// Plus [`STRIDE`] per skill, plus the part: 0 the row, 1 its details, 2 Show changes, 3 Open folder, 4 to 7 its
+    /// actions, 8 its facts, 9 Preview, 10 Copy path, 11 Copy GitHub link, 12 Open on GitHub.
     pub const SKILL: i32 = 1_000_000;
+    pub const STRIDE: i32 = 16;
 }
 
 /// A part of a skill's row.
@@ -93,6 +95,10 @@ pub enum Part {
     Compare,
     Open,
     Action(usize),
+    Preview,
+    CopyPath,
+    CopyLink,
+    OnGitHub,
 }
 
 /// What a control's id stands for.
@@ -110,14 +116,18 @@ pub fn hit(n: i32) -> Hit {
     let index = |base: i32| (n - base) as usize;
     match n {
         id::SKILL.. => {
-            let part = match (n - id::SKILL) % 8 {
+            let part = match (n - id::SKILL) % id::STRIDE {
                 0 => Part::Row,
-                1 => return Hit::Other(n),
                 2 => Part::Compare,
                 3 => Part::Open,
-                k => Part::Action(k as usize - 4),
+                k @ 4..=7 => Part::Action(k as usize - 4),
+                9 => Part::Preview,
+                10 => Part::CopyPath,
+                11 => Part::CopyLink,
+                12 => Part::OnGitHub,
+                _ => return Hit::Other(n),
             };
-            Hit::Skill(index(id::SKILL) / 8, part)
+            Hit::Skill(index(id::SKILL) / id::STRIDE as usize, part)
         }
         id::GAP.. => Hit::Gap(index(id::GAP)),
         id::FILE.. => Hit::File(index(id::FILE)),
@@ -126,6 +136,16 @@ pub fn hit(n: i32) -> Hit {
         id::DIFF_ACTION..id::TITLE => Hit::DiffAction(index(id::DIFF_ACTION)),
         _ => Hit::Other(n),
     }
+}
+
+/// The id of part `k` of the skill at `index` (see [`id::SKILL`]).
+pub fn skill_id(index: usize, k: i32) -> i32 {
+    id::SKILL + id::STRIDE * index as i32 + k
+}
+
+/// The id of the row a part of a skill is on.
+pub fn row_id(n: i32) -> i32 {
+    n - (n - id::SKILL) % id::STRIDE
 }
 
 /// Which page the right side shows.
@@ -603,35 +623,64 @@ fn skills(o: &mut Out, p: &RepoPage, x: i32, mut y: i32, cw: i32) -> i32 {
     o.text([x + head_w + 8, y, 60, 20], rows.len().to_string(), Font::Caption, Role::Text2, ONE_LINE);
     y += 28;
     let (mark, top) = (o.s.decos.len(), y);
+    let linkable = crate::github::web_url(p.repo, None).is_some();
     for (j, row) in rows.iter().enumerate() {
         if j > 0 {
             o.fill([x + 1, y, cw - 2, 1], 0, Role::Divider, Role::None);
         }
-        let base = id::SKILL + 8 * j as i32;
+        let base = skill_id(j, 0);
         let (tone, pill) = pill_of(row);
-        let look = Look::Row { tone, glyph: pill };
+        let look = Look::Row { tone, glyph: pill, folder: row.has_folder() };
         o.item(base, [x + 1, y, cw - 2, ROW_H], two_lines(&printable(&row.name), row.tag), look, true);
         y += ROW_H;
         if !is_open(row, p.toggled) {
             continue;
         }
-        let (dx, dw) = (x + 44, cw - 44 - 16);
-        y += o.para(base + 1, [dx, y, dw], printable_lines(&row.text), Font::Caption, Role::Text2) + 10;
-        let mut buttons = Vec::new();
-        if row.can_compare() {
-            let kind = if row.actions.contains(&Action::Overwrite) { Kind::Accent } else { Kind::Standard };
-            buttons.push(btn(base + 2, "Show changes", kind, Some(glyph::FILE)));
-        }
-        for (k, action) in row.actions.iter().enumerate() {
-            buttons.push(btn(base + 4 + k as i32, action.label(), Kind::Standard, action_glyph(*action)));
-        }
-        if row.has_folder() {
-            buttons.push(btn(base + 3, "Open folder", Kind::Standard, Some(glyph::OPEN)));
-        }
-        y = o.flow(dx, y, dx + dw, 28, buttons) + 12;
+        y = skill_card(o, p, row, base, linkable, [x + 44, y, cw - 44 - 16]);
     }
     o.card(mark, [x, top, cw, y - top]);
     y
+}
+
+/// What an open skill shows, at x, y, w wide: what is the matter and the choices first, then what the record says and
+/// what can be done with the skill. Returns the bottom.
+fn skill_card(o: &mut Out, p: &RepoPage, row: &Row, base: i32, linkable: bool, [x, mut y, w]: [i32; 3]) -> i32 {
+    let facts = row.facts.as_ref();
+    if !(row.plain() && facts.is_some()) {
+        y += o.para(base + 1, [x, y, w], printable_lines(&row.text), Font::Caption, Role::Text2) + 10;
+    }
+    let mut choices = Vec::new();
+    if row.can_compare() {
+        let kind = if row.actions.contains(&Action::Overwrite) { Kind::Accent } else { Kind::Standard };
+        choices.push(btn(base + 2, "Show changes", kind, Some(glyph::FILE)));
+    }
+    for (k, action) in row.actions.iter().enumerate() {
+        choices.push(btn(base + 4 + k as i32, action.label(), Kind::Standard, action_glyph(*action)));
+    }
+    if !choices.is_empty() {
+        y = o.flow(x, y, x + w, 28, choices) + 10;
+    }
+    if let Some(facts) = facts {
+        y += o.para(base + 8, [x, y, w], board::facts_text(facts, p.now), Font::Caption, Role::Text2) + 10;
+    }
+    let mut more = Vec::new();
+    if row.has_folder() {
+        if facts.is_some() {
+            more.push(btn(base + 9, "Preview", Kind::Standard, Some(glyph::VIEW)));
+        }
+        more.push(btn(base + 10, "Copy path", Kind::Standard, Some(glyph::COPY)));
+    }
+    if row.listed && linkable {
+        more.push(btn(base + 11, "Copy GitHub link", Kind::Standard, Some(glyph::LINK)));
+        more.push(btn(base + 12, "Open on GitHub", Kind::Standard, Some(glyph::GLOBE)));
+    }
+    if row.has_folder() {
+        more.push(btn(base + 3, "Open folder", Kind::Standard, Some(glyph::OPEN)));
+    }
+    if !more.is_empty() {
+        y = o.flow(x, y, x + w, 28, more) + 10;
+    }
+    y + 2
 }
 
 pub struct SettingsPage<'a> {
@@ -852,7 +901,7 @@ pub fn diff_layout(w: i32, h: i32, files_w: i32) -> DiffLayout {
 
 /// Fits both lines of each file entry, while leaving at least half the cards' available width for the comparison.
 pub fn diff_files_width(v: &DiffView, w: i32, bar: i32, fit: Fit) -> i32 {
-    let text = v.files().iter().map(|f| nav_text_width(&f.path, &file_summary(f).2, fit)).max().unwrap_or(0);
+    let text = v.files().iter().map(|f| nav_text_width(&f.path, &v.summary(f).2, fit)).max().unwrap_or(0);
     // Card borders, entry insets, the icon and text padding, plus 2 DIPs for rounding.
     let wanted = text + 2 + 8 + 40 + 8 + 2 + bar;
     wanted.min((w - 52) / 2).max(DIFF_FILES_W)
@@ -867,7 +916,7 @@ pub fn diff_backdrop(l: &DiffLayout, w: i32, h: i32) -> Vec<Deco> {
     out
 }
 
-/// What "Show changes" found, or that it is still looking.
+/// What "Show changes" or "Preview" found, or that it is still looking.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Report {
     Loading,
@@ -875,12 +924,14 @@ pub enum Report {
     Ready(DiffReport),
 }
 
-/// The diff view of one skill.
+/// The diff view of one skill, which also shows a Preview: the files GitHub put there, whole, as they are on this PC.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DiffView {
     pub repo_id: String,
     pub repo_label: String,
     pub skill: String,
+    /// A Preview rather than a comparison: no choices, no legend, and one column of line numbers.
+    pub preview: bool,
     /// The skill's choices when it was opened.
     pub actions: Vec<Action>,
     pub report: Report,
@@ -901,13 +952,32 @@ impl DiffView {
     fn shown(&self) -> Option<&FileChange> {
         self.files().get(self.file)
     }
+
+    /// The mark, its colour and the second line of a file in the list.
+    pub fn summary(&self, change: &FileChange) -> (char, Role, String) {
+        if !self.preview {
+            return file_summary(change);
+        }
+        match &change.body {
+            Body::Text(t) if t.new.is_empty() => (glyph::FILE, Role::Text2, "Empty".to_string()),
+            Body::Text(t) if t.new.len() == 1 => (glyph::FILE, Role::Text2, "1 line".to_string()),
+            Body::Text(t) => (glyph::FILE, Role::Text2, format!("{} lines", t.new.len())),
+            Body::NotText => (glyph::BINARY, Role::Text2, "Not text".to_string()),
+            Body::Hidden(_) => (glyph::INFO, Role::Text2, "Not shown".to_string()),
+        }
+    }
+
+    fn reading(&self) -> &'static str {
+        if self.preview { "Reading the files…" } else { "Reading both copies…" }
+    }
 }
 
 /// The sentence under the skill's name.
 pub fn diff_sub(v: &DiffView) -> String {
     match &v.report {
-        Report::Loading => "Reading both copies…".to_string(),
+        Report::Loading => v.reading().to_string(),
         Report::Failed(why) => sentence(&printable(why)),
+        Report::Ready(_) if v.preview => "The files GitHub put in this skill, as they are on this PC. Files you added are not shown.".to_string(),
         Report::Ready(r) if r.files.is_empty() => "The copy on this PC is the same as GitHub.".to_string(),
         Report::Ready(r) if !r.here => "Its folder is not on this PC, so every file shows as only on GitHub.".to_string(),
         Report::Ready(r) if !r.on_github => "GitHub no longer lists it, so every file shows as only on this PC.".to_string(),
@@ -920,9 +990,11 @@ pub fn diff_head(v: &DiffView, l: &DiffLayout, fit: Fit) -> Surface {
     let w = l.head[2];
     let mut o = Out::new(fit);
     o.item(id::BACK, [12, 10, 32, 32], "Back", Look::Button { kind: Kind::Icon, glyph: Some(glyph::BACK) }, true);
-    // From the right: the first choice, which takes GitHub's version, ends the row.
+    // From the right: the first choice, which takes GitHub's version, ends the row. A Preview changes nothing, so it
+    // offers none.
+    let actions: &[Action] = if v.preview { &[] } else { &v.actions };
     let mut right = w - 20;
-    for (k, action) in v.actions.iter().enumerate() {
+    for (k, action) in actions.iter().enumerate() {
         if *action == Action::RemoveThem {
             continue;
         }
@@ -947,13 +1019,18 @@ pub fn diff_head(v: &DiffView, l: &DiffLayout, fit: Fit) -> Surface {
     o.label(id::SUB, [56, 42, (w - 56 - 24).max(0), 20], diff_sub(v), Font::Caption, Role::Text2);
     let files = v.files();
     if !files.is_empty() {
-        let count = if files.len() == 1 { "1 file is different".to_string() } else { format!("{} files are different", files.len()) };
+        let count = match (v.preview, files.len()) {
+            (true, 1) => "1 file".to_string(),
+            (true, n) => format!("{n} files"),
+            (false, 1) => "1 file is different".to_string(),
+            (false, n) => format!("{n} files are different"),
+        };
         o.text([l.files_card[0] + 12, DIFF_TOP, l.files_card[2] - 24, CARD_HEAD - 1], count, Font::Caption, Role::Text2, ONE_LINE);
     }
     if let Some(change) = v.shown() {
         let [cx, _, cw, _] = l.code_card;
         let mut lx = cx + cw - 14;
-        if matches!(change.body, Body::Text(_)) {
+        if !v.preview && matches!(change.body, Body::Text(_)) {
             for (sign, ink, text, bg) in [("+", Role::Ok, "Only on GitHub", Role::AddBg), ("−", Role::Err, "Only on this PC", Role::DelBg)] {
                 let lw = 8 + 8 + 6 + o.width(text, Font::Caption) + 2 + 8;
                 if lx - lw < cx + 14 {
@@ -971,7 +1048,7 @@ pub fn diff_head(v: &DiffView, l: &DiffLayout, fit: Fit) -> Surface {
     o.done(DIFF_TOP + CARD_HEAD)
 }
 
-/// The mark, its colour and the second line of a file in the list.
+/// The mark, its colour and the second line of a file in the list of differences.
 pub fn file_summary(change: &FileChange) -> (char, Role, String) {
     match (change.presence, &change.body) {
         (Presence::OnlyHere, _) => (glyph::REMOVE, Role::Err, "Only on this PC".to_string()),
@@ -983,12 +1060,12 @@ pub fn file_summary(change: &FileChange) -> (char, Role, String) {
     }
 }
 
-/// The files that are different, in the left card.
+/// The files that are different, or a Preview's files, in the left card.
 pub fn diff_files(v: &DiffView, w: i32, fit: Fit) -> Surface {
     let mut o = Out::new(fit);
     let mut y = 4;
     for (i, change) in v.files().iter().enumerate() {
-        let (mark, ink, sub) = file_summary(change);
+        let (mark, ink, sub) = v.summary(change);
         let look = Look::Nav { mark: Mark::Glyph(mark, ink), ink: Role::Text, selected: i == v.file };
         o.item(id::FILE + i as i32, [4, y, w - 8, 46], two_lines(&printable(&change.path), &sub), look, true);
         y += 48;
@@ -1012,8 +1089,15 @@ pub fn diff_code(v: &DiffView, w: i32, fit: Fit) -> Surface {
     let mut o = Out::new(fit);
     let message = |o: &mut Out, text: &str| 12 + o.para(id::EMPTY, [16, 12, (w - 32).max(1)], text, Font::Body, Role::Text2) + 12;
     let bottom = match (&v.report, v.shown()) {
-        (Report::Loading, _) => message(&mut o, "Reading both copies…"),
+        (Report::Loading, _) => message(&mut o, v.reading()),
         (Report::Ready(_), None) | (Report::Failed(_), _) => 0,
+        // A Preview's file is whole, so it has no change to describe.
+        (Report::Ready(_), Some(change)) if v.preview => match &change.body {
+            Body::NotText => message(&mut o, "This file is not text, so it is not shown."),
+            Body::Hidden(why) => message(&mut o, &format!("This file is not shown: {}.", printable(why))),
+            Body::Text(t) if t.new.is_empty() => message(&mut o, "This file is empty."),
+            Body::Text(t) => lines(&mut o, t, &[], w, true),
+        },
         (Report::Ready(_), Some(change)) => match &change.body {
             Body::NotText => message(&mut o, "This file is not text, so only the fact that it is different is shown."),
             Body::Hidden(why) => message(&mut o, &format!("This file is not shown: {}.", printable(why))),
@@ -1023,17 +1107,19 @@ pub fn diff_code(v: &DiffView, w: i32, fit: Fit) -> Surface {
                 "Every line is the same. Only a mark that can't be seen at the start of the file (a byte order mark) is \
                  different. Line breaks and blank lines don't count.",
             ),
-            Body::Text(t) => lines(&mut o, t, &v.gaps, w),
+            Body::Text(t) => lines(&mut o, t, &v.gaps, w, false),
         },
     };
     o.done(bottom)
 }
 
-fn lines(o: &mut Out, t: &TextDiff, open: &[usize], w: i32) -> i32 {
+/// Draws the rows of `t`. `one` shows a single column of numbers, the line's own, and leaves room for no sign: a
+/// Preview's lines are all the same.
+fn lines(o: &mut Out, t: &TextDiff, open: &[usize], w: i32, one: bool) -> i32 {
     let most = t.old.len().max(t.new.len()).max(1);
     let gw = 38.max(o.width(&"0".repeat(most.to_string().len()), Font::Mono) + 16);
-    let sx = 2 * gw;
-    let tx = sx + 18;
+    let sx = if one { gw } else { 2 * gw };
+    let tx = if one { sx + 8 } else { sx + 18 };
     let mut y = 4;
     let mut shown = 0;
     let line = |o: &mut Out, y: i32, old: Option<usize>, new: Option<usize>| {
@@ -1048,7 +1134,8 @@ fn lines(o: &mut Out, t: &TextDiff, open: &[usize], w: i32) -> i32 {
             o.fill([0, y, w, LINE_H], 0, bg, Role::None);
             o.fill([0, y, sx, LINE_H], 0, gut, Role::None);
         }
-        for (k, number) in [old, new].into_iter().enumerate() {
+        let numbers = if one { [new, None] } else { [old, new] };
+        for (k, number) in numbers.into_iter().enumerate() {
             if let Some(n) = number {
                 o.text([k as i32 * gw, y, gw - 8, LINE_H], n.to_string(), Font::Mono, Role::Text3, ONE_LINE | DT_RIGHT);
             }
@@ -1210,7 +1297,8 @@ pub fn ask(q: &Question, fit: Fit) -> (Surface, Option<Rect>) {
 mod tests {
     use super::*;
     use crate::config::DEFAULT_INTERVAL;
-    use crate::diff::{Content, compare, text_diff};
+    use crate::diff::{Content, compare, text_diff, whole};
+    use crate::engine::SkillFacts;
     use crate::interval::Unit;
 
     const NOW: UnixSecs = 1_700_000_000;
@@ -1223,7 +1311,7 @@ mod tests {
     }
 
     fn row(name: &str, level: Level, tag: &'static str, actions: Vec<Action>) -> Row {
-        Row { name: name.to_string(), text: format!("about {name}"), tag, level, actions }
+        Row { name: name.to_string(), text: format!("about {name}"), tag, level, actions, facts: None, listed: true }
     }
 
     fn ok(name: &str) -> Row {
@@ -1439,20 +1527,110 @@ mod tests {
         // The status is in the window text too, after a line break, so a screen reader reads it with the name.
         assert_eq!(item(&s, id::SKILL).text, "rlo-\\u{202e}gpj\nEdited on this PC");
         assert_eq!(hit(id::SKILL), Hit::Skill(0, Part::Row));
-        assert_eq!(item(&s, id::SKILL + 8).text, "alpha\nUp to date");
-        assert_eq!(hit(id::SKILL + 8), Hit::Skill(1, Part::Row));
+        assert_eq!(item(&s, id::SKILL + id::STRIDE).text, "alpha\nUp to date");
+        assert_eq!(hit(id::SKILL + id::STRIDE), Hit::Skill(1, Part::Row));
         // The skill that needs the user is open: its choices are there, Show changes first and accented.
         assert_eq!(item(&s, id::SKILL + 2).look, Look::Button { kind: Kind::Accent, glyph: Some(glyph::FILE) });
         assert_eq!(item(&s, id::SKILL + 4).text, "Use the GitHub version");
         assert_eq!(hit(id::SKILL + 5), Hit::Skill(0, Part::Action(1)));
         assert_eq!(hit(id::SKILL + 3), Hit::Skill(0, Part::Open));
-        assert!(!s.items.iter().any(|i| i.id == id::SKILL + 8 + 3), "a skill that is fine is closed");
+        assert!(!s.items.iter().any(|i| i.id == id::SKILL + id::STRIDE + 3), "a skill that is fine is closed");
         fits_in(&s, 600);
 
         let toggled: HashSet<String> = ["rlo-\u{202e}gpj".to_string(), "alpha".to_string()].into();
         let s = page(&toggled);
         assert!(!s.items.iter().any(|i| i.id == id::SKILL + 2), "closed by the user");
-        assert_eq!(item(&s, id::SKILL + 8 + 3).text, "Open folder", "opened by the user");
+        assert_eq!(item(&s, id::SKILL + id::STRIDE + 3).text, "Open folder", "opened by the user");
+    }
+
+    #[test]
+    fn each_skill_has_sixteen_ids_and_each_part_is_told_apart() {
+        let at = |j: i32, k: i32| id::SKILL + id::STRIDE * j + k;
+        for j in [0, 1, 7, 5_000] {
+            let skill = |part| Hit::Skill(j as usize, part);
+            assert_eq!(hit(at(j, 0)), skill(Part::Row));
+            assert_eq!(hit(at(j, 2)), skill(Part::Compare));
+            assert_eq!(hit(at(j, 3)), skill(Part::Open));
+            for k in 0..4 {
+                assert_eq!(hit(at(j, 4 + k)), skill(Part::Action(k as usize)));
+            }
+            assert_eq!(hit(at(j, 9)), skill(Part::Preview));
+            assert_eq!(hit(at(j, 10)), skill(Part::CopyPath));
+            assert_eq!(hit(at(j, 11)), skill(Part::CopyLink));
+            assert_eq!(hit(at(j, 12)), skill(Part::OnGitHub));
+            for k in [1, 8, 13, 14, 15] {
+                assert_eq!(hit(at(j, k)), Hit::Other(at(j, k)), "part {k} is text or unused");
+            }
+            for k in 0..id::STRIDE {
+                assert_eq!((skill_id(j as usize, k), row_id(at(j, k))), (at(j, k), at(j, 0)));
+            }
+        }
+    }
+
+    fn facts(name: &str) -> SkillFacts {
+        SkillFacts { name: name.to_string(), commit: "1a2b3c4d5e6f".to_string(), files: 3, bytes: 12 * 1024, updated: Some(NOW - 2 * 86_400) }
+    }
+
+    #[test]
+    fn an_open_skill_tells_what_the_record_says_and_offers_what_can_be_done_with_it() {
+        let known = |row: Row| Row { facts: Some(facts(&row.name)), ..row };
+        let v = view(
+            "o/a",
+            vec![
+                known(ok("alpha")),
+                known(edited("beta")),
+                row("gamma", Level::Ok, "New", Vec::new()),
+                Row { listed: false, ..known(row("delta", Level::Attention, "Removed on GitHub", vec![Action::KeepMine])) },
+                ok("epsilon"),
+            ],
+        );
+        // beta and delta need the user, so they are open; the others are opened by the user.
+        let toggled: HashSet<String> = ["alpha", "gamma", "epsilon"].map(String::from).into();
+        let at = |j: i32, k: i32| id::SKILL + id::STRIDE * j + k;
+        let has = |s: &Surface, n: i32| s.items.iter().any(|i| i.id == n);
+        for w in [344, 600, 900] {
+            let s = repo_page(&RepoPage { view: &v, repo: &repo("o/a"), default: DEFAULT_INTERVAL, now: NOW, toggled: &toggled }, w, &fit);
+            fits_in(&s, w);
+            // Top to bottom, then left to right.
+            let in_order = |j: i32, parts: &[i32]| {
+                parts.windows(2).all(|p| {
+                    let ([ax, ay, ..], [bx, by, ..]) = (item(&s, at(j, p[0])).at, item(&s, at(j, p[1])).at);
+                    (ay, ax) < (by, bx)
+                })
+            };
+
+            // In sync: the facts say more than the sentence behind "Up to date" would.
+            assert!(!has(&s, at(0, 1)), "the sentence behind the tag is left out");
+            assert_eq!(item(&s, at(0, 8)).text, "Version 1a2b3c4 · 3 files, 12 KB · Updated 2 days ago");
+            let texts: Vec<&str> = [9, 10, 11, 12, 3].iter().map(|&k| item(&s, at(0, k)).text.as_str()).collect();
+            assert_eq!(texts, ["Preview", "Copy path", "Copy GitHub link", "Open on GitHub", "Open folder"]);
+            assert!(in_order(0, &[0, 8, 9, 10, 11, 12, 3]), "at {w}");
+            assert_eq!(item(&s, at(0, 9)).look, Look::Button { kind: Kind::Standard, glyph: Some(glyph::VIEW) });
+            assert_eq!(item(&s, at(0, 0)).look, Look::Row { tone: Tone::Ok, glyph: Some(glyph::OK), folder: true });
+
+            // Needs the user: what is the matter and the choices come first, then the facts and the rest.
+            assert!(in_order(1, &[0, 1, 2, 4, 5, 8, 9, 10, 11, 12, 3]), "at {w}");
+
+            // New: nothing is on this PC yet to open, copy or show, but GitHub has it.
+            for k in [3, 8, 9, 10] {
+                assert!(!has(&s, at(2, k)), "a new skill has no part {k}");
+            }
+            assert!(in_order(2, &[0, 1, 11, 12]), "at {w}");
+            assert_eq!(item(&s, at(2, 0)).look, Look::Row { tone: Tone::Off, glyph: None, folder: false });
+
+            // Gone from GitHub: there is nothing there to link to.
+            assert!(!has(&s, at(3, 11)) && !has(&s, at(3, 12)));
+            assert!(in_order(3, &[0, 1, 4, 8, 9, 10, 3]), "at {w}");
+
+            // In sync, but nothing is known about it yet: the sentence stays, and there is no record to preview.
+            assert!(!has(&s, at(4, 8)) && !has(&s, at(4, 9)));
+            assert!(in_order(4, &[0, 1, 10, 11, 12, 3]), "at {w}");
+        }
+
+        // No link is made to a repository whose name can't be put in one as it is.
+        let odd = RepoConfig { repo: "o/\u{202e}a".to_string(), ..repo("o/a") };
+        let s = repo_page(&RepoPage { view: &v, repo: &odd, default: DEFAULT_INTERVAL, now: NOW, toggled: &toggled }, 600, &fit);
+        assert!(!has(&s, at(0, 11)) && !has(&s, at(0, 12)) && has(&s, at(0, 10)));
     }
 
     #[test]
@@ -1561,11 +1739,64 @@ mod tests {
             repo_id: "o/a".to_string(),
             repo_label: "o/a".to_string(),
             skill: "beta".to_string(),
+            preview: false,
             actions: vec![Action::Overwrite, Action::KeepMine],
             report: Report::Ready(DiffReport { on_github: true, here: true, files: vec![change] }),
             file: 0,
             gaps: Vec::new(),
         }
+    }
+
+    #[test]
+    fn a_preview_shows_each_file_whole_with_one_column_of_numbers_and_offers_no_choices() {
+        let file = |path: &str, content: Content| FileChange { path: path.to_string(), presence: Presence::Both, body: whole(content) };
+        let files = vec![
+            file("SKILL.md", Content::Bytes(b"# A\n\ntext\n".to_vec())),
+            file("one.md", Content::Bytes(b"x".to_vec())),
+            file("empty.md", Content::Bytes(Vec::new())),
+            file("logo.png", Content::Bytes(b"a\0b".to_vec())),
+            file("big.bin", Content::Hidden("it is too big to show".to_string())),
+        ];
+        let mut v = DiffView { preview: true, report: Report::Ready(DiffReport { on_github: true, here: true, files }), ..diff_of("a\n", "b\n") };
+        assert_eq!(diff_sub(&v), "The files GitHub put in this skill, as they are on this PC. Files you added are not shown.");
+        let summaries: Vec<String> = v.files().iter().map(|f| v.summary(f).2).collect();
+        assert_eq!(summaries, ["3 lines", "1 line", "Empty", "Not text", "Not shown"]);
+        assert_eq!(v.summary(&v.files()[0]).0, glyph::FILE);
+
+        for w in [640, 900, 1400] {
+            let l = diff_layout(w, 600, diff_files_width(&v, w, 17, &fit));
+            let head = diff_head(&v, &l, &fit);
+            assert!(head.items.iter().all(|i| !matches!(hit(i.id), Hit::DiffAction(_))), "Preview changes nothing, so it offers no choice");
+            assert!(head.decos.iter().any(|d| deco_text(d) == "5 files"));
+            assert!(!head.decos.iter().any(|d| deco_text(d).starts_with("Only on")), "and has nothing to tell apart");
+            fits_in(&head, w);
+            fits_in(&diff_files(&v, l.files[2] - 17, &fit), l.files[2] - 17);
+        }
+
+        let s = diff_code(&v, 500, &fit);
+        let numbers_beside = |text: &str| -> Vec<String> {
+            let y = s.decos.iter().find_map(|d| matches!(d, Deco::Text { text: t, .. } if t == text).then(|| deco_at(d)[1])).unwrap();
+            s.decos.iter().filter(|d| matches!(d, Deco::Text { text: t, .. } if t != text && deco_at(d)[1] == y)).map(deco_text).collect()
+        };
+        assert_eq!(numbers_beside("# A"), ["1"]);
+        assert_eq!(numbers_beside("text"), ["3"], "a blank line is a line too");
+        assert!(s.decos.iter().any(|d| deco_text(d) == "2"));
+        assert!(!s.decos.iter().any(|d| matches!(d, Deco::Fill { .. })), "no line is marked as added or removed");
+        fits_in(&s, 500);
+
+        let message = |v: &DiffView| diff_code(v, 500, &fit).items.iter().find(|i| i.id == id::EMPTY).map(|i| i.text.clone());
+        v.file = 2;
+        assert_eq!(message(&v).as_deref(), Some("This file is empty."));
+        v.file = 3;
+        assert_eq!(message(&v).as_deref(), Some("This file is not text, so it is not shown."));
+        v.file = 4;
+        assert_eq!(message(&v).as_deref(), Some("This file is not shown: it is too big to show."));
+        let one = DiffView { report: Report::Ready(DiffReport { on_github: true, here: true, files: v.files()[..1].to_vec() }), ..v.clone() };
+        let head = diff_head(&one, &diff_layout(900, 600, DIFF_FILES_W), &fit);
+        assert!(head.decos.iter().any(|d| deco_text(d) == "1 file"));
+        let loading = DiffView { report: Report::Loading, ..v };
+        assert_eq!(diff_sub(&loading), "Reading the files…");
+        assert_eq!(message(&loading).as_deref(), Some("Reading the files…"));
     }
 
     #[test]

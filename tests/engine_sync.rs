@@ -5,8 +5,9 @@ mod common;
 use std::fs;
 
 use common::*;
+use tiny_skill_sync::apply::Step;
 use tiny_skill_sync::diff::{Body, FileChange, Presence};
-use tiny_skill_sync::engine::{ApplyResult, DIFF_FILE_BYTES, DiffReport, Outcome, Resolution, SyncOptions, SyncReport};
+use tiny_skill_sync::engine::{ApplyResult, DIFF_FILE_BYTES, DiffReport, Outcome, Resolution, SkillFacts, SyncOptions, SyncReport};
 use tiny_skill_sync::github::{FailureKind, RemoteError};
 use tiny_skill_sync::reconcile::{Hold, Skip, Verdict};
 
@@ -818,6 +819,181 @@ fn show_changes_reads_at_most_a_few_megabytes_from_each_side_not_counting_files_
     assert!(hidden.iter().any(|p| p.starts_with("up-")) && hidden.iter().any(|p| p.starts_with("here-")), "{hidden:?}");
     assert_eq!(s.remote.calls().file, 4);
 }
+
+// ---------------------------------------------------------------------------------------------------------------------
+// What the window tells about a skill that is in place
+// ---------------------------------------------------------------------------------------------------------------------
+
+fn facts_of(s: &Setup, name: &str) -> SkillFacts {
+    s.engine.facts("fx").into_iter().find(|f| f.name == name).unwrap_or_else(|| panic!("no facts about {name}"))
+}
+
+#[test]
+fn the_record_tells_each_skills_version_files_size_and_last_update() {
+    let mut s = Setup::installed("facts");
+    let alpha = facts_of(&s, "alpha");
+    assert_eq!(alpha.commit, s.remote.head(REPO));
+    assert_eq!(alpha.files, 3);
+    assert_eq!(alpha.bytes, (ALPHA_V1.len() + "guide v1\n".len() + "Write-Output 'hello'\n".len()) as u64);
+    assert_eq!(alpha.updated, Some(T0));
+    assert_eq!(s.engine.facts("fx").len(), 3);
+    assert!(s.engine.facts("nope").is_empty());
+
+    s.advance(3600);
+    let before = s.w.snapshot();
+    s.sync();
+    assert_eq!(s.w.snapshot(), before, "telling the facts writes nothing");
+    assert_eq!(facts_of(&s, "alpha"), alpha, "a check that changes nothing changes none of it");
+
+    s.remote.put(REPO, "skills/alpha/SKILL.md", ALPHA_V2);
+    s.advance(3600);
+    s.sync();
+    let updated = facts_of(&s, "alpha");
+    assert_eq!(updated.updated, Some(T0 + 7200));
+    assert_eq!(updated.commit, s.remote.head(REPO));
+    assert_ne!(updated.commit, alpha.commit);
+    assert_eq!(facts_of(&s, "beta").updated, Some(T0), "only the skill that changed has a new time");
+
+    s.remote.put(REPO, "skills/beta/SKILL.md", "beta v2\n");
+    let mut fired = false;
+    s.engine.set_step_hook(move |step| {
+        if step == Step::Marked && !fired {
+            fired = true;
+            return Err(RemoteError::new(FailureKind::Local, "the power went out"));
+        }
+        Ok(())
+    });
+    s.sync();
+    let names: Vec<String> = s.engine.facts("fx").into_iter().map(|f| f.name).collect();
+    assert_eq!(names, ["alpha", "gamma"], "an interrupted change has nothing to tell until it is sorted out");
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Preview
+// ---------------------------------------------------------------------------------------------------------------------
+
+fn preview(s: &mut Setup, skill: &str) -> DiffReport {
+    s.engine.preview(&s.cfg, "fx", skill, &cancel_flag()).expect("the files could be shown")
+}
+
+fn preview_err(s: &mut Setup, skill: &str) -> String {
+    s.engine.preview(&s.cfg, "fx", skill, &cancel_flag()).unwrap_err().to_string()
+}
+
+fn whole(change: &FileChange) -> String {
+    match &change.body {
+        Body::Text(text) => text.new.join("\n"),
+        other => panic!("{} is not shown as text: {other:?}", change.path),
+    }
+}
+
+fn hidden(change: &FileChange) -> &str {
+    match &change.body {
+        Body::Hidden(why) => why,
+        other => panic!("{} is shown: {other:?}", change.path),
+    }
+}
+
+#[test]
+fn preview_shows_the_files_github_put_in_a_skill_as_they_are_here_and_never_one_the_user_added() {
+    let mut s = Setup::installed("preview");
+    s.w.write("alpha/SKILL.md", "mine\n\n  more\n");
+    s.w.write("alpha/notes.md", "my notes\n");
+    s.w.write("alpha/references/extra.md", "my extra\n");
+    fs::remove_file(s.w.skills.join("alpha").join("scripts").join("hello.ps1")).unwrap();
+    let before = s.w.snapshot();
+
+    let report = preview(&mut s, "Alpha");
+
+    assert!(report.on_github && report.here);
+    assert_eq!(
+        shown(&report),
+        [("references/guide.md", Presence::Both), ("scripts/hello.ps1", Presence::Both), ("SKILL.md", Presence::Both)],
+        "only the files the app installed, by name whatever their case"
+    );
+    assert_eq!(whole(&report.files[0]), "guide v1");
+    assert_eq!(hidden(&report.files[1]), "it is not on this PC", "a file the user deleted is named, with the reason");
+    assert_eq!(whole(&report.files[2]), "mine\n\n  more", "an edit is shown as it is here, blank lines and all");
+    assert_eq!(s.remote.calls(), Calls::default(), "Preview asks GitHub nothing");
+    assert_eq!(s.w.snapshot(), before, "and writes nothing, not even state.json");
+}
+
+#[test]
+fn preview_refuses_a_skill_the_app_does_not_have_in_place_and_never_follows_a_link() {
+    let mut s = Setup::installed("preview-refused");
+    s.w.write("mine/SKILL.md", "mine\n");
+    assert!(preview_err(&mut s, "mine").contains("was not installed by this app"));
+    assert!(preview_err(&mut s, "nope").contains("was not installed by this app"));
+    assert!(preview_err(&mut s, "..").contains("not a skill name"));
+    assert!(s.engine.preview(&s.cfg, "nope", "alpha", &cancel_flag()).is_err());
+    let stopped = s.engine.preview(&s.cfg, "fx", "alpha", &std::sync::atomic::AtomicBool::new(true)).unwrap_err();
+    assert!(stopped.to_string().contains("stopped"), "{stopped}");
+
+    fs::remove_dir_all(s.w.skills.join("beta")).unwrap();
+    assert!(preview_err(&mut s, "beta").contains("not on this PC"));
+
+    let outside = s.w.root.join("outside");
+    fs::create_dir_all(&outside).unwrap();
+    fs::write(outside.join("SKILL.md"), "not in the skill\n").unwrap();
+    fs::write(outside.join("hello.ps1"), "Write-Output 'hello'\n").unwrap();
+    let junction = |link: &std::path::Path| {
+        let made = std::process::Command::new("cmd").args(["/C", "mklink", "/J"]).arg(link).arg(&outside).output().unwrap().status.success();
+        assert!(made, "creating a junction needs no privileges");
+    };
+    let alpha = s.w.skills.join("alpha");
+    let guide = alpha.join("references").join("guide.md");
+    fs::remove_file(&guide).unwrap();
+    junction(&guide);
+    fs::remove_dir_all(alpha.join("scripts")).unwrap();
+    junction(&alpha.join("scripts"));
+    let beta = s.w.skills.join("beta");
+    junction(&beta);
+
+    let report = preview(&mut s, "alpha");
+    assert_eq!(report.files.len(), 3);
+    assert!(hidden(&report.files[0]).contains("never followed"), "{:?}", report.files[0]);
+    assert!(hidden(&report.files[1]).contains("never followed"), "a folder on the way that is a link: {:?}", report.files[1]);
+    assert!(preview_err(&mut s, "beta").contains("link"), "a skill's folder that is a link is not looked into");
+    for link in [guide, alpha.join("scripts"), beta] {
+        fs::remove_dir(link).unwrap();
+    }
+
+    s.remote.put(REPO, "skills/gamma/SKILL.md", "gamma v2\n");
+    let mut fired = false;
+    s.engine.set_step_hook(move |step| {
+        if step == Step::Marked && !fired {
+            fired = true;
+            return Err(RemoteError::new(FailureKind::Local, "the power went out"));
+        }
+        Ok(())
+    });
+    s.sync();
+    assert!(preview_err(&mut s, "gamma").contains("in the middle of a change"), "an interrupted change is sorted out first");
+}
+
+#[test]
+fn preview_reads_at_most_a_megabyte_a_file_and_a_few_in_all() {
+    let mut s = Setup::fresh("preview-budget");
+    s.remote.put_bytes(REPO, "skills/alpha/a-big.bin", &vec![b'x'; DIFF_FILE_BYTES as usize + 1]);
+    for i in 1..=5 {
+        s.remote.put_bytes(REPO, &format!("skills/alpha/z-{i}.bin"), &vec![0u8; DIFF_FILE_BYTES as usize]);
+    }
+    s.sync();
+
+    let report = preview(&mut s, "alpha");
+
+    let bodies: Vec<(&str, &Body)> = report.files.iter().map(|f| (f.path.as_str(), &f.body)).collect();
+    assert_eq!(bodies.len(), 9, "{bodies:?}");
+    assert!(hidden(&report.files[0]).contains("too big"), "{:?}", bodies[0]);
+    assert_eq!(whole(&report.files[3]), ALPHA_V1.trim_end(), "a file too big takes nothing from the others");
+    for change in &report.files[4..7] {
+        assert_eq!(change.body, Body::NotText, "{}", change.path);
+    }
+    for change in &report.files[7..] {
+        assert_eq!(hidden(change), "the files before it are already as much as can be shown", "the small ones took a few bytes too");
+    }
+}
+
 #[test]
 fn historical_whole_copy_is_updated_without_backup_and_extras_are_carried() {
     let w = World::new("historical-old");

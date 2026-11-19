@@ -48,6 +48,26 @@ impl<'a> RepoRef<'a> {
     }
 }
 
+/// The page on github.com that shows a repository, or one of its skills on the configured branch (`HEAD`, the default
+/// branch, when none is set). A skill named like the configured folder is taken to be that folder, as when the folder
+/// itself is one skill; a skill of the same name inside it is then one click away. `None` when the owner or name has
+/// anything but letters, digits, `-`, `_` and `.`.
+pub fn web_url(cfg: &RepoConfig, skill: Option<&str>) -> Option<String> {
+    let plain = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b));
+    let repo = RepoRef::of(cfg).ok().filter(|r| plain(r.owner) && plain(r.name))?;
+    let mut url = format!("https://github.com/{}/{}", repo.owner, repo.name);
+    if let Some(skill) = skill {
+        let folders = [repo.path, if skill == cfg.single_skill_name() { "" } else { skill }];
+        url.push_str("/tree/");
+        url.push_str(&percent_encode_path(repo.reference()));
+        for folder in folders.into_iter().filter(|f| !f.is_empty()) {
+            url.push('/');
+            url.push_str(&percent_encode_path(folder));
+        }
+    }
+    Some(url)
+}
+
 pub enum TreeReply {
     /// The listing is the one the stored ETag stands for.
     NotModified,
@@ -502,5 +522,26 @@ mod tests {
         let repo = RepoRef { owner: "o", name: "n", branch: "", path: "" };
         let e = remote.file(&repo, "main", "a.md", 1, None, &AtomicBool::new(false), &mut |_| true).unwrap_err();
         assert_eq!(e.kind, FailureKind::Protocol);
+    }
+
+    #[test]
+    fn web_links_show_the_repository_or_a_skill_on_the_branch_with_every_part_encoded() {
+        let cfg = |repo: &str, branch: &str, path: &str| RepoConfig {
+            repo: repo.to_string(),
+            branch: branch.to_string(),
+            path: path.to_string(),
+            ..RepoConfig::default()
+        };
+        let plain = cfg("o-1/n_2.x", "", "");
+        assert_eq!(web_url(&plain, None).as_deref(), Some("https://github.com/o-1/n_2.x"));
+        assert_eq!(web_url(&plain, Some("my skill")).as_deref(), Some("https://github.com/o-1/n_2.x/tree/HEAD/my%20skill"));
+        let deep = cfg("o/n", "feature/x y", "skills/team #1");
+        assert_eq!(web_url(&deep, Some("a&b")).as_deref(), Some("https://github.com/o/n/tree/feature/x%20y/skills/team%20%231/a%26b"));
+        // The folder is itself one skill: its own page, whether it is a folder or the whole repository.
+        assert_eq!(web_url(&deep, Some("team #1")).as_deref(), Some("https://github.com/o/n/tree/feature/x%20y/skills/team%20%231"));
+        assert_eq!(web_url(&plain, Some("n_2.x")).as_deref(), Some("https://github.com/o-1/n_2.x/tree/HEAD"));
+        for odd in ["o/n?x", "o/n#x", "o/n/x", "o%2f/n", "/n", "o/", "o\u{202e}/n", "nothing"] {
+            assert_eq!(web_url(&cfg(odd, "", ""), Some("s")), None, "{odd}");
+        }
     }
 }

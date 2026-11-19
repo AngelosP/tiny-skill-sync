@@ -69,7 +69,17 @@ fn last(mut settled: Vec<(Job, Settled)>) -> Settled {
 fn answer(app: &mut App, result: Result<Answer, EngineError>, next_wake: Option<i64>, now: i64) -> Settled {
     let order = app.next_order().expect("a job is waiting");
     app.finish(
-        Done { job: order.job, result, next_wake, last_checks: Vec::new(), kept: Vec::new(), lists_nothing: Vec::new(), private: Vec::new(), stamp: None },
+        Done {
+            job: order.job,
+            result,
+            next_wake,
+            last_checks: Vec::new(),
+            kept: Vec::new(),
+            facts: Vec::new(),
+            lists_nothing: Vec::new(),
+            private: Vec::new(),
+            stamp: None,
+        },
         now,
     )
 }
@@ -106,6 +116,22 @@ fn row(app: &App, name: &str) -> Row {
 
 fn fx() -> String {
     "fx".to_string()
+}
+
+#[test]
+fn a_skills_row_tells_what_the_record_says_about_it() {
+    let mut s = Setup::installed("app-facts");
+    let mut app = started(&mut s);
+    let alpha = row(&app, "alpha");
+    let facts = alpha.facts.expect("the row of a skill the app installed has facts");
+    assert_eq!((facts.commit, facts.files, facts.updated), (s.remote.head(REPO), 3, Some(T0)));
+    assert!(alpha.listed);
+
+    s.remote.put(REPO, "skills/alpha/SKILL.md", ALPHA_V2);
+    s.advance(60);
+    app.want(Job::Check(None));
+    run(&mut app, &mut s.engine, T0 + 60);
+    assert_eq!(row(&app, "alpha").facts.and_then(|f| f.updated), Some(T0 + 60), "an update is told at once");
 }
 
 #[test]
@@ -201,6 +227,7 @@ fn quitting_drops_what_is_waiting_and_saves_last() {
         next_wake: Some(T0),
         last_checks: Vec::new(),
         kept: Vec::new(),
+        facts: Vec::new(),
         lists_nothing: Vec::new(),
         private: Vec::new(),
         stamp: None,
@@ -584,7 +611,7 @@ fn what_is_different_is_answered_to_the_window_and_is_neither_news_nor_a_failure
     let mut app = started(&mut s);
     s.w.write("alpha/SKILL.md", "my alpha\n");
     let news = app.board.messages().count();
-    let alpha = || Job::Diff { repo: fx(), skill: "alpha".to_string() };
+    let alpha = || Job::Diff { repo: fx(), skill: "alpha".to_string(), preview: false };
 
     assert!(app.want(alpha()));
     let order = app.next_order().unwrap();
@@ -592,9 +619,15 @@ fn what_is_different_is_answered_to_the_window_and_is_neither_news_nor_a_failure
     let settled = app.finish(app::perform(&mut s.engine, &order, &cancel_flag()), T0);
     assert_eq!(settled.feedback, None);
     let shown = settled.diff.expect("an answer for the window");
-    assert_eq!((shown.repo.as_str(), shown.skill.as_str()), ("fx", "alpha"));
+    assert_eq!((shown.repo.as_str(), shown.skill.as_str(), shown.preview), ("fx", "alpha", false));
     assert_eq!(shown.result.unwrap().files.len(), 1);
     assert_eq!(s.w.read("alpha/SKILL.md"), "my alpha\n");
+
+    assert!(app.want(Job::Diff { repo: fx(), skill: "alpha".to_string(), preview: true }));
+    let order = app.next_order().unwrap();
+    let shown = app.finish(app::perform(&mut s.engine, &order, &cancel_flag()), T0).diff.expect("an answer for the window");
+    assert!(shown.preview, "an answer says which it is, so the window never takes one for the other");
+    assert_eq!(shown.result.unwrap().files.len(), 3, "Preview shows every file GitHub put there");
 
     app.want(alpha());
     let shown = answer(&mut app, Err(EngineError::Busy), None, T0).diff.unwrap();

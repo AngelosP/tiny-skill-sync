@@ -12,7 +12,6 @@ use std::collections::HashSet;
 use std::fs;
 use std::mem::zeroed;
 use std::path::PathBuf;
-use std::process::Command;
 use std::ptr::{null, null_mut};
 use std::time::Instant;
 
@@ -41,9 +40,10 @@ use crate::app::Job;
 use crate::autostart::{Keys, Startup};
 use crate::board::{APP_NAME, Action, Health, RepoView, Row};
 use crate::config::{Config, Paths, RepoConfig, RepoSpec};
+use crate::github::web_url;
 use crate::interval::{Interval, MIN_POLL_MINUTES};
 use crate::pathsafe::printable;
-use crate::win::{autorun, cred, wide};
+use crate::win::{autorun, clip, cred, proc, wide};
 
 const CLASS: &str = "TinySkillSyncWindow";
 const STYLE: u32 = WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN;
@@ -314,7 +314,8 @@ fn update(hwnd: HWND) {
     let shown = shell::take_diff();
     let moved = with_state(|st| {
         if let Some(shown) = shown {
-            let waiting = st.diff.as_mut().filter(|d| d.repo_id == shown.repo && d.skill == shown.skill && d.report == Report::Loading);
+            let waiting =
+                st.diff.as_mut().filter(|d| d.repo_id == shown.repo && d.skill == shown.skill && d.preview == shown.preview && d.report == Report::Loading);
             if let Some(d) = waiting {
                 d.report = match shown.result {
                     Ok(report) => Report::Ready(report),
@@ -777,14 +778,15 @@ fn more(hwnd: HWND, button: HWND) {
 }
 
 fn open_on_github(repo: &RepoConfig) {
-    let plain = |s: &str| !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c));
-    match repo.owner_and_name() {
-        Some((owner, name)) if plain(owner) && plain(name) => {
-            if let Err(e) = Command::new("explorer.exe").arg(format!("https://github.com/{owner}/{name}")).spawn() {
-                shell::tell(format!("The browser could not be started: {e}"));
-            }
-        }
-        _ => shell::tell(format!("{} can’t be opened on GitHub.", printable(&repo.repo))),
+    match web_url(repo, None) {
+        Some(url) => open_url(&url),
+        None => shell::tell(format!("{} can’t be opened on GitHub.", printable(&repo.repo))),
+    }
+}
+
+fn open_url(url: &str) {
+    if let Err(e) = proc::explorer(url.as_ref()) {
+        shell::tell(format!("The browser could not be started: {e}"));
     }
 }
 
@@ -803,7 +805,7 @@ fn remove(hwnd: HWND, repo: &RepoConfig) {
 
 /// A part of a skill's row was clicked.
 fn skill(hwnd: HWND, index: usize, part: Part) {
-    let Some((repo, label, row)) = shown_repo(|r, v| Some((r.id.clone(), v.label.clone(), v.skills.get(index)?.clone()))).flatten() else { return };
+    let Some((repo, label, row)) = shown_repo(|r, v| Some((r.clone(), v.label.clone(), v.skills.get(index)?.clone()))).flatten() else { return };
     match part {
         Part::Row => {
             with_state(|st| {
@@ -813,13 +815,27 @@ fn skill(hwnd: HWND, index: usize, part: Part) {
             });
             render(hwnd);
         }
-        Part::Compare => compare(hwnd, repo, label, row, id::SKILL + 8 * index as i32 + 2),
+        Part::Compare => compare(hwnd, repo.id, label, row, page::skill_id(index, 2), false),
         Part::Open => open_skill(&row.name),
         Part::Action(k) => {
             if let Some(&action) = row.actions.get(k) {
-                act(hwnd, repo, &label, row.name, action);
+                act(hwnd, repo.id, &label, row.name, action);
             }
         }
+        Part::Preview => compare(hwnd, repo.id, label, row, page::skill_id(index, 9), true),
+        Part::CopyPath => {
+            if let Some(dir) = skill_dir(&row.name) {
+                copy(hwnd, dir.as_os_str());
+            }
+        }
+        Part::CopyLink => match web_url(&repo, Some(&row.name)) {
+            Some(url) => copy(hwnd, url.as_ref()),
+            None => shell::tell(format!("{} can’t be opened on GitHub.", printable(&row.name))),
+        },
+        Part::OnGitHub => match web_url(&repo, Some(&row.name)) {
+            Some(url) => open_url(&url),
+            None => shell::tell(format!("{} can’t be opened on GitHub.", printable(&row.name))),
+        },
     }
 }
 
@@ -842,10 +858,10 @@ fn act(hwnd: HWND, repo: String, label: &str, skill: String, action: Action) {
     }
 }
 
-/// Show changes: the window shows the differences of one skill, read by the worker.
-fn compare(hwnd: HWND, repo: String, repo_label: String, row: Row, from: i32) {
-    let view =
-        DiffView { repo_id: repo.clone(), repo_label, skill: row.name.clone(), actions: row.actions, report: Report::Loading, file: 0, gaps: Vec::new() };
+/// Show changes, or a Preview: the window shows the differences, or the files, of one skill, read by the worker.
+fn compare(hwnd: HWND, repo: String, repo_label: String, row: Row, from: i32, preview: bool) {
+    let actions = if preview { Vec::new() } else { row.actions };
+    let view = DiffView { repo_id: repo.clone(), repo_label, skill: row.name.clone(), preview, actions, report: Report::Loading, file: 0, gaps: Vec::new() };
     let Some(p) = with_state(|st| {
         st.diff = Some(view);
         st.diff_from = from;
@@ -853,7 +869,7 @@ fn compare(hwnd: HWND, repo: String, repo_label: String, row: Row, from: i32) {
     }) else {
         return;
     };
-    shell::want(Job::Diff { repo, skill: row.name });
+    shell::want(Job::Diff { repo, skill: row.name, preview });
     control::scroll_top(p.files);
     control::scroll_top(p.code);
     render(hwnd);
@@ -867,7 +883,7 @@ fn leave_diff(hwnd: HWND) {
     let Some((from, p)) = with_state(|st| st.diff.take().map(|_| (st.diff_from, st.p))).flatten() else { return };
     render(hwnd);
     // Show changes, or the skill's row if it is closed now.
-    let back = [from, from - 2].into_iter().map(|n| control::child(p.page, n)).find(|h| !h.is_null()).unwrap_or(hwnd);
+    let back = [from, page::row_id(from)].into_iter().map(|n| control::child(p.page, n)).find(|h| !h.is_null()).unwrap_or(hwnd);
     unsafe { SetFocus(back) };
 }
 
@@ -976,14 +992,32 @@ fn open_backups() {
 
 /// Open folder, of a skill.
 fn open_skill(name: &str) {
-    let Some(dir) = with_state(|st| st.snap.as_ref().map(|s| s.skills_dir.clone())).flatten() else { return };
+    if let Some(path) = skill_dir(name) {
+        if let Err(e) = open_folder(&path) {
+            shell::tell(e);
+        }
+    }
+}
+
+/// A skill's folder, if it is there; if not, the status line says so.
+fn skill_dir(name: &str) -> Option<PathBuf> {
+    let dir = with_state(|st| st.snap.as_ref().map(|s| s.skills_dir.clone())).flatten()?;
     // Only a plain folder name: the name comes from upstream, and a rejected one is listed too.
     let plain = !name.is_empty() && name != "." && name != ".." && !name.contains(['\\', '/', ':']);
     let path = dir.join(name);
-    if !plain || !path.is_dir() {
+    if plain && path.is_dir() {
+        Some(path)
+    } else {
         shell::tell(format!("{} is not in the skills folder.", printable(name)));
-    } else if let Err(e) = open_folder(&path) {
-        shell::tell(e);
+        None
+    }
+}
+
+/// Copy path and Copy GitHub link.
+fn copy(hwnd: HWND, text: &std::ffi::OsStr) {
+    match clip::set_text(hwnd, text) {
+        Ok(()) => shell::tell(format!("Copied: {}", printable(&text.to_string_lossy()))),
+        Err(e) => shell::tell(format!("The clipboard could not be used: {e}")),
     }
 }
 
@@ -1010,6 +1044,7 @@ fn on_command(hwnd: HWND, wp: WPARAM, lp: LPARAM) {
     match (page::hit(n), code) {
         (Hit::Other(id::EVERY), CBN_SELENDOK) => every(hwnd, ctl, false),
         (Hit::Other(id::DEFAULT_EVERY), CBN_SELENDOK) => every(hwnd, ctl, true),
+        (Hit::Skill(j, Part::Row), control::ROW_FOLDER) => skill(hwnd, j, Part::Open),
         (_, code) if code != BN_CLICKED => {}
         (Hit::Repo(i), _) => {
             if let Some(page) = with_state(|st| st.snap.as_ref()?.views.get(i).map(|v| Page::Repo(v.id.clone()))).flatten() {

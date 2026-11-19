@@ -338,6 +338,7 @@ impl Shell {
                         next_wake: None,
                         last_checks: Vec::new(),
                         kept: Vec::new(),
+                        facts: Vec::new(),
                         lists_nothing: Vec::new(),
                         private: Vec::new(),
                         stamp: None,

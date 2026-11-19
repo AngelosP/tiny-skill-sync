@@ -163,6 +163,39 @@ public static class TssLive {
         }
     }
 
+    // Where something drawn on a plain background starts, going left along line y of a picture from x (a point of the
+    // background right of it): the leftmost x of the first run of pixels that are not the background's colour, or -1
+    // when there is none. Finds the left edge of a skill's status pill, which is as wide as its text.
+    public static int LeftEdge(string path, int x, int y) {
+        using (Bitmap bmp = new Bitmap(path)) {
+            Color bg = bmp.GetPixel(x, y);
+            Func<int, bool> same = i => { Color c = bmp.GetPixel(i, y); return Math.Abs(c.R - bg.R) <= 8 && Math.Abs(c.G - bg.G) <= 8 && Math.Abs(c.B - bg.B) <= 8; };
+            int at = x;
+            while (at > 0 && same(at)) at--;
+            if (at == 0) return -1;
+            while (at > 0 && !same(at - 1)) at--;
+            return at;
+        }
+    }
+
+    [DllImport("user32.dll")] static extern bool OpenClipboard(IntPtr owner);
+    [DllImport("user32.dll")] static extern bool EmptyClipboard();
+    [DllImport("user32.dll")] static extern bool CloseClipboard();
+
+    // Empties the clipboard: how the ui scenario puts back one that held no text. Another program can have it open for
+    // a moment, so this tries a few times.
+    public static bool ClearClipboard() {
+        for (int i = 0; i < 10; i++) {
+            if (OpenClipboard(IntPtr.Zero)) {
+                bool ok = EmptyClipboard();
+                CloseClipboard();
+                return ok;
+            }
+            System.Threading.Thread.Sleep(20);
+        }
+        return false;
+    }
+
     // Whether another window is on top of this one: the process and class of what is on top at the corners and the
     // middle of the window, or "" when the window itself is on top at all of them.
     public static string CoveredBy(IntPtr hwnd) {
@@ -357,6 +390,8 @@ $WM_COMMAND = 0x111
 $WM_CLOSE = 0x10
 $WM_SETTEXT = 0xC
 $WM_KEYDOWN = 0x100
+$WM_LBUTTONDOWN = 0x201
+$WM_LBUTTONUP = 0x202
 $WM_CANCELMODE = 0x1F
 $WM_EXITSIZEMOVE = 0x232
 $BM_CLICK = 0xF5
@@ -387,9 +422,9 @@ $UiId = @{
     DefaultEvery = 320; OpenSkills = 321; OpenBackups = 322; Startup = 325; StartupText = 413
     Title = 400; Private = 401; Sub = 402; InfoLead = 403; InfoText = 404; SkillsDir = 410; TokenText = 411; Empty = 412
     Back = 330; DiffAction = 333; Note = 100000; File = 200000; Gap = 300000
-    # Plus 8 per skill, plus the part: 0 the row ("name`ntag"), 1 its details, 2 Show changes, 3 Open folder, 4 and on
-    # its actions.
-    Skill = 1000000
+    # Plus 16 per skill, plus the part: 0 the row ("name`ntag"), 1 its details, 2 Show changes, 3 Open folder, 4 to 7
+    # its actions, 8 its facts, 9 Preview, 10 Copy path, 11 Copy GitHub link, 12 Open on GitHub.
+    Skill = 1000000; SkillStride = 16
 }
 # A question (src\win\ui\page.rs, mod ask_id): its controls are on one panel.
 $AskPanel = 100
@@ -834,20 +869,20 @@ function Read-Nav([IntPtr]$Window) {
 }
 
 # The skills on a repository's page, top to bottom: the name and the tag on the row and, when the row is open, the
-# details and buttons under it ($null and none when it is closed). Wrap the call in @( ).
+# details, the facts and the buttons under it ($null and none when it is closed). Wrap the call in @( ).
 function Read-Skills([IntPtr]$Window) {
     for ($j = 0; ; $j++) {
-        $base = $UiId.Skill + 8 * $j
+        $base = $UiId.Skill + $UiId.SkillStride * $j
         $row = Read-Ui $Window $UiPanel.Page $base
         if ($null -eq $row) { break }
         $two = $row -split "`n", 2
-        $buttons = @(foreach ($k in 2..7) {
+        $buttons = @(foreach ($k in @(2..7) + @(9..12)) {
                 $t = Read-Ui $Window $UiPanel.Page ($base + $k)
                 if ($null -ne $t) { [pscustomobject]@{ Id = $base + $k; Text = $t } }
             })
         [pscustomobject]@{
             Index = $j; Id = $base; Name = $two[0]; Tag = $(if ($two.Count -gt 1) { $two[1] } else { '' })
-            Detail = (Read-Ui $Window $UiPanel.Page ($base + 1)); Buttons = $buttons
+            Detail = (Read-Ui $Window $UiPanel.Page ($base + 1)); Facts = (Read-Ui $Window $UiPanel.Page ($base + 8)); Buttons = $buttons
         }
     }
 }

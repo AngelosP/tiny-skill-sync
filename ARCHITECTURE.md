@@ -42,18 +42,20 @@ case by case. Code that talks to Windows is kept in `src\win\`.
 | `board` | What the tray and the window say: one line per repository and per skill, and the buttons. | yes |
 | `app` | The tray app without its windows: which job runs next and when to wake up. | yes |
 | `autostart` | Start with Windows: what the startup entry says, what it means, and which registry keys may be written. | yes |
-| `diff` | What is different between the GitHub copy of a skill and the copy on disk, line by line ("Show changes"). | yes |
+| `diff` | What is different between the GitHub copy of a skill and the copy on disk, line by line ("Show changes"), and a skill's files whole ("Preview"). | yes |
 | `text` | When two copies of a file are the same: line endings, the line break at the end and blank lines don't count. | yes |
 | `state` | `state.json`, the ownership record: what the app installed, file by file. | file I/O |
 | `verify` | Is a skill folder on disk still what was installed? | file I/O |
 | `apply` | The only module that moves or deletes anything in the skills folder. | file I/O |
 | `engine` | Puts it together: lock, load, ask GitHub, reconcile, apply, save. | uses all |
-| `github` | List a folder, pin the commit, download a file, page through path history and read complete historical subtrees. | network |
+| `github` | List a folder, pin the commit, download a file, page through path history and read complete historical subtrees; the address of a skill on github.com (`web_url`). | network |
 | `hash` | SHA-1 and Git blob hashes, in plain Rust. | yes |
 | `cli` | `tss`. | uses engine |
 | `win::fs` | File facts `std` does not give: file id, USN, volume, links; one-handle folder listing. | Windows |
 | `win::http` | A small blocking HTTP client on WinHTTP. The only networking code. | Windows |
-| `win::cred`, `win::proc` | The token from Credential Manager, or from `gh auth token`. | Windows |
+| `win::cred` | The token in Windows Credential Manager. | Windows |
+| `win::proc` | Starts other programs with `CreateProcessW` (not `std::process`, which costs the tray exe about 60 KB): `gh auth token` for the GitHub CLI's token, and File Explorer. | Windows |
+| `win::clip` | Puts text on the clipboard (Copy path, Copy GitHub link). | Windows |
 | `win::autorun` | The startup entry in the registry: read, written and deleted only when the user asks. | Windows |
 | `win::ui` | The tray icon, the window, questions, and the controls they are drawn with (see [below](#the-tray-and-the-window)). | Windows |
 
@@ -349,7 +351,9 @@ flowchart TD
 - `config.json` is meant to be read and edited by hand. The tray reloads it when it changes.
 - `state.json` holds, per repository: the ETag of the last fully applied listing, the last check time, whether the last
   listing had no skills in it at all, the "keep mine" list, and per owned skill its commit, its files (path, Git blob
-  hash, size, fingerprint, and `canon`, the hash of the lines that count) and an optional pending marker. It also
+  hash, size, fingerprint, and `canon`, the hash of the lines that count), when the app last installed, updated or took
+  over the skill (`updated`, only ever shown; an older record has none until the skill's next update) and an optional
+  pending marker. It also
   keeps resumable historical searches and their local evidence (above). It is written
   only when something changed, through a temporary file and a rename. A damaged one is kept as `state.json.damaged-*`;
   one written by a newer version is not touched.
@@ -384,7 +388,9 @@ everything they show.
   them, or when the window asks for one by id (`child`). 463 skills open in about 43 ms; with a control made for every
   row it took 125 ms. The controls of a page never overlap: they are sibling windows that do not clip each other, so a
   control that paints again by itself (under the mouse, on a click) would draw over the part of a neighbour it covers.
-  The `page.rs` tests and the e2e layout check enforce this.
+  The `page.rs` tests and the e2e layout check enforce this. So the folder button a skill row shows under the mouse is
+  not a control: the row draws it (`Look::Row { folder }`), knows where it is (`control::row_parts`), and tells the
+  window `ROW_FOLDER` instead of a click when a press starts and ends on it.
 - **`paint.rs`** draws each paint into one off-screen bitmap and copies it to the screen at once, so nothing flickers.
   Rounded boxes are anti-aliased by hand (GDI cannot); text is drawn by GDI with ClearType. Positions are in DIPs and
   become pixels at the window's DPI. A control has no background of its own: it asks its parent to draw what is under
@@ -398,7 +404,10 @@ everything they show.
   "Show changes" turns the whole window into the differences of one skill until Back (or Esc); the worker reads them
   with `engine::diff`, which only reads, and `diff.rs` lines them up from this PC (`−`) to GitHub (`+`), so they read
   as what taking GitHub's version would do. Only upstream's files and the files the record says this repository put
-  there are compared; files the user added are never read or shown. The window is made when opened and destroyed when
+  there are compared; files the user added are never read or shown. "Preview" uses the same view (`DiffView.preview`)
+  with nothing to choose: `engine::preview` asks GitHub nothing, reads only the files the record lists through
+  `win::fs` on the worker, with the same size limits, and `diff::whole` shows each one whole with one column of line
+  numbers. The window is made when opened and destroyed when
   closed (its fonts and bitmap released, the memory trimmed), so it costs nothing while closed. Its size is saved in
   `window.txt` when you finish resizing it.
 - **The list on the left widens under the mouse** when a repository's name or a diff file's path or summary is cut
@@ -423,8 +432,14 @@ can't be read, skills that need you, repositories that need you, the first check
 line under it says where, when the last check was, and when the next one is (`page::hero_of`). While the app works, or
 just after it told you something, that line says so instead. After a check you asked for, it is `summary` in `app.rs`:
 a failed check puts the reason first, and a check that found nothing new says "Checked: nothing new on GitHub" unless
-all is well. A skill row opens to show its whole text (`Row.detail`, `board.rs`) and its buttons; a skill that needs
-you starts open. Text that came from a repository passes through `printable` before it is shown, so a name cannot carry
+all is well. A skill row opens to show a card (`page::skill_card`): what is the matter (`Row.text`, `board.rs`) and the
+choices first, then one line of facts, then **Preview**, **Copy path**, **Copy GitHub link**, **Open on GitHub** and
+**Open folder**, each only when it can work. The facts (`Row.facts`) come from the record after every job
+(`engine::facts`, which reads nothing from disk) and are worded by `board::facts_text`; a plain row ("Up to date",
+"Installed") that has them leaves out its sentence, which says no more than its tag. A skill that needs you starts
+open. Each skill has 16 ids (`page::id::STRIDE`): its row, its parts and its buttons, so `page::hit` tells the skill and
+the button from the id alone. The links name the repository's branch, or `HEAD` when none is set (`github::web_url`).
+Text that came from a repository passes through `printable` before it is shown, so a name cannot carry
 control or text-direction characters.
 
 ## Start with Windows

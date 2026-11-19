@@ -15,7 +15,7 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 
 use crate::apply::Note;
 use crate::config::{Config, RepoConfig};
-use crate::engine::{ApplyResult, Failure, LocalStatus, Outcome, RepoReport, Resolution, SkillReport, StartupReport, SyncReport, VerifyReport};
+use crate::engine::{ApplyResult, Failure, LocalStatus, Outcome, RepoReport, Resolution, SkillFacts, SkillReport, StartupReport, SyncReport, VerifyReport};
 use crate::github::FailureKind;
 use crate::interval::UnixSecs;
 use crate::pathsafe::fold;
@@ -107,6 +107,10 @@ pub struct Row {
     pub tag: &'static str,
     pub level: Level,
     pub actions: Vec<Action>,
+    /// What the record says about it, when the app put it in place.
+    pub facts: Option<SkillFacts>,
+    /// GitHub lists it, so there is something to link to.
+    pub listed: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -207,7 +211,8 @@ impl SkillBoard {
 
     fn row(&self) -> Row {
         let shown = present(self.local.as_ref(), self.fact.as_ref());
-        Row { name: self.name.clone(), text: shown.text, tag: shown.tag, level: shown.level, actions: shown.actions }
+        let listed = !matches!(self.fact, Some(Fact::Removed | Fact::EmptyListing | Fact::NotSafe(_)));
+        Row { name: self.name.clone(), text: shown.text, tag: shown.tag, level: shown.level, actions: shown.actions, facts: None, listed }
     }
 }
 
@@ -291,6 +296,41 @@ impl Row {
     pub fn has_folder(&self) -> bool {
         !matches!(self.tag, DELETED_TAG | NEW_TAG | NOT_SAFE_TAG)
     }
+
+    /// Nothing is the matter: the sentence behind the tag says no more than the tag.
+    pub fn plain(&self) -> bool {
+        matches!(self.tag, UP_TO_DATE_TAG | INSTALLED_TAG)
+    }
+}
+
+/// What the record says about a skill, in one short line: "Version 1a2b3c4 · 3 files, 12 KB · Updated 2 days ago".
+/// What is not known is left out.
+pub fn facts_text(facts: &SkillFacts, now: UnixSecs) -> String {
+    let mut parts = Vec::with_capacity(3);
+    if !facts.commit.is_empty() {
+        parts.push(format!("Version {}", facts.commit.chars().take(7).collect::<String>()));
+    }
+    let files = if facts.files == 1 { "1 file".to_string() } else { format!("{} files", facts.files) };
+    parts.push(format!("{files}, {}", size_text(facts.bytes)));
+    if let Some(at) = facts.updated {
+        parts.push(format!("Updated {}", ago(now, at)));
+    }
+    parts.join(" · ")
+}
+
+/// "1 byte", "12 KB", "1.5 MB", rounded to the nearest. Whole numbers only, so no floating-point code is pulled in.
+fn size_text(bytes: u64) -> String {
+    const KIB: u64 = 1024;
+    const MIB: u64 = 1024 * 1024;
+    if bytes < KIB {
+        return if bytes == 1 { "1 byte".to_string() } else { format!("{bytes} bytes") };
+    }
+    let kb = bytes.saturating_add(KIB / 2) / KIB;
+    if kb < KIB {
+        return format!("{kb} KB");
+    }
+    let tenths = bytes.saturating_mul(10).saturating_add(MIB / 2) / MIB;
+    format!("{}.{} MB", tenths / 10, tenths % 10)
 }
 
 /// Puts what is known about the disk and about upstream together. An edit or a deletion is the user's doing and is
@@ -359,11 +399,13 @@ struct RepoBoard {
     lists_nothing: bool,
     /// GitHub could not find the repository without the token.
     needs_token: bool,
+    /// What the record says about the skills the app put in place, by case-folded name.
+    facts: HashMap<String, SkillFacts>,
 }
 
 impl RepoBoard {
     fn rows(&self) -> Vec<Row> {
-        let mut rows: Vec<Row> = self.skills.values().map(SkillBoard::row).collect();
+        let mut rows: Vec<Row> = self.skills.iter().map(|(key, skill)| Row { facts: self.facts.get(key).cloned(), ..skill.row() }).collect();
         rows.sort_by_key(|row| std::cmp::Reverse(row.level));
         rows
     }
@@ -533,6 +575,16 @@ impl Board {
         for (name, key) in names.iter().zip(kept) {
             repo.skills.entry(key).or_insert_with(|| SkillBoard { name: name.clone(), local: None, fact: Some(Fact::Kept) });
         }
+    }
+
+    /// What the record says about the skills the app put in place, as the engine has it now. It replaces what was
+    /// known, and shows only on the rows there are.
+    pub fn note_facts(&mut self, repo_id: &str, facts: &[SkillFacts]) {
+        if facts.is_empty() && !self.repos.contains_key(repo_id) {
+            return;
+        }
+        let repo = self.repos.entry(repo_id.to_string()).or_default();
+        repo.facts = facts.iter().map(|f| (fold(&f.name), f.clone())).collect();
     }
 
     /// The engine could not do its work at all (`Some`), or did it again (`None`). A new failure is also told once.
@@ -1666,6 +1718,79 @@ mod tests {
 
         board.note_kept("other", &[]);
         assert!(!board.repos.contains_key("other"), "nothing kept, nothing to remember");
+    }
+
+    fn facts(name: &str, commit: &str, files: usize, bytes: u64, updated: Option<UnixSecs>) -> SkillFacts {
+        SkillFacts { name: name.to_string(), commit: commit.to_string(), files, bytes, updated }
+    }
+
+    #[test]
+    fn what_the_record_says_about_a_skill_is_on_its_row() {
+        let mut board = after(Outcome::Unchanged, vec![in_sync("alpha"), skill("Beta", Verdict::ModifiedLocally(info("a.md")), ApplyResult::NotApplicable)]);
+        let alpha = facts("alpha", "c1", 3, 12, Some(NOW));
+        let beta = facts("beta", "c1", 1, 5, None);
+        board.note_facts("a", &[alpha.clone(), beta.clone(), facts("gone", "c1", 1, 1, None)]);
+        assert_eq!(row(&board, "alpha").facts, Some(alpha.clone()));
+        assert_eq!(row(&board, "Beta").facts, Some(beta), "matched whatever the case");
+        assert_eq!(names(&board), ["Beta", "alpha"], "facts alone make no row");
+
+        board.note_facts("a", std::slice::from_ref(&alpha));
+        assert_eq!(row(&board, "Beta").facts, None, "the facts are replaced, not added to");
+        board.note_sync(&sync_of(vec![report("a", Outcome::Synced, vec![in_sync("alpha")])]), NOW);
+        assert_eq!(row(&board, "alpha").facts, Some(alpha), "a new listing keeps them: they come from the record");
+
+        board.note_facts("other", &[]);
+        assert!(!board.repos.contains_key("other"), "nothing to tell, nothing to remember");
+    }
+
+    #[test]
+    fn only_a_skill_github_lists_can_be_linked_to() {
+        let na = || ApplyResult::NotApplicable;
+        let cases = [
+            (Verdict::InSync, na(), true),
+            (Verdict::Install, ApplyResult::DryRun, true),
+            (Verdict::ModifiedLocally(info("a.md")), na(), true),
+            (Verdict::MissingLocally, na(), true),
+            (Verdict::Skipped(Skip::Ignored), na(), true),
+            (Verdict::Skipped(Skip::Collision { owner: "o/b".to_string() }), na(), true),
+            (Verdict::Delete, ApplyResult::DryRun, false),
+            (Verdict::Held(Hold::DeleteBlocked(info("a.md"))), na(), false),
+            (Verdict::Held(Hold::MassDeletion), na(), false),
+            (Verdict::Skipped(Skip::Rejected { reason: "too deep".to_string() }), na(), false),
+        ];
+        for (verdict, result, listed) in cases {
+            let board = after(Outcome::Unchanged, vec![skill("s", verdict.clone(), result.clone())]);
+            assert_eq!(row(&board, "s").listed, listed, "{verdict:?} / {result:?}");
+        }
+        let mut board = Board::new();
+        board.note_verify(&verified(vec![("a", "s", clean())]), NOW);
+        assert!(row(&board, "s").listed, "installed by the app, and not known to be gone");
+    }
+
+    #[test]
+    fn a_row_with_nothing_the_matter_is_plain() {
+        assert!(row(&after(Outcome::Unchanged, vec![in_sync("s")]), "s").plain());
+        let mut installed = Board::new();
+        installed.note_verify(&verified(vec![("a", "s", clean())]), NOW);
+        assert!(row(&installed, "s").plain());
+        assert!(!row(&after(Outcome::Unchanged, vec![deleted_locally("s")]), "s").plain());
+        assert!(!row(&after(Outcome::Unchanged, vec![skill("s", Verdict::Update, ApplyResult::DryRun)]), "s").plain());
+    }
+
+    #[test]
+    fn the_facts_read_as_one_short_line() {
+        let day = 24 * 60 * 60;
+        let commit = "1a2b3c4d5e6f7a8b9c0d1a2b3c4d5e6f7a8b9c0d";
+        assert_eq!(facts_text(&facts("s", commit, 3, 12_000, Some(NOW - 2 * day)), NOW), "Version 1a2b3c4 · 3 files, 12 KB · Updated 2 days ago");
+        assert_eq!(facts_text(&facts("s", commit, 1, 1, Some(NOW + 60)), NOW), "Version 1a2b3c4 · 1 file, 1 byte · Updated just now");
+        assert_eq!(facts_text(&facts("s", commit, 2, 1023, None), NOW), "Version 1a2b3c4 · 2 files, 1023 bytes", "a time not known is left out");
+        assert_eq!(facts_text(&facts("s", "", 2, 0, None), NOW), "2 files, 0 bytes", "and so is a version");
+        assert_eq!(facts_text(&facts("s", "abc", 2, 1024, None), NOW), "Version abc · 2 files, 1 KB");
+        let sizes = [(1535, "1 KB"), (1536, "2 KB"), (1_047_552, "1023 KB"), (1_048_064, "1.0 MB"), (1_572_864, "1.5 MB"), (10 * 1_048_576, "10.0 MB")];
+        for (bytes, size) in sizes {
+            assert_eq!(facts_text(&facts("s", "", 1, bytes, None), NOW), format!("1 file, {size}"), "{bytes} bytes");
+        }
+        assert!(facts_text(&facts("s", "", 1, u64::MAX, None), NOW).ends_with(" MB"), "no overflow");
     }
 
     #[test]

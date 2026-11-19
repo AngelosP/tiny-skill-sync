@@ -282,6 +282,7 @@ mod tests {
                 fp: None,
                 canon: None,
             }],
+            updated: None,
             pending: None,
         }
     }

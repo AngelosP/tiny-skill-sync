@@ -1127,6 +1127,8 @@ mod tests {
             tag: "Edited on this PC",
             level: Level::Attention,
             actions: actions.to_vec(),
+            facts: None,
+            listed: true,
         };
 
         let mut out = String::new();

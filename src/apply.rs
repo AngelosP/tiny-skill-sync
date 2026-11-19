@@ -31,6 +31,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use crate::fsx::{exists_no_follow, join_rel, move_no_replace_retry, remove_dir_all_retry, rename_retry, unique_suffix};
 use crate::github::{FailureKind, RemoteError};
 use crate::hash::BlobHasher;
+use crate::interval::UnixSecs;
 use crate::pathsafe::{self, fold};
 use crate::reconcile::LocalState;
 use crate::state::{ManagedFile, OwnedSkill, Pending, State};
@@ -111,6 +112,8 @@ pub struct Applier {
     pub work_dir: PathBuf,
     pub state_path: PathBuf,
     pub hasher: FileHasher,
+    /// The time a change made now is recorded at.
+    pub now: UnixSecs,
     /// Tests only. Returning an error models a crash at that step: the code stops with no cleanup at all.
     pub hook: Option<Hook>,
 }
@@ -277,8 +280,8 @@ enum Retired {
 }
 
 impl Applier {
-    pub fn new(skills_dir: PathBuf, work_dir: PathBuf, state_path: PathBuf) -> Applier {
-        Applier { skills_dir, work_dir, state_path, hasher: FileHasher::default(), hook: None }
+    pub fn new(skills_dir: PathBuf, work_dir: PathBuf, state_path: PathBuf, now: UnixSecs) -> Applier {
+        Applier { skills_dir, work_dir, state_path, hasher: FileHasher::default(), now, hook: None }
     }
 
     fn at(&mut self, step: Step) -> Result<(), RemoteError> {
@@ -468,7 +471,7 @@ impl Applier {
     /// Records a finished install or update: fingerprints are taken now, at the final location.
     fn commit_new(&mut self, state: &mut State, repo: &str, name: &str, commit: &str, mut files: Vec<ManagedFile>) {
         verify::capture(&self.live(name), &mut files, &mut self.hasher);
-        state.repo_mut(repo).upsert_skill(OwnedSkill { name: name.to_string(), commit: commit.to_string(), files, pending: None });
+        state.repo_mut(repo).upsert_skill(OwnedSkill { name: name.to_string(), commit: commit.to_string(), files, updated: Some(self.now), pending: None });
     }
 
     /// Undoes the pending marker in memory and on disk, after a change was abandoned before it touched anything.
@@ -568,7 +571,8 @@ impl Applier {
         let removing = new_files.is_empty();
         let live = self.live(name);
         let stage = self.stage_dir(txn);
-        let mut record = before.clone().unwrap_or_else(|| OwnedSkill { name: name.to_string(), commit: String::new(), files: Vec::new(), pending: None });
+        let mut record =
+            before.clone().unwrap_or_else(|| OwnedSkill { name: name.to_string(), commit: String::new(), files: Vec::new(), updated: None, pending: None });
         record.pending = Some(Pending::Update { txn: txn.to_string(), commit: commit.to_string(), files: new_files.to_vec() });
         state.repo_mut(repo_id).upsert_skill(record);
         if let Err(e) = self.save(state) {
@@ -727,7 +731,13 @@ impl Applier {
         if files.iter().any(|f| f.fp.is_none()) {
             return Ok(Applied::Held("the existing folder changed while it was being checked; it was left alone".into()));
         }
-        state.repo_mut(repo_id).upsert_skill(OwnedSkill { name: skill.name.clone(), commit: commit.to_string(), files, pending: None });
+        state.repo_mut(repo_id).upsert_skill(OwnedSkill {
+            name: skill.name.clone(),
+            commit: commit.to_string(),
+            files,
+            updated: Some(self.now),
+            pending: None,
+        });
         self.save(state)?;
         Ok(Applied::Done)
     }
@@ -936,6 +946,8 @@ mod tests {
     const V1: &[(&str, &str)] = &[("SKILL.md", "# alpha v1\n"), ("scripts/run.ps1", "echo one\n"), ("references/a.md", "ref a\n")];
     const V2: &[(&str, &str)] = &[("SKILL.md", "# alpha v2\n"), ("scripts/run.ps1", "echo two, longer\n"), ("references/b.md", "ref b\n")];
     const EDITED: &str = "# alpha vX\n";
+    /// The time the applier of `Env::restart` records changes at.
+    const T0: UnixSecs = 1_700_000_000;
 
     type Files<'a> = &'a [(&'a str, &'a str)];
 
@@ -955,7 +967,7 @@ mod tests {
 
         /// A fresh applier and the state as saved on disk: what the app sees after a restart.
         fn restart(&self) -> (Applier, State) {
-            (Applier::new(self.skills.clone(), self.work.clone(), self.state.clone()), State::load(&self.state).unwrap().state)
+            (Applier::new(self.skills.clone(), self.work.clone(), self.state.clone(), T0), State::load(&self.state).unwrap().state)
         }
 
         fn live(&self, name: &str) -> PathBuf {
@@ -1707,6 +1719,40 @@ mod tests {
         assert_eq!(before, after, "no file was written, not even its timestamps");
         assert_eq!(local_state(&mut a, &env, &state, "alpha"), LocalState::Clean);
         assert!(record(&state, "alpha").files.iter().all(|f| f.fp.is_some()));
+        assert_eq!(record(&state, "alpha").updated, Some(T0), "adopting counts as the skill's last change");
+    }
+
+    /// The card's "Updated 2 days ago" is the time the app last put a version of the skill in place, and nothing else.
+    #[test]
+    fn a_skill_records_when_a_version_was_last_put_in_place_and_anything_that_keeps_the_old_version_keeps_its_time() {
+        let env = Env::new("updated");
+        let (mut a, mut state) = installed_v1(&env);
+        assert_eq!(record(&state, "alpha").updated, Some(T0));
+        a.now = T0 + 10;
+        assert_eq!(install(&mut a, &mut state, "alpha", V2, C2, Mode::Normal).unwrap(), Applied::Done);
+        assert_eq!(record(&state, "alpha").updated, Some(T0 + 10));
+        assert_eq!(State::load(&env.state).unwrap().state, state, "saved with the update");
+
+        edit_skill_file(&env);
+        a.now = T0 + 20;
+        held_reason(install(&mut a, &mut state, "alpha", V1, C1, Mode::Normal));
+        assert_eq!(record(&state, "alpha").updated, Some(T0 + 10), "a held update changes nothing");
+        assert_eq!(install(&mut a, &mut state, "alpha", V1, C1, Mode::Overwrite).unwrap(), Applied::Done);
+        assert_eq!(record(&state, "alpha").updated, Some(T0 + 20));
+
+        // After a crash, recovery records the time it finished the update; an undone update keeps the old time.
+        for (step, finished) in [(Step::Marked, false), (Step::Settled, true)] {
+            let env = Env::new("updated-crash");
+            let (mut a, mut state) = installed_v1(&env);
+            a.now = T0 + 10;
+            crash_at(&mut a, step);
+            assert!(install(&mut a, &mut state, "alpha", V2, C2, Mode::Normal).is_err());
+            drop((a, state));
+            let (mut a, mut state) = env.restart();
+            a.now = T0 + 30;
+            a.recover(&mut state).unwrap();
+            assert_eq!(record(&state, "alpha").updated, Some(if finished { T0 + 30 } else { T0 }), "{step:?}");
+        }
     }
 
     #[test]

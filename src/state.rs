@@ -82,6 +82,10 @@ pub struct OwnedSkill {
     pub name: String,
     pub commit: String,
     pub files: Vec<ManagedFile>,
+    /// When the app last installed, updated or adopted this skill. Records written by older versions have none until
+    /// the skill's next update.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending: Option<Pending>,
 }
@@ -441,7 +445,7 @@ mod tests {
     }
 
     fn skill(name: &str) -> OwnedSkill {
-        OwnedSkill { name: name.to_string(), commit: "c".repeat(40), files: vec![file("SKILL.md", true), file("a/b.md", false)], pending: None }
+        OwnedSkill { name: name.to_string(), commit: "c".repeat(40), files: vec![file("SKILL.md", true), file("a/b.md", false)], updated: None, pending: None }
     }
 
     fn temp(name: &str) -> PathBuf {
@@ -479,6 +483,15 @@ mod tests {
         assert_eq!(back, st);
         assert_eq!(back.repos["r"].skills[0].files[0].fp.unwrap().file_id[0], u64::MAX);
         assert!(back.has_pending());
+    }
+
+    #[test]
+    fn the_time_of_a_skills_last_change_round_trips_and_older_records_have_none() {
+        let older: OwnedSkill = serde_json::from_str(r#"{"name":"alpha","commit":"c","files":[]}"#).unwrap();
+        assert_eq!(older.updated, None);
+        assert!(!serde_json::to_string(&older).unwrap().contains("updated"), "nothing is written until it is known");
+        let known = OwnedSkill { updated: Some(1_800_000_000), ..skill("alpha") };
+        assert_eq!(serde_json::from_str::<OwnedSkill>(&serde_json::to_string(&known).unwrap()).unwrap(), known);
     }
 
     #[test]

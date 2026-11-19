@@ -20,8 +20,8 @@ use std::sync::atomic::AtomicBool;
 use crate::board::{Board, Health, Level, capitalized};
 use crate::config::Config;
 use crate::engine::{
-    Access, DiffReport, Engine, EngineError, Outcome, RemoveReport, Resolution, ResolveReport, Stamp, StartupReport, SyncOptions, SyncReport, VerifyReport,
-    Which,
+    Access, DiffReport, Engine, EngineError, Outcome, RemoveReport, Resolution, ResolveReport, SkillFacts, Stamp, StartupReport, SyncOptions, SyncReport,
+    VerifyReport, Which,
 };
 use crate::interval::UnixSecs;
 
@@ -62,10 +62,12 @@ pub enum Job {
         repo: String,
         delete_skills: bool,
     },
-    /// "Show changes": what is different between a skill on GitHub and the copy on this PC. Changes nothing.
+    /// "Show changes": what is different between a skill on GitHub and the copy on this PC; or, with `preview`, the files
+    /// GitHub put in it as they are on this PC. Changes nothing.
     Diff {
         repo: String,
         skill: String,
+        preview: bool,
     },
     /// Quitting: save what is waiting to be saved.
     Flush,
@@ -116,6 +118,8 @@ pub struct Done {
     pub next_wake: Option<UnixSecs>,
     pub last_checks: Vec<(String, UnixSecs)>,
     pub kept: Vec<(String, Vec<String>)>,
+    /// What the record says about each repository's skills.
+    pub facts: Vec<(String, Vec<SkillFacts>)>,
     /// Whether the last listing of each repository had no skills in it at all.
     pub lists_nothing: Vec<(String, bool)>,
     /// Whether each repository was found to need the token.
@@ -145,7 +149,8 @@ pub fn perform(engine: &mut Engine, order: &Order, cancel: &AtomicBool) -> Done 
             engine.sync(cfg, &Which::One(id.clone()), &opts, cancel).map(|sync| Answer::Checked { verified: None, sync })
         }
         Job::Remove { repo, delete_skills } => engine.remove_repo(repo, *delete_skills).map(Answer::Removed),
-        Job::Diff { repo, skill } => engine.diff(cfg, repo, skill, cancel).map(Answer::Diffed),
+        Job::Diff { repo, skill, preview: false } => engine.diff(cfg, repo, skill, cancel).map(Answer::Diffed),
+        Job::Diff { repo, skill, preview: true } => engine.preview(cfg, repo, skill, cancel).map(Answer::Diffed),
         Job::Flush => engine.flush().map(|()| Answer::Flushed),
         Job::Plan => Ok(Answer::Planned),
     };
@@ -155,6 +160,7 @@ pub fn perform(engine: &mut Engine, order: &Order, cancel: &AtomicBool) -> Done 
         next_wake: engine.next_wake(cfg),
         last_checks: cfg.repos.iter().filter_map(|r| engine.last_check(&r.id).map(|at| (r.id.clone(), at))).collect(),
         kept: cfg.repos.iter().map(|r| (r.id.clone(), engine.kept(&r.id))).collect(),
+        facts: cfg.repos.iter().map(|r| (r.id.clone(), engine.facts(&r.id))).collect(),
         lists_nothing: cfg.repos.iter().map(|r| (r.id.clone(), engine.lists_nothing(&r.id))).collect(),
         private: cfg.repos.iter().map(|r| (r.id.clone(), engine.needs_token(&r.id))).collect(),
         stamp: engine.state_stamp(),
@@ -174,11 +180,12 @@ pub struct Settled {
     pub diff: Option<Shown>,
 }
 
-/// What "Show changes" found for a skill, or why it could not be shown.
+/// What "Show changes" or Preview found for a skill, or why it could not be shown.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Shown {
     pub repo: String,
     pub skill: String,
+    pub preview: bool,
     pub result: Result<DiffReport, String>,
 }
 
@@ -425,6 +432,9 @@ impl App {
         for (id, names) in &done.kept {
             self.board.note_kept(id, names);
         }
+        for (id, facts) in &done.facts {
+            self.board.note_facts(id, facts);
+        }
         for (id, nothing) in &done.lists_nothing {
             self.board.note_lists_nothing(id, *nothing);
         }
@@ -535,7 +545,7 @@ fn backoff(failures: u32) -> UnixSecs {
 
 fn shown(job: &Job, result: Result<DiffReport, String>) -> Option<Shown> {
     match job {
-        Job::Diff { repo, skill } => Some(Shown { repo: repo.clone(), skill: skill.clone(), result }),
+        Job::Diff { repo, skill, preview } => Some(Shown { repo: repo.clone(), skill: skill.clone(), preview: *preview, result }),
         _ => None,
     }
 }

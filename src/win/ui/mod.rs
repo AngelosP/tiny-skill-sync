@@ -103,9 +103,9 @@ pub fn local_time(secs: UnixSecs) -> String {
     }
 }
 
-/// Opens a folder in File Explorer. Started as a process, so no COM is needed on this thread.
+/// Opens a folder in File Explorer.
 pub fn open_folder(path: &Path) -> Result<(), String> {
-    std::process::Command::new("explorer.exe").arg(path).spawn().map(drop).map_err(|e| format!("File Explorer could not be started: {e}"))
+    super::proc::explorer(path.as_os_str()).map_err(|e| format!("File Explorer could not be started: {e}"))
 }
 
 /// Gives memory the app is not using back to Windows. Pages it touches again come back on demand.

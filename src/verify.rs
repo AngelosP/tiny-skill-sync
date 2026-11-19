@@ -386,7 +386,7 @@ mod tests {
             managed.push(ManagedFile { path: path.to_string(), blob: blob_hex(content.as_bytes()), size: content.len() as u64, fp: None, canon: None });
         }
         capture(dir, &mut managed, &mut FileHasher::default());
-        OwnedSkill { name: "alpha".into(), commit: "c".repeat(40), files: managed, pending: None }
+        OwnedSkill { name: "alpha".into(), commit: "c".repeat(40), files: managed, updated: None, pending: None }
     }
 
     const FILES: [(&str, &str); 3] = [("SKILL.md", "# alpha\n"), ("scripts/run.ps1", "echo hi\n"), ("refs/a.md", "reference\n")];

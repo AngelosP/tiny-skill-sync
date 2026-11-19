@@ -17,7 +17,8 @@ what came from GitHub and was later removed there; files you add are yours, and 
 - **Public and private repositories.** Public ones need nothing. Private ones are read with the GitHub CLI's sign-in
   (`gh auth login`) or a token saved in Windows Credential Manager, without any setting to turn on.
 - **A tray icon and a window** that shows every repository and skill, says in plain words what needs you, and shows
-  line by line what is different between GitHub and your copy of a skill. It follows the Windows light or dark mode.
+  line by line what is different between GitHub and your copy of a skill. An open skill also shows its version and
+  size, a preview of its files, its folder and its address on GitHub. It follows the Windows light or dark mode.
 - **A command line** (`tss`) that does the same work one command at a time.
 
 Windows 10 and 11, x64. There is no installer yet, and the exes are not signed.
@@ -171,7 +172,23 @@ room from the page beside it, and narrows again when the mouse leaves.
     repository…**. Removing asks whether to leave its skills installed (they become yours) or to delete them too
     (skills you edited are kept, and files you added stay where they are).
 - **Its skills,** each with its state. A skill that needs you is open already; click any other to open it. An open
-  skill says what is going on, and offers the choices that make sense (see below), **Show changes** and **Open folder**.
+  skill says what is going on, and offers the choices that make sense (see below) and **Show changes**. Under them:
+  - For a skill the app installed, one line from its record: the version (the start of the commit it came from), how
+    many files GitHub put there and their size, and when the app installed or last updated it ("Version 1a2b3c4 ·
+    3 files, 12 KB · Updated 2 days ago"). Skills installed by an older version of the app say when only after their
+    next update.
+  - **Preview** shows the files GitHub put in the skill, each whole, as they are on this PC, in the same view as
+    **Show changes** but with nothing to choose. Files you added are not shown, and nothing is written.
+  - **Copy path** copies the path of the skill's folder. **Copy GitHub link** copies the address of the skill on
+    GitHub, and **Open on GitHub** opens it in your browser; the address names the repository's branch, or its default
+    branch when none is set. The line under the band says what was copied.
+  - **Open folder** opens the skill's folder in File Explorer.
+
+  Each button shows only when it can work: no **Preview** for a skill the app did not install, no **Preview**, **Copy
+  path** or **Open folder** for a skill whose folder is not on this PC, and no GitHub link for a skill GitHub no longer
+  lists.
+- **Rest the mouse on a skill** whose folder is on this PC, and a folder button appears beside its state: click it to
+  open the folder without opening the skill.
 - **Show changes** turns the window into the differences between the GitHub version of the skill and the copy on this
   PC, shown as what taking the GitHub version would do to the copy on this PC. Nothing changes until you choose.
   - The files are listed on the left, each marked "Only on GitHub" (`+`, it would be added), "Only on this PC" (`−`,
@@ -385,17 +402,17 @@ historical adoption; the larger install is an earlier baseline.
 | Start at sign-in, its first 3 s: CPU, file I/O | 7.8 ms, 241 bytes | under 16 ms, 251 bytes | 300 ms, 300 KB |
 | Idle for 10 s: CPU, disk, page faults | 0, 0, 0 | 0, 0, 0 | 0 |
 | Idle memory: trimmed working set / private | 1.0 / 1.9 MiB | 1.2 / 2.6 MiB | 2 / 4 MiB |
-| Window: open to painted (median) | 38.1 ms | 43 ms | 100 ms |
-| Window open: working set | 13.4 MiB | 14.4 MiB | 40 MiB |
+| Window: open to painted (median) | 37.0 ms | 43 ms | 100 ms |
+| Window open: working set | 13.6 MiB | 14.4 MiB | 40 MiB |
 | Window closed: working set (trimmed) | 1.5 MiB | 1.5 MiB | 2 MiB |
-| Unchanged check: CPU, file reads and writes | 15.6 ms, 0, 0 | 16 ms, 0, 0 | 50 ms, 0 |
-| Exe size | 1,045,504 bytes | 0.93 MiB | 1 MiB |
+| Unchanged check: CPU, file reads and writes | 0 ms, 0, 0 | 16 ms, 0, 0 | 50 ms, 0 |
+| Exe size | 1,004,544 bytes | 0.93 MiB | 1 MiB |
 
-Every budget row passed. The current startup check took 47.5 microseconds per file; an unchanged poll took 227 ms
+Every budget row passed. The current startup check took 48.2 microseconds per file; an unchanged poll took 438 ms
 wall time and changed no files. The eight-candidate historical quick slice took 11.4 seconds in the live fixture
 check, including an initial install and an older-copy update; its time depends on the network.
 
-Windows counts a process's CPU time in ticks of 15.6 ms, so an unchanged check shows as one to three ticks (16 to
+Windows counts a process's CPU time in ticks of 15.6 ms, so an unchanged check shows as zero to three ticks (0 to
 47 ms) from run to run. The exe is built for size: in the earlier comparison, building for speed made it 1.01 MiB,
 over its budget, and hashed files about 13% faster (384 instead of 339 MB/s). A list of 463 skills opens almost as fast
 as one of 19, because only

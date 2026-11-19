@@ -143,6 +143,22 @@ fn decode(bytes: &[u8]) -> Option<&str> {
     Some(text.strip_prefix('\u{feff}').unwrap_or(text))
 }
 
+/// One file as Preview shows it, whole: every line, blank ones too, is a line that is the same, numbered on the new
+/// side only (`old` is empty).
+pub fn whole(content: Content) -> Body {
+    match content {
+        Content::Hidden(why) => Body::Hidden(why),
+        Content::Bytes(bytes) => match decode(&bytes) {
+            Some(text) => {
+                let new: Vec<String> = text::numbered_lines(text).map(|(_, line)| line.to_string()).collect();
+                let rows = (1..=new.len()).map(|n| Row::Same { old: n, new: n }).collect();
+                Body::Text(TextDiff { old: Vec::new(), new, rows, added: 0, removed: 0 })
+            }
+            None => Body::NotText,
+        },
+    }
+}
+
 /// The lines of two texts, compared. Only the lines that count ([`text::counted_lines`]) are compared and shown.
 pub fn text_diff(old: &str, new: &str) -> TextDiff {
     let (old_counted, old_at): (Vec<&str>, Vec<usize>) = text::counted_lines(old).map(|(n, line)| (line, n)).unzip();
@@ -544,5 +560,17 @@ mod tests {
                 ("l", Presence::OnlyHere, &Body::Hidden("a link".into())),
             ]
         );
+    }
+
+    #[test]
+    fn a_whole_file_keeps_every_line_blank_ones_too_and_numbers_each() {
+        let Body::Text(t) = whole(Content::Bytes("\u{feff}# A\r\n\n  \ntext\n".into())) else { panic!("text is shown as text") };
+        assert_eq!(t.new, ["# A", "", "  ", "text"], "without the byte order mark or the line breaks");
+        assert_eq!(t.rows, [same(1, 1), same(2, 2), same(3, 3), same(4, 4)]);
+        assert!(t.old.is_empty());
+        let Body::Text(empty) = whole(Content::Bytes(Vec::new())) else { panic!("an empty file is text") };
+        assert!(empty.new.is_empty() && empty.rows.is_empty());
+        assert_eq!(whole(Content::Bytes(b"a\0b".to_vec())), Body::NotText);
+        assert_eq!(whole(Content::Hidden("too big".into())), Body::Hidden("too big".into()));
     }
 }

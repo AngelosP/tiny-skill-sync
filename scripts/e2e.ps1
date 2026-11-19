@@ -28,7 +28,9 @@
     stale         GitHub answering with a tree that is newer than its commit
     empty         a repository added as a whole when its skills are in a subfolder
     signin        Start with Windows: the entry, a start the way Windows starts it at sign-in, copies in long folders
-    ui            the window, its questions and the tray menu, driven and read from outside, with screenshots
+    ui            the window, its questions and the tray menu, driven and read from outside, with screenshots (it moves
+                  the mouse pointer and uses the clipboard, putting both back, and opens a skill's folder in File
+                  Explorer once, closing it again)
 
   A summary table is printed at the end and the whole run is saved in bench\out\e2e-STAMP.txt. The exit code is 1
   when a check failed.
@@ -844,17 +846,18 @@ function Test-Names {
         $rows = @(Read-Skills $win)
         $text = ($rows | ForEach-Object { "$($_.Name): $($_.Tag)" }) -join "`n"
         Check 'the window lists the skills with the characters written out' ($rows.Count -ge 2 -and $text -match '\\u\{202e\}' -and -not (Has-Danger $text)) (Show-Safe ($text -replace "`n", ' | '))
-        # A skill that needs the user is open to start with; any other is opened, as a click on its row does.
-        foreach ($row in @($rows | Where-Object { $null -eq $_.Detail })) {
+        # A skill that needs the user is open to start with; any other is opened, as a click on its row does. An open
+        # skill that is up to date shows its facts instead of a detail.
+        foreach ($row in @($rows | Where-Object { $null -eq $_.Detail -and $null -eq $_.Facts })) {
             Click-Ui $win $UiPanel.Page $row.Id
-            [void](Wait-Maybe { if ($null -ne (Read-Ui $win $UiPanel.Page ($row.Id + 1))) { $true } } 5 100)
+            [void](Wait-Maybe { if ($null -ne (Read-Ui $win $UiPanel.Page ($row.Id + 1)) -or $null -ne (Read-Ui $win $UiPanel.Page ($row.Id + 8))) { $true } } 5 100)
         }
         $rows = @(Read-Skills $win)
-        $details = @($rows | ForEach-Object { [string]$_.Detail })
+        $details = @($rows | ForEach-Object { [string]$_.Detail + [string]$_.Facts })
         $unsafeDetails = @($details | Where-Object { Has-Danger $_ })
-        $missing = @($rows | Where-Object { -not $_.Detail } | ForEach-Object { $_.Name })
-        Check 'and so does the detail of every skill, each one opened' ($rows.Count -ge 2 -and $unsafeDetails.Count -eq 0 -and $missing.Count -eq 0) ("$($rows.Count) row(s); $($unsafeDetails.Count) detail(s) with a control or direction character; without a detail: " + (Show-Safe ($missing -join ', ')))
-        Note ('the details, one per skill: ' + (Show-Safe (($rows | ForEach-Object { "$($_.Name): " + ($_.Detail -replace "\s+", ' ') }) -join ' || ')))
+        $missing = @($rows | Where-Object { -not $_.Detail -and -not $_.Facts } | ForEach-Object { $_.Name })
+        Check 'and so does what every skill says once opened' ($rows.Count -ge 2 -and $unsafeDetails.Count -eq 0 -and $missing.Count -eq 0) ("$($rows.Count) row(s); $($unsafeDetails.Count) with a control or direction character; saying nothing: " + (Show-Safe ($missing -join ', ')))
+        Note ('what each skill says: ' + (Show-Safe (($rows | ForEach-Object { "$($_.Name): " + (([string]$_.Detail + ' ' + [string]$_.Facts).Trim() -replace "\s+", ' ') }) -join ' || ')))
 
         # No command is printed for such a name, so this window is the way to settle that skill.
         $rlo = @($rows | Where-Object { $_.Name -like 'rlo-*' })[0]
@@ -1189,7 +1192,8 @@ function Test-ListHover($c, [IntPtr]$Window, [switch]$Diff) {
             Check 'moving between diff files keeps the list wide' ((Get-Width $nav) -eq $wide)
         }
         Move-Pointer $pane
-        $back = Wait-Maybe { if ((Get-Width $nav) -eq $narrow) { $true } } 3 25
+        # The window sizes the list, then the page: wait for both, as a reader from outside can see one between them.
+        $back = Wait-Maybe { if ((Get-Width $nav) -eq $narrow -and (Get-Width $nav) + (Get-Width $pane) -eq $both) { $true } } 3 25
         Check "${state}: moving the mouse onto the page narrows the list again" ($null -ne $back -and (Get-Width $nav) + (Get-Width $pane) -eq $both) ("list $(Get-Width $nav) px, page $(Get-Width $pane) px")
         if ($Diff) {
             Check 'narrowing the diff keeps both scroll positions' ([TssLive]::GetScrollPos($nav, 1) -eq $listScroll -and [TssLive]::GetScrollPos($pane, 1) -eq $pageScroll)
@@ -1208,6 +1212,127 @@ function Test-ListHover($c, [IntPtr]$Window, [switch]$Diff) {
         }
     } finally {
         [void][TssLive]::SetCursorPos([int]$was[0], [int]$was[1])
+    }
+}
+
+# An open skill that is up to date (issue #3): what it says about itself and its buttons; Copy path and Copy GitHub
+# link, which use the real clipboard (its text is put back afterwards, or it is emptied if it held none); Preview,
+# which shows the files GitHub put there and not a file of mine; and the Open folder button its row draws while the
+# mouse is on it, which opens the skill's folder in File Explorer (closed again here). It moves the real mouse
+# pointer, and puts it back.
+function Test-SkillCard($c, [IntPtr]$Window) {
+    $dot = [string][char]0x00B7
+    # A file of my own in beta: it is mine, so it changes nothing and Preview does not show it.
+    $mine = Join-Path $c.Skills 'beta\my-beta-notes.md'
+    [IO.File]::WriteAllText($mine, "my notes`n")
+    Wait-Settled $c
+    try {
+        $row = @(Read-Skills $Window | Where-Object { $_.Name -eq 'beta' })
+        if ($row.Count -ne 1) { Check 'beta is listed' $false; return }
+        $id = $row[0].Id
+        Click-Ui $Window $UiPanel.Page $id
+        $beta = Wait-Maybe { $r = @(Read-Skills $Window | Where-Object { $_.Name -eq 'beta' -and $_.Facts }); if ($r.Count -ge 1) { $r[0] } } 5
+        $files = @((Get-UpstreamFiles $c.Repo $c.Ref 'skills').Keys | Where-Object { $_ -like 'beta/*' } | ForEach-Object { $_.Substring(5) } | Sort-Object)
+        $commit = ([string](Invoke-Gh @('api', "repos/$($c.Repo)/git/ref/heads/$($c.Branch)", '--jq', '.object.sha'))).Trim().ToLowerInvariant()
+        $count = if ($files.Count -eq 1) { '1 file' } else { "$($files.Count) files" }
+        $facts = if ($beta) { [string]$beta.Facts } else { '' }
+        Check 'an open skill that is up to date says which version it has, how many files and how big, and when it was updated' ($facts -match "^Version $($commit.Substring(0, 7)) $dot $count, \d+(\.\d)? (bytes?|KB|MB) $dot Updated (just now|\d+ minutes? ago)$") "$facts (GitHub: $($commit.Substring(0, 7)), $count)"
+        $texts = if ($beta) { @($beta.Buttons | ForEach-Object { $_.Text }) } else { @() }
+        Check 'and offers Open folder, Preview, Copy path, Copy GitHub link and Open on GitHub, with nothing to fix' (($texts -join ', ') -eq 'Open folder, Preview, Copy path, Copy GitHub link, Open on GitHub' -and $null -eq $beta.Detail) ($texts -join ', ')
+        $pic = Save-Shot $Window '05c-skill-open'
+        Test-Painted $pic $Window 'an open skill that is up to date' @(@($UiPanel.Page, $id), @($UiPanel.Page, ($id + 8)), @($UiPanel.Page, ($id + 9)), @($UiPanel.Page, ($id + 3)))
+        Test-Layout $Window 'an open skill that is up to date'
+        Test-TabOrder $Window 'an open skill that is up to date'
+
+        # ---- Copy path and Copy GitHub link
+        $clipWas = Get-Clipboard -Raw -ErrorAction SilentlyContinue
+        try {
+            $path = Join-Path $c.Skills 'beta'
+            Click-Ui $Window $UiPanel.Page ($id + 10)
+            $copied = Wait-Maybe { if ((Get-Clipboard -Raw) -eq $path) { $true } } 5
+            $said = Wait-Maybe { $s = (Read-Hero $Window).Sub; if ($s -like 'Copied: *') { $s } } 5
+            Check 'Copy path puts the folder of the skill on the clipboard, and says so' ($copied -and $said -eq "Copied: $path") "clipboard: $(Get-Clipboard -Raw) / $((Read-Hero $Window).Sub)"
+            $link = "https://github.com/$($c.Repo)/tree/$($c.Ref)/skills/beta"
+            Click-Ui $Window $UiPanel.Page ($id + 11)
+            $copied = Wait-Maybe { if ((Get-Clipboard -Raw) -eq $link) { $true } } 5
+            Check 'Copy GitHub link puts the address of the skill''s folder on GitHub on the clipboard' ($null -ne $copied) "clipboard: $(Get-Clipboard -Raw)"
+        } finally {
+            if ($clipWas) { Set-Clipboard -Value $clipWas } else { [void][TssLive]::ClearClipboard() }
+        }
+
+        # ---- Preview, and back
+        Click-Ui $Window $UiPanel.Page ($id + 9)
+        [void](Wait-Maybe { Read-Ui $Window $UiPanel.Files $UiId.File } 15)
+        $entries = @(for ($i = 0; $i -lt 500; $i++) { $t = Read-Ui $Window $UiPanel.Files ($UiId.File + $i); if ($null -eq $t) { break }; $t })
+        $names = @($entries | ForEach-Object { ($_ -split "`n", 2)[0] } | Sort-Object)
+        $odd = @($entries | Where-Object { ($_ -split "`n", 2)[1] -notmatch '^(1 line|\d+ lines|Empty|Not text)$' })
+        Check 'Preview lists the files GitHub put in the skill, each with how many lines it has, and not my own file' ($entries.Count -gt 0 -and ($names -join '|') -eq ($files -join '|') -and $odd.Count -eq 0) (($entries -join ' / ') -replace "`n", ' - ')
+        $head = Read-Panel $Window $UiPanel.Head
+        Check 'it names the skill, says it shows the files as they are on this PC without mine, and offers no choice' ((Read-Ui $Window $UiPanel.Head $UiId.Title) -eq 'beta' -and $head -match 'Files you added are not shown' -and $head -notmatch 'Use the GitHub version|Keep my version') $head
+        $pic = Save-Shot $Window '05d-preview'
+        Test-Painted $pic $Window 'a Preview' @(@($UiPanel.Head, $UiId.Back), @($UiPanel.Head, $UiId.Title), @($UiPanel.Files, $UiId.File))
+        if ($pic -and $pic.Screen) {
+            # The lines are drawn by the code panel itself, not by controls in it.
+            $wb = ([TssLive]::Bounds($Window)) -split ','
+            $cb = ([TssLive]::Bounds([TssLive]::GetDlgItem($Window, $UiPanel.Code))) -split ','
+            $contrast = [TssLive]::Contrast($pic.Path, [int]$cb[0] - [int]$wb[0], [int]$cb[1] - [int]$wb[1], [int]$cb[2] - [int]$cb[0], [int]$cb[3] - [int]$cb[1])
+            Check 'a Preview: the picture shows the lines of the first file drawn' ($contrast -ge 40) "the code panel varies by $contrast"
+        }
+        Test-Layout $Window 'a Preview'
+        Send-Key (Get-Ui $Window $UiPanel.Head $UiId.Back) $VK_ESCAPE
+        $back = Wait-Maybe { if ([TssLive]::Shown([TssLive]::GetDlgItem($Window, $UiPanel.Page)) -and -not [TssLive]::Shown([TssLive]::GetDlgItem($Window, $UiPanel.Head))) { $true } } 5
+        $differs = @(Compare-Skill $c 'beta')
+        Check 'Esc goes back to the page, and Preview changed nothing: my file is still there, the rest as on GitHub' ($back -and ($differs -join ', ') -eq 'unexpected: beta/my-beta-notes.md') ($differs -join ', ')
+
+        # ---- the Open folder button the row draws while the mouse is on it, left of its status
+        $over = [TssLive]::CoveredBy($Window)
+        if ($over -ne '') { Note "the folder button of a row was not checked, because a window ($over) is on top of this one"; return }
+        $was = ([TssLive]::CursorAt()) -split ','
+        $opened = $null
+        try {
+            $rowH = Get-Ui $Window $UiPanel.Page $id
+            $dpi = [int][TssLive]::GetDpiForWindow($Window)
+            $px = { param([int]$Dips) [int][math]::Round($Dips * $dpi / 96) }
+            $wb = ([TssLive]::Bounds($Window)) -split ','
+            $rb = ([TssLive]::Bounds($rowH)) -split ','
+            $cy = [int](([int]$rb[1] + [int]$rb[3]) / 2)
+            Move-Pointer ([TssLive]::GetDlgItem($Window, $UiPanel.Hero))
+            Start-Sleep -Milliseconds 300
+            $away = Save-Shot $Window '05e-row-mouse-away'
+            # The status pill is as wide as its words, so its left edge is found in the picture. The button, 32 wide,
+            # is 8 left of it: its middle is 24 left of the pill.
+            $pill = if ($away) { [TssLive]::LeftEdge($away.Path, [int]$rb[2] - [int]$wb[0] - (& $px 8), $cy - [int]$wb[1]) } else { -1 }
+            $zx = [int]$wb[0] + $pill - (& $px 24)
+            [void][TssLive]::SetCursorPos([int]$rb[0] + (& $px 60), $cy)
+            Start-Sleep -Milliseconds 300
+            $onRow = Save-Shot $Window '05f-row-mouse-on-name'
+            [void][TssLive]::SetCursorPos($zx, $cy)
+            Start-Sleep -Milliseconds 300
+            $onButton = Save-Shot $Window '05g-row-mouse-on-folder-button'
+            $zone = @(($zx - [int]$wb[0] - (& $px 16)), ($cy - [int]$wb[1] - (& $px 16)), (& $px 32), (& $px 32))
+            $name = @(([int]$rb[0] - [int]$wb[0] + (& $px 44)), ([int]$rb[1] - [int]$wb[1]), (& $px 120), ([int]$rb[3] - [int]$rb[1]))
+            $ok = $pill -gt 0 -and $away -and $onRow -and $onButton
+            $shows = if ($ok) { [TssLive]::Differ($away.Path, $onRow.Path, $zone[0], $zone[1], $zone[2], $zone[3]) } else { -1 }
+            $lit = if ($ok) { [TssLive]::Differ($onRow.Path, $onButton.Path, $zone[0], $zone[1], $zone[2], $zone[3]) } else { -1 }
+            $calm = if ($ok) { [TssLive]::Differ($onRow.Path, $onButton.Path, $name[0], $name[1], $name[2], $name[3]) } else { -1 }
+            Check 'a row shows an Open folder button while the mouse is on it, and lights only that button under the mouse' ($shows -gt 0 -and $lit -gt 0 -and $calm -eq 0) "pill at x $pill; with the mouse on the row $shows pixels of the button appear; on the button $lit of them change, and $calm of the name"
+            Test-Layout $Window 'the mouse on the folder button of a row'
+            # Clicked, it opens the folder, and the row stays open.
+            $target = [TssLive]::LongPath($path)
+            $lp = [IntPtr]((($cy - [int]$rb[1]) -shl 16) -bor ($zx - [int]$rb[0]))
+            [void][TssLive]::PostMessageW($rowH, $WM_LBUTTONDOWN, [IntPtr]1, $lp)
+            [void][TssLive]::PostMessageW($rowH, $WM_LBUTTONUP, [IntPtr]::Zero, $lp)
+            $shell = New-Object -ComObject Shell.Application
+            $opened = Wait-Maybe { foreach ($w in @($shell.Windows())) { try { if ([TssLive]::LongPath($w.Document.Folder.Self.Path) -eq $target) { $w } } catch { } } } 10 300
+            $open = @(Read-Skills $Window | Where-Object { $_.Name -eq 'beta' -and $_.Facts }).Count -eq 1
+            Check 'clicking it opens the folder of the skill in File Explorer, and the row stays open' ($null -ne $opened -and $open) "File Explorer on beta: $($null -ne $opened); row open: $open"
+        } finally {
+            if ($opened) { foreach ($w in @($opened)) { try { $w.Quit() } catch { } } }
+            [void][TssLive]::SetCursorPos([int]$was[0], [int]$was[1])
+        }
+    } finally {
+        Remove-Item -LiteralPath $mine -Force -ErrorAction SilentlyContinue
+        Wait-Settled $c
     }
 }
 
@@ -1336,10 +1461,11 @@ function Test-Ui {
         $hero = Wait-Maybe { $h = Read-Hero $win; if ($h.Title -eq 'All skills are up to date') { $h } } 8
         Check 'the top of the window says all skills are up to date, and how the check the user asked for ended' ($null -ne $hero -and $hero.Sub -like 'Checked: skills were updated*') $(if ($hero) { "$($hero.Title) / $($hero.Sub)" } else { (Read-Hero $win).Title })
         $pic = Save-Shot $win '05-installed'
-        Test-Painted $pic $win 'a repository added' @(@($UiPanel.Hero, $UiId.HeroTitle), @($UiPanel.Hero, $UiId.Sync), @($UiPanel.Nav, $UiId.NavRepo), @($UiPanel.Nav, $UiId.NavSettings), @($UiPanel.Page, $UiId.Title), @($UiPanel.Page, $UiId.Every), @($UiPanel.Page, ($UiId.Skill + 16)))
+        Test-Painted $pic $win 'a repository added' @(@($UiPanel.Hero, $UiId.HeroTitle), @($UiPanel.Hero, $UiId.Sync), @($UiPanel.Nav, $UiId.NavRepo), @($UiPanel.Nav, $UiId.NavSettings), @($UiPanel.Page, $UiId.Title), @($UiPanel.Page, $UiId.Every), @($UiPanel.Page, ($UiId.Skill + 2 * $UiId.SkillStride)))
         Test-Layout $win 'a repository added'
         Test-TabOrder $win 'a repository added'
         Test-ListHover $c $win
+        Test-SkillCard $c $win
         Click-Ui $win $UiPanel.Nav $UiId.NavActivity
         $notes = Wait-Maybe { $t = Read-Ui $win $UiPanel.Page $UiId.Note; if ($t) { $t } } 5
         Check 'Activity tells what was done' ($notes -match 'alpha' -or $notes -match 'nstalled') (Read-Panel $win $UiPanel.Page)
