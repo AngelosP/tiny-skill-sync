@@ -84,13 +84,14 @@ path.
 5. If it changes what the app shows or does while it runs (the tray, the window, the visible result of a
    check): the matching scenarios of `scripts\dev.ps1 e2e -Only ...` pass, and for a window you have looked at the
    screenshots they save.
-6. The docs say what the code does: [README.md](README.md) for users, [ARCHITECTURE.md](ARCHITECTURE.md) for how it
+6. The docs say what the code does: [README.md](README.md) for the introduction, [docs/GUIDE.md](docs/GUIDE.md) for users,
+   [ARCHITECTURE.md](ARCHITECTURE.md) for how it
    works, [CONTRIBUTING.md](CONTRIBUTING.md) for commands.
 7. No leftovers: `scripts\dev.ps1 clean` removes the sandbox and test folders.
 
 ## Where the history is
 
 The design plan, with the requirements, every decision, the spike measurements and the implementation log, is kept
-outside this repository by its owner. The measurements that matter are repeated in [README.md](README.md) and
+outside this repository by its owner. The measurements that matter are repeated in [docs/GUIDE.md](docs/GUIDE.md#measured-cost) and
 [spikes/README.md](spikes/README.md). When you find something new (a defect, a measurement, a decision), say so in your
 report so it can be recorded there.

@@ -13,6 +13,7 @@
   bench    Measure startup, memory, CPU and disk use against the budgets. Options: see scripts\bench.ps1
   e2e      Run the real app against real GitHub test repositories and check what it does. Options: see scripts\e2e.ps1
   soak     Leave the app running for an hour or so against a test repository and measure it. Options: see scripts\soak.ps1
+  demo     Make the captioned README GIF with throwaway fixture data. Options: -Python PATH -SkipBuild
   clean    Close the sandbox copy and any copy a live script left running, delete the sandbox, test leftovers in %TEMP%,
            the test startup entries (HKCU\Software\tiny-skill-sync-test) and bench results. Keeps target\ (use
            'cargo clean' for that).
@@ -41,6 +42,7 @@ $scripts = @{
     'bench'   = 'bench.ps1'
     'e2e'     = 'e2e.ps1'
     'soak'    = 'soak.ps1'
+    'demo'    = 'demo.ps1'
 }
 
 switch ($Task) {
@@ -84,7 +86,7 @@ switch ($Task) {
         Get-Help $PSCommandPath -Detailed | Out-Host
     }
     default {
-        Write-Host "Unknown task '$Task'. Tasks: run, build, test, tss, dry-run, bench, e2e, soak, clean, help" -ForegroundColor Red
+        Write-Host "Unknown task '$Task'. Tasks: run, build, test, tss, dry-run, bench, e2e, soak, demo, clean, help" -ForegroundColor Red
         exit 3
     }
 }

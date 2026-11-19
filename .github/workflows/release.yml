@@ -70,6 +70,7 @@ jobs:
           $stage = Join-Path $env:RUNNER_TEMP $name
           New-Item -ItemType Directory -Force $dist, $stage | Out-Null
           Copy-Item target\release\tiny-skill-sync.exe, target\release\tss.exe, README.md -Destination $stage
+          Copy-Item docs -Destination $stage -Recurse
           $zip = Join-Path $dist "$name.zip"
           Compress-Archive -Path (Join-Path $stage '*') -DestinationPath $zip
           $files = @(Get-Item $zip) + @(Get-ChildItem $stage -Filter '*.exe')

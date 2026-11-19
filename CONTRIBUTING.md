@@ -28,6 +28,7 @@ Start with `scripts\dev.ps1`; it runs the others.
 | `scripts\dev.ps1 bench` | Measure the release app against its budgets (see [Measuring](#measuring)). |
 | `scripts\dev.ps1 e2e` | Run the real exes against real GitHub test repositories and check what they do (see [Live end-to-end runs](#live-end-to-end-runs)). `-Only NAME,NAME`, `-Keep`, `-SkipBuild`. |
 | `scripts\dev.ps1 soak` | Leave the release app running for 75 minutes against a repository that changes every 10 minutes, and sample its memory, handles, threads, CPU and file I/O. `-Minutes`, `-Every`, `-ChangeEveryMinutes`, `-Keep`. |
+| `scripts\dev.ps1 demo` | Make `docs\demo.gif` from the real app and disposable public fixture data. `-Python PATH`, `-SkipBuild`. See [Remaking the README demo](#remaking-the-readme-demo). |
 | `scripts\dev.ps1 clean` | Close the sandbox copy and any copy a live script left running, and delete the sandbox, test and live-script leftovers in `%TEMP%` and `bench\out`, and the test copies' Start with Windows keys (`HKCU\Software\tiny-skill-sync-test`). Keeps `target\`. |
 
 The **sandbox** is `.tss-test\` in the repository (ignored by git): its own settings (`.tss-test\home`) and skills
@@ -65,7 +66,7 @@ refuses to write Windows' own keys from a test.
 | --- | --- |
 | `src\*.rs` (`#[cfg(test)]`) | Unit tests next to the code. The modules that make decisions (`reconcile`, `tree`, `scheduler`, `board`, `app`, `interval`, `pathsafe`, `autostart`) are pure, so every rule is tested without a disk or a network; so are the comparison behind **Show changes** (`diff`) and the window's pages (`win::ui::page`). `apply` and `win::fs` are tested on the real file system, `win::autorun` on the real registry. |
 | `tests\engine_sync.rs`, `engine_failures.rs`, `engine_lifecycle.rs` | The engine end to end, on the real file system, with a fake GitHub (`tests\common\mod.rs`: `FakeRemote`, `World`). Failures, crashes in every step of a change, restarts. |
-| `tests\downtime.rs` | Edits made while the app was stopped, and drives that cannot vouch for a file. The evidence for [How edits are found](README.md#how-edits-are-found). |
+| `tests\downtime.rs` | Edits made while the app was stopped, and drives that cannot vouch for a file. The evidence for [How edits are found](docs/GUIDE.md#how-edits-are-found). |
 | `tests\http.rs` | The real WinHTTP client against a local test server: redirects, timeouts, limits, cancel. |
 | `tests\cli.rs`, `tests\app.rs` | The command line and the tray's logic, with a real engine and a fake GitHub. |
 
@@ -132,6 +133,56 @@ that is fully painted on screen.
 2. Fix the code. The test passes, and so does everything else.
 3. Keep the test.
 
+### Remaking the README demo
+
+The demo needs Python 3.13, Pillow (development only), a release build, and a GitHub CLI sign-in with push access
+to `AngelosP/tiny-skill-sync-fixtures-public`. The script never installs tools for you:
+
+```powershell
+python -m venv bench\out\demo-venv
+bench\out\demo-venv\Scripts\python.exe -m pip install -r scripts\requirements-demo.txt
+scripts\dev.ps1 demo -Python bench\out\demo-venv\Scripts\python.exe
+```
+
+It takes about five minutes plus GitHub's cache delays. It creates its own `e2e-demo-*` branch in that fixed public fixture, adds two small
+skills through the app's window, and proves they reached disk. It pushes an update and **really waits for the
+five-minute scheduled check**, with no manual sync. Then it edits a managed file, pushes a conflicting change,
+uses **Sync now**, opens **Show changes**, and chooses **Keep my version**. Assertions check that the edit survives,
+the other skill is unchanged, and the window reports each result.
+
+Every app process uses a throwaway `%TEMP%\tss-demo-*` install, with both `TSS_HOME` and `TSS_SKILLS_DIR` set and
+`TSS_NO_SAVED_TOKEN=1`. The child environment is checked before starting. The startup offer is declined.
+The branch and app install are removed in `finally`, including on failure. Cleanup failures are reported and make
+the script fail. There is no repository or branch override, so it cannot be pointed at a real skill repository.
+
+Only the app's own windows are photographed, with `PrintWindow`, never a desktop capture. Because `PrintWindow`
+can leave a blank band, captures are retried until the visible text controls have painted. The script refuses
+captures whose controls contain a local absolute path or credential-shaped text. It uses the current Windows theme,
+does not move the mouse or use the clipboard, and never opens Settings or File Explorer.
+
+Pillow adds readable captions, pulsing highlights, a progress strip and an enlarged tray-icon illustration.
+The last illustration is separate from the captured UI: update it in `demo_gif.py` if the tray design changes.
+The window captures themselves pick up new app icons on the next run. No logo is required in the README.
+The five-minute wait is labelled as shortened; the later manual check is labelled too.
+
+The output is 960 by 760 pixels, 25 seconds, loops forever and must be strictly under 5,000,000 bytes.
+The renderer checks the decoded frame count, duration and loop, exports every decoded frame for review, and runs
+twice on the same inputs to prove identical GIF bytes. A new live capture is not byte-identical: its branch,
+commit and relative times change.
+
+Raw shots, `story.json`, decoded `frame-*.png` files and both encodings are left in `bench\out\demo-*`.
+Inspect every frame for clipped text, blank areas and private information before committing `docs\demo.gif`.
+To re-encode those same captures without another live run:
+
+```powershell
+bench\out\demo-venv\Scripts\python.exe scripts\demo_gif.py bench\out\demo-RUN\story.json bench\out\demo-RUN\demo.gif
+```
+
+Run `scripts\dev.ps1 test` after changing the script. `scripts\dev.ps1 clean` removes the capture folders,
+the Python environment and any abandoned demo install, but keeps the committed GIF.
+When worktrees share this PC, do not run the global cleanup while another run is active: remove only your own
+worktree's outputs. Serialize live runs with the coordination lock agreed for that work.
+
 ### When a new test passes at once
 
 For code that protects the user's files (`apply`, `reconcile`, `verify`, `text`, `win::fs`, the engine), a test that
@@ -177,7 +228,7 @@ The budgets, agreed before the app was written:
 | Quit | 2 s at most |
 | `tiny-skill-sync.exe` | 1 MiB |
 
-The latest results are in [README.md](README.md#measured-cost).
+The recorded results and their test conditions are in [the user guide](docs/GUIDE.md#measured-cost).
 
 ## Code style
 
@@ -213,7 +264,7 @@ Windows shows for each exe, as in Task Manager's startup apps (about 1 KiB).
 2. `git tag -a vX.Y.Z -m "tiny-skill-sync X.Y.Z"`, then `git push origin main vX.Y.Z`.
 
 On a Windows runner, the workflow refuses a tag that does not match `Cargo.toml`, runs `scripts\test.ps1` and
-`scripts\build.ps1`, and publishes `tiny-skill-sync-X.Y.Z-windows-x64.zip` (both exes and the README) with
+`scripts\build.ps1`, and publishes `tiny-skill-sync-X.Y.Z-windows-x64.zip` (both exes, the README, user guide and demo GIF) with
 `SHA256SUMS.txt` (the zip and both exes). A tag with a hyphen (`v0.2.0-rc.1`) makes a pre-release. To check that a
 release would build, without publishing anything: `gh workflow run release.yml`, then `gh run watch`.
 

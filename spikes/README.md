@@ -83,4 +83,4 @@ the token from `gh auth token` and keep it in memory only.
 
 These numbers became the budgets the real app is measured against (see
 [CONTRIBUTING.md](../CONTRIBUTING.md#measuring)); the real app's results are in
-[README.md](../README.md#measured-cost).
+[the user guide](../docs/GUIDE.md#measured-cost).

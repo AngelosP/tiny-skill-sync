@@ -1,6 +1,7 @@
 # Architecture
 
-How tiny-skill-sync works inside. For what it does and how to use it, see [README.md](README.md). For building and
+How tiny-skill-sync works inside. For the introduction, see [README.md](README.md); for how to use it, see
+[the user guide](docs/GUIDE.md). For building and
 testing, see [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## The big picture
