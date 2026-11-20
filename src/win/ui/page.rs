@@ -350,8 +350,10 @@ pub fn hero_of(views: &[RepoView], problem: Option<&str>, status: &str, news: bo
 
 pub fn hero(h: &Hero, can_sync: bool, w: i32, fit: Fit) -> Surface {
     let mut o = Out::new(fit);
-    o.fill([24, 8, 40, 40], 20, h.tone.bg(), Role::None);
-    o.glyph([24, 8, 40, 40], h.glyph, 18, h.tone.ink());
+    // A status is marked as in the list (a filled dot); the calm states (Off) stay quiet.
+    let (fill, ink) = if h.tone == Tone::Off { (h.tone.bg(), h.tone.ink()) } else { (h.tone.dot(), Role::DotGlyph) };
+    o.fill([24, 8, 40, 40], 20, fill, Role::None);
+    o.glyph([24, 8, 40, 40], h.glyph, 18, ink);
     let bw = o.button_width(SYNC_NOW, Some(glyph::SYNC));
     let bx = w - PAD_X - bw;
     o.button(Btn { enabled: can_sync, ..btn(id::SYNC, SYNC_NOW, Kind::Accent, Some(glyph::SYNC)) }, bx, 12, 32);
@@ -779,7 +781,7 @@ pub fn settings_page(p: &SettingsPage, w: i32, fit: Fit) -> Surface {
     let (items, shown) = every_choices(Some(p.default), None);
     let every = Ctl::Combo { id: id::DEFAULT_EVERY, items, shown };
     let desc = Desc::Text(0, "Used by every repository set to Default".to_string());
-    y = setting(&mut o, x, y, cw, glyph::TIMER, "Check for updates every", desc, vec![every]) + GAP;
+    y = setting(&mut o, x, y, cw, glyph::TIMER, "Check for skill updates every", desc, vec![every]) + GAP;
     let (on, enabled, note) = match p.startup {
         Ok(state) => (state.is_on(), state.can_change(), state.note(Via::Window)),
         Err(e) => (false, false, format!("Whether Windows starts it can’t be read: {e}")),
@@ -1413,6 +1415,16 @@ mod tests {
             ("1 skill needs your attention", "Checking for updates…"),
             "news replaces the summary, not the title"
         );
+    }
+
+    #[test]
+    fn the_top_mark_has_the_colours_of_the_marks_in_the_list() {
+        let mark = [24, 8, 40, 40];
+        for tone in [Tone::Ok, Tone::Warn, Tone::Err] {
+            let s = hero(&Hero { tone, glyph: glyph::OK, title: "Title".to_string(), sub: String::new() }, true, 800, &fit);
+            assert!(s.decos.contains(&Deco::Fill { at: mark, radius: 20, fill: tone.dot(), border: Role::None }), "{tone:?}: {:?}", s.decos);
+            assert!(s.decos.contains(&Deco::Glyph { at: mark, ch: glyph::OK, size: 18, ink: Role::DotGlyph }), "{tone:?}: {:?}", s.decos);
+        }
     }
 
     #[test]

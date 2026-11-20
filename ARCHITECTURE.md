@@ -482,7 +482,7 @@ everything they show.
   the centre). `logo::draw` decides each pixel from 16 samples (4 by 4) inside or outside the shapes, so the edges are
   smooth at any size, and gives straight-alpha pixels, which `tray::icon` copies into a 32-bit icon. Nothing is scaled:
   each icon is drawn at the exact size Windows asks for. The tray draws the icon at the small-icon size of the
-  taskbar's DPI, one picture per `Health` made the first time it is shown (solid blue, amber or red, or hollow blue
+  taskbar's DPI, one picture per `Health` made the first time it is shown (solid green, amber or red, or hollow blue
   or grey: the colour says how things are), and draws them again when the display or its scale changes
   (`tray::rescale`, on `WM_DISPLAYCHANGE`, `WM_DPICHANGED`, `WM_SETTINGCHANGE` and `TaskbarCreated`). The window
   draws its big and small icons at its own DPI when it opens and when it moves to a screen with another scale. The

@@ -170,7 +170,7 @@ try {
     Assert-Demo ([IO.File]::ReadAllText($localReview) -eq $mine) 'Keep my version preserved the edit'
     Assert-Demo ([IO.File]::ReadAllText((Join-Path $skills 'write-tests\SKILL.md')) -eq $tests) 'the other skill is unchanged'
     Save-DemoScene $win '06-kept' 'Your version stays yours' 'Everything is settled. The other skills stay in sync.' `
-        (Get-Ui $win $UiPanel.Hero $UiId.HeroTitle) 'Blue tray icon: all is well (enlarged illustration).'
+        (Get-Ui $win $UiPanel.Hero $UiId.HeroTitle) 'Green tray icon: all is well (enlarged illustration).'
     Close-Window $tray
     $manifest = Join-Path $shots 'story.json'
     [IO.File]::WriteAllText($manifest, (ConvertTo-Json -InputObject $scenes.ToArray() -Depth 5), $utf8)

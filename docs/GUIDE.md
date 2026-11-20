@@ -84,7 +84,7 @@ allows the same current-or-historical adoption checks.
    and of both exes. Or build them yourself (see [CONTRIBUTING.md](../CONTRIBUTING.md)): `scripts\dev.ps1 build` makes
    them in `target\release`.
 2. Put both exes, `tiny-skill-sync.exe` (the tray app) and `tss.exe` (the command line), in a folder of your choice, for
-   example `%LOCALAPPDATA%\Programs\tiny-skill-sync`, and start `tiny-skill-sync.exe`. Its icon, a blue tile with two
+   example `%LOCALAPPDATA%\Programs\tiny-skill-sync`, and start `tiny-skill-sync.exe`. Its icon, a tile with two
    sync arrows round a spark, appears in the
    notification area. The first start of a new exe can take up to a second while Microsoft Defender scans it. The exes
    are not signed, so if a browser downloaded them, Windows may ask before the first start (**More info**, **Run
@@ -187,7 +187,7 @@ The icon is the app's logo; its colour and fill say how things are.
 
 | Icon | Meaning |
 | --- | --- |
-| Blue | All skills are up to date. |
+| Solid green | All skills are up to date. |
 | Blue outline | Checking for updates, or, just after sign-in, waiting for Windows to finish starting. |
 | Grey outline | No repositories are set up. |
 | Amber | A skill needs you (see below). |
@@ -258,7 +258,7 @@ room from the page beside it, and narrows again when the mouse leaves.
     4 MiB from either side, and links (never followed) are named but not shown.
 - **Activity:** what the app did recently, newest first, and what went wrong.
 - **Settings:**
-  - **Check for updates every**: the default interval, for every repository set to **Default** (1 day at first).
+  - **Check for skill updates every**: the default interval, for every repository set to **Default** (1 day at first).
   - **Start with Windows**: a switch, and a line under it that says how it is, also when it was turned off in Task
     Manager or when Windows starts another copy of the app (see [Start with Windows](#start-with-windows)).
   - **Skills folder** and **Backups**, each with **Open**.

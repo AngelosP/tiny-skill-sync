@@ -10,7 +10,7 @@ from PIL import Image, ImageDraw, ImageFont
 SIZE = (960, 760)
 MAX_BYTES = 5_000_000
 # The healthy tray icon, written from src\logo.rs by `scripts\dev.ps1 logo`.
-LOGO = Path(__file__).resolve().parent.parent / "assets" / "logo-48.png"
+LOGO = Path(__file__).resolve().parent.parent / "assets" / "tray-ok-48.png"
 
 
 def font(size, bold=False):

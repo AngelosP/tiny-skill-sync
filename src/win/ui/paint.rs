@@ -70,7 +70,7 @@ impl Tone {
         }
     }
 
-    fn dot(self) -> Role {
+    pub fn dot(self) -> Role {
         match self {
             Tone::Ok => Role::Ok,
             Tone::Warn => Role::DotWarn,

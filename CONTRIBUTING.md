@@ -164,7 +164,7 @@ captures whose controls contain a local absolute path or credential-shaped text.
 does not move the mouse or use the clipboard, and never opens Settings or File Explorer.
 
 Pillow adds readable captions, pulsing highlights, a progress strip and a tray-icon illustration.
-That illustration is `assets\logo-48.png` (the healthy tray icon), so it follows the logo after `scripts\dev.ps1 logo`.
+That illustration is `assets\tray-ok-48.png` (the healthy tray icon), so it follows the logo after `scripts\dev.ps1 logo`.
 The window captures themselves pick up new app icons on the next run. No logo is required in the README.
 The five-minute wait is labelled as shortened; the later manual check is labelled too.
 

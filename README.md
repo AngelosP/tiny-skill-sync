@@ -61,8 +61,8 @@ Downloads are copied, never run.
 2. Its skills appear in the app and are verified on disk in an isolated copy of the Copilot skills folder.
 3. Change a file on GitHub and let the next scheduled check install it. The five-minute wait is cut from the GIF.
 4. Edit a managed file locally. An upstream update is held, and **Show changes** explains the difference.
-5. Choose **Keep my version**. That skill stays yours, the other skills stay managed, and the blue tray icon means
-   all is well. The final icon illustration is enlarged, not a recording of the desktop.
+5. Choose **Keep my version**. That skill stays yours and the other skills stay in sync. The healthy tray icon is
+   now solid green; the demo shows the earlier blue icon in an enlarged illustration.
 
 ## More
 

@@ -37,10 +37,11 @@ use super::theme::{self, Role};
 use super::{bench, local_time, open_folder, place, register_class, scale, sentence, text_of, tray, trim_memory};
 use crate::app::Job;
 use crate::autostart::{Keys, Startup};
-use crate::board::{APP_NAME, Action, Health, RepoView, Row};
+use crate::board::{APP_NAME, Action, RepoView, Row};
 use crate::config::{Config, Paths, RepoConfig, RepoSpec};
 use crate::github::web_url;
 use crate::interval::{Interval, MIN_POLL_MINUTES};
+use crate::logo;
 use crate::pathsafe::printable;
 use crate::win::{autorun, clip, cred, proc, wide};
 
@@ -159,7 +160,7 @@ fn dpi_of(hwnd: HWND) -> u32 {
 /// Gives the window the logo drawn at the exact sizes of its big and small icons at `dpi`, and returns them; the
 /// caller destroys them once they are replaced or the window is gone.
 fn set_icons(hwnd: HWND, dpi: u32) -> [HICON; 2] {
-    let icons = [SM_CXICON, SM_CXSMICON].map(|metric| tray::icon(Health::Ok, unsafe { GetSystemMetricsForDpi(metric, dpi) }));
+    let icons = [SM_CXICON, SM_CXSMICON].map(|metric| tray::icon(logo::Look::Solid(logo::BLUE), unsafe { GetSystemMetricsForDpi(metric, dpi) }));
     unsafe {
         SendMessageW(hwnd, WM_SETICON, ICON_BIG as usize, icons[0] as isize);
         SendMessageW(hwnd, WM_SETICON, ICON_SMALL as usize, icons[1] as isize);
@@ -746,7 +747,7 @@ fn custom_interval(hwnd: HWND, default: bool) -> Option<String> {
         })
     };
     let question = Ask {
-        heading: "Check for updates every".to_string(),
+        heading: "Check for skill updates every".to_string(),
         text: "Type how often, such as 45 minutes, 2 hours, 3 days or 2 weeks.".to_string(),
         field: Some(Field::Text {
             label: "Interval".to_string(),

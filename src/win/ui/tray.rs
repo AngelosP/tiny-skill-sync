@@ -37,7 +37,7 @@ impl Tray {
     fn icon(&mut self, health: Health) -> HICON {
         let slot = &mut self.icons[health as usize];
         if slot.is_null() {
-            *slot = icon(health, self.size);
+            *slot = icon(look(health), self.size);
         }
         *slot
     }
@@ -174,7 +174,7 @@ pub fn remove() {
 /// to do.
 fn look(health: Health) -> Look {
     match health {
-        Health::Ok => Look::Solid(logo::BLUE),
+        Health::Ok => Look::Solid(logo::GREEN),
         Health::Working | Health::Waiting => Look::Hollow(logo::BLUE),
         Health::NotConfigured => Look::Hollow(logo::GREY),
         Health::Attention => Look::Solid(logo::AMBER),
@@ -182,10 +182,10 @@ fn look(health: Health) -> Look {
     }
 }
 
-/// The logo in the look of `health`, `size` pixels square, drawn for that size. The caller destroys it.
-pub fn icon(health: Health, size: i32) -> HICON {
+/// The logo in the requested look, drawn at `size` pixels square. The caller destroys it.
+pub fn icon(look: Look, size: i32) -> HICON {
     let size = size.max(1);
-    let drawn = logo::draw(look(health), size as u32);
+    let drawn = logo::draw(look, size as u32);
     unsafe {
         let mut bmi: BITMAPINFO = zeroed();
         bmi.bmiHeader.biSize = size_of::<BITMAPINFOHEADER>() as u32;
@@ -218,9 +218,9 @@ mod tests {
 
     #[test]
     fn each_state_the_readme_names_looks_different() {
-        assert_eq!(look(Health::Ok), Look::Solid(logo::BLUE));
+        assert_eq!(look(Health::Ok), Look::Solid(logo::GREEN));
         assert_eq!(look(Health::Working), look(Health::Waiting), "both are 'busy, nothing wrong'");
-        assert!(matches!(look(Health::Working), Look::Hollow(_)), "working is hollow, so a glance tells it from fine");
+        assert_eq!(look(Health::Working), Look::Hollow(logo::BLUE));
         let states = [Health::NotConfigured, Health::Ok, Health::Working, Health::Attention, Health::Error];
         for (i, a) in states.iter().enumerate() {
             for b in &states[i + 1..] {

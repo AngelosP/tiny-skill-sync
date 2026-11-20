@@ -5,6 +5,7 @@
 //! README and the site, the favicon) are written from these two by a test, which fails when they differ.
 
 pub const BLUE: u32 = 0x0F6CBD;
+pub const GREEN: u32 = 0x107C10;
 pub const GREY: u32 = 0x8A8A8A;
 pub const AMBER: u32 = 0xD98C00;
 pub const RED: u32 = 0xD13438;
@@ -170,6 +171,7 @@ mod tests {
         for size in [16, 32, 48, 64, 128, 256] {
             all.push((format!("logo-{size}.png"), png(size)));
         }
+        all.push(("tray-ok-48.png".to_string(), files::png(&draw(Look::Solid(GREEN), 48), 48)));
         all.push(("favicon.ico".to_string(), files::ico(&[16, 32, 48].map(|s| (s, png(s))))));
         all.push(("tiny-skill-sync.ico".to_string(), files::ico(&EXE_ICON.map(|s| (s, png(s))))));
         all
