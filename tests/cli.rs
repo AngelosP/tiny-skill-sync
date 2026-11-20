@@ -14,10 +14,11 @@ use common::*;
 use tiny_skill_sync::autostart::{Keys, Startup, TEST_ROOT, VALUE_NAME, program};
 use tiny_skill_sync::board::APP_NAME;
 use tiny_skill_sync::cli::{self, Host};
-use tiny_skill_sync::config::{CONFIG_FILE, Config};
+use tiny_skill_sync::config::{CONFIG_FILE, Config, Paths, UpdateInterval, UpdatePrefs, UpdateTiming};
 use tiny_skill_sync::github::{FailureKind, Remote, RemoteError, TokenProvider};
 use tiny_skill_sync::logo;
 use tiny_skill_sync::portable::{SETTINGS_FILE, SOURCES_FILE};
+use tiny_skill_sync::updater::Action as AppAction;
 use tiny_skill_sync::win::{autorun, wide};
 use windows_sys::Win32::Foundation::ERROR_SUCCESS;
 use windows_sys::Win32::Storage::FileSystem::{GetFileVersionInfoSizeW, GetFileVersionInfoW, VS_FFI_SIGNATURE, VS_FIXEDFILEINFO, VerQueryValueW};
@@ -32,10 +33,31 @@ struct TestHost {
     typed: Mutex<Option<String>>,
     /// What the registry layer would say. It is tested on the registry itself; here only what `tss` makes of it.
     startup: Mutex<Result<Startup, String>>,
+    app: Option<FakeApp>,
+    change_before_second_home_read: Mutex<Option<Config>>,
+    home_reads: std::cell::Cell<u32>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum AppCall {
+    ReadPair,
+    Manual(AppAction),
+}
+
+struct FakeApp {
+    calls: Mutex<Vec<AppCall>>,
+    installed: Result<&'static str, &'static str>,
+    failure: Option<&'static str>,
 }
 
 impl Host for TestHost {
     fn home(&self) -> PathBuf {
+        self.home_reads.set(self.home_reads.get() + 1);
+        if self.home_reads.get() == 2 {
+            if let Some(external) = self.change_before_second_home_read.lock().unwrap().take() {
+                self.save(&external);
+            }
+        }
         self.world.home.clone()
     }
 
@@ -47,32 +69,62 @@ impl Host for TestHost {
         self.world.skills.clone()
     }
 
+    fn installed_app_version(&self, directory: &Path) -> Result<String, String> {
+        assert_eq!(directory, self.world.root.join("exe"));
+        let app = self.app.as_ref().expect("a skill command inspected the app binaries");
+        app.calls.lock().unwrap().push(AppCall::ReadPair);
+        app.installed.map(str::to_string).map_err(str::to_string)
+    }
+
+    fn manual_app_update(&self, paths: &Paths, directory: &Path, action: AppAction) -> Result<String, String> {
+        assert_eq!(directory, self.world.root.join("exe"));
+        assert_eq!(paths.home, self.world.home);
+        assert_eq!(paths.skills, self.world.skills);
+        let app = self.app.as_ref().expect("a skill command asked the app updater");
+        app.calls.lock().unwrap().push(AppCall::Manual(action));
+        if let Some(why) = app.failure {
+            return Err(why.to_string());
+        }
+        Ok(match action {
+            AppAction::Check => "Installed on disk: 8.0.0. Available: 9.0.0.",
+            AppAction::Install => "Installed 9.0.0 on disk.",
+        }
+        .into())
+    }
+
     fn remote(&self) -> Result<Box<dyn Remote>, String> {
+        self.skill_services_only();
         Ok(self.remote.client())
     }
 
     fn tokens(&self) -> Box<dyn TokenProvider> {
+        self.skill_services_only();
         self.tokens.provider()
     }
 
     fn token_saved(&self) -> bool {
+        self.skill_services_only();
         self.saved.lock().unwrap().is_some()
     }
 
     fn save_token(&self, token: &str) -> Result<(), String> {
+        self.skill_services_only();
         *self.saved.lock().unwrap() = Some(token.to_string());
         Ok(())
     }
 
     fn delete_token(&self) -> Result<bool, String> {
+        self.skill_services_only();
         Ok(self.saved.lock().unwrap().take().is_some())
     }
 
     fn gh_signed_in(&self) -> Result<(), String> {
+        self.skill_services_only();
         self.gh.clone()
     }
 
     fn read_token(&self) -> Result<String, String> {
+        self.skill_services_only();
         self.typed.lock().unwrap().take().ok_or_else(|| "no token was given".to_string())
     }
 
@@ -114,7 +166,18 @@ impl TestHost {
             gh: Err("the GitHub CLI is not signed in".to_string()),
             typed: Mutex::new(None),
             startup: Mutex::new(Ok(Startup::Off)),
+            app: None,
+            change_before_second_home_read: Mutex::new(None),
+            home_reads: std::cell::Cell::new(0),
         }
+    }
+
+    fn for_app(name: &str) -> Self {
+        Self { app: Some(FakeApp { calls: Mutex::new(Vec::new()), installed: Ok("8.0.0"), failure: None }), ..Self::empty(name) }
+    }
+
+    fn skill_services_only(&self) {
+        assert!(self.app.is_none(), "an app command asked for the skills remote or credentials");
     }
 
     fn save(&self, cfg: &Config) {
@@ -149,6 +212,15 @@ fn tss(host: &TestHost, line: &str) -> Ran {
     Ran { code, out: String::from_utf8(out).unwrap(), err: String::from_utf8(err).unwrap() }
 }
 
+#[test]
+fn cli_update_preference_edit_cannot_reenable_external_off_from_a_stale_snapshot() {
+    let host = TestHost::for_app("cli-concurrent-update-prefs");
+    let off = Config { app_update: UpdatePrefs { enabled: false, ..UpdatePrefs::default() }, ..Config::default() };
+    *host.change_before_second_home_read.lock().unwrap() = Some(off.clone());
+    expect(&tss(&host, "update every 7d"), 2, &["changed since"]);
+    assert_eq!(host.config(), off);
+}
+
 #[track_caller]
 fn expect(ran: &Ran, code: i32, wanted: &[&str]) {
     assert_eq!(ran.code, code, "{ran:?}");
@@ -178,6 +250,97 @@ fn a_check_installs_and_status_looks_only_at_the_disk() {
         &["Needs attention (1)", "  ! alpha: Edited locally", "tss resolve fx alpha replace", "(Use the GitHub version)", "tss resolve fx alpha keep"],
     );
     assert!(host.remote.log().is_empty(), "status asked GitHub: {:?}", host.remote.log());
+}
+
+#[test]
+fn app_status_and_manual_actions_work_with_automation_off_and_a_bad_skill_repository() {
+    let host = TestHost::for_app("cli-app-manual");
+    let mut cfg = standard_config();
+    cfg.repos[0].repo = "not a repository".into();
+    cfg.repos[0].use_token = true;
+    cfg.app_update = UpdatePrefs { enabled: false, interval: UpdateInterval::Weekly, timing: UpdateTiming::OnQuit };
+    host.save(&cfg);
+    host.world.write("handmade/SKILL.md", "leave this alone\n");
+    let before = host.world.snapshot();
+
+    let status = tss(&host, "update");
+    expect(
+        &status,
+        0,
+        &[
+            "Automatic app updates: off",
+            "7 days",
+            "on Quit",
+            &format!("Running tss build: {}", env!("CARGO_PKG_VERSION")),
+            "Installed on disk (tray and tss): 8.0.0",
+        ],
+    );
+    assert!(!status.out.contains("9.0.0"), "a local status has not checked the release feed");
+    expect(&tss(&host, "update check"), 0, &["Installed on disk: 8.0.0. Available: 9.0.0."]);
+    expect(&tss(&host, "update install"), 0, &["Installed 9.0.0 on disk."]);
+    assert_eq!(*host.app.as_ref().unwrap().calls.lock().unwrap(), [AppCall::ReadPair, AppCall::Manual(AppAction::Check), AppCall::Manual(AppAction::Install)]);
+    assert_eq!(host.world.snapshot(), before, "the CLI itself did not change settings, skills or state");
+}
+
+#[test]
+fn app_preferences_use_the_active_settings_and_do_not_rewrite_skill_sources() {
+    let host = TestHost::for_app("cli-app-settings");
+    let cfg = standard_config();
+    host.save(&cfg);
+    for (command, interval) in
+        [("update every 7d", UpdateInterval::Weekly), ("update every 30d", UpdateInterval::Monthly), ("update every 1d", UpdateInterval::Daily)]
+    {
+        expect(&tss(&host, command), 0, &[]);
+        assert_eq!(host.config().app_update.interval, interval);
+    }
+    expect(&tss(&host, "update off"), 0, &["Automatic app updates: off"]);
+    expect(&tss(&host, "update when quit"), 0, &["on Quit", "does not restart itself"]);
+    let local = host.config();
+    assert_eq!(local, Config { app_update: UpdatePrefs { enabled: false, interval: UpdateInterval::Daily, timing: UpdateTiming::OnQuit }, ..cfg });
+    expect(&tss(&host, "update on"), 0, &["Automatic app updates: on"]);
+    assert!(host.config().app_update.enabled);
+
+    let dir = host.executable_dir().unwrap();
+    let sources = r#"{"version":1,"repos":[{"id":"keep","repo":"o/keep","enabled":false}]} "#;
+    std::fs::write(dir.join(SOURCES_FILE), sources).unwrap();
+    let local_before = std::fs::read(host.config_file()).unwrap();
+    expect(&tss(&host, "update every 30d"), 0, &["30 days"]);
+    expect(&tss(&host, "update when quit"), 0, &["on Quit"]);
+    expect(&tss(&host, "update when immediate"), 0, &["timing: immediate.", "then restarts into it"]);
+    let shared = tiny_skill_sync::portable::load(&dir).unwrap().unwrap().app_update;
+    assert_eq!((shared.interval, shared.timing), (UpdateInterval::Monthly, UpdateTiming::Immediate));
+    assert_eq!(std::fs::read_to_string(dir.join(SOURCES_FILE)).unwrap(), sources);
+    assert_eq!(std::fs::read(host.config_file()).unwrap(), local_before);
+    assert!(host.app.as_ref().unwrap().calls.lock().unwrap().is_empty(), "editing preferences is not a request to check or install");
+}
+
+#[test]
+fn app_update_usage_settings_and_release_failures_do_not_report_success() {
+    let mut host = TestHost::for_app("cli-app-errors");
+    host.app.as_mut().unwrap().installed = Err("the two file versions differ");
+    host.app.as_mut().unwrap().failure = Some("the release could not be verified: bad\u{202e}name, \u{e9}");
+    let before = host.world.snapshot();
+    for bad in ["update every 2d", "update every 1mo", "update when restart", "update check install", "update install --dry-run"] {
+        expect(&tss(&host, bad), cli::EXIT_USAGE, &["tss:"]);
+    }
+    assert!(host.app.as_ref().unwrap().calls.lock().unwrap().is_empty());
+    let status = tss(&host, "update status");
+    expect(&status, cli::EXIT_FAILED, &["Running tss build:", "Cannot verify the installed tray and tss on disk: the two file versions differ"]);
+    assert!(!status.out.contains("Installed on disk (tray and tss):"), "{status:?}");
+    let install = tss(&host, "update install");
+    expect(&install, cli::EXIT_FAILED, &["the release could not be verified: bad\\u{202e}name, \\u{e9}"]);
+    assert!(install.out.is_empty(), "{install:?}");
+    assert!(install.err.is_ascii(), "{install:?}");
+    assert_eq!(host.world.snapshot(), before);
+
+    let settings = host.executable_dir().unwrap().join(SETTINGS_FILE);
+    std::fs::write(&settings, "{ bad").unwrap();
+    let before = host.world.snapshot();
+    for cmd in ["update off", "update check", "update install"] {
+        expect(&tss(&host, cmd), cli::EXIT_FAILED, &[SETTINGS_FILE]);
+    }
+    assert_eq!(host.world.snapshot(), before);
+    assert_eq!(*host.app.as_ref().unwrap().calls.lock().unwrap(), [AppCall::ReadPair, AppCall::Manual(AppAction::Install)]);
 }
 
 #[test]
@@ -630,12 +793,24 @@ fn portable_export_refuses_to_overwrite_either_companion() {
 // The executable itself
 // ---------------------------------------------------------------------------------------------------------------------
 
-/// `tss.exe` with its own home and skills folder, talking to a loopback port nothing listens on.
+/// Only copies of locally built binaries are run; neither the build output nor downloaded files are execution targets.
+fn world_with_binaries(name: &str) -> World {
+    let world = World::new(name);
+    let bin = world.root.join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    std::fs::copy(env!("CARGO_BIN_EXE_tss"), bin.join("tss.exe")).unwrap();
+    std::fs::copy(env!("CARGO_BIN_EXE_tiny-skill-sync"), bin.join("tiny-skill-sync.exe")).unwrap();
+    world
+}
+
+/// `tss.exe` with its own executables, home and skills folder, talking to a loopback port nothing listens on.
 fn exe(world: &World, dead: &str, args: &[&str]) -> Ran {
-    let output = Command::new(env!("CARGO_BIN_EXE_tss"))
+    let output = Command::new(world.root.join("bin").join("tss.exe"))
         .args(args)
         .env("TSS_HOME", &world.home)
         .env("TSS_SKILLS_DIR", &world.skills)
+        .env("TSS_NO_APP_UPDATES", "1")
+        .env("TSS_NO_SAVED_TOKEN", "1")
         .env("TSS_API_BASE", dead)
         .env("TSS_RAW_BASE", dead)
         .output()
@@ -645,7 +820,7 @@ fn exe(world: &World, dead: &str, args: &[&str]) -> Ran {
 
 #[test]
 fn the_executable_runs_against_its_own_folders() {
-    let world = World::new("cli-exe");
+    let world = world_with_binaries("cli-exe");
     let port = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
     let dead = format!("http://127.0.0.1:{port}");
 
@@ -691,7 +866,7 @@ impl Drop for OwnKeys {
 
 #[test]
 fn the_executable_has_windows_start_the_tray_app_beside_it() {
-    let world = World::new("cli-exe-startup");
+    let world = world_with_binaries("cli-exe-startup");
     let keys = OwnKeys::of(&world.home);
     let port = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
     let dead = format!("http://127.0.0.1:{port}");
@@ -699,7 +874,7 @@ fn the_executable_has_windows_start_the_tray_app_beside_it() {
     expect(&exe(&world, &dead, &["startup"]), 0, &["Start with Windows: off"]);
     expect(&exe(&world, &dead, &["startup", "on"]), 0, &["Start with Windows: on"]);
     let entry = keys.entry().expect("the entry is in the key of this app folder");
-    let tray = autorun::exe_at(Path::new(env!("CARGO_BIN_EXE_tiny-skill-sync")));
+    let tray = autorun::exe_at(&world.root.join("bin").join("tiny-skill-sync.exe"));
     assert!(tray.is(program(&entry)) && entry.ends_with("\" --background"), "{entry}");
     expect(&exe(&world, &dead, &["startup"]), 0, &["Start with Windows: on"]);
     expect(&exe(&world, &dead, &["startup", "off"]), 0, &["Start with Windows: off"]);

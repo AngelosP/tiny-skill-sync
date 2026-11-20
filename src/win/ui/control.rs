@@ -58,7 +58,7 @@ const WM_REVEAL: u32 = WM_APP + 6;
 /// the mouse is without asking all the time.
 pub const WM_HOVER: u32 = WM_APP + 7;
 pub const BN_CLICKED: u32 = 0;
-/// The code a combo sends when an entry was chosen; the combo's text is then the entry.
+/// The code a combo sends after updating its window text; [`combo_value`] reads the chosen entry.
 pub const CBN_SELENDOK: u32 = 9;
 /// Ask the owner to show *all* currently available commands, including those shown inline.
 pub const ROW_MENU: u32 = 0x110;
@@ -169,7 +169,7 @@ pub enum Look {
     Radio {
         on: bool,
     },
-    /// A button that offers a list; the text is the entry shown.
+    /// A button that offers a list. Its window text is the entry, optionally preceded by its purpose and a newline.
     Combo {
         items: Vec<String>,
     },
@@ -360,13 +360,11 @@ fn activate(hwnd: HWND) {
             }
         }
         Look::Combo { items } => {
-            let current = text_of(hwnd);
-            let refs: Vec<&str> = items.iter().map(String::as_str).collect();
-            let Some(chosen) = menu(hwnd, &refs, items.iter().position(|i| *i == current), false) else { return };
+            let Some(text) = choose_combo(&text_of(hwnd), &items, |entries, checked| menu(hwnd, entries, checked, false)) else { return };
             if unsafe { IsWindow(hwnd) } == 0 {
                 return;
             }
-            unsafe { SetWindowTextW(hwnd, wide(&items[chosen]).as_ptr()) };
+            unsafe { SetWindowTextW(hwnd, wide(&text).as_ptr()) };
             notify(hwnd, CBN_SELENDOK);
         }
         _ => {
@@ -380,6 +378,22 @@ fn activate(hwnd: HWND) {
 /// A name never holds a line break: names pass `printable` first.
 pub fn lines(text: &str) -> (&str, &str) {
     text.split_once('\n').unwrap_or((text, ""))
+}
+
+/// Named combos expose both purpose and value through WM_GETTEXT, but paint, check and dispatch the value alone.
+pub fn combo_value(text: &str) -> &str {
+    text.split_once('\n').map_or(text, |(_, value)| value)
+}
+
+fn choose_combo(before: &str, items: &[String], choose: impl FnOnce(&[&str], Option<usize>) -> Option<usize>) -> Option<String> {
+    let entries: Vec<&str> = items.iter().map(String::as_str).collect();
+    let current = combo_value(before);
+    let checked = entries.iter().position(|&entry| entry == current);
+    let &value = entries.get(choose(&entries, checked)?)?;
+    Some(match before.split_once('\n') {
+        Some((purpose, _)) => two_lines(purpose, value),
+        None => value.to_string(),
+    })
 }
 
 struct RowText<'a> {
@@ -662,7 +676,7 @@ fn draw_ctl(hwnd: HWND) {
             if enabled && tint != Role::None {
                 paint::fill(c.at, 4, tint, Role::None);
             }
-            paint::line([x + 12, y, w - 12 - 32, h], &text, Font::Body, if enabled { Role::Text } else { Role::Text3 });
+            paint::line([x + 12, y, w - 12 - 32, h], combo_value(&text), Font::Body, if enabled { Role::Text } else { Role::Text3 });
             paint::glyph([x + w - 32, y, 22, h], glyph::CHEVRON_DOWN, 12, Role::Text2);
         }
     }
@@ -1730,5 +1744,28 @@ mod tests {
         };
         assert_eq!(click(more, more), [(FIRST, ROW_MENU)]);
         unsafe { DestroyWindow(top) };
+    }
+
+    #[test]
+    fn a_combo_checks_the_current_entry_and_keeps_its_accessible_name_after_a_choice() {
+        let items = ["Daily", "Every 7 days", "Every 30 days"].map(String::from);
+        for purpose in ["App update check interval\n", ""] {
+            let before = format!("{purpose}Every 30 days");
+            let changed = choose_combo(&before, &items, |offered, checked| {
+                assert_eq!(offered, ["Daily", "Every 7 days", "Every 30 days"]);
+                assert_eq!(checked, Some(2));
+                Some(1)
+            })
+            .unwrap();
+            assert_eq!(changed, format!("{purpose}Every 7 days"));
+            assert_eq!(combo_value(&changed), "Every 7 days", "what the button paints and dispatches");
+            assert!(
+                choose_combo(&changed, &items, |_, checked| {
+                    assert_eq!(checked, Some(1));
+                    None
+                })
+                .is_none()
+            );
+        }
     }
 }

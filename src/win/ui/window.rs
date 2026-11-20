@@ -38,7 +38,7 @@ use super::{bench, local_time, open_folder, place, register_class, scale, senten
 use crate::app::Job;
 use crate::autostart::{Keys, Startup};
 use crate::board::{APP_NAME, Action, RepoView, Row};
-use crate::config::{Config, Paths, RepoConfig, RepoSpec};
+use crate::config::{Config, Paths, RepoConfig, RepoSpec, UpdatePrefs};
 use crate::github::web_url;
 use crate::interval::{Interval, MIN_POLL_MINUTES};
 use crate::logo;
@@ -434,7 +434,15 @@ fn page_of(st: &Win, snap: &Snapshot, w: i32, fit: Fit) -> Surface {
                 Some(Err(e)) => Err(e.as_str()),
                 None => Err("it was not read"),
             };
-            let settings = SettingsPage { default, skills_dir: &skills_dir, token_saved: st.token_saved, startup, version: env!("CARGO_PKG_VERSION") };
+            let settings = SettingsPage {
+                default,
+                skills_dir: &skills_dir,
+                token_saved: st.token_saved,
+                startup,
+                running_version: env!("CARGO_PKG_VERSION"),
+                app_update: snap.cfg.app_update,
+                app_update_status: &snap.app_update_status,
+            };
             page::settings_page(&settings, w, fit)
         }
         None => page::welcome(w, fit),
@@ -775,6 +783,15 @@ fn set_enabled(toggle: HWND) {
     if on && matches!(result, Ok(true)) {
         shell::want(Job::Check(Some(repo)));
     }
+    refresh();
+}
+
+fn set_app_update(change: impl FnOnce(&mut UpdatePrefs)) {
+    let _ = shell::edit_app_update(|cfg| {
+        let before = cfg.app_update;
+        change(&mut cfg.app_update);
+        Ok(cfg.app_update != before)
+    });
     refresh();
 }
 
@@ -1139,6 +1156,16 @@ fn on_command(hwnd: HWND, wp: WPARAM, lp: LPARAM) {
     match (page::hit(n), code) {
         (Hit::Other(id::EVERY), CBN_SELENDOK) => every(hwnd, ctl, false),
         (Hit::Other(id::DEFAULT_EVERY), CBN_SELENDOK) => every(hwnd, ctl, true),
+        (Hit::Other(id::APP_EVERY), CBN_SELENDOK) => {
+            if let Some(every) = page::selection(page::APP_INTERVALS, control::combo_value(&text_of(ctl))) {
+                set_app_update(|prefs| prefs.interval = every);
+            }
+        }
+        (Hit::Other(id::APP_WHEN), CBN_SELENDOK) => {
+            if let Some(when) = page::selection(page::APP_TIMINGS, control::combo_value(&text_of(ctl))) {
+                set_app_update(|prefs| prefs.timing = when);
+            }
+        }
         (Hit::Skill(j, Part::Row), code) if code == control::ROW_MENU || RowCmd::from_code(code).is_some() => row_command(hwnd, ctl, j, code),
         (_, code) if code != BN_CLICKED => {}
         (Hit::Repo(i), _) => {
@@ -1150,6 +1177,9 @@ fn on_command(hwnd: HWND, wp: WPARAM, lp: LPARAM) {
         (Hit::File(i), _) => show_file(hwnd, i),
         (Hit::Gap(r), _) => open_gap(hwnd, r),
         (Hit::DiffAction(k), _) => diff_action(hwnd, k),
+        (Hit::AppUpdate(action), _) => {
+            shell::want(Job::AppUpdate(action));
+        }
         (Hit::Other(n), _) => match n {
             id::SYNC => {
                 shell::want(Job::Check(None));
@@ -1159,6 +1189,10 @@ fn on_command(hwnd: HWND, wp: WPARAM, lp: LPARAM) {
             id::NAV_SETTINGS | id::OPEN_SETTINGS => go(hwnd, Some(Page::Settings)),
             id::MORE => more(hwnd, ctl),
             id::ENABLED => set_enabled(ctl),
+            id::APP_AUTO => {
+                let on = unsafe { SendMessageW(ctl, BM_GETCHECK, 0, 0) } != 0;
+                set_app_update(|prefs| prefs.enabled = on);
+            }
             id::STARTUP => set_startup(ctl),
             id::RETRY => {
                 if let Some(repo) = shown_repo(|r, _| r.id.clone()) {

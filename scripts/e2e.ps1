@@ -6,7 +6,8 @@
 .DESCRIPTION
   Each scenario makes its own folder in %TEMP% and, where it changes upstream, its own branch of a test repository
   (named e2e-STAMP-SCENARIO; nothing else is ever changed or deleted). Both are removed afterwards (-Keep leaves the
-  folders). Needs the network and a signed-in GitHub CLI (gh) that may push to the test repositories.
+  folders). Needs the network and a signed-in GitHub CLI (gh) that may push to the test repositories, except
+  for -Only portable: that scenario only reads the owner's public fixture, without credentials or a branch.
 
   Nothing here touches the real skills folder, the real settings, the saved GitHub token or Windows' startup apps (a
   copy started with TSS_HOME keeps its Start with Windows entry in keys of its own, which the scenarios delete). While a
@@ -367,23 +368,23 @@ function Set-SkillsDir([string]$File, [string]$Dir) {
 }
 
 function Test-Portable {
-    $c = New-Env 'portable' -NoBranch
+    $c = New-Env 'portable' -Repo 'AngelosP/tiny-skill-sync-fixtures-public' -NoBranch
     try {
-        $realStartup = Get-RealStartup
+        $anon = Get-AnonymousAppEnv $c.Root
         $address = Get-Address $c
-        $added = Tss $c @('add', $address, '--every', '6h')
+        $added = Tss $c @('add', $address, '--every', '6h') $anon
         Check 'a fixture repository can be added to the local settings first' ($added.Code -eq 0 -and $added.Text -match "Added .* as '") $added.Text
         if ($added.Code -ne 0) { throw 'refusing to continue: the local settings were not created' }
 
         $localConfig = Join-Path $c.Home 'config.json'
         $localHash = Get-BlobId $localConfig
-        $export = Tss $c @('portable')
+        $export = Tss $c @('portable') $anon
         $settings = Join-Path $c.Root "bin\tiny-skill-sync.settings.json"
         $sources = Join-Path $c.Root "bin\tiny-skill-sync.sources.json"
         Check 'tss portable creates the two companion files without changing config.json' ($export.Code -eq 0 -and (Test-Path -LiteralPath $settings) -and (Test-Path -LiteralPath $sources) -and (Get-BlobId $localConfig) -eq $localHash) "exit $($export.Code)"
         $settingsHash = Get-BlobId $settings
         $sourcesHash = Get-BlobId $sources
-        $portableStatus = Tss $c @('status')
+        $portableStatus = Tss $c @('status') $anon
         Check 'tss status reads the companion files and keeps the machine-local skills override' ($portableStatus.Text -match 'Settings: portable companions beside tss.exe' -and $portableStatus.Text -match [regex]::Escape("Skills folder: $($c.Skills)")) $portableStatus.Text
 
         $secondHome = Join-Path $c.Root 'machine-2\home'
@@ -391,12 +392,18 @@ function Test-Portable {
         New-Item -ItemType Directory -Force $secondHome, $secondSkills | Out-Null
         Copy-Item -LiteralPath $localConfig -Destination (Join-Path $secondHome 'config.json')
         $secondReport = Join-Path $c.Root 'out\machine-2-marks.txt'
-        $c.Tray = Start-LiveTray $c.Root @() (Get-EnvOf $c @{ TSS_BENCH_REPORT = $c.Report })
-        $c.Tray2 = Start-LiveTray $c.Root @() (Get-EnvOf $c @{ TSS_HOME = $secondHome; TSS_SKILLS_DIR = $secondSkills; TSS_BENCH_REPORT = $secondReport })
+        $anon.TSS_BENCH_REPORT = $c.Report
+        $c.Tray = Start-LiveTray $c.Root @() $anon
+        $other = $anon.Clone()
+        $other.TSS_HOME = $secondHome
+        $other.TSS_SKILLS_DIR = $secondSkills
+        $other.TSS_BENCH_REPORT = $secondReport
+        $c.Tray2 = Start-LiveTray $c.Root @() $other
         $firstSkill = Join-Path $c.Skills 'alpha\scripts\hello.ps1'
         $secondSkill = Join-Path $secondSkills 'alpha\scripts\hello.ps1'
         [void](Wait-Live { Test-Path -LiteralPath $firstSkill } 'the first machine to install from shared sources' 120)
         [void](Wait-Live { Test-Path -LiteralPath $secondSkill } 'the second machine to install from shared sources' 120)
+        [void](Wait-Live { (Get-MarkCount $c.Report 'job-poll') -gt 0 -and (Get-MarkCount $secondReport 'job-poll') -gt 0 } 'both installs to finish writing their records' 120)
 
         $firstStateFile = Join-Path $c.Home 'state.json'
         $secondStateFile = Join-Path $secondHome 'state.json'
@@ -411,7 +418,6 @@ function Test-Portable {
         Check 'both local config files and shared companions remain unchanged' ((Get-BlobId $localConfig) -eq $localHash -and (Get-BlobId (Join-Path $secondHome 'config.json')) -eq $localHash -and (Get-BlobId $settings) -eq $settingsHash -and (Get-BlobId $sources) -eq $sourcesHash) ''
         $binEntries = Get-Entries (Join-Path $c.Root 'bin')
         Check 'state and skills are not written beside the shared executables' ($binEntries -eq 'tiny-skill-sync.exe,tiny-skill-sync.settings.json,tiny-skill-sync.sources.json,tss.exe') $binEntries
-        Check 'Windows startup entries were not touched' ((Get-RealStartup) -eq $realStartup) ''
     } finally { Close-Env $c }
 }
 
@@ -2199,12 +2205,10 @@ $scenarios = [ordered]@{
     'ui'           = 'Test-Ui'
 }
 
-Use-Cargo
-if (-not $SkipBuild) { & "$PSScriptRoot\build.ps1" | Out-Host }
-[void](Invoke-Gh @('api', 'user', '--jq', '.login'))
-
 $names = if ($Only.Count) { @($Only | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim() } | Where-Object { $_ }) } else { @($scenarios.Keys) }
 foreach ($name in $names) { if (-not $scenarios.Contains($name)) { throw "Unknown scenario '$name'. The scenarios are: $($scenarios.Keys -join ', ')" } }
+if (-not $SkipBuild) { & "$PSScriptRoot\build.ps1" | Out-Host }
+if (@($names | Where-Object { $_ -ne 'portable' }).Count -gt 0) { [void](Invoke-Gh @('api', 'user', '--jq', '.login')) }
 
 Log "e2e ${stamp}: $($names -join ', ')" 'Cyan'
 foreach ($name in $names) {

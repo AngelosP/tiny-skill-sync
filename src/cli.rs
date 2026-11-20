@@ -5,6 +5,7 @@
 //! Exit codes: 0 everything is fine, 1 something needs the user's attention, 2 a check or command failed,
 //! 3 the command line was not understood.
 
+use std::borrow::Cow;
 use std::fs;
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
@@ -12,7 +13,7 @@ use std::sync::atomic::AtomicBool;
 
 use crate::autostart::{Exe, Keys, Startup, Via};
 use crate::board::{Action, Board, Level, RepoView, Row};
-use crate::config::{CONFIG_FILE, Config, Paths, RepoConfig, RepoSpec};
+use crate::config::{CONFIG_FILE, Config, Paths, RepoConfig, RepoSpec, UpdateInterval, UpdatePrefs, UpdateTiming};
 use crate::engine::{Access, ApplyResult, Engine, EngineError, Outcome, Resolution, SkillReport, SyncOptions, Tracking, Which};
 use crate::github::{GitHubRemote, Remote, SystemTokens, TokenProvider};
 use crate::interval::{Interval, now_secs};
@@ -20,6 +21,7 @@ use crate::pathsafe::{fold, printable_lines};
 use crate::portable;
 use crate::reconcile::Verdict;
 use crate::state::State;
+use crate::updater::Action as AppAction;
 use crate::verify::Check;
 use crate::win::{autorun, console, cred, proc};
 
@@ -41,10 +43,20 @@ Usage:
   tss status
       What is installed and what needs attention. Reads only local files.
   tss check [REPO] [--dry-run] [--full-listing] [--delete-all]
-      Ask GitHub now and apply what is safe: install, update, remove.
+      Check skills only. Ask GitHub now and apply what is safe: install, update, remove.
         --dry-run       show what would change, and change nothing
         --full-listing  fetch the whole listing even if GitHub says nothing changed
         --delete-all    REPO lists no skills at all any more: delete its skills anyway
+  tss update [status | check | install | on | off]
+  tss update every 1d|7d|30d
+  tss update when immediate|quit
+      Update Tiny Skill Sync itself, not skills. Status reads only local files.
+      'check' looks for a release without installing it. 'install' installs now.
+      Both work with automatic app updates off. 'every' takes fixed days.
+      Immediate (the default): the tray installs an update when it finds one,
+      then restarts into it. 'quit' waits until you choose Quit from the tray
+      menu, and the tray stays closed. 'tss update install' does not restart a
+      running tray: quit it and open it again to use the new build.
   tss resolve REPO SKILL ACTION
       Settle a skill that needs you. ACTION is one of:
         replace   take upstream's version; what is there now is kept as a backup
@@ -95,6 +107,10 @@ pub trait Host {
     fn portable_skills_dir(&self, cfg: &Config) -> Result<PathBuf, String> {
         Ok(self.skills_dir(cfg))
     }
+    /// Reads the version of the installed tray and CLI pair, not the build running this command.
+    fn installed_app_version(&self, directory: &Path) -> Result<String, String>;
+    /// Explicit app release operation, separate from the skills engine and its credential sources.
+    fn manual_app_update(&self, paths: &Paths, directory: &Path, action: AppAction) -> Result<String, String>;
     fn remote(&self) -> Result<Box<dyn Remote>, String>;
     fn tokens(&self) -> Box<dyn TokenProvider>;
     fn token_saved(&self) -> bool;
@@ -137,6 +153,14 @@ impl Host for SystemHost {
         portable::resolve_skills_dir(cfg, std::env::var_os("TSS_SKILLS_DIR").as_deref(), profile.as_deref(), |name| {
             std::env::var_os(name).map(|value| value.to_string_lossy().into_owned())
         })
+    }
+
+    fn installed_app_version(&self, directory: &Path) -> Result<String, String> {
+        crate::replacement::installed_version(directory).map(|version| version.to_string())
+    }
+
+    fn manual_app_update(&self, paths: &Paths, directory: &Path, action: AppAction) -> Result<String, String> {
+        crate::updater::manual(&paths.home, directory, &paths.skills, action)
     }
 
     fn remote(&self) -> Result<Box<dyn Remote>, String> {
@@ -201,6 +225,7 @@ pub enum Command {
     Help,
     Version,
     Status,
+    Update(UpdateCommand),
     Check { repo: Option<String>, dry_run: bool, full_listing: bool, delete_all: bool },
     Resolve { repo: String, skill: String, how: Resolution },
     Add { spec: String, every: Option<Interval>, use_token: bool },
@@ -222,6 +247,15 @@ pub enum StartupAction {
     Status,
     On,
     Off,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UpdateCommand {
+    Status,
+    Manual(AppAction),
+    Automatic(bool),
+    Every(UpdateInterval),
+    When(UpdateTiming),
 }
 
 /// Options as given: `--name` or `--name=value`.
@@ -258,6 +292,7 @@ impl Flags {
 fn usage_of(command: &str) -> &'static str {
     match command {
         "check" => "tss check [REPO] [--dry-run] [--full-listing] [--delete-all]",
+        "update" => "tss update [status|check|install|on|off|every 1d|7d|30d|when immediate|quit]",
         "resolve" => "tss resolve REPO SKILL replace|restore|keep|leave|manage|pause|resume",
         "add" => "tss add OWNER/NAME [--every INTERVAL] [--use-token]",
         "remove" => "tss remove REPO [--delete-skills]",
@@ -343,6 +378,24 @@ pub fn parse(args: &[String]) -> Result<Command, String> {
         "status" => {
             expect_words(&name, words, 0, 0)?;
             Command::Status
+        }
+        "update" => {
+            expect_words(&name, words, 0, 2)?;
+            let word = |n: usize| words.get(n).map(|w| w.to_ascii_lowercase());
+            let update = match (word(0).as_deref(), word(1).as_deref()) {
+                (None | Some("status"), None) => UpdateCommand::Status,
+                (Some("check"), None) => UpdateCommand::Manual(AppAction::Check),
+                (Some("install"), None) => UpdateCommand::Manual(AppAction::Install),
+                (Some("on"), None) => UpdateCommand::Automatic(true),
+                (Some("off"), None) => UpdateCommand::Automatic(false),
+                (Some("every"), Some("1d")) => UpdateCommand::Every(UpdateInterval::Daily),
+                (Some("every"), Some("7d")) => UpdateCommand::Every(UpdateInterval::Weekly),
+                (Some("every"), Some("30d")) => UpdateCommand::Every(UpdateInterval::Monthly),
+                (Some("when"), Some("immediate")) => UpdateCommand::When(UpdateTiming::Immediate),
+                (Some("when"), Some("quit")) => UpdateCommand::When(UpdateTiming::OnQuit),
+                _ => return Err(format!("use: {}", usage_of("update"))),
+            };
+            Command::Update(update)
         }
         "check" => {
             expect_words(&name, words, 0, 1)?;
@@ -441,6 +494,24 @@ fn gap(out: &mut String) {
     }
 }
 
+/// Release reports can include a localized Windows error or a path. Unlike skill names in a command to paste,
+/// these can be written out in ASCII without changing what the user needs to type.
+fn app_lines(text: &str) -> Cow<'_, str> {
+    let safe = printable_lines(text);
+    if safe.is_ascii() {
+        return safe;
+    }
+    let mut plain = String::with_capacity(safe.len());
+    for ch in safe.chars() {
+        if ch.is_ascii() {
+            plain.push(ch);
+        } else {
+            plain.extend(ch.escape_unicode());
+        }
+    }
+    Cow::Owned(plain)
+}
+
 /// Runs one command. What it prints goes to `out`, problems go to `err`; the result is the exit code.
 ///
 /// Everything printed passes through `printable_lines`: names and messages come from the repository, and a control
@@ -449,22 +520,24 @@ pub fn run(args: &[String], host: &dyn Host, out: &mut dyn Write, err: &mut dyn 
     let command = match parse(args) {
         Ok(command) => command,
         Err(e) => {
-            let _ = writeln!(err, "tss: {}\nRun 'tss help' to see the commands.", printable_lines(&e));
+            let why = if args.first().is_some_and(|c| c.eq_ignore_ascii_case("update")) { app_lines(&e) } else { printable_lines(&e) };
+            let _ = writeln!(err, "tss: {why}\nRun 'tss help' to see the commands.");
             return EXIT_USAGE;
         }
     };
+    let lines = if matches!(command, Command::Update(_)) { app_lines } else { printable_lines };
     let mut text = String::new();
     let result = execute(command, host, &mut text);
     // Output that cannot be written (a closed pipe) is not a reason to fail the command.
-    let _ = out.write_all(printable_lines(&text).as_bytes()).and_then(|()| out.flush());
+    let _ = out.write_all(lines(&text).as_bytes()).and_then(|()| out.flush());
     match result {
         Ok(code) => code,
         Err(Fail::Usage(e)) => {
-            let _ = writeln!(err, "tss: {}", printable_lines(&e));
+            let _ = writeln!(err, "tss: {}", lines(&e));
             EXIT_USAGE
         }
         Err(Fail::Failed(e)) => {
-            let _ = writeln!(err, "tss: {}", printable_lines(&e));
+            let _ = writeln!(err, "tss: {}", lines(&e));
             EXIT_FAILED
         }
     }
@@ -481,6 +554,7 @@ fn execute(command: Command, host: &dyn Host, out: &mut String) -> Result<i32, F
             Ok(EXIT_OK)
         }
         Command::Status => status(host, out),
+        Command::Update(command) => update(host, out, command),
         Command::Check { repo, dry_run, full_listing, delete_all } => check(host, out, repo.as_deref(), dry_run, full_listing, delete_all),
         Command::Resolve { repo, skill, how } => resolve(host, out, &repo, &skill, how),
         Command::Add { spec, every, use_token } => add(host, out, &spec, every, use_token),
@@ -497,16 +571,26 @@ fn config_path(host: &dyn Host) -> PathBuf {
 
 fn load_config(host: &dyn Host) -> Result<(Config, Option<PathBuf>), Fail> {
     let directory = host.executable_dir().map_err(Fail::Failed)?;
-    match portable::load(&directory).map_err(Fail::Failed)? {
-        Some(config) => Ok((config, Some(directory))),
-        None => Config::load(&config_path(host)).map(|config| (config, None)).map_err(Fail::Failed),
+    let (config, portable) = load_config_at(host, &directory)?;
+    Ok((config, portable.then_some(directory)))
+}
+
+fn load_config_at(host: &dyn Host, directory: &Path) -> Result<(Config, bool), Fail> {
+    match portable::load(directory).map_err(Fail::Failed)? {
+        Some(config) => Ok((config, true)),
+        None => Config::load(&config_path(host)).map(|config| (config, false)).map_err(Fail::Failed),
     }
 }
 
 fn save_config(host: &dyn Host, directory: Option<&Path>, before: &Config, after: &Config) -> Result<(), String> {
     match directory {
         Some(directory) => portable::save_changes(directory, before, after).map(|_| ()),
-        None => after.save(&config_path(host)),
+        None => {
+            if portable::load(&host.executable_dir()?)?.is_some() {
+                return Err("portable settings appeared since the local settings were loaded; try the command again".into());
+            }
+            after.save_if_unchanged(&config_path(host), before)
+        }
     }
 }
 
@@ -522,6 +606,58 @@ fn export_portable(host: &dyn Host, out: &mut String) -> Result<i32, Fail> {
 fn paths(host: &dyn Host, cfg: &Config, portable: bool) -> Result<Paths, Fail> {
     let skills = if portable { host.portable_skills_dir(cfg) } else { Ok(host.skills_dir(cfg)) }.map_err(Fail::Failed)?;
     Ok(Paths::new(host.home(), skills))
+}
+
+fn update_preferences(out: &mut String, prefs: UpdatePrefs) {
+    let every = match prefs.interval {
+        UpdateInterval::Daily => "1 day",
+        UpdateInterval::Weekly => "7 days",
+        UpdateInterval::Monthly => "30 days",
+    };
+    say!(out, "Automatic app updates: {}", if prefs.enabled { "on" } else { "off" });
+    say!(out, "Automatic check interval: {every}");
+    match prefs.timing {
+        UpdateTiming::Immediate => {
+            say!(out, "Install timing: immediate. The tray installs an update when it finds one, then restarts into it.")
+        }
+        UpdateTiming::OnQuit => {
+            say!(out, "Install timing: on Quit. Choose Quit from the tray menu to install a pending update. The tray does not restart itself.")
+        }
+    }
+}
+
+fn update(host: &dyn Host, out: &mut String, command: UpdateCommand) -> Result<i32, Fail> {
+    let directory = host.executable_dir().map_err(Fail::Failed)?;
+    let (cfg, portable) = load_config_at(host, &directory)?;
+    let mut prefs = cfg.app_update;
+    match command {
+        UpdateCommand::Status => {
+            update_preferences(out, prefs);
+            say!(out, "Running tss build: {}", env!("CARGO_PKG_VERSION"));
+            let installed =
+                host.installed_app_version(&directory).map_err(|e| Fail::Failed(format!("Cannot verify the installed tray and tss on disk: {e}")))?;
+            say!(out, "Installed on disk (tray and tss): {installed}");
+            say!(out, "To see which release is offered without installing it, run 'tss update check'.");
+            return Ok(EXIT_OK);
+        }
+        UpdateCommand::Manual(action) => {
+            let paths = paths(host, &cfg, portable)?;
+            let report = host.manual_app_update(&paths, &directory, action).map_err(|e| Fail::Failed(format!("App update failed: {e}")))?;
+            say!(out, "{report}");
+            return Ok(EXIT_OK);
+        }
+        UpdateCommand::Automatic(on) => prefs.enabled = on,
+        UpdateCommand::Every(every) => prefs.interval = every,
+        UpdateCommand::When(when) => prefs.timing = when,
+    }
+    if prefs != cfg.app_update {
+        let paths = paths(host, &cfg, portable)?;
+        crate::updater::Locations { home: &paths.home, dir: &directory, skills: &paths.skills }.check().map_err(Fail::Failed)?;
+        let changed = Config { app_update: prefs, ..cfg.clone() };
+        save_config(host, portable.then_some(directory.as_path()), &cfg, &changed).map_err(Fail::Failed)?;
+    }
+    update_preferences(out, prefs);
+    Ok(EXIT_OK)
 }
 
 fn open_engine(host: &dyn Host, cfg: &Config, portable: bool) -> Result<Engine, Fail> {

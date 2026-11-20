@@ -5,17 +5,19 @@
 //! is selected. Use [`save_changes`] with the previously loaded and edited configs to write only the
 //! changed part. Resolve skills paths with [`resolve_skills_dir`], passing environment inputs from
 //! the caller so portable path expansion is testable and never changes the stored setting.
+//! Cooperating writers and exports lock the same directory through comparison and publication. This is
+//! neither a two-file transaction nor a lock across independently synchronized cloud replicas.
 
 use std::ffi::OsStr;
 use std::fs;
-use std::fs::OpenOptions;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::config::{CONFIG_VERSION, Config, DEFAULT_INTERVAL, RepoConfig};
-use crate::fsx;
+use crate::config::{
+    CONFIG_VERSION, Config, DEFAULT_INTERVAL, RepoConfig, UpdatePrefs, parse_json_object, read_optional, settings_write_lock, write_json_atomic,
+};
 use crate::interval::Interval;
 
 pub const SETTINGS_FILE: &str = "tiny-skill-sync.settings.json";
@@ -37,6 +39,8 @@ struct Settings {
     default_interval: Interval,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     skills_dir: Option<String>,
+    #[serde(default, deserialize_with = "UpdatePrefs::read_object", skip_serializing_if = "UpdatePrefs::is_default")]
+    app_update: UpdatePrefs,
 }
 
 fn default_interval() -> Interval {
@@ -45,13 +49,13 @@ fn default_interval() -> Interval {
 
 impl Default for Settings {
     fn default() -> Self {
-        Settings { version: SETTINGS_VERSION, default_interval: DEFAULT_INTERVAL, skills_dir: None }
+        Settings { version: SETTINGS_VERSION, default_interval: DEFAULT_INTERVAL, skills_dir: None, app_update: UpdatePrefs::default() }
     }
 }
 
 impl Settings {
     fn from_config(config: &Config) -> Settings {
-        Settings { version: SETTINGS_VERSION, default_interval: config.default_interval, skills_dir: config.skills_dir.clone() }
+        Settings { version: SETTINGS_VERSION, default_interval: config.default_interval, skills_dir: config.skills_dir.clone(), app_update: config.app_update }
     }
 
     fn validate_version(&mut self, file: &str) -> Result<(), String> {
@@ -90,16 +94,17 @@ impl Sources {
 /// Exports a local configuration without replacing either companion file. The skills folder is
 /// deliberately omitted because its default belongs to each machine.
 pub fn export(directory: &Path, config: &Config) -> Result<(), String> {
+    let _lock = settings_write_lock(directory)?;
     check_export_target(directory)?;
     let settings_path = directory.join(SETTINGS_FILE);
     let sources_path = directory.join(SOURCES_FILE);
-    let settings = Settings { version: SETTINGS_VERSION, default_interval: config.default_interval, skills_dir: None };
+    let settings = Settings { skills_dir: None, ..Settings::from_config(config) };
     let sources = Sources::from_config(config);
     let settings_bytes = serde_json::to_vec_pretty(&settings).expect("portable settings serialize");
     let sources_bytes = serde_json::to_vec_pretty(&sources).expect("portable sources serialize");
-    write_new(&settings_path, &settings_bytes).map_err(|error| format!("cannot create {}: {error}", settings_path.display()))?;
+    let settings = write_new(&settings_path, &settings_bytes).map_err(|error| format!("cannot create {}: {error}", settings_path.display()))?;
     if let Err(error) = write_new(&sources_path, &sources_bytes) {
-        let _ = fs::remove_file(&settings_path);
+        let _ = crate::win::install::delete(&settings);
         return Err(format!("cannot create {}: {error}", sources_path.display()));
     }
     Ok(())
@@ -118,14 +123,13 @@ pub fn check_export_target(directory: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn write_new(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
-    let result = file.write_all(bytes).and_then(|()| file.sync_all());
-    if result.is_err() {
-        drop(file);
-        let _ = fs::remove_file(path);
+fn write_new(path: &Path, bytes: &[u8]) -> io::Result<fs::File> {
+    let mut file = crate::win::install::create(path)?;
+    if let Err(e) = file.write_all(bytes).and_then(|()| file.sync_all()) {
+        let _ = crate::win::install::delete(&file);
+        return Err(e);
     }
-    result
+    Ok(file)
 }
 
 fn validate_version(file: &str, version: u32, current: u32) -> Result<(), String> {
@@ -138,24 +142,14 @@ fn validate_version(file: &str, version: u32, current: u32) -> Result<(), String
     }
 }
 
-fn read_optional(path: &Path) -> Result<Option<Vec<u8>>, String> {
-    match fs::read(path) {
-        Ok(bytes) => Ok(Some(bytes)),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(format!("cannot read {}: {error}", path.display())),
-    }
-}
-
 fn parse_settings(bytes: &[u8], path: &Path) -> Result<Settings, String> {
-    let bytes = bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(bytes);
-    let mut settings: Settings = serde_json::from_slice(bytes).map_err(|error| format!("{} is not valid: {error} ({})", SETTINGS_FILE, path.display()))?;
+    let mut settings: Settings = parse_json_object(bytes).map_err(|error| format!("{} is not valid: {error} ({})", SETTINGS_FILE, path.display()))?;
     settings.validate_version(SETTINGS_FILE).map_err(|error| format!("{error} ({})", path.display()))?;
     Ok(settings)
 }
 
 fn parse_sources(bytes: &[u8], path: &Path) -> Result<Sources, String> {
-    let bytes = bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(bytes);
-    let mut sources: Sources = serde_json::from_slice(bytes).map_err(|error| format!("{} is not valid: {error} ({})", SOURCES_FILE, path.display()))?;
+    let mut sources: Sources = parse_json_object(bytes).map_err(|error| format!("{} is not valid: {error} ({})", SOURCES_FILE, path.display()))?;
     sources.validate_version(SOURCES_FILE).map_err(|error| format!("{error} ({})", path.display()))?;
     let mut config = Config { repos: sources.repos, ..Config::default() };
     config.assign_missing_ids();
@@ -182,6 +176,7 @@ pub fn load(directory: &Path) -> Result<Option<Config>, String> {
         version: CONFIG_VERSION,
         skills_dir: settings.skills_dir,
         default_interval: settings.default_interval,
+        app_update: settings.app_update,
         repos: std::mem::take(&mut sources.repos),
     };
     config.assign_missing_ids();
@@ -194,8 +189,12 @@ pub fn load(directory: &Path) -> Result<Option<Config>, String> {
 pub fn save_changes(directory: &Path, before: &Config, after: &Config) -> Result<WriteResult, String> {
     let settings_path = directory.join(SETTINGS_FILE);
     let sources_path = directory.join(SOURCES_FILE);
+    let _lock = (before != after).then(|| settings_write_lock(directory)).transpose()?;
     let settings_bytes = read_optional(&settings_path)?;
     let sources_bytes = read_optional(&sources_path)?;
+    if settings_bytes.is_none() && sources_bytes.is_none() {
+        return Err("portable settings disappeared since they were loaded; reload settings and try again".into());
+    }
     let disk_settings = settings_bytes.as_deref().map(|bytes| parse_settings(bytes, &settings_path)).transpose()?.unwrap_or_default();
     let disk_sources = sources_bytes.as_deref().map(|bytes| parse_sources(bytes, &sources_path)).transpose()?.unwrap_or_default();
 
@@ -215,11 +214,11 @@ pub fn save_changes(directory: &Path, before: &Config, after: &Config) -> Result
 
     if settings_changed {
         let json = serde_json::to_vec_pretty(&new_settings).expect("portable settings serialize");
-        fsx::write_atomic(&settings_path, &json).map_err(|error| format!("cannot save {}: {error}", settings_path.display()))?;
+        write_json_atomic(&settings_path, &json).map_err(|error| format!("cannot save {}: {error}", settings_path.display()))?;
     }
     if sources_changed {
         let json = serde_json::to_vec_pretty(&new_sources).expect("portable sources serialize");
-        fsx::write_atomic(&sources_path, &json).map_err(|error| format!("cannot save {}: {error}", sources_path.display()))?;
+        write_json_atomic(&sources_path, &json).map_err(|error| format!("cannot save {}: {error}", sources_path.display()))?;
     }
 
     Ok(WriteResult { settings_written: settings_changed, sources_written: sources_changed })
@@ -283,11 +282,12 @@ mod tests {
 
     use std::fs;
 
-    use crate::config::{Config, RepoConfig, RepoSpec};
+    use crate::config::{Config, RepoConfig, RepoSpec, UpdateInterval, UpdateTiming};
     use crate::interval::{Interval, Unit};
 
     fn temp_dir(label: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("tss-portable-{label}-{}", crate::fsx::unique_suffix()));
+        let base = std::env::var_os("TSS_TEST_ROOT").filter(|s| !s.is_empty()).map(PathBuf::from).unwrap_or_else(std::env::temp_dir);
+        let dir = base.join(format!("tss-portable-{label}-{}", crate::fsx::unique_suffix()));
         fs::create_dir_all(&dir).unwrap();
         dir
     }
@@ -304,6 +304,7 @@ mod tests {
         write_json(&dir, SETTINGS_FILE, r#"{"version":1,"default_interval":"12h","skills_dir":null}"#);
         let config = load(&dir).unwrap().unwrap();
         assert_eq!(config.default_interval, Interval::new(12, Unit::Hour));
+        assert_eq!(config.app_update, UpdatePrefs::default());
         assert!(config.repos.is_empty());
         assert_eq!(config.skills_dir, None);
 
@@ -311,6 +312,7 @@ mod tests {
         write_json(&dir, SOURCES_FILE, r#"{"version":1,"repos":[{"id":"shared-id","repo":"o/r"}]}"#);
         let config = load(&dir).unwrap().unwrap();
         assert_eq!(config.default_interval, DEFAULT_INTERVAL);
+        assert_eq!(config.app_update, UpdatePrefs::default());
         assert_eq!(config.skills_dir, None);
         assert_eq!(config.repos[0].id, "shared-id");
 
@@ -346,11 +348,14 @@ mod tests {
             (SETTINGS_FILE, r#"{"version":99}"#),
             (SETTINGS_FILE, r#"{"version":0}"#),
             (SETTINGS_FILE, r#"{"unknown":true}"#),
+            (SETTINGS_FILE, r#"{"version":1,"app_update":[]}"#),
+            (SETTINGS_FILE, r#"{"version":1,"app_update":{"timing":"later"}}"#),
             (SOURCES_FILE, "{ broken"),
             (SOURCES_FILE, r#"{"repos":[]}"#),
             (SOURCES_FILE, r#"{"version":99}"#),
             (SOURCES_FILE, r#"{"version":0}"#),
             (SOURCES_FILE, r#"{"version":1,"unknown":true}"#),
+            (SOURCES_FILE, r#"{"version":1,"app_update":{"enabled":false}}"#),
         ];
         for (index, (file, contents)) in cases.into_iter().enumerate() {
             let dir = temp_dir(&format!("invalid-{index}"));
@@ -397,6 +402,7 @@ mod tests {
     #[test]
     fn save_changes_leaves_a_logically_unchanged_file_unwritten() {
         let dir = temp_dir("no-op");
+        write_json(&dir, SOURCES_FILE, r#"{"version":1,"repos":[]}"#);
         let before = Config::default();
         let mut after = before.clone();
         after.repos.push(RepoConfig { id: "kept-id".into(), repo: "o/r".into(), ..RepoConfig::default() });
@@ -420,6 +426,107 @@ mod tests {
         assert!(save_changes(&dir, &before, &after).is_err());
         assert!(load(&dir).unwrap().unwrap().default_interval == Interval::new(6, Unit::Hour));
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn preference_changes_only_write_settings_and_participate_in_conflict_checks() {
+        let dir = temp_dir("update-prefs");
+        let sources = r#"{"version":1, "repos": [{"repo":"o/r"}]}"#;
+        write_json(&dir, SOURCES_FILE, sources);
+        let before = load(&dir).unwrap().unwrap();
+        let after = Config { app_update: UpdatePrefs { enabled: false, interval: UpdateInterval::Weekly, timing: UpdateTiming::OnQuit }, ..before.clone() };
+        let written = save_changes(&dir, &before, &after).unwrap();
+        assert_eq!(written, WriteResult { settings_written: true, sources_written: false });
+        assert_eq!(fs::read(dir.join(SOURCES_FILE)).unwrap(), sources.as_bytes());
+        assert_eq!(load(&dir).unwrap().unwrap(), after);
+
+        let stale = Config { default_interval: Interval::new(6, Unit::Hour), ..before.clone() };
+        assert!(save_changes(&dir, &before, &stale).unwrap_err().contains("changed since it was loaded"));
+        assert_eq!(load(&dir).unwrap().unwrap(), after);
+        assert_eq!(fs::read(dir.join(SOURCES_FILE)).unwrap(), sources.as_bytes());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn portable_writers_and_export_share_exclusion_but_readers_do_not() {
+        let dir = temp_dir("writer");
+        let lock = dir.join(".tss-settings.lock");
+        fs::write(&lock, b"someone else's file").unwrap();
+        let before = Config::default();
+        let after = Config { app_update: UpdatePrefs { enabled: false, ..before.app_update }, ..before.clone() };
+        assert_eq!(load(&dir).unwrap(), None, "a lock alone does not select portable mode");
+        assert!(export(&dir, &after).is_err());
+        assert!(!dir.join(SETTINGS_FILE).exists() && !dir.join(SOURCES_FILE).exists());
+        write_json(&dir, SETTINGS_FILE, r#"{"version":1}"#);
+        assert!(save_changes(&dir, &before, &after).is_err());
+        assert_eq!(load(&dir).unwrap(), Some(before.clone()));
+        assert_eq!(fs::read(&lock).unwrap(), b"someone else's file");
+
+        fs::remove_file(&lock).unwrap();
+        let held = settings_write_lock(&dir).unwrap();
+        assert!(save_changes(&dir, &before, &after).is_err());
+        assert_eq!(load(&dir).unwrap(), Some(before.clone()));
+        drop(held);
+        assert!(save_changes(&dir, &before, &after).unwrap().settings_written);
+        assert!(!lock.exists() && !dir.join(SOURCES_FILE).exists(), "no extra companion on success");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_stale_sources_only_session_cannot_recreate_portable_mode_over_local_off() {
+        let dir = temp_dir("missing-both");
+        let local = dir.join(crate::config::CONFIG_FILE);
+        write_json(&dir, SOURCES_FILE, r#"{"version":1,"repos":[]}"#);
+        let before = load(&dir).unwrap().unwrap();
+        let after = Config { default_interval: Interval::new(6, Unit::Hour), ..before.clone() };
+        fs::remove_file(dir.join(SOURCES_FILE)).unwrap();
+        fs::write(&local, br#"{"app_update":{"enabled":false}}"#).unwrap();
+        assert!(save_changes(&dir, &before, &after).is_err());
+        assert_eq!(load(&dir).unwrap(), None);
+        assert!(!Config::load(&local).unwrap().app_update.enabled);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_present_but_unreadable_companion_or_local_config_is_not_missing() {
+        use std::os::windows::fs::{OpenOptionsExt, symlink_file};
+        let dir = temp_dir("dangling");
+        let missing = dir.join("absent");
+        let link = dir.join(SETTINGS_FILE);
+        write_json(&dir, SETTINGS_FILE, r#"{"version":1}"#);
+        let held = fs::OpenOptions::new().read(true).share_mode(0).open(&link).unwrap();
+        assert!(load(&dir).is_err());
+        assert!(Config::load(&link).is_err());
+        drop(held);
+        fs::remove_file(&link).unwrap();
+        // Creating a file symlink needs the privilege or developer mode, and a supporting test drive.
+        if symlink_file(&missing, &link).is_ok() {
+            assert!(load(&dir).is_err());
+            assert!(Config::load(&link).is_err());
+            assert!(Config::default().save(&link).is_err());
+            assert!(fs::symlink_metadata(&link).is_ok());
+            fs::remove_file(&link).unwrap();
+        }
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn export_copies_only_nondefault_app_preferences_and_omits_the_local_skills_path() {
+        for prefs in [UpdatePrefs::default(), UpdatePrefs { enabled: false, interval: UpdateInterval::Weekly, timing: UpdateTiming::OnQuit }] {
+            let dir = temp_dir("export-updates");
+            let local = Config { skills_dir: Some(r"C:\local-skills".into()), app_update: prefs, ..Config::default() };
+            export(&dir, &local).unwrap();
+            let settings: serde_json::Value = serde_json::from_slice(&fs::read(dir.join(SETTINGS_FILE)).unwrap()).unwrap();
+            assert_eq!(settings["version"], 1);
+            assert!(settings.get("skills_dir").is_none());
+            if prefs == UpdatePrefs::default() {
+                assert!(settings.get("app_update").is_none(), "must remain readable by strict v1 readers");
+            } else {
+                assert_eq!(settings["app_update"], serde_json::json!({"enabled":false,"interval":"weekly","timing":"on_quit"}));
+            }
+            assert_eq!(load(&dir).unwrap().unwrap().app_update, prefs);
+            fs::remove_dir_all(dir).unwrap();
+        }
     }
 
     #[test]

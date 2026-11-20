@@ -45,7 +45,6 @@ Do not weaken any of these. Each one has tests; if a change makes one of them fa
 6. **Destructive steps use the full check.** The quick (fingerprint) check is for status only.
 7. **Links inside the skills folder are never followed** (`win::fs` opens every path with `FILE_FLAG_OPEN_REPARSE_POINT`),
    and names from GitHub pass `pathsafe` before they reach the disk.
-8. **Downloads are never run.**
 
 In rules 2 to 4, "equals", "identical" and "edited" are decided by `text.rs` and nowhere else: two copies of a text file
 are the same when only their line endings, the line break at the end or blank lines differ (the owner chose this).

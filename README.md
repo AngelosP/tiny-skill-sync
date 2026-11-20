@@ -50,7 +50,7 @@ If the whole listing becomes empty, the app asks first.
 Edited skills are held for your choice. **Show changes** compares your copy with GitHub.
 **Use the GitHub version** keeps the replaced copy as a backup; **Keep my version** stops managing that skill.
 Existing copies are adopted only after a complete match with a current or past upstream version.
-Downloads are copied, never run.
+Skill downloads are copied, never run.
 
 [Read the full safety promises](docs/GUIDE.md#safety-promises), including
 [which text differences count as edits](docs/GUIDE.md#what-counts-as-the-same).
@@ -71,7 +71,11 @@ Downloads are copied, never run.
 - [Contributing](CONTRIBUTING.md): build, test and remake the demo.
 - [Architecture](ARCHITECTURE.md): how the safety rules work inside.
 
-The app does not update itself. To update, quit it from the tray, replace both exes, and start it again.
+**Updating the app is separate from syncing skills.** Copies with the updater can check the official stable
+release and replace both exes in their existing folder. Use **Settings → App updates** or `tss update check`.
+After an immediate install the tray restarts into the update; an install at Quit leaves it closed, and
+`tss update install` changes only the files. Copies without the updater (including 0.6.0) need one
+[manual upgrade](docs/GUIDE.md#updating-the-app).
 Whether an already-running Copilot session reloads changed skills without restarting has not been verified.
 
 ### Run from a shared folder

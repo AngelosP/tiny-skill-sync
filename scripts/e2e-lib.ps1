@@ -456,6 +456,7 @@ $UiId = @{
     NavAdd = 300; NavActivity = 301; NavSettings = 302; NavHead = 303; NavRepo = 1000
     WelcomeAdd = 305; More = 310; Every = 311; Enabled = 312; Retry = 313; OpenSettings = 314
     DefaultEvery = 320; OpenSkills = 321; OpenBackups = 322; Startup = 325; StartupText = 413
+    AppHeading = 420; AppStatus = 421; AppCheck = 422; AppInstall = 423; AppAuto = 424; AppEvery = 425; AppWhen = 426
     Title = 400; Private = 401; Sub = 402; InfoLead = 403; InfoText = 404; SkillsDir = 410; TokenText = 411; Empty = 412
     Back = 330; DiffAction = 333; Note = 100000; File = 200000; Gap = 300000
     # Plus 16 per skill: 0 row ("name`ntag"), 1 explanation, 8 facts; 2 Show changes, 4 to 7 repair choices.
@@ -467,39 +468,6 @@ $AskPanel = 100
 $AskId = @{ Ok = 1; Cancel = 2; Edit = 10; Heading = 11; Text = 12; Label = 13; Hint = 14; ComboLabel = 15; Combo = 16; Note = 17; Choice = 20 }
 
 # ---------------------------------------------------------------- a throwaway install
-
-# A folder in %TEMP% with its own settings, skills and copies of the release executables (a rebuild does not
-# disturb a run that is still going).
-function New-LiveRoot([string]$Prefix) {
-    $root = Join-Path $env:TEMP ("tss-$Prefix-" + [guid]::NewGuid().ToString('N').Substring(0, 8))
-    foreach ($d in 'home', 'skills', 'bin', 'out') { New-Item -ItemType Directory -Force (Join-Path $root $d) | Out-Null }
-    $from = Get-ExeDir 'release'
-    foreach ($exe in 'tiny-skill-sync.exe', 'tss.exe') {
-        if (-not (Test-Path (Join-Path $from $exe))) { throw "$exe is not built. Run scripts\build.ps1 first." }
-        Copy-Item (Join-Path $from $exe) (Join-Path $root 'bin')
-    }
-    $root
-}
-
-function Format-Arg([string]$Text) {
-    if ($Text -notmatch '[\s"]' -and $Text -ne '') { return $Text }
-    '"' + ($Text -replace '(\\*)"', '$1$1\"' -replace '(\\+)$', '$1$1') + '"'
-}
-
-function New-LiveStartInfo($Root, [string]$Exe, [string[]]$AppArgs, [hashtable]$Env) {
-    $psi = New-Object Diagnostics.ProcessStartInfo
-    $psi.FileName = Join-Path $Root "bin\$Exe"
-    $psi.Arguments = ($AppArgs | ForEach-Object { Format-Arg $_ }) -join ' '
-    $psi.UseShellExecute = $false
-    $psi.EnvironmentVariables['TSS_HOME'] = Join-Path $Root 'home'
-    $psi.EnvironmentVariables['TSS_SKILLS_DIR'] = Join-Path $Root 'skills'
-    $psi.EnvironmentVariables['TSS_NO_SAVED_TOKEN'] = '1'
-    # A $null value removes the variable.
-    foreach ($key in @($Env.Keys)) {
-        if ($null -eq $Env[$key]) { $psi.EnvironmentVariables.Remove($key) } else { $psi.EnvironmentVariables[$key] = [string]$Env[$key] }
-    }
-    $psi
-}
 
 # The environment a program started with these settings gets, as cmd.exe reports it: name -> value. Lets a scenario
 # that removes TSS_HOME and TSS_SKILLS_DIR prove which folders the app would use before it starts the app.
@@ -523,27 +491,6 @@ function Get-LiveChildEnv($Root, [hashtable]$Env = @{}) {
 function Start-LiveTray($Root, [string[]]$AppArgs = @(), [hashtable]$Env = @{}) {
     $psi = New-LiveStartInfo $Root 'tiny-skill-sync.exe' $AppArgs $Env
     [Diagnostics.Process]::Start($psi)
-}
-
-# Runs the command line on the throwaway install and returns its exit code and everything it printed. $Exe runs another
-# copy of tss.exe on the same folders instead.
-function Invoke-LiveTss($Root, [string[]]$TssArgs, [hashtable]$Env = @{}, [int]$TimeoutSec = 240, [string]$Exe = '') {
-    Assert-NotTokenChange $TssArgs
-    $psi = New-LiveStartInfo $Root 'tss.exe' $TssArgs $Env
-    if ($Exe) { $psi.FileName = $Exe }
-    $psi.RedirectStandardOutput = $true
-    $psi.RedirectStandardError = $true
-    $psi.StandardOutputEncoding = [Text.Encoding]::UTF8
-    $psi.StandardErrorEncoding = [Text.Encoding]::UTF8
-    $p = [Diagnostics.Process]::Start($psi)
-    $out = $p.StandardOutput.ReadToEndAsync()
-    $err = $p.StandardError.ReadToEndAsync()
-    if (-not $p.WaitForExit($TimeoutSec * 1000)) {
-        Stop-Process -Id $p.Id -Force
-        throw "tss $($TssArgs -join ' ') did not finish within $TimeoutSec s and was stopped."
-    }
-    $p.WaitForExit()
-    [pscustomobject]@{ Code = $p.ExitCode; Text = ($out.Result + $err.Result).TrimEnd() }
 }
 
 function Find-LiveWindow([int]$ProcId, [string]$Class, [switch]$Visible) {
@@ -1059,6 +1006,8 @@ function Start-Entry([string]$Command, [hashtable]$Env) {
     $now = [Environment]::GetEnvironmentVariables()
     foreach ($k in $now.Keys) { $vars[[string]$k] = [string]$now[$k] }
     foreach ($k in $Env.Keys) { if ($null -eq $Env[$k]) { $vars.Remove($k) } else { $vars[$k] = [string]$Env[$k] } }
+    $vars['TSS_NO_APP_UPDATES'] = '1'
+    $vars['TSS_NO_SAVED_TOKEN'] = '1'
     foreach ($k in 'TSS_HOME', 'TSS_SKILLS_DIR') {
         if (-not $vars[$k] -or -not ([string]$vars[$k]).StartsWith("$env:TEMP\tss-", [StringComparison]::OrdinalIgnoreCase)) {
             throw "refusing to start $Command`: $k is not a throwaway folder"

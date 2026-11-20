@@ -53,7 +53,6 @@ These are the rules the app follows. Each one is covered by tests (see [CONTRIBU
    one. If the app or the computer stops half way, the next start finishes or undoes the change. Whenever the app must
    set aside something you might want, it keeps it as a backup and never deletes it.
 5. **Edits made while the app was not running are found.** See [How edits are found](#how-edits-are-found).
-6. **Downloads are never run.** Skills often contain scripts. The app only copies them.
 
 ### Copies installed before the app
 
@@ -98,9 +97,46 @@ allows the same current-or-historical adoption checks.
 
 4. The app installs the skills at once and then checks once a day. It also asks whether to start with Windows.
 
-To update it, quit the app (right-click the icon, **Quit**), replace both exes with the new ones and start it again.
-In local mode, the settings and the record of what it installed stay in `%LOCALAPPDATA%\tiny-skill-sync`, and Start
-with Windows stays as it was, because it names the exe's path.
+### Updating the app
+
+**Sync now** and `tss check` update *skills*. **Settings → App updates** and `tss update` concern only the two programs.
+While the tray runs it checks for a newer stable Windows x64 release from `AngelosP/tiny-skill-sync`, even if
+there are no skill repositories. The default is every 24 hours; the alternatives are 7 and 30 days.
+
+| What you want | Command |
+|---|---|
+| See preferences and installed version, without checking GitHub | `tss update status` |
+| See whether a newer version is offered, without downloading the programs | `tss update check` |
+| Check, verify and install both files now | `tss update install` |
+| Turn automatic checks and pending automatic installs off or back on | `tss update off` / `tss update on` |
+| Set the interval | `tss update every 1d`, `7d` or `30d` |
+| Choose when to change the files | `tss update when immediate` or `tss update when quit` |
+
+Manual check and install still work with automation off. When the tray installs an update, by **Install now** or
+an Immediate install (the default), it restarts into the new version once both files are replaced and the new tray
+matches its release digest. If the window was open, it opens again on its first page, and the line at the top says
+the tray restarted. A question, the tray menu or a sign-out that is under way delays the restart until it is over;
+Quit, `--quit` or signing out in the meantime cancels it, and the app stays closed. If the new tray cannot be started
+or stops at once, the old one keeps running and says why.
+`tss update install` changes only the files: a running tray keeps its old code until you quit and start it
+yourself. In Quit mode the worker holds both verified files until you explicitly choose **Quit**, and the tray
+stays closed afterwards. Closing Settings is not Quit, and signing out does not install a pending update.
+
+The updater does not use a skill token or a configurable release feed. Both standalone files must have the expected
+sizes and SHA-256 digests from GitHub before either is replaced. The installed pair must also match both digests
+in its own official release: a custom build, edited file, or tag without standalone digests is left alone. These
+checks detect changes; the programs are not publisher-signed. An unavailable share, access error or busy folder
+is a failure, not an update. A lock on a share protects one folder; it cannot lock another PC's separate OneDrive
+replica. Use a single writer and wait for both files to sync before using another PC. Live SMB and OneDrive
+replacement have not been verified.
+
+**First upgrade or manual recovery:** for 0.6.0 and older, quit the tray and close other copies of `tss` using this
+folder. Put **both** exes from the same official release ZIP in their place and start the tray yourself. Leave
+the companion settings, local skill records and startup entry alone. If an automatic replacement was interrupted,
+let the same copy recover using its original, private settings home. If it reports a conflict, preserve the
+installation folder and that home, including their recovery files; use a fresh folder with both programs from
+the ZIP rather than guessing which file to overwrite. A skipped on-Quit install is not scheduled for later by a
+disk record: the next session must obtain and verify a release again.
 
 ### Run from a shared folder
 
@@ -113,7 +149,7 @@ tss portable
 
 This creates two files beside `tss.exe` and refuses to replace either one if it already exists:
 
-- `tiny-skill-sync.settings.json` holds the default interval and optional skills-folder setting.
+- `tiny-skill-sync.settings.json` holds the default skill interval, optional skills folder and app-update preferences.
 - `tiny-skill-sync.sources.json` holds the repositories, including their branch, folder, enabled state, interval and
   `use_token` choice.
 
@@ -196,7 +232,8 @@ The icon is the app's logo; its colour and fill say how things are.
 The tooltip says what the state is. Click the icon to open the window, or right-click for **Open Tiny Skill Sync**,
 **Sync now** and **Quit**. Starting `tiny-skill-sync.exe` again opens the window of the copy that already runs;
 `tiny-skill-sync.exe --quit` closes it. `tiny-skill-sync.exe --background` starts it the way Windows does at sign-in
-(see [Start with Windows](#start-with-windows)); when a copy already runs, it does nothing.
+(see [Start with Windows](#start-with-windows)); when a copy already runs, it does nothing. After installing an app
+update, the tray starts its new version with `--restarted` (or `--restarted-open` when its window was open).
 
 ## The window
 
@@ -259,6 +296,7 @@ room from the page beside it, and narrows again when the mouse leaves.
 - **Activity:** what the app did recently, newest first, and what went wrong.
 - **Settings:**
   - **Check for skill updates every**: the default interval, for every repository set to **Default** (1 day at first).
+  - **App updates**: manual check and install, plus when the tray checks for and installs new versions of the two programs.
   - **Start with Windows**: a switch, and a line under it that says how it is, also when it was turned off in Task
     Manager or when Windows starts another copy of the app (see [Start with Windows](#start-with-windows)).
   - **Skills folder** and **Backups**, each with **Open**.
@@ -266,7 +304,7 @@ room from the page beside it, and narrows again when the mouse leaves.
     **Delete token**.
   - **About**.
 
-Every change is saved at once; there is no OK button. Intervals are a number and a unit: `30m`, `6h`, `1d`, `2w` or
+Every change is saved at once; there is no OK button. **Skill** intervals are a number and a unit: `30m`, `6h`, `1d`, `2w` or
 `1mo` (a calendar month), at least 5 minutes. **Custom…** also takes words, such as `45 minutes` or `3 days`.
 
 The window follows the Windows light or dark mode, and high contrast. It can be resized and remembers its size
@@ -314,6 +352,7 @@ also raises GitHub's rate limit: without one, every program on your network shar
 
 ```text
 tss status                                   what is installed and what needs attention (no network)
+tss update status                            app versions and preferences (not a skill check)
 tss check [REPO] [--dry-run]                 check GitHub now and apply what is safe
 tss add OWNER/NAME|URL [--every 6h] [--use-token]
 tss remove REPO [--delete-skills]
@@ -344,6 +383,7 @@ was interrupted.
 | What | Where |
 | --- | --- |
 | Local settings | `%LOCALAPPDATA%\tiny-skill-sync\config.json` |
+| Local app-release schedule (not shared preferences) | `%LOCALAPPDATA%\tiny-skill-sync\update-clock.json` |
 | Shared settings and repositories (portable mode) | `tiny-skill-sync.settings.json` and `tiny-skill-sync.sources.json` beside the exes |
 | What the app installed (the ownership record) | `%LOCALAPPDATA%\tiny-skill-sync\state.json` |
 | The window's size | `%LOCALAPPDATA%\tiny-skill-sync\window.txt` |
@@ -361,6 +401,10 @@ four folders used), so going back to it carries on where it left off: edits made
 and kept, and a change that was interrupted there is finished then, not before. Until the app has taken in the new
 folder (the tray does at once; with `tss` alone, run `tss check`), a choice about a skill or the removal of a repository
 is refused with a request to check first.
+
+The optional `app_update` settings object contains `enabled`, `interval` (`daily`, `weekly`, `monthly` meaning
+30 days) and `timing` (`immediate`, `on_quit`). Upgrade older copies before sharing nondefault preferences:
+an old portable reader can reject the field, and an old local writer can omit it when saving.
 
 In local mode, `config.json` can be edited by hand while the app runs; it is picked up at once. An example:
 
@@ -461,12 +505,17 @@ updating and removing a skill, taking over a folder of yours, and **Show changes
 
 ## Measured cost
 
+With the app updater built in, the tray exe measured **1,173,504 bytes** (1.12 MiB), over its 1.1 MiB budget.
+On the three-skill, five-file public fixture, the tray appeared in 8.2 ms median, Settings painted in 33.5 ms
+median, and ordinary Quit took at most 0.9 ms. Ten idle seconds showed zero CPU, I/O and page faults. The
+benchmark suppressed release checks; it does not measure retaining an offered update or installing on a slow share.
+
 Measured with `scripts\bench.ps1` on a Ryzen 7 5800X3D with Windows 11, files in the cache, real installs of
 [anthropics/skills](https://github.com/anthropics/skills) (19 skills, 442 files) and
 [github/awesome-copilot](https://github.com/github/awesome-copilot) (463 skills, 1,555 files). The 442-file run includes
 historical adoption; the larger install is an earlier baseline.
 
-| Measure | 442 files, current | 1,555 files, earlier | Budget |
+| Measure | 442 files, before app updates | 1,555 files, earlier | Budget |
 | --- | --- | --- | --- |
 | Start to tray icon | 7.7 ms | 8.6 ms | 30 ms median |
 | Start-up check of every installed file | 20.1 ms | 105 ms | 75 µs per file |
@@ -479,7 +528,7 @@ historical adoption; the larger install is an earlier baseline.
 | Unchanged check: CPU, file reads and writes | 0 ms, 0, 0 | 16 ms, 0, 0 | 50 ms, 0 |
 | Exe size | 1,057,280 bytes (1.01 MiB) | 0.93 MiB | 1.1 MiB |
 
-Every budget row passed. The current startup check took 48.2 microseconds per file; an unchanged poll took 438 ms
+Every budget row passed in those earlier runs. The 442-file startup check took 48.2 microseconds per file; an unchanged poll took 438 ms
 wall time and changed no files. The eight-candidate historical quick slice took 11.4 seconds in the live fixture
 check, including an initial install and an older-copy update; its time depends on the network.
 
@@ -510,7 +559,8 @@ ended at 3.2 MiB of private memory. Each change reached the disk within one inte
 
 ## Limitations
 
-- No installer, no signed exe, no automatic updates of the app itself.
+- No installer or publisher signature. App installs replace both files on disk; only the tray restarts itself
+  afterwards, not `tss update install` and not an install at Quit.
 - Start with Windows names the exe by its path, and Windows starts no command over 260 characters, so the path can be
   at most 245 characters (the rest is the quotes and `--background`). In a deeper folder the app names itself by its
   short (8.3) path, such as `C:\Users\you\AppData\Local\TINY-S~1\TINY-S~1.EXE`, which works only on drives that keep
@@ -525,7 +575,8 @@ ended at 3.2 MiB of private memory. Each change reached the disk within one inte
 - A repository that is renamed or moved on GitHub is reported as a failure; update its address yourself.
 - A change of display scale while the app runs is followed by the tray icon (it is drawn again at the taskbar's new
   size) but has not been tried on a real scale change.
-- It uses the Windows proxy settings (WinHTTP's automatic proxy), but it has not been tested behind a proxy.
+- Skill checks use the Windows proxy settings (not tested behind a proxy). The anonymous app-release check
+  connects directly to GitHub; if the network requires a proxy, use the manual ZIP upgrade instead.
 - A short network failure turns the icon red until the next successful check.
 - `gh` is found only on the `PATH`; with several `gh` accounts, the active one is used.
 - When Windows long paths are off, a folder you add inside a skill whose path is longer than 260 characters cannot be

@@ -1,5 +1,5 @@
-//! Starting other programs: the GitHub CLI for its token, and File Explorer. `gh` is only a token source here; it never
-//! makes the requests.
+//! Starting other programs: the GitHub CLI for its token, File Explorer, and the tray an app update installed, after
+//! its bytes were proven to be the verified release. `gh` is only a token source here; it never makes the requests.
 //!
 //! Programs are started with `CreateProcessW` rather than `std::process`, which costs the tray exe about 60 KB of its
 //! 1 MiB budget.
@@ -95,6 +95,31 @@ pub fn explorer(arg: &OsStr) -> io::Result<()> {
     let exe = system_dir(GetSystemWindowsDirectoryW).ok_or_else(last)?.join("explorer.exe");
     let mut line = command_line(&exe, &[arg])?;
     create(&exe, &mut line, None, None).map(drop)
+}
+
+/// A program that was started and left to run. Dropping this closes the handle, not the program.
+pub struct Started(Owned);
+
+impl Started {
+    /// Waits up to `wait` for the program to end: its exit code if it did, `None` while it still runs.
+    pub fn ended_within(&self, wait: Duration) -> Option<u32> {
+        let ms = wait.as_millis().min(u128::from(u32::MAX - 1)) as u32;
+        let mut code = 0u32;
+        (unsafe { WaitForSingleObject(self.0.0, ms) } == WAIT_OBJECT_0 && unsafe { GetExitCodeProcess(self.0.0, &mut code) } != 0).then_some(code)
+    }
+
+    /// Ends the program and waits a moment for it to be gone.
+    pub fn stop(&self) {
+        unsafe { TerminateProcess(self.0.0, 1) };
+        self.ended_within(Duration::from_secs(5));
+    }
+}
+
+/// Starts `program`, which the caller holds open after proving it is the program it means, and does not wait. The
+/// program gets this process's environment and current folder, and no handles.
+pub fn start(program: &Path, args: &[&OsStr]) -> io::Result<Started> {
+    let mut line = command_line(program, args)?;
+    create(program, &mut line, None, None).map(Started)
 }
 
 fn read_some(h: Owned) -> Vec<u8> {
@@ -323,5 +348,31 @@ mod tests {
     fn a_missing_program_is_not_found() {
         let err = run_capture("tss-no-such-program-xyz", &[], &[], Duration::from_secs(1)).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn only_a_tray_proven_and_held_is_started_and_it_is_left_to_run() {
+        let base = std::env::var_os("TSS_TEST_ROOT").map(PathBuf::from).unwrap_or_else(std::env::temp_dir);
+        let dir = base.join(format!("tss-it-restart-{}", crate::fsx::unique_suffix()));
+        std::fs::create_dir(&dir).unwrap();
+        let tray = dir.join("tiny-skill-sync.exe");
+        let bytes = std::fs::read(system_dir(GetSystemDirectoryW).unwrap().join("cmd.exe")).unwrap();
+        std::fs::write(&tray, &bytes).unwrap();
+        let mut wrong = crate::release::sha256(&bytes);
+        wrong[31] ^= 1;
+        assert!(crate::replacement::verified_tray(&dir, wrong).is_err());
+
+        let proven = crate::replacement::verified_tray(&dir, crate::release::sha256(&bytes)).unwrap();
+        assert!(std::fs::rename(&tray, dir.join("other.exe")).is_err(), "the proven file cannot be swapped before it starts");
+        assert!(std::fs::write(&tray, b"not the tray").is_err());
+        let ended = start(proven.path(), &[OsStr::new("/C"), OsStr::new("exit 7")]).unwrap();
+        assert_eq!(ended.ended_within(Duration::from_secs(10)), Some(7));
+        let running = start(proven.path(), &[OsStr::new("/K")]).unwrap();
+        assert_eq!(running.ended_within(Duration::from_millis(200)), None);
+        running.stop();
+        assert_eq!(running.ended_within(Duration::ZERO), Some(1));
+        drop(proven);
+        std::fs::rename(&tray, dir.join("other.exe")).expect("only the hold refused the swap");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

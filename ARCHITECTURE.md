@@ -57,7 +57,7 @@ case by case. Code that talks to Windows is kept in `src\win\`.
 | `win::fs` | File facts `std` does not give: file id, USN, volume, links; one-handle folder listing. | Windows |
 | `win::http` | A small blocking HTTP client on WinHTTP. The only networking code. | Windows |
 | `win::cred` | The token in Windows Credential Manager. | Windows |
-| `win::proc` | Starts other programs with `CreateProcessW` (not `std::process`, which costs the tray exe about 60 KB): `gh auth token` for the GitHub CLI's token, and File Explorer. | Windows |
+| `win::proc` | Starts other programs with `CreateProcessW` (not `std::process`, which costs the tray exe about 60 KB): `gh auth token` for the GitHub CLI's token, File Explorer, and the tray an app update installed. | Windows |
 | `win::clip` | Puts text on the clipboard (Copy path, Copy GitHub link). | Windows |
 | `win::autorun` | The startup entry in the registry: read, written and deleted only when the user asks. | Windows |
 | `win::ui` | The tray icon, the window, questions, and the controls they are drawn with (see [below](#the-tray-and-the-window)). | Windows |
@@ -68,7 +68,10 @@ The tray app has two threads.
 
 - The **UI thread** owns the hidden main window, the tray icon, the window you open and the message loop. It sleeps in
   `MsgWaitForMultipleObjectsEx` on window messages and three handles: a waitable timer set to the next check, a change
-  notification on the local app's folder (`config.json`, `state.json`), and one on the skills folder. Nothing polls.
+  notification on the local app's folder (`config.json`, `state.json`), and one on the skills folder. Nothing polls
+  while idle. Two waits around an app restart do: a tray started to replace an older one tries the single-instance
+  mutex every 100 ms, for up to 120 s, until that one has gone, and a pending restart tries again every 500 ms while a
+  question, the tray menu or a sign-out holds it.
 - The **worker thread** owns the engine and runs one job at a time: loading settings, the start-up look, a check, a
   resolution. Network calls, hashing, portable companion-file I/O and file changes never run on the UI thread.
   Settings load at startup and are reloaded before a poll or explicit check, and when the window opens; no
@@ -357,6 +360,51 @@ The evidence for this design, including the spikes that measured it, is in [spik
 tests in `tests\downtime.rs`.
 
 ## Scheduling
+
+### The app release schedule
+
+`release` asks the official latest stable release endpoint. When installing, it also reads the installed tag's
+official metadata: both existing files must match that tag, and **both** downloaded sizes and SHA-256 digests
+must match the new tag. Metadata, redirects and both downloads share a 90-second deadline. The skill client's
+redirect and token rules do not change. It distinguishes the running build from the pair on disk.
+
+`update_clock` lives in the machine-local settings home, separate from preferences, skill timestamps and the
+ownership record. The tray uses the earlier app or skill deadline on the **existing** timer. A release request,
+verification and replacement all use the same serialized worker as skills, with separate failure/backoff state.
+Queued automatic work reloads the active preferences. A preference change revokes a pending pair; no settings
+or timing file is a deferred instruction to install code.
+
+`replacement` coordinates writers at the executable folder, not the settings home, and rechecks the installed
+version and digests there. Staging, backups and the shared receipt use the installation volume. A separate
+witness in the initiating settings home corroborates recovery; a different home does not retire another
+updater's backups. Neither record authorizes a future install.
+
+An on-Quit pair is held only in worker memory (at most two 8 MiB payloads). Explicit Quit drains current work and
+requires successful settings saves and an engine flush. Its two-second drain is a limit on starting new work,
+not a promise to terminate an already active filesystem transaction in two seconds. Session end revokes an
+uncommitted install. A filesystem lock coordinates one physical
+directory, not independent cloud replicas: use one writer and allow replication to finish before using another PC.
+
+Only two installs start a program afterwards: **Install now** in the tray and a scheduled Immediate install whose
+preferences are still current. Each must really have replaced the pair. Then `replacement::verified_tray` opens the
+new `tiny-skill-sync.exe` and its folder without delete sharing, and compares the file's SHA-256 with the release
+digest. The tray starts that held file (`win::proc::start`: no inherited handles, the same environment and current
+folder, so `TSS_HOME` and `TSS_SKILLS_DIR` carry over) with `--restarted`, or `--restarted-open` when its window was
+open, and quits the normal way. The proof relies on the volume enforcing the held handle's share modes. The new copy
+waits up to 120 s on the single-instance mutex, which the old one holds until its process ends, so it cannot take
+over early. Quit, `--quit`, an On-Quit install, sign-out, a `WM_CLOSE` to the tray, a failed or unneeded install, a
+stale schedule, an app clock that could not be saved and `tss update install` start nothing. A restart waits while a
+question, the tray menu or a sign-out (`WM_QUERYENDSESSION` until `WM_ENDSESSION`) is pending. After the start, the
+UI thread waits one second to see that the new copy keeps running, and the window does not answer meanwhile. If the
+new file cannot be proven or started, or it stops within that second, the old tray keeps running and says why. A
+Quit, a close or a sign-out that arrives during that second, or while the old tray finishes quitting, stops the new
+copy, which is still waiting for the mutex, so the app stays closed. Only a `--quit` in the fraction of a second
+between the old tray's window going and the new one's appearing finds no tray to close. `--restarted` and
+`--restarted-open` only choose the first status line and whether the window opens; they grant nothing. The new
+tray's status line says it restarted once its first look at the skills folder is done. Debug builds only have tray
+commands 1098 and 1099, which fake such an install with a right or wrong digest for `scripts\relaunch-smoke.ps1`.
+
+### The skill schedule
 
 `scheduler.rs` is pure: the time is passed in.
 

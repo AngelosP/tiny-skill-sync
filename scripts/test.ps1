@@ -32,8 +32,10 @@ param(
 . "$PSScriptRoot\common.ps1"
 Use-Cargo
 Push-Location $RepoRoot
-$savedRoot = $env:TSS_TEST_ROOT
+$saved = $env:TSS_TEST_ROOT, $env:TSS_NO_APP_UPDATES, $env:TSS_NO_SAVED_TOKEN
 try {
+    $env:TSS_NO_APP_UPDATES = '1'
+    $env:TSS_NO_SAVED_TOKEN = '1'
     if (-not $Quick) {
         Write-Host '== cargo fmt --check' -ForegroundColor Cyan
         Invoke-Native cargo @('fmt', '--check')
@@ -50,7 +52,7 @@ try {
     Invoke-Native cargo $testArgs
     Write-Host 'All checks passed.' -ForegroundColor Green
 } finally {
-    $env:TSS_TEST_ROOT = $savedRoot
+    $env:TSS_TEST_ROOT, $env:TSS_NO_APP_UPDATES, $env:TSS_NO_SAVED_TOKEN = $saved
     Pop-Location
     $left = @(Get-ChildItem $env:TEMP -Directory -ErrorAction SilentlyContinue | Where-Object { $_.Name -match $TestTempPattern })
     if ($left.Count -gt 0) {

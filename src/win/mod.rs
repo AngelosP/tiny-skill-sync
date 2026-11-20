@@ -6,7 +6,9 @@ pub mod console;
 pub mod cred;
 pub mod fs;
 pub mod http;
+pub(crate) mod install;
 pub mod proc;
+pub(crate) mod release_hash;
 mod ui;
 
 /// Runs the tray app until it quits. The process exit code.

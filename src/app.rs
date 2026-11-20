@@ -16,6 +16,7 @@
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
+use std::time::Instant;
 
 use crate::board::{Board, Health, Level, capitalized};
 use crate::config::{Config, Paths};
@@ -24,6 +25,9 @@ use crate::engine::{
     VerifyReport, Which,
 };
 use crate::interval::UnixSecs;
+use crate::replacement::VerifiedTray;
+use crate::update_clock::ClockState;
+use crate::updater::{Action, Locations, Request, Updates};
 
 /// How long to wait before trying again when another check held the engine.
 pub const BUSY_RETRY: UnixSecs = 60;
@@ -52,6 +56,12 @@ pub enum Job {
     Poll,
     /// The user asked: look at the disk, then check every enabled repository (`None`) or one.
     Check(Option<String>),
+    AppUpdate(Action),
+    ScheduledUpdate,
+    /// Only after receiving a successful Flush during an explicit Quit, not on logoff.
+    InstallOnQuit {
+        before: Instant,
+    },
     Resolve {
         repo: String,
         skill: String,
@@ -85,7 +95,16 @@ impl Job {
 
     /// The user asked for it, so they are told how it went.
     fn by_user(&self) -> bool {
-        matches!(self, Job::Check(_) | Job::Resolve { .. } | Job::DeleteGone(_) | Job::Remove { .. })
+        matches!(self, Job::Check(_) | Job::AppUpdate(_) | Job::Resolve { .. } | Job::DeleteGone(_) | Job::Remove { .. })
+    }
+
+    fn update_request(&self) -> Option<Request> {
+        match self {
+            Self::AppUpdate(action) => Some(Request::Manual(*action)),
+            Self::ScheduledUpdate => Some(Request::Scheduled),
+            Self::InstallOnQuit { .. } => Some(Request::Quit),
+            _ => None,
+        }
     }
 }
 
@@ -109,7 +128,7 @@ impl SettingsSource {
                 let skills_dir = crate::portable::resolve_skills_dir(&config, std::env::var_os("TSS_SKILLS_DIR").as_deref(), profile.as_deref(), |name| {
                     std::env::var_os(name).map(|value| value.to_string_lossy().into_owned())
                 })?;
-                return Ok(Some(LoadedSettings { config, skills_dir, portable: true, first_run: !self.local_file.exists() }));
+                return Ok(Some(LoadedSettings { config, skills_dir, portable: true, first_run: !self.local_file.exists(), local_stamp: None }));
             }
         }
 
@@ -117,13 +136,26 @@ impl SettingsSource {
             return Ok(None);
         }
 
+        let local_stamp = crate::engine::stamp_of(&self.local_file);
         let config = Config::load(&self.local_file)?;
         let skills_dir = Paths::skills_dir(&config);
-        Ok(Some(LoadedSettings { config, skills_dir, portable: false, first_run: !self.local_file.exists() }))
+        Ok(Some(LoadedSettings { config, skills_dir, portable: false, first_run: !self.local_file.exists(), local_stamp }))
     }
 
     fn save(&self, before: &Config, after: &Config, portable_mode: bool) -> Result<(), String> {
-        if portable_mode { crate::portable::save_changes(&self.executable_dir, before, after).map(|_| ()) } else { after.save(&self.local_file) }
+        if before.app_update != after.app_update {
+            let active = self.load(portable_mode, true, true)?.ok_or("cannot locate the active settings")?;
+            if active.portable != portable_mode {
+                return Err("settings changed since they were loaded; reload before saving".into());
+            }
+            Locations { home: self.local_file.parent().ok_or("cannot locate the settings folder")?, dir: &self.executable_dir, skills: &active.skills_dir }
+                .check()?;
+        }
+        if portable_mode {
+            crate::portable::save_changes(&self.executable_dir, before, after).map(|_| ())
+        } else {
+            after.save_if_unchanged(&self.local_file, before)
+        }
     }
 }
 
@@ -133,6 +165,13 @@ pub struct LoadedSettings {
     pub skills_dir: PathBuf,
     pub portable: bool,
     pub first_run: bool,
+    pub local_stamp: Option<Stamp>,
+}
+
+impl LoadedSettings {
+    pub(crate) fn matches_local_file(&self, path: &std::path::Path) -> bool {
+        self.portable || self.local_stamp == crate::engine::stamp_of(path)
+    }
 }
 
 #[derive(Debug)]
@@ -169,6 +208,7 @@ pub struct Order {
     pub settings_initialized: bool,
     pub reload_settings: bool,
     pub config_saves: Vec<ConfigSave>,
+    update_generation: u64,
     /// Run it as background work: lower CPU, I/O and memory priority, so it never gets in the way.
     pub background: bool,
 }
@@ -184,6 +224,24 @@ pub enum Answer {
     Diffed(DiffReport),
     Flushed,
     Planned,
+    AppUpdate(String),
+}
+
+#[derive(Debug)]
+pub struct UpdateState {
+    generation: u64,
+    clock: Option<ClockState>,
+    staged: Option<crate::release::Version>,
+    status: Option<Result<String, String>>,
+    disk: Option<Result<String, String>>,
+    restart: Option<Result<VerifiedTray, String>>,
+}
+
+impl UpdateState {
+    /// The tray a successful install put in place, held and proven, or why it could not be: see [`Settled::restart`].
+    pub fn take_restart(&mut self) -> Option<Result<VerifiedTray, String>> {
+        self.restart.take()
+    }
 }
 
 /// What the worker sends back: the answer, and what the engine knows now.
@@ -208,10 +266,15 @@ pub struct Done {
     pub config_saves: Vec<ConfigSaveOutcome>,
     /// Whether this order checked for portable companions.
     pub settings_checked: bool,
+    pub update: Option<UpdateState>,
 }
 
 /// Runs one order. Called on the worker thread, which owns the engine.
 pub fn perform(engine: &mut Engine, order: &Order, cancel: &AtomicBool) -> Done {
+    perform_with_updates(engine, order, cancel, None, crate::interval::now_secs())
+}
+
+pub(crate) fn perform_with_updates(engine: &mut Engine, order: &Order, cancel: &AtomicBool, mut updates: Option<&mut Updates>, now: UnixSecs) -> Done {
     let mut config_saves = Vec::with_capacity(order.config_saves.len());
     for save in &order.config_saves {
         let result = order
@@ -221,12 +284,15 @@ pub fn perform(engine: &mut Engine, order: &Order, cancel: &AtomicBool) -> Done 
         config_saves.push(ConfigSaveOutcome { before: save.before.clone(), after: save.after.clone(), revert_on_failure: save.revert_on_failure, result });
     }
 
-    let explicit_check = matches!(order.job, Job::Check(_));
+    let update_request = order.job.update_request();
+    let explicit_check = matches!(order.job, Job::Check(_)) || update_request.is_some();
     let probe_portable = !order.settings_initialized || order.portable_mode || order.reload_settings || explicit_check;
     let loads_settings = order.job == Job::LoadSettings
         || (!order.settings_initialized && order.job == Job::Startup)
+        || update_request.is_some()
         || (probe_portable && (matches!(order.job, Job::Poll | Job::Check(_)) || order.reload_settings));
-    let force_local = !order.settings_initialized && matches!(order.job, Job::LoadSettings | Job::Startup);
+    let force_local =
+        order.reload_settings || update_request.is_some() || (!order.settings_initialized && matches!(order.job, Job::LoadSettings | Job::Startup));
     let mut cfg = order.cfg.clone();
     let mut skills_dir = order.skills_dir.clone();
     let portable_mode = order.portable_mode;
@@ -252,12 +318,71 @@ pub fn perform(engine: &mut Engine, order: &Order, cancel: &AtomicBool) -> Done 
     let moved = skills_dir != order.skills_dir;
     let reload_only = order.job == Job::LoadSettings || (order.job == Job::Plan && order.reload_settings);
     let skip_for_folder_change = moved && matches!(order.job, Job::Poll | Job::Check(_));
-    if settings_error.is_none() && !skip_for_folder_change && !reload_only && engine.paths().skills != skills_dir {
+    if update_request.is_none() && settings_error.is_none() && !skip_for_folder_change && !reload_only && engine.paths().skills != skills_dir {
         engine.set_skills_dir(skills_dir.clone());
     }
 
+    let mut update_status = None;
+    let mut disk = None;
+    let mut restart = None;
+    let source = order.settings_source.as_ref();
+    if let Some(worker) = updates.as_deref_mut() {
+        worker.reset_if_changed(order.update_generation, cfg.app_update);
+        if settings_error.is_none() {
+            if let Some(source) = source {
+                let loc = Locations { home: &engine.paths().home, dir: &source.executable_dir, skills: &skills_dir };
+                if order.reload_settings {
+                    disk = Some(loc.check().and_then(|()| worker.disk_status(loc.dir)));
+                }
+                if order.job == Job::Startup {
+                    if let Err(e) = worker.initialize(&loc) {
+                        update_status = Some(Err(e));
+                    }
+                } else if order.reload_settings && worker.clock.is_none() && order.job == Job::Plan {
+                    // A previously unreadable clock can be repaired and loaded without restarting.
+                    if let Err(e) = worker.initialize(&loc) {
+                        update_status = Some(Err(e));
+                    }
+                }
+            }
+        }
+    }
     let result = if let Some(error) = settings_error {
         Err(EngineError::Failed(error))
+    } else if let Some(request) = update_request {
+        let mut run = || -> Result<String, String> {
+            let source = source.ok_or("cannot locate the installation folder")?;
+            let worker = updates.as_deref_mut().ok_or("the app update worker is unavailable")?;
+            let loaded_portable = settings.as_ref().and_then(|s| s.result.as_ref().ok()).is_some_and(|s| s.portable);
+            if !matches!(request, Request::Manual(_)) && (cfg.app_update != order.cfg.app_update || moved || loaded_portable != order.portable_mode) {
+                return Ok("App update settings changed; the schedule will use the new settings.".into());
+            }
+            let loc = Locations { home: &engine.paths().home, dir: &source.executable_dir, skills: &skills_dir };
+            let confirm = || {
+                if config_saves.iter().any(|s| s.result.is_err()) {
+                    return Err("settings could not be saved; app update cancelled".into());
+                }
+                let active = source.load(loaded_portable, true, true)?.ok_or("cannot reload app update settings")?;
+                if active.skills_dir != skills_dir || active.portable != loaded_portable {
+                    return Err("the active settings folder changed; check again".into());
+                }
+                if !matches!(request, Request::Manual(_)) && (!active.config.app_update.enabled || active.config.app_update != cfg.app_update) {
+                    return Err("app update settings changed; automatic installation cancelled".into());
+                }
+                if matches!(order.job, Job::InstallOnQuit { before } if Instant::now() >= before) {
+                    return Err("the clean Quit timed out before replacement; neither program was installed".into());
+                }
+                Ok(())
+            };
+            let result = worker.run(&loc, request, cfg.app_update, now, cancel, &confirm);
+            let installed = worker.take_restart();
+            if result.is_ok() {
+                restart = installed;
+            }
+            disk = Some(loc.check().and_then(|()| worker.disk_status(loc.dir)));
+            result
+        };
+        run().map(Answer::AppUpdate).map_err(EngineError::Failed)
     } else if reload_only || skip_for_folder_change {
         Ok(Answer::SettingsLoaded)
     } else {
@@ -281,6 +406,7 @@ pub fn perform(engine: &mut Engine, order: &Order, cancel: &AtomicBool) -> Done 
             Job::Diff { repo, skill, preview: true } => engine.preview(&cfg, repo, skill, cancel).map(Answer::Diffed),
             Job::Flush => engine.flush().map(|()| Answer::Flushed),
             Job::Plan => Ok(Answer::Planned),
+            Job::AppUpdate(_) | Job::ScheduledUpdate | Job::InstallOnQuit { .. } => unreachable!("release jobs are handled separately"),
         }
     };
     Done {
@@ -296,6 +422,7 @@ pub fn perform(engine: &mut Engine, order: &Order, cancel: &AtomicBool) -> Done 
         settings,
         config_saves,
         settings_checked: loads_settings && probe_portable,
+        update: updates.map(|u| UpdateState { generation: order.update_generation, clock: u.clock, staged: u.staged(), status: update_status, disk, restart }),
     }
 }
 
@@ -310,6 +437,9 @@ pub struct Settled {
     pub stale_feedback: bool,
     /// "Show changes" finished.
     pub diff: Option<Shown>,
+    /// The tray may restart into an app update this job installed, if it installed one: the user asked for the
+    /// install, or the schedule made it under the settings in use, and the app is not quitting.
+    pub restart: bool,
 }
 
 /// What "Show changes" or Preview found for a skill, or why it could not be shown.
@@ -336,6 +466,12 @@ pub struct App {
     queue: VecDeque<Job>,
     busy: Option<Job>,
     next_wake: Option<UnixSecs>,
+    update_clock: Option<ClockState>,
+    update_hold: UnixSecs,
+    update_generation: u64,
+    staged_for_quit: Option<crate::release::Version>,
+    app_disk: String,
+    pub app_update_status: String,
     /// No timer-driven job starts before this.
     not_before: UnixSecs,
     /// Jobs in a row that failed as a whole.
@@ -349,6 +485,9 @@ pub struct App {
     sign_in_wait: bool,
     quitting: bool,
     state_stamp: Option<Stamp>,
+    /// Said on the status line when the first look is done: this tray restarted into the update the one before it
+    /// installed.
+    restart_note: Option<String>,
 }
 
 impl App {
@@ -367,6 +506,12 @@ impl App {
             queue: VecDeque::from([Job::Startup]),
             busy: None,
             next_wake: None,
+            update_clock: None,
+            update_hold: 0,
+            update_generation: 0,
+            staged_for_quit: None,
+            app_disk: String::new(),
+            app_update_status: "Not checked in this session.".into(),
             not_before: 0,
             failures: 0,
             started: false,
@@ -375,6 +520,7 @@ impl App {
             sign_in_wait: false,
             quitting: false,
             state_stamp: None,
+            restart_note: None,
         }
     }
 
@@ -412,6 +558,14 @@ impl App {
         self.want(Job::Plan);
     }
 
+    pub(crate) fn reload_before_next_job(&mut self) {
+        if !self.quitting {
+            self.request_settings_reload();
+            self.queue.retain(|job| *job != Job::Plan);
+            self.queue.push_front(Job::Plan);
+        }
+    }
+
     pub fn queue_config_save(&mut self, before: Config, after: Config, portable: bool, revert_on_failure: bool) {
         self.config_saves.push(ConfigSave { before, after, portable, revert_on_failure });
         self.want(Job::Plan);
@@ -420,6 +574,9 @@ impl App {
     /// Takes in settings loaded on the worker. A changed skills folder is always started before it is checked.
     pub fn settings_reloaded(&mut self, loaded: LoadedSettings, during: &Job) {
         let moved = loaded.skills_dir != self.skills_dir;
+        if self.settings_initialized && self.portable_mode != loaded.portable {
+            self.revoke_update();
+        }
         self.retain_current_work(&loaded.config, moved);
         self.cfg = loaded.config;
         self.skills_dir = loaded.skills_dir;
@@ -451,6 +608,9 @@ impl App {
     }
 
     fn retain_current_work(&mut self, cfg: &Config, moved: bool) {
+        if moved || self.cfg.app_update != cfg.app_update {
+            self.revoke_update();
+        }
         self.queue.retain(|job| match job {
             Job::Resolve { repo, .. } | Job::Diff { repo, .. } | Job::Remove { repo, .. } | Job::Check(Some(repo)) | Job::DeleteGone(repo) => {
                 !moved
@@ -460,8 +620,27 @@ impl App {
                         .zip(cfg.find(repo))
                         .is_some_and(|(old, new)| old.repo == new.repo && old.branch == new.branch && old.path == new.path)
             }
+
             _ => true,
         });
+    }
+
+    fn revoke_update(&mut self) {
+        self.update_generation = self.update_generation.wrapping_add(1);
+        if self.staged_for_quit.is_some() {
+            self.app_update_status = "Pending automatic install cancelled.".into();
+        }
+        self.staged_for_quit = None;
+        self.queue.retain(|job| !matches!(job, Job::ScheduledUpdate | Job::InstallOnQuit { .. }));
+    }
+
+    pub(crate) fn accepts_update(&self, done: &Done) -> bool {
+        done.update.as_ref().is_none_or(|u| u.generation == self.update_generation)
+    }
+
+    pub(crate) fn release_summary(&self) -> String {
+        let pending = self.staged_for_quit.map_or_else(|| "Nothing waiting for Quit.".into(), |v| format!("Waiting for Quit: {v}."));
+        format!("{} {pending}\nLast result: {}", self.app_disk, self.app_update_status).trim_start().to_owned()
     }
 
     pub fn health(&self) -> Health {
@@ -547,7 +726,7 @@ impl App {
         }
         self.busy = Some(job.clone());
         self.armed = None;
-        let background = job == Job::Poll || (matches!(job, Job::LoadSettings | Job::Startup) && self.at_sign_in);
+        let background = matches!(job, Job::Poll | Job::ScheduledUpdate) || (matches!(job, Job::LoadSettings | Job::Startup) && self.at_sign_in);
         let reload_settings = std::mem::take(&mut self.reload_settings_pending);
         let config_saves = std::mem::take(&mut self.config_saves);
         Some(Order {
@@ -558,6 +737,7 @@ impl App {
             portable_mode: self.portable_mode,
             settings_initialized: self.settings_initialized,
             reload_settings,
+            update_generation: self.update_generation,
             config_saves,
             background,
         })
@@ -569,6 +749,19 @@ impl App {
         self.board.set_working(false);
         let before = self.health();
         let mut settled = Settled::default();
+        let current = self.accepts_update(&done);
+        if let Some(update) = done.update {
+            self.update_clock = update.clock;
+            if current {
+                self.staged_for_quit = update.staged;
+                if let Some(disk) = update.disk {
+                    self.app_disk = disk.unwrap_or_else(|why| format!("Could not read the installed pair: {why}"));
+                }
+                if let Some(status) = update.status {
+                    self.note_app_update(status, now, &mut settled);
+                }
+            }
+        }
         let job = done.job;
         let config_saves = done.config_saves;
         if done.settings_checked && !self.reload_settings_pending && !self.queue.iter().any(|job| matches!(job, Job::Check(_))) {
@@ -578,6 +771,14 @@ impl App {
         let mut checked = None;
 
         match done.result {
+            Err(e) if job.update_request().is_some() => {
+                if current || matches!(job, Job::AppUpdate(_)) {
+                    self.note_app_update(Err(e.to_string()), now, &mut settled);
+                }
+                if job == Job::ScheduledUpdate {
+                    self.update_hold = now.saturating_add(FAILURE_BACKOFF);
+                }
+            }
             Err(e) if matches!(job, Job::Diff { .. }) => settled.diff = shown(&job, Err(capitalized(&e.to_string()))),
             Err(EngineError::Busy) => match job {
                 Job::Startup | Job::Poll => self.hold(now + BUSY_RETRY),
@@ -598,15 +799,22 @@ impl App {
                 }
             }
             Ok(answer) => {
-                if !matches!(answer, Answer::Flushed | Answer::Planned | Answer::SettingsLoaded | Answer::Diffed(_)) {
+                if !matches!(answer, Answer::Flushed | Answer::Planned | Answer::SettingsLoaded | Answer::Diffed(_) | Answer::AppUpdate(_)) {
                     self.failures = 0;
                     self.board.note_failure(now, None);
                 }
                 match answer {
+                    Answer::AppUpdate(message) => {
+                        if current || matches!(job, Job::AppUpdate(_)) {
+                            self.note_app_update(Ok(message), now, &mut settled);
+                        }
+                        settled.restart = !self.quitting && (job == Job::AppUpdate(Action::Install) || (job == Job::ScheduledUpdate && current));
+                    }
                     Answer::Started(report) => {
                         self.board.note_startup(&report, now);
                         self.started = true;
                         self.at_sign_in = false;
+                        settled.feedback = self.restart_note.take();
                     }
                     Answer::Looked(report) => self.board.note_verify(&report, now),
                     Answer::Checked { verified, sync } => {
@@ -651,7 +859,7 @@ impl App {
                     self.cfg = save.before;
                     self.queue.retain(|queued| !matches!(queued, Job::Check(_)));
                 }
-                let text = format!("Shared settings could not be saved: {}", capitalized(&error));
+                let text = format!("Settings could not be saved: {}", capitalized(&error));
                 self.board.say(now, Level::Error, text.clone());
                 settled.feedback = Some(text);
             }
@@ -684,14 +892,49 @@ impl App {
         settled
     }
 
+    fn note_app_update(&mut self, result: Result<String, String>, now: UnixSecs, settled: &mut Settled) {
+        let (level, message) = match result {
+            Ok(message) => (Level::Ok, message),
+            Err(why) => (Level::Error, format!("App update failed: {why}")),
+        };
+        self.app_update_status = message.clone();
+        self.board.say(now, level, message.clone());
+        settled.feedback = Some(message);
+    }
+
+    /// The tray could not restart into the update it installed, so it keeps running the build it has. What the user is
+    /// told, for the status line.
+    pub fn restart_failed(&mut self, why: &str, now: UnixSecs) -> String {
+        let message = format!("Could not restart the tray: {why}. Quit and open it again to use the update.");
+        self.app_update_status = format!("{} {message}", self.app_update_status).trim_start().to_owned();
+        self.board.say(now, Level::Error, message.clone());
+        message
+    }
+
+    /// This tray was started by the one before it, which installed this build and then quit. The status line says so
+    /// once the first look at the skills folder is done, which would otherwise clear it.
+    pub fn restarted(&mut self, version: &str, now: UnixSecs) {
+        let message = format!("Restarted after the app update. Now running {version}.");
+        self.app_update_status = message.clone();
+        self.board.say(now, Level::Ok, message.clone());
+        self.restart_note = Some(message);
+    }
+
+    fn update_due(&self, now: UnixSecs) -> Option<UnixSecs> {
+        self.update_clock?.due(self.cfg.app_update, now).map(|t| t.max(self.update_hold))
+    }
+
+    pub(crate) fn has_quit_update(&self) -> bool {
+        self.staged_for_quit.is_some() && self.cfg.app_update.enabled
+    }
+
     /// When the timer should fire next, or `None` for no timer. Call after every change.
     pub fn arm(&mut self, now: UnixSecs) -> Option<UnixSecs> {
         let at = if self.busy.is_some() || self.quitting || !self.queue.is_empty() {
             None
-        } else if !self.started {
-            Some(self.not_before)
         } else {
-            self.next_wake.map(|wake| wake.max(self.not_before))
+            let skills = if self.started { self.next_wake.map(|wake| wake.max(self.not_before)) } else { Some(self.not_before) };
+            skills.into_iter().chain(self.update_due(now)).min()
         };
         self.armed = at.map(|at| at.max(now));
         self.armed
@@ -704,22 +947,25 @@ impl App {
             return;
         }
         if expected.is_some_and(|at| now > at + LATE_TIMER) {
-            self.hold(now + RESUME_GRACE);
+            self.resumed(now);
             return;
         }
-        if now < self.not_before {
-            return;
+        if now >= self.not_before {
+            if !self.started {
+                self.want(Job::Startup);
+            } else if self.next_wake.is_some_and(|wake| wake <= now) {
+                self.want(Job::Poll);
+            }
         }
-        if !self.started {
-            self.want(Job::Startup);
-        } else if self.next_wake.is_some_and(|wake| wake <= now) {
-            self.want(Job::Poll);
+        if self.update_due(now).is_some_and(|at| at <= now) {
+            self.want(Job::ScheduledUpdate);
         }
     }
 
     /// The computer woke up: give the network a moment.
     pub fn resumed(&mut self, now: UnixSecs) {
         self.hold(now + RESUME_GRACE);
+        self.update_hold = self.update_hold.max(now + RESUME_GRACE);
     }
 
     /// Windows started the app as the user signed in. Settings load on the worker, but the first look at the disk waits
@@ -728,6 +974,7 @@ impl App {
     pub fn started_by_windows(&mut self, now: UnixSecs) {
         self.at_sign_in = true;
         self.hold(now + SIGN_IN_GRACE);
+        self.update_hold = self.update_hold.max(now + SIGN_IN_GRACE);
         if self.queue.contains(&Job::Startup) {
             self.queue.retain(|job| *job != Job::Startup);
             self.sign_in_wait = true;
@@ -749,6 +996,15 @@ impl App {
         self.queue.clear();
         self.queue.push_back(Job::Flush);
         self.quitting = true;
+    }
+
+    pub(crate) fn finish_on_quit(&mut self, clean_and_flushed: bool, before: Instant) -> bool {
+        if clean_and_flushed && self.quitting && self.has_quit_update() && self.is_idle() && Instant::now() < before {
+            self.queue.push_back(Job::InstallOnQuit { before });
+            true
+        } else {
+            false
+        }
     }
 
     fn hold(&mut self, until: UnixSecs) {
@@ -867,6 +1123,135 @@ mod tests {
         app.want(choice.clone());
         assert_eq!(app.next_order().unwrap().job, choice);
         assert!(app.next_order().is_none(), "only one worker owns the engine");
+    }
+
+    #[test]
+    fn app_deadline_survives_a_busy_skill_job_with_no_extra_timer_or_poll() {
+        let mut app = App::new(Config::default(), PathBuf::from("skills"));
+        app.queue.clear();
+        app.started = true;
+        app.update_clock = Some(ClockState::default());
+        app.next_wake = Some(50);
+        assert_eq!(app.arm(50), Some(50));
+        app.on_timer(50);
+        assert_eq!(app.next_order().unwrap().job, Job::Poll);
+        assert_eq!(app.queued(), &[Job::ScheduledUpdate]);
+        assert_eq!(app.arm(55), None);
+        assert!(app.next_order().is_none());
+        app.busy = None;
+        assert_eq!(app.next_order().unwrap().job, Job::ScheduledUpdate);
+        app.busy = None;
+        app.next_wake = None;
+        app.not_before = 9999; // failed skill job or no configured repositories
+        assert_eq!(app.arm(61), Some(61));
+        app.resumed(61);
+        assert_eq!(app.arm(61), Some(61 + RESUME_GRACE));
+        app.on_timer(62);
+        assert!(app.is_idle());
+        app.on_timer(61 + RESUME_GRACE);
+        assert_eq!(app.next_order().unwrap().job, Job::ScheduledUpdate);
+    }
+
+    #[test]
+    fn app_checks_honor_sign_in_grace_even_after_a_user_opens_the_window() {
+        let mut app = App::new(Config::default(), PathBuf::from("skills"));
+        app.started_by_windows(100);
+        app.user_here();
+        assert_eq!(app.next_order().unwrap().job, Job::Startup);
+        app.busy = None;
+        app.started = true;
+        app.update_clock = Some(ClockState::default());
+        assert_eq!(app.arm(101), Some(100 + SIGN_IN_GRACE));
+        app.on_timer(100 + SIGN_IN_GRACE);
+        assert_eq!(app.next_order().unwrap().job, Job::ScheduledUpdate);
+    }
+
+    #[test]
+    fn disabling_discards_a_queued_app_update_and_revokes_a_late_staged_answer() {
+        let mut app = App::new(Config::default(), PathBuf::from("skills"));
+        app.cfg.app_update.timing = crate::config::UpdateTiming::OnQuit;
+        app.queue.clear();
+        app.started = true;
+        app.update_clock = Some(ClockState::default());
+        app.staged_for_quit = Some("1.2.3".parse().unwrap());
+        let generation = app.update_generation;
+        app.want(Job::ScheduledUpdate);
+        let mut off = app.cfg().clone();
+        off.app_update.enabled = false;
+        app.set_cfg(off, app.skills_dir.clone());
+        assert!(!app.queued().contains(&Job::ScheduledUpdate));
+        let delayed = Done {
+            job: Job::ScheduledUpdate,
+            result: Ok(Answer::AppUpdate("staged before Off".into())),
+            update: Some(UpdateState { generation, clock: app.update_clock, staged: Some("1.2.3".parse().unwrap()), status: None, disk: None, restart: None }),
+            next_wake: None,
+            last_checks: vec![],
+            kept: vec![],
+            facts: vec![],
+            lists_nothing: vec![],
+            private: vec![],
+            stamp: None,
+            settings: None,
+            config_saves: vec![],
+            settings_checked: true,
+        };
+        assert!(app.finish(delayed, 100).feedback.is_none());
+        assert!(!app.has_quit_update());
+        app.queue.clear();
+        assert_eq!(app.arm(101), None);
+        assert!(app.want(Job::AppUpdate(Action::Check)));
+    }
+
+    fn app_update_done(job: Job, generation: u64, result: Result<Answer, EngineError>) -> Done {
+        Done {
+            job,
+            result,
+            update: Some(UpdateState { generation, clock: None, staged: None, status: None, disk: None, restart: None }),
+            next_wake: None,
+            last_checks: vec![],
+            kept: vec![],
+            facts: vec![],
+            lists_nothing: vec![],
+            private: vec![],
+            stamp: None,
+            settings: None,
+            config_saves: vec![],
+            settings_checked: false,
+        }
+    }
+
+    #[test]
+    fn only_an_install_the_user_asked_for_or_a_current_schedule_restarts_the_tray() {
+        let mut app = App::new(Config::default(), PathBuf::from("skills"));
+        let generation = app.update_generation;
+        let installed = || Ok(Answer::AppUpdate("Installed 1.2.3 on disk (both programs).".into()));
+        let mut restarts = |job: Job, generation: u64, result| app.finish(app_update_done(job, generation, result), 100).restart;
+        assert!(restarts(Job::AppUpdate(Action::Install), generation, installed()));
+        assert!(restarts(Job::ScheduledUpdate, generation, installed()));
+        // The settings changed while it ran: the answer is stale, whatever it did.
+        assert!(!restarts(Job::ScheduledUpdate, generation.wrapping_add(1), installed()));
+        assert!(!restarts(Job::AppUpdate(Action::Check), generation, installed()));
+        assert!(!restarts(Job::InstallOnQuit { before: Instant::now() }, generation, installed()));
+        assert!(!restarts(Job::AppUpdate(Action::Install), generation, Err(EngineError::Failed("the download failed".into()))));
+        assert!(!restarts(Job::Check(None), generation, Ok(Answer::Flushed)));
+        app.quit();
+        for job in [Job::AppUpdate(Action::Install), Job::ScheduledUpdate] {
+            assert!(!app.finish(app_update_done(job, generation, installed()), 100).restart);
+        }
+    }
+
+    #[test]
+    fn a_restarted_tray_says_so_when_its_first_look_is_done() {
+        let started = || {
+            let tracking = crate::engine::Tracking { check: crate::verify::Check::Full, volume_changed: false, journal: false, folder_missing: false };
+            let verify = crate::engine::VerifyReport { skills: vec![], orphans: vec![], stats: Default::default(), tracking, notes: vec![], warnings: vec![] };
+            let report = crate::engine::StartupReport { verify, problem: None };
+            Done { update: None, ..app_update_done(Job::Startup, 0, Ok(Answer::Started(report))) }
+        };
+        let mut app = App::new(Config::default(), PathBuf::from("skills"));
+        app.restarted("1.2.3", 100);
+        assert_eq!(app.finish(started(), 101).feedback.as_deref(), Some("Restarted after the app update. Now running 1.2.3."));
+        assert_eq!(app.finish(started(), 102).feedback, None, "said once");
     }
 
     #[test]

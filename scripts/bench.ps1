@@ -4,8 +4,8 @@
   unchanged poll. Prints a table and saves it in bench\out\.
 
 .DESCRIPTION
-  Everything happens in a throwaway folder in %TEMP% (deleted at the end unless -Keep). Real skills are downloaded
-  into it from -Repo, so this needs the network.
+  The executable pair, settings and skills are in a throwaway folder (deleted at the end unless -Keep).
+  Only skills from the owner's public fixture are fetched. Neither saved credentials nor gh nor app updates are used.
 
   1. Install: 'tss add' and 'tss check' fill the throwaway skills folder.
   2. Startup: the tray app starts -Runs times on that install (warm: the files are in the cache). The app writes
@@ -24,13 +24,6 @@
   Counters are the ones Task Manager uses (WMI Win32_PerfRawData_PerfProc_Process). File reads and writes are
   counted apart from network traffic ("other" I/O).
 
-.PARAMETER Repo
-  Repositories to install, as for 'tss add'. Default: the skills folder of anthropics/skills.
-
-.PARAMETER UseToken
-  Send the GitHub token with every request (tss add --use-token). Without it, the app sends the token only after GitHub
-  answers that a repository is private or missing.
-
 .PARAMETER Runs
   How many times to measure startup, and the start at sign-in. Default 10.
 
@@ -46,18 +39,21 @@
 .PARAMETER Keep
   Keep the throwaway folder, to look at it afterwards.
 
+.PARAMETER SkipBuild
+  Copy the already built release pair instead of building before the run.
+
 .EXAMPLE
   scripts\bench.ps1
-  scripts\bench.ps1 -Repo https://github.com/github/awesome-copilot/tree/main/skills -Runs 5
+  scripts\bench.ps1 -SkipBuild -Runs 5
 #>
+[CmdletBinding()]
 param(
-    [string[]]$Repo = @('https://github.com/anthropics/skills/tree/main/skills'),
-    [switch]$UseToken,
     [int]$Runs = 10,
     [int]$IdleSeconds = 10,
     [switch]$NoSettings,
     [int]$SettingsRuns = 5,
-    [switch]$Keep
+    [switch]$Keep,
+    [switch]$SkipBuild
 )
 
 . "$PSScriptRoot\common.ps1"
@@ -79,12 +75,7 @@ $CMD_QUIT = 1003
 $TRAY_CLASS = 'TinySkillSyncTray'
 $WINDOW_CLASS = 'TinySkillSyncWindow'
 
-$exe = Join-Path (Get-ExeDir 'release') 'tiny-skill-sync.exe'
-$tssExe = Join-Path (Get-ExeDir 'release') 'tss.exe'
-$root = Join-Path $env:TEMP ('tss-bench-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
-$homeDir = Join-Path $root 'home'
-$skillsDir = Join-Path $root 'skills'
-$reports = Join-Path $root 'reports'
+$repo = 'https://github.com/AngelosP/tiny-skill-sync-fixtures-public/tree/main/skills'
 $started = New-Object System.Collections.Generic.List[object]
 $rows = New-Object System.Collections.Generic.List[object]
 $notes = New-Object System.Collections.Generic.List[string]
@@ -105,12 +96,7 @@ function Add-Row([string]$Measure, [string]$Result, [string]$Budget, $Ok) {
 }
 
 function Start-Tray([string]$Report, [string[]]$AppArgs = @()) {
-    $psi = New-Object Diagnostics.ProcessStartInfo
-    $psi.FileName = $exe
-    $psi.Arguments = $AppArgs -join ' '
-    $psi.UseShellExecute = $false
-    $psi.EnvironmentVariables['TSS_HOME'] = $homeDir
-    $psi.EnvironmentVariables['TSS_SKILLS_DIR'] = $skillsDir
+    $psi = New-LiveStartInfo $root 'tiny-skill-sync.exe' $AppArgs $anon
     $psi.EnvironmentVariables['TSS_BENCH_REPORT'] = $Report
     $p = [Diagnostics.Process]::Start($psi)
     $started.Add($p)
@@ -251,31 +237,30 @@ function MiB([double]$KiB) { '{0:N1} MiB' -f ($KiB / 1024) }
 
 # ---------------------------------------------------------------- the run
 
-& "$PSScriptRoot\build.ps1" | Out-Host
+if (-not $SkipBuild) { & "$PSScriptRoot\build.ps1" | Out-Host }
 $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
-New-Item -ItemType Directory -Force $reports | Out-Null
+$root = New-LiveRoot 'bench'
 
 try {
+    $exe = Join-Path $root 'bin\tiny-skill-sync.exe'
+    $homeDir = Join-Path $root 'home'
+    $skillsDir = Join-Path $root 'skills'
+    $reports = Join-Path $root 'out'
+    $anon = Get-AnonymousAppEnv $root
     # 1. Install
     Write-Host "== Install into $root" -ForegroundColor Cyan
-    $install = Invoke-InSandbox -Root $root -Body {
-        $ErrorActionPreference = 'Continue'
-        foreach ($r in $Repo) {
-            $a = @('add', $r)
-            if ($UseToken) { $a += '--use-token' }
-            & $tssExe @a | Out-Host
-            if ($LASTEXITCODE -ne 0) { throw "tss add $r failed with exit code $LASTEXITCODE" }
-        }
-        $sw = [Diagnostics.Stopwatch]::StartNew()
-        & $tssExe check | Out-Host
-        [pscustomobject]@{ Code = $LASTEXITCODE; Ms = $sw.Elapsed.TotalMilliseconds }
-    }
-    if ($install.Code -eq 2) { throw 'tss check failed: see above.' }
+    $added = Invoke-LiveTss $root @('add', $repo) $anon
+    if ($added.Code -ne 0) { throw "tss add failed (exit $($added.Code)): $($added.Text)" }
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    $install = Invoke-LiveTss $root @('check') $anon
+    $installedMs = $sw.Elapsed.TotalMilliseconds
+    if ($install.Code -ne 0) { throw "tss check failed (exit $($install.Code)): $($install.Text)" }
     $files = @(Get-ChildItem $skillsDir -Recurse -File -Force)
     $fileCount = $files.Count
+    if ($fileCount -eq 0) { throw 'Nothing was installed from the public fixture; there is nothing to measure.' }
     $bytes = ($files | Measure-Object Length -Sum).Sum
     $skillCount = @(Get-ChildItem $skillsDir -Directory).Count
-    $notes.Add(('Install: {0} skills, {1} files, {2:N1} MiB from {3}; tss check took {4:N0} ms (exit code {5}).' -f $skillCount, $fileCount, ($bytes / 1MB), ($Repo -join ', '), $install.Ms, $install.Code))
+    $notes.Add(('Install: {0} skills, {1} files, {2:N1} MiB from {3}; tss check took {4:N0} ms (exit code {5}).' -f $skillCount, $fileCount, ($bytes / 1MB), $repo, $installedMs, $install.Code))
 
     # 2. Startup. The first start of a new build is not counted: Windows Defender scans it once (0.5 to 1 s).
     Write-Host "== Startup x $Runs" -ForegroundColor Cyan
@@ -448,7 +433,7 @@ try {
     Add-Row 'tiny-skill-sync.exe' ('{0:N0} bytes ({1:N2} MiB)' -f $size, ($size / 1MB)) '1.1 MiB or less' ($size -le 1.1MB)
 } finally {
     foreach ($p in $started) { if (-not $p.HasExited) { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue } }
-    if ($Keep) { Write-Host "Kept: $root" } elseif (Test-Path $root) { Start-Sleep -Milliseconds 200; Remove-Item -Recurse -Force $root }
+    if ($Keep) { Write-Host "Kept: $root" } elseif (Test-Path -LiteralPath $root) { Start-Sleep -Milliseconds 200; Remove-Item -LiteralPath $root -Recurse -Force }
 }
 
 # ---------------------------------------------------------------- the result

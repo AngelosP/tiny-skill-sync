@@ -93,6 +93,7 @@ fn answer(app: &mut App, result: Result<Answer, EngineError>, next_wake: Option<
             settings: None,
             config_saves: Vec::new(),
             settings_checked: false,
+            update: None,
         },
         now,
     )
@@ -405,6 +406,7 @@ fn quitting_drops_what_is_waiting_and_saves_last() {
         settings: None,
         config_saves: Vec::new(),
         settings_checked: false,
+        update: None,
     };
     app.finish(done, T0);
     assert!(app.is_idle());
@@ -435,6 +437,7 @@ fn checking_settings_blocks_local_edits_until_the_worker_finishes() {
             settings: None,
             config_saves: Vec::new(),
             settings_checked: true,
+            update: None,
         },
         T0,
     );

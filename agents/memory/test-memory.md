@@ -15,11 +15,12 @@
 
 ## Learned
 
-No additional findings recorded.
+- `cargo test --lib <filter>` with TSS_NO_APP_UPDATES=1 and TSS_NO_SAVED_TOKEN=1 works from the repo root; cargo's "Finished" line on stderr makes PowerShell report exit 1 even when tests pass. Read the "test result" line, not the exit code.
+- relaunch-smoke.ps1 -NoBuild runs in about 20 s and reports five PASS lines; it uses disposable %TEMP% roots.
 
 ## Baselines
 
-No test results recorded. Tool availability alone is not a passing test.
+- Relaunch restart tests (proc, app, updater x2, shell) pass by filter; relaunch-smoke.ps1 -NoBuild: 5 PASS, exit 0 (one run observed by the test specialist).
 
 ## Open proposals
 

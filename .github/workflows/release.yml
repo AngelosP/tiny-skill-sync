@@ -73,7 +73,11 @@ jobs:
           Copy-Item docs -Destination $stage -Recurse
           $zip = Join-Path $dist "$name.zip"
           Compress-Archive -Path (Join-Path $stage '*') -DestinationPath $zip
-          $files = @(Get-Item $zip) + @(Get-ChildItem $stage -Filter '*.exe')
+          # Publish the same two files that went into the manual-install ZIP. GitHub supplies a digest per asset.
+          $exes = foreach ($exe in 'tiny-skill-sync.exe', 'tss.exe') {
+            Copy-Item -LiteralPath (Join-Path $stage $exe) -Destination $dist -PassThru
+          }
+          $files = @(Get-Item $zip) + @($exes)
           $sums = foreach ($file in $files) {
             '{0}  {1}' -f (Get-FileHash $file.FullName -Algorithm SHA256).Hash.ToLowerInvariant(), $file.Name
           }
@@ -84,7 +88,7 @@ jobs:
           "zip=$name.zip" >> $env:GITHUB_OUTPUT
 
       - name: Publish the release
-        if: github.ref_type == 'tag'
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
@@ -97,12 +101,14 @@ jobs:
             'Windows 10 and 11, x64. The exes are not signed.'
             ''
             "Unzip ``$env:ZIP`` into a folder of your choice, for example ``%LOCALAPPDATA%\Programs\tiny-skill-sync``,"
-            'and start `tiny-skill-sync.exe`. To update, quit the app from its tray menu first, then replace both exes;'
+            'and start `tiny-skill-sync.exe`. To update by hand, quit the app from its tray menu first, then replace both exes;'
             'your settings and records stay in `%LOCALAPPDATA%\tiny-skill-sync`. See the README in the zip.'
             ''
+            'The two standalone exes are the same build as the copies in the zip.'
             '`SHA256SUMS.txt` holds the SHA-256 of the zip and of both exes.'
           ) -join "`n"
           $create = @('release', 'create', $env:TAG, '--repo', $env:GITHUB_REPOSITORY, '--verify-tag',
             '--title', "tiny-skill-sync $env:TAG", '--notes', $notes, '--generate-notes')
           if ($env:TAG.Contains('-')) { $create += '--prerelease' }
-          gh @create (Join-Path $env:DIST $env:ZIP) (Join-Path $env:DIST 'SHA256SUMS.txt')
+          $assets = @($env:ZIP, 'SHA256SUMS.txt', 'tiny-skill-sync.exe', 'tss.exe') | ForEach-Object { Join-Path $env:DIST $_ }
+          gh @create @assets

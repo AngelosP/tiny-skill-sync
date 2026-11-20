@@ -129,8 +129,9 @@
             again.</p>
         </li>
         <li>
-          <h3>Downloads are never run</h3>
-          <p>Skills often contain scripts. The app only copies them.</p>
+          <h3>Skills are never run</h3>
+          <p>Skills often contain scripts. The app only copies them. The one program it starts is its own tray, after
+            an update from the official release whose SHA-256 digest it checked.</p>
         </li>
       </ol>
       <p>The <a href="https://github.com/AngelosP/tiny-skill-sync/blob/main/docs/GUIDE.md#safety-promises">user guide</a>
@@ -164,8 +165,11 @@
             Windows.</p>
         </li>
       </ol>
-      <p>To update, quit the app (right-click the icon, then <strong>Quit</strong>), replace both exes with the new
-        ones and start it again. Your settings stay in <code>%LOCALAPPDATA%\tiny-skill-sync</code>.</p>
+      <p>Copies with <strong>App updates</strong> in Settings can check the official stable release and replace
+        both programs in their current folder. After an immediate install the tray restarts into the update; an
+        install at Quit leaves it closed. For the first upgrade from an older copy, quit the tray, replace both exes
+        from the same zip, and start it again.
+        <a href="https://github.com/AngelosP/tiny-skill-sync/blob/main/docs/GUIDE.md#updating-the-app">App update options and recovery</a>.</p>
       <p>Want to build it yourself? <a href="https://github.com/AngelosP/tiny-skill-sync/blob/main/CONTRIBUTING.md">CONTRIBUTING.md</a>
         says how.</p>
     </section>

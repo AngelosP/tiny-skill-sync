@@ -1,11 +1,14 @@
-//! What the user configures: which repositories to follow, how often, and where skills are installed.
+//! What the user configures: repositories, where skills are installed, and app update preferences.
 //! `config.json` is meant to be readable and hand-editable.
 
-use std::fs;
-use std::io;
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Write};
+use std::os::windows::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+use windows_sys::Win32::Foundation::GENERIC_WRITE;
+use windows_sys::Win32::Storage::FileSystem::{DELETE, FILE_FLAG_DELETE_ON_CLOSE, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE, FILE_SHARE_READ};
 
 use crate::fsx;
 use crate::interval::{Interval, Unit};
@@ -15,6 +18,146 @@ pub const CONFIG_FILE: &str = "config.json";
 pub const CONFIG_VERSION: u32 = 1;
 pub const DEFAULT_INTERVAL: Interval = Interval::new(1, Unit::Day);
 
+/// Hold through re-read, decision, and replacement. The directory must exist. Cooperating writers must see the
+/// *same filesystem directory*; independently synchronized cloud replicas do not share a lock. Readers need no lock.
+pub(crate) fn settings_write_lock(directory: &Path) -> Result<File, String> {
+    let path = directory.join(".tss-settings.lock");
+    // CREATE_NEW never takes over an existing entry. Delete-on-close removes only the file this handle created,
+    // including on process exit; unlinking a lock by name could remove somebody else's lock.
+    OpenOptions::new()
+        .write(true)
+        .access_mode(GENERIC_WRITE | DELETE)
+        .create_new(true)
+        .share_mode(0)
+        .custom_flags(FILE_FLAG_DELETE_ON_CLOSE | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(&path)
+        .map_err(|e| format!("cannot lock settings at {} (another writer may be busy); try again: {e}", path.display()))
+}
+
+fn local_settings_lock(path: &Path) -> Result<File, String> {
+    let dir = path.parent().ok_or_else(|| format!("{} has no settings folder", path.display()))?;
+    fs::create_dir_all(dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+    settings_write_lock(dir)
+}
+
+pub(crate) fn read_optional(path: &Path) -> Result<Option<Vec<u8>>, String> {
+    // A read of a dangling link can say NotFound; only a missing directory entry selects defaults/local mode.
+    match fs::symlink_metadata(path) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(format!("cannot check {}: {e}", path.display())),
+        Ok(_) => fs::read(path).map(Some).map_err(|e| format!("cannot read {}: {e}", path.display())),
+    }
+}
+
+pub(crate) fn write_json_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir)?;
+    }
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    let tmp = path.with_file_name(format!("{name}.{}.tmp", fsx::unique_suffix()));
+    write_with_temp(path, bytes, &tmp)
+}
+
+fn write_with_temp(path: &Path, bytes: &[u8], tmp: &Path) -> io::Result<()> {
+    // A colliding name is not ours: neither open it for overwrite nor run failure cleanup on it.
+    let mut f = OpenOptions::new()
+        .write(true)
+        .access_mode(GENERIC_WRITE | DELETE)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_DELETE)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .create_new(true)
+        .open(tmp)?;
+    let result = f.write_all(bytes).and_then(|()| f.sync_all()).and_then(|()| fsx::rename_retry(tmp, path));
+    if result.is_err() {
+        let _ = crate::win::install::delete(&f);
+    }
+    result
+}
+
+// Hand-edited JSON may have a UTF-8 BOM. Require an object: Serde also accepts arrays for structs, and e.g. `[]`
+// must not select enabled defaults as if a settings file were missing.
+pub(crate) fn parse_json_object<'de, T: Deserialize<'de>>(bytes: &'de [u8]) -> Result<T, String> {
+    let bytes = bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(bytes);
+    if !bytes.trim_ascii_start().starts_with(b"{") {
+        return Err("expected a JSON object".into());
+    }
+    serde_json::from_slice(bytes).map_err(|e| e.to_string())
+}
+
+/// `app_update` in both local and portable settings. Omitted members mean enabled, daily and immediate.
+/// An entirely default object is not written, so legacy version 1 readers can still use those files.
+#[derive(Copy, Clone, Eq, PartialEq, Debug, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct UpdatePrefs {
+    pub enabled: bool,
+    #[serde(deserialize_with = "read_choice")]
+    pub interval: UpdateInterval,
+    #[serde(deserialize_with = "read_choice")]
+    pub timing: UpdateTiming,
+}
+
+impl Default for UpdatePrefs {
+    fn default() -> Self {
+        Self { enabled: true, interval: UpdateInterval::Daily, timing: UpdateTiming::Immediate }
+    }
+}
+
+impl UpdatePrefs {
+    pub(crate) fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+
+    // Serde normally accepts positional arrays for structs; in particular `[]` would silently turn updates on.
+    pub(crate) fn read_object<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Object;
+        impl<'de> serde::de::Visitor<'de> for Object {
+            type Value = UpdatePrefs;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("an app_update settings object")
+            }
+
+            fn visit_map<A: serde::de::MapAccess<'de>>(self, map: A) -> Result<UpdatePrefs, A::Error> {
+                UpdatePrefs::deserialize(serde::de::value::MapAccessDeserializer::new(map))
+            }
+        }
+        deserializer.deserialize_map(Object)
+    }
+}
+
+// Only the documented strings are choices, not Serde's alternate externally tagged enum objects.
+fn read_choice<'de, D: serde::Deserializer<'de>, T: Deserialize<'de>>(deserializer: D) -> Result<T, D::Error> {
+    T::deserialize(serde::de::value::StringDeserializer::new(String::deserialize(deserializer)?))
+}
+
+/// JSON: `"daily"`, `"weekly"` or `"monthly"`. These are fixed durations, unlike a repository's calendar month.
+#[derive(Copy, Clone, Eq, PartialEq, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UpdateInterval {
+    Daily,
+    Weekly,
+    Monthly,
+}
+
+impl UpdateInterval {
+    pub const fn seconds(self) -> i64 {
+        let days = match self {
+            Self::Daily => 1,
+            Self::Weekly => 7,
+            Self::Monthly => 30,
+        };
+        days * 86_400
+    }
+}
+
+/// JSON: `"immediate"` or `"on_quit"`. This does not change how often releases are checked.
+#[derive(Copy, Clone, Eq, PartialEq, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UpdateTiming {
+    Immediate,
+    OnQuit,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -23,12 +166,14 @@ pub struct Config {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub skills_dir: Option<String>,
     pub default_interval: Interval,
+    #[serde(deserialize_with = "UpdatePrefs::read_object", skip_serializing_if = "UpdatePrefs::is_default")]
+    pub app_update: UpdatePrefs,
     pub repos: Vec<RepoConfig>,
 }
 
 impl Default for Config {
     fn default() -> Self {
-        Config { version: CONFIG_VERSION, skills_dir: None, default_interval: DEFAULT_INTERVAL, repos: Vec::new() }
+        Config { version: CONFIG_VERSION, skills_dir: None, default_interval: DEFAULT_INTERVAL, app_update: UpdatePrefs::default(), repos: Vec::new() }
     }
 }
 
@@ -116,9 +261,7 @@ impl RepoConfig {
 
 impl Config {
     pub fn parse(bytes: &[u8]) -> Result<Config, String> {
-        // Notepad and Windows PowerShell 5.1 start UTF-8 files with a byte order mark.
-        let bytes = bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(bytes);
-        let mut cfg: Config = serde_json::from_slice(bytes).map_err(|e| format!("config.json is not valid: {e}"))?;
+        let mut cfg: Config = parse_json_object(bytes).map_err(|e| format!("config.json is not valid: {e}"))?;
         if cfg.version > CONFIG_VERSION {
             return Err(format!("config.json was written by a newer version (format {}, this app understands {CONFIG_VERSION})", cfg.version));
         }
@@ -138,15 +281,31 @@ impl Config {
     /// A missing file is an empty configuration; a file that cannot be read or understood is an error, so it is never
     /// overwritten by mistake.
     pub fn load(path: &Path) -> Result<Config, String> {
-        match fs::read(path) {
-            Ok(bytes) => Config::parse(&bytes).map_err(|e| format!("{e} ({})", path.display())),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Config::default()),
-            Err(e) => Err(format!("cannot read {}: {e}", path.display())),
+        match read_optional(path)? {
+            Some(bytes) => Config::parse(&bytes).map_err(|e| format!("{e} ({})", path.display())),
+            None => Ok(Config::default()),
         }
     }
 
+    /// Explicit replacement of a readable config. Use `save_if_unchanged` for an edit based on a snapshot.
     pub fn save(&self, path: &Path) -> Result<(), String> {
-        fsx::write_atomic(path, self.to_json().as_bytes()).map_err(|e| format!("cannot save {}: {e}", path.display()))
+        let _lock = local_settings_lock(path)?;
+        Config::load(path)?;
+        self.write(path)
+    }
+
+    /// For an edit based on a snapshot. As with portable saves, compare before replacing the file, not just
+    /// when the settings window opens.
+    pub fn save_if_unchanged(&self, path: &Path, before: &Config) -> Result<(), String> {
+        let _lock = (self != before).then(|| local_settings_lock(path)).transpose()?;
+        if Config::load(path)? != *before {
+            return Err(format!("{CONFIG_FILE} changed since it was loaded ({})", path.display()));
+        }
+        if self == before { Ok(()) } else { self.write(path) }
+    }
+
+    fn write(&self, path: &Path) -> Result<(), String> {
+        write_json_atomic(path, self.to_json().as_bytes()).map_err(|e| format!("cannot save {}: {e}", path.display()))
     }
 
     /// Entries written by hand may lack an id. The id is derived from the repository name, so it is the same on every load.
@@ -354,6 +513,11 @@ pub fn instance_tag(home: &Path) -> String {
 mod tests {
     use super::*;
 
+    fn temp_dir(label: &str) -> PathBuf {
+        let base = std::env::var_os("TSS_TEST_ROOT").filter(|s| !s.is_empty()).map(PathBuf::from).unwrap_or_else(std::env::temp_dir);
+        base.join(format!("tss-config-{label}-{}", fsx::unique_suffix()))
+    }
+
     #[test]
     fn parses_plain_names_and_addresses() {
         let spec = RepoSpec::parse("AngelosP/tiny-skill-sync-fixtures-public").unwrap();
@@ -415,6 +579,41 @@ mod tests {
     }
 
     #[test]
+    fn app_update_is_optional_in_v1_and_non_defaults_round_trip() {
+        let legacy = Config::parse(br#"{"version":1,"repos":[{"repo":"o/r"}]}"#).unwrap();
+        assert_eq!(legacy.app_update, UpdatePrefs { enabled: true, interval: UpdateInterval::Daily, timing: UpdateTiming::Immediate });
+        let json: serde_json::Value = serde_json::from_str(&legacy.to_json()).unwrap();
+        assert_eq!(json["version"], 1);
+        assert!(json.get("app_update").is_none());
+
+        let off = Config::parse(br#"{"app_update":{"enabled":false}}"#).unwrap();
+        assert_eq!(off.app_update, UpdatePrefs { enabled: false, ..legacy.app_update });
+        let cfg = Config::parse(br#"{"app_update":{"interval":"monthly","timing":"on_quit"}}"#).unwrap();
+        assert_eq!(cfg.app_update, UpdatePrefs { enabled: true, interval: UpdateInterval::Monthly, timing: UpdateTiming::OnQuit });
+        assert_eq!(Config::parse(cfg.to_json().as_bytes()).unwrap(), cfg);
+    }
+
+    #[test]
+    fn invalid_present_update_preferences_never_fall_back_to_enabled() {
+        for bad in [
+            "null",
+            "[]",
+            r#"[false,"weekly","on_quit"]"#,
+            r#"{"enabled":null}"#,
+            r#"{"enabled":"false"}"#,
+            r#"{"enable":false}"#,
+            r#"{"enabled":false,"enabled":true}"#,
+            r#"{"interval":"1mo"}"#,
+            r#"{"timing":"on_start"}"#,
+            r#"{"interval":{"daily":null}}"#,
+        ] {
+            let json = format!(r#"{{"app_update":{bad}}}"#);
+            assert!(Config::parse(json.as_bytes()).is_err(), "{json}");
+        }
+        assert!(Config::parse(b"[]").is_err());
+    }
+
+    #[test]
     fn new_configs_and_repositories_default_to_one_day() {
         let daily = Interval::new(1, Unit::Day);
         assert_eq!(DEFAULT_INTERVAL, daily);
@@ -448,7 +647,7 @@ mod tests {
 
     #[test]
     fn a_missing_file_is_an_empty_config_and_a_saved_one_loads_back() {
-        let dir = std::env::temp_dir().join(format!("tss-config-{}", fsx::unique_suffix()));
+        let dir = temp_dir("load");
         let file = dir.join(CONFIG_FILE);
         assert_eq!(Config::load(&file).unwrap(), Config::default());
 
@@ -466,6 +665,68 @@ mod tests {
         let e = Config::load(&file).unwrap_err();
         assert!(e.contains("not valid") && e.contains(CONFIG_FILE), "{e}");
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_local_preference_edit_preserves_conflicting_or_unreadable_settings() {
+        let dir = temp_dir("stale");
+        let file = dir.join(CONFIG_FILE);
+        let before = Config::load(&file).unwrap();
+        let off = Config { app_update: UpdatePrefs { enabled: false, ..before.app_update }, ..before.clone() };
+        off.save_if_unchanged(&file, &before).unwrap();
+        let stale = Config { default_interval: Interval::new(6, Unit::Hour), ..before.clone() };
+        assert!(stale.save_if_unchanged(&file, &before).unwrap_err().contains("changed since it was loaded"));
+        assert_eq!(Config::load(&file).unwrap(), off);
+
+        let invalid = br#"{"app_update":{"timing":"invalid"}}"#;
+        fs::write(&file, invalid).unwrap();
+        assert!(off.save_if_unchanged(&file, &before).is_err());
+        assert!(off.save(&file).is_err());
+        assert_eq!(fs::read(&file).unwrap(), invalid);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_competing_local_settings_writer_cannot_undo_off() {
+        let dir = temp_dir("writer");
+        fs::create_dir_all(&dir).unwrap();
+        let file = dir.join(CONFIG_FILE);
+        let lock = dir.join(".tss-settings.lock");
+        let before = Config::load(&file).unwrap();
+        assert!(!lock.exists(), "read-only status creates no lock");
+        let stale = Config { default_interval: Interval::new(6, Unit::Hour), ..before.clone() };
+        let off = Config { app_update: UpdatePrefs { enabled: false, ..before.app_update }, ..before.clone() };
+
+        // The first writer has compared its snapshot but has not replaced the file yet.
+        let held = settings_write_lock(&dir).unwrap();
+        assert!(stale.save_if_unchanged(&file, &before).is_err());
+        assert_eq!(Config::load(&file).unwrap(), before);
+        fs::write(&file, off.to_json()).unwrap();
+        drop(held);
+        assert!(!lock.exists());
+        fs::write(&lock, b"not ours to remove").unwrap();
+        assert!(stale.save(&file).is_err(), "never take over an unrelated entry at the lock name");
+        assert_eq!(fs::read(&lock).unwrap(), b"not ours to remove");
+        fs::remove_file(&lock).unwrap();
+
+        assert!(stale.save_if_unchanged(&file, &before).is_err());
+        assert_eq!(Config::load(&file).unwrap(), off);
+        assert!(!lock.exists());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_colliding_atomic_temp_is_not_opened_for_overwrite_or_cleaned_up() {
+        let dir = temp_dir("atomic-collision");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(crate::update_clock::CLOCK_FILE);
+        let temp = dir.join("occupied.tmp");
+        fs::write(&temp, b"not the writer's file").unwrap();
+        fs::write(&path, b"last good record").unwrap();
+        assert!(write_with_temp(&path, b"new record", &temp).is_err());
+        assert_eq!(fs::read(&temp).unwrap(), b"not the writer's file");
+        assert_eq!(fs::read(&path).unwrap(), b"last good record");
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

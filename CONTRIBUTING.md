@@ -78,6 +78,19 @@ an SMB share once found a bug the local NTFS runs could not.
 **Live GitHub.** The tests never talk to GitHub. To try the real client, use `scripts\dev.ps1 dry-run -Repo ...` or the
 sandbox (`scripts\dev.ps1 tss add ...` then `tss check`), and for everything the tests cannot see, the live runs below.
 
+**App updater tests.** Keep a throwaway folder for the two executables as well as separate settings and skills
+folders. Test release discovery with a fake transport and replacement with inert payloads. Do not start a program
+to discover its version or to verify installation: compare both files' bytes and test interruption, file-in-use and
+recovery instead. `TSS_NO_APP_UPDATES=1` disables release requests and installation during unrelated live runs;
+it is not a feed override. After a release build, `scripts\app-update-smoke.ps1 -Screenshot` exercises both
+guarded app buttons and saves and reloads local and portable preferences. `scripts\relaunch-smoke.ps1` builds the
+debug exes and tests the restart after an install with real trays on throwaway folders: a debug-only tray command
+fakes a verified install (nothing is downloaded or replaced), and the script checks that the old tray quits, the
+new one runs from the same folder with the same settings and reopens an open window, a wrong digest starts nothing,
+Quit stays quit, a sign-out holds the restart, and a sign-out, Quit or close during the handoff stops the new tray.
+It posts or sends Windows' sign-out messages itself; no real sign-out happens. The regular benchmark disables the
+updater; its idle and normal Quit rows do not measure a retained update or a slow filesystem transaction.
+
 ### Live end-to-end runs
 
 The tests use a fake GitHub and no windows. `scripts\dev.ps1 e2e` is the other half: it starts the real release exes on
@@ -255,10 +268,12 @@ The recorded results and their test conditions are in [the user guide](docs/GUID
 ## Release build
 
 `Cargo.toml` and `.cargo\config.toml` set the release profile: `opt-level = "z"`, fat LTO, one codegen unit,
-`panic = "abort"`, stripped symbols and a static C runtime (no Visual C++ redistributable needed). `opt-level = "z"`
-keeps the tray exe at 1,057,280 bytes, within its 1.1 MiB budget (in the earlier comparison, `opt-level = "s"` made the
-0.89 MiB exe 1.01 MiB, `opt-level = 3` larger still). It costs about 12% of SHA-1 speed (339 MB/s instead of 384) and nothing the
-bench can see. `build.rs` embeds
+`panic = "abort"`, stripped symbols and a static C runtime (no Visual C++ redistributable needed). The 1.1 MiB
+tray budget is unchanged. The earlier 1,057,280-byte baseline passed; the build with the app updater measured
+1,168,384 bytes, and 1,173,504 with the tray restart after an update, and does not pass. In the earlier size
+comparison, `opt-level = "s"` made the 0.89 MiB exe
+1.01 MiB, `opt-level = 3` larger still. Building for size costs about 12% of SHA-1 speed (339 MB/s instead of 384).
+`build.rs` embeds
 `app.manifest` (common controls 6, per-monitor DPI, long paths, UTF-8), a version resource: the name and version
 Windows shows for each exe, as in Task Manager's startup apps (about 1 KiB), and the icon, `assets\tiny-skill-sync.ico`
 (about 13 KB).
@@ -274,8 +289,9 @@ Windows shows for each exe, as in Task Manager's startup apps (about 1 KiB), and
 2. `git tag -a vX.Y.Z -m "tiny-skill-sync X.Y.Z"`, then `git push origin main vX.Y.Z`.
 
 On a Windows runner, the workflow refuses a tag that does not match `Cargo.toml`, runs `scripts\test.ps1` and
-`scripts\build.ps1`, and publishes `tiny-skill-sync-X.Y.Z-windows-x64.zip` (both exes, the README, user guide and demo GIF) with
-`SHA256SUMS.txt` (the zip and both exes). A tag with a hyphen (`v0.2.0-rc.1`) makes a pre-release. To check that a
+`scripts\build.ps1`, and publishes `tiny-skill-sync-X.Y.Z-windows-x64.zip` (both exes, the README, user guide and demo GIF),
+the same build's standalone `tiny-skill-sync.exe` and `tss.exe`, and `SHA256SUMS.txt` (the zip and both exes).
+A tag with a hyphen (`v0.2.0-rc.1`) makes a pre-release. To check that a
 release would build, without publishing anything: `gh workflow run release.yml`, then `gh run watch`.
 
 The workflow uses the Rust version in its `RUSTUP_TOOLCHAIN`, so a new clippy lint cannot block a release. Raise it when

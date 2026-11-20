@@ -15,11 +15,12 @@ use super::sentence;
 use super::theme::Role;
 use crate::autostart::{Startup, Via};
 use crate::board::{self, Action, Board, Level, RepoView, Row, ago, repo_name};
-use crate::config::{RepoConfig, RepoSpec};
+use crate::config::{RepoConfig, RepoSpec, UpdateInterval, UpdatePrefs, UpdateTiming};
 use crate::diff::{Body, FileChange, Presence, Row as Line, TextDiff};
 use crate::engine::DiffReport;
 use crate::interval::{Interval, UnixSecs};
 use crate::pathsafe::{printable, printable_lines};
+use crate::updater::Action as AppAction;
 
 /// Measures text in DIPs: (width, height), on one line when the width given is 0, else wrapped at it.
 pub type Fit<'a> = &'a dyn Fn(&str, Font, i32) -> (i32, i32);
@@ -77,6 +78,15 @@ pub mod id {
     pub const TOKEN_TEXT: i32 = 411;
     pub const EMPTY: i32 = 412;
     pub const STARTUP_TEXT: i32 = 413;
+    pub const APP_HEADING: i32 = 420;
+    pub const APP_STATUS: i32 = 421;
+    pub const APP_CHECK: i32 = 422;
+    pub const APP_INSTALL: i32 = 423;
+    pub const APP_AUTO: i32 = 424;
+    pub const APP_EVERY: i32 = 425;
+    pub const APP_WHEN: i32 = 426;
+    pub const APP_TIMING_TEXT: i32 = 427;
+    pub const APP_STATUS_HELP: i32 = 428;
     /// Plus the index of the repository in the settings.
     pub const NAV_REPO: i32 = 1_000;
     pub const NOTE: i32 = 100_000;
@@ -110,6 +120,7 @@ pub enum Hit {
     File(usize),
     Gap(usize),
     DiffAction(usize),
+    AppUpdate(AppAction),
     Other(i32),
 }
 
@@ -135,6 +146,8 @@ pub fn hit(n: i32) -> Hit {
         id::NOTE.. => Hit::Other(n),
         id::NAV_REPO.. => Hit::Repo(index(id::NAV_REPO)),
         id::DIFF_ACTION..id::TITLE => Hit::DiffAction(index(id::DIFF_ACTION)),
+        id::APP_CHECK => Hit::AppUpdate(AppAction::Check),
+        id::APP_INSTALL => Hit::AppUpdate(AppAction::Install),
         _ => Hit::Other(n),
     }
 }
@@ -692,7 +705,17 @@ pub struct SettingsPage<'a> {
     pub token_saved: bool,
     /// Whether Windows starts this copy when the user signs in, or why that can't be told.
     pub startup: Result<&'a Startup, &'a str>,
-    pub version: &'a str,
+    pub running_version: &'a str,
+    pub app_update: UpdatePrefs,
+    pub app_update_status: &'a str,
+}
+
+pub const APP_INTERVALS: &[(&str, UpdateInterval)] =
+    &[("Daily", UpdateInterval::Daily), ("Every 7 days", UpdateInterval::Weekly), ("Every 30 days", UpdateInterval::Monthly)];
+pub const APP_TIMINGS: &[(&str, UpdateTiming)] = &[("Immediate", UpdateTiming::Immediate), ("On Quit", UpdateTiming::OnQuit)];
+
+pub fn selection<T: Copy>(choices: &[(&str, T)], text: &str) -> Option<T> {
+    choices.iter().find(|(label, _)| *label == text).map(|&(_, value)| value)
 }
 
 enum Ctl {
@@ -709,6 +732,11 @@ enum Ctl {
         on: bool,
         enabled: bool,
     },
+}
+
+fn app_combo<T: PartialEq>(id: i32, purpose: &str, choices: &[(&str, T)], current: T) -> Ctl {
+    let shown = choices.iter().find(|(_, value)| *value == current).expect("all app update preferences have a choice").0;
+    Ctl::Combo { id, items: choices.iter().map(|(label, _)| (*label).to_string()).collect(), shown: two_lines(purpose, shown) }
 }
 
 enum Desc {
@@ -800,9 +828,72 @@ pub fn settings_page(p: &SettingsPage, w: i32, fit: Fit) -> Surface {
     };
     let desc = Desc::Text(id::TOKEN_TEXT, token_text(p.token_saved).to_string());
     y = setting(&mut o, x, y, cw, glyph::KEY, "GitHub sign-in for private repositories", desc, tokens) + GAP;
-    let about = format!("Tiny Skill Sync {} · runs in the notification area · tss.exe is the command line", p.version);
-    y = setting(&mut o, x, y, cw, glyph::INFO, "About", Desc::Text(0, about), Vec::new());
+    let about = format!("Tiny Skill Sync {} is running in the notification area. tss.exe is the command line.", p.running_version);
+    y = setting(&mut o, x, y, cw, glyph::INFO, "About", Desc::Text(0, about), Vec::new()) + GAP;
+    y = app_updates(&mut o, p, x, y, cw);
     o.done(y + 16)
+}
+
+fn app_updates(o: &mut Out, p: &SettingsPage, x: i32, mut y: i32, cw: i32) -> i32 {
+    o.label(id::APP_HEADING, [x, y, cw, 28], "App updates", Font::Title, Role::Text);
+    y = app_report(o, p, x, y + 28 + 8, cw) + GAP;
+    let auto = Ctl::Toggle { id: id::APP_AUTO, text: "Automatic app updates".into(), on: p.app_update.enabled, enabled: true };
+    let desc = "Let the tray check for and install new versions. Even when off, Check only looks without installing, and Install now installs at once and restarts the tray.";
+    y = setting(o, x, y, cw, glyph::REFRESH, "Automatic app updates", Desc::Text(0, desc.into()), vec![auto]) + GAP;
+    let purpose = "App update check interval";
+    let every = app_combo(id::APP_EVERY, purpose, APP_INTERVALS, p.app_update.interval);
+    let desc = Desc::Text(0, "How often the tray checks for an app release when automatic updates are on. Skill checks have their own schedule.".into());
+    y = setting(o, x, y, cw, glyph::TIMER, purpose, desc, vec![every]) + GAP;
+    let purpose = "When to install app updates";
+    let when = app_combo(id::APP_WHEN, purpose, APP_TIMINGS, p.app_update.timing);
+    let timing = match p.app_update.timing {
+        UpdateTiming::Immediate => {
+            "Install as soon as an update is found, then restart the tray into it. If the tray cannot restart, it keeps running its current build and says why."
+        }
+        UpdateTiming::OnQuit => {
+            "Install a pending update when you choose Quit from the tray menu, not when you close this window. The tray stays closed: open it again yourself to use the update."
+        }
+    };
+    setting(o, x, y, cw, glyph::POWER, purpose, Desc::Text(id::APP_TIMING_TEXT, timing.into()), vec![when])
+}
+
+fn app_report(o: &mut Out, p: &SettingsPage, x: i32, top: i32, cw: i32) -> i32 {
+    let (mark, tx, width) = (o.s.decos.len(), x + 16, (cw - 32).max(1));
+    let status = format!("Running tray build: {}.\n{}", p.running_version, printable_lines(p.app_update_status));
+    let status = wrap_report(status, width, o.fit);
+    let mut y = top + 12;
+    y += o.para(id::APP_STATUS, [tx, y, width], status, Font::Caption, Role::Text) + 8;
+    let help = "The last result describes a past check or install. An offered release may differ from the version on disk. Only a pending update is ready to install on Quit.";
+    y += o.para(id::APP_STATUS_HELP, [tx, y, width], help, Font::Caption, Role::Text2) + 10;
+    let buttons = vec![btn(id::APP_CHECK, "Check only", Kind::Standard, None), btn(id::APP_INSTALL, "Install now", Kind::Standard, None)];
+    y = o.flow(tx, y, tx + width, 32, buttons) + 12;
+    o.card(mark, [x, top, cw, y - top]);
+    y
+}
+
+/// DrawText with word wrapping can ask for more width than the card if, for example, an error names a long path.
+/// Only break such words; keep the worker's line breaks and every character of its message.
+fn wrap_report(text: String, width: i32, fit: Fit) -> String {
+    if fit(&text, Font::Caption, width).0 <= width {
+        return text;
+    }
+    fn push_word(out: &mut String, word: &str, width: i32, fit: Fit) {
+        match word.char_indices().nth(word.chars().count() / 2) {
+            Some((cut, _)) if cut > 0 && fit(word, Font::Caption, 0).0 > width => {
+                push_word(out, &word[..cut], width, fit);
+                out.push('\n');
+                push_word(out, &word[cut..], width, fit);
+            }
+            _ => out.push_str(word),
+        }
+    }
+    let mut out = String::with_capacity(text.len());
+    for part in text.split_inclusive(char::is_whitespace) {
+        let word = part.trim_end_matches(char::is_whitespace);
+        push_word(&mut out, word, width, fit);
+        out.push_str(&part[word.len()..]);
+    }
+    out
 }
 
 /// One entry of the Activity page.
@@ -1348,6 +1439,18 @@ mod tests {
         RepoConfig { id: name.to_string(), repo: name.to_string(), path: "skills".to_string(), branch: "main".to_string(), ..RepoConfig::default() }
     }
 
+    fn settings<'a>(startup: Result<&'a Startup, &'a str>) -> SettingsPage<'a> {
+        SettingsPage {
+            default: DEFAULT_INTERVAL,
+            skills_dir: r"C:\skills",
+            token_saved: false,
+            startup,
+            running_version: "0.2.0",
+            app_update: UpdatePrefs::default(),
+            app_update_status: "Not checked in this session.",
+        }
+    }
+
     fn texts(s: &Surface) -> Vec<(i32, String)> {
         s.items.iter().map(|i| (i.id, i.text.clone())).collect()
     }
@@ -1657,13 +1760,7 @@ mod tests {
         let none = HashSet::new();
         // The longest note there is, with a path that has no spaces to break at.
         let other = Startup::OtherCopy(format!(r"D:\{}\tiny-skill-sync.exe", "d".repeat(200)));
-        let settings = SettingsPage {
-            default: DEFAULT_INTERVAL,
-            skills_dir: r"C:\Users\someone\.copilot\skills",
-            token_saved: true,
-            startup: Ok(&other),
-            version: "0.2.0",
-        };
+        let settings = SettingsPage { skills_dir: r"C:\Users\someone\.copilot\skills", token_saved: true, ..settings(Ok(&other)) };
         for w in [344, 900] {
             let p = RepoPage { view: &v, repo: &r, default: DEFAULT_INTERVAL, now: NOW, toggled: &none };
             let s = repo_page(&p, w, &fit);
@@ -1682,7 +1779,7 @@ mod tests {
 
     #[test]
     fn the_settings_page_offers_to_replace_a_saved_token_and_to_save_one_otherwise() {
-        let p = |token_saved| SettingsPage { default: DEFAULT_INTERVAL, skills_dir: "C:\\skills", token_saved, startup: Ok(&Startup::Off), version: "0.2.0" };
+        let p = |token_saved| SettingsPage { token_saved, ..settings(Ok(&Startup::Off)) };
         let saved = settings_page(&p(true), 700, &fit);
         assert_eq!(item(&saved, id::SAVE_TOKEN).text, "Replace token…");
         assert_eq!(item(&saved, id::DELETE_TOKEN).text, "Delete token");
@@ -1693,10 +1790,79 @@ mod tests {
     }
 
     #[test]
-    fn start_with_windows_is_a_switch_that_says_how_it_is_and_is_greyed_out_when_it_cant_be_changed() {
-        let page = |startup: Result<&Startup, &str>| {
-            settings_page(&SettingsPage { default: DEFAULT_INTERVAL, skills_dir: "C:\\skills", token_saved: false, startup, version: "0.2.0" }, 700, &fit)
+    fn app_updates_are_separate_from_skill_checks_and_manual_actions_stay_available() {
+        let report = "Installed on disk: 0.3.0. Available: 0.4.0. Verified for Quit.";
+        let p = SettingsPage {
+            app_update: UpdatePrefs { enabled: false, interval: UpdateInterval::Monthly, timing: UpdateTiming::OnQuit },
+            app_update_status: report,
+            ..settings(Ok(&Startup::Off))
         };
+        for w in [344, 900] {
+            let s = settings_page(&p, w, &fit);
+            fits_in(&s, w);
+            assert_eq!(item(&s, id::APP_HEADING).text, "App updates");
+            assert_eq!(item(&s, id::APP_STATUS).text, format!("Running tray build: 0.2.0.\n{report}"));
+            assert_eq!(item(&s, id::APP_AUTO).look, Look::Toggle { on: false });
+            assert!(item(&s, id::APP_AUTO).enabled);
+            assert_eq!(item(&s, id::APP_EVERY).text, "App update check interval\nEvery 30 days");
+            assert_eq!(item(&s, id::DEFAULT_EVERY).text, "1 day", "skill polling is a separate setting");
+            assert_eq!(item(&s, id::APP_WHEN).text, "When to install app updates\nOn Quit");
+            assert!(item(&s, id::APP_TIMING_TEXT).text.contains("Quit from the tray menu, not when you close this window. The tray stays closed"));
+            for (id, label, action) in [(id::APP_CHECK, "Check only", AppAction::Check), (id::APP_INSTALL, "Install now", AppAction::Install)] {
+                assert!(item(&s, id).enabled);
+                assert_eq!(item(&s, id).text, label);
+                assert_eq!(hit(id), Hit::AppUpdate(action));
+            }
+            assert_eq!(hit(id::SYNC), Hit::Other(id::SYNC));
+        }
+
+        let failed = SettingsPage { app_update_status: "Check failed: bad\u{202e}name", ..settings(Ok(&Startup::Off)) };
+        let s = settings_page(&failed, 700, &fit);
+        assert!(item(&s, id::APP_STATUS).text.ends_with("Check failed: bad\\u{202e}name"));
+        assert_eq!(item(&s, id::APP_AUTO).look, Look::Toggle { on: true });
+        assert_eq!(item(&s, id::APP_EVERY).text, "App update check interval\nDaily");
+        assert_eq!(item(&s, id::APP_WHEN).text, "When to install app updates\nImmediate", "the default installs at once");
+        assert!(item(&s, id::APP_TIMING_TEXT).text.contains("then restart the tray into it"));
+        let Look::Combo { items } = &item(&s, id::APP_EVERY).look else { panic!("no app interval menu") };
+        assert_eq!(items, &["Daily", "Every 7 days", "Every 30 days"]);
+        assert_eq!(
+            items.iter().map(|label| selection(APP_INTERVALS, label)).collect::<Vec<_>>(),
+            [Some(UpdateInterval::Daily), Some(UpdateInterval::Weekly), Some(UpdateInterval::Monthly)]
+        );
+        let Look::Combo { items } = &item(&s, id::APP_WHEN).look else { panic!("no install timing menu") };
+        assert_eq!(items.iter().map(|label| selection(APP_TIMINGS, label)).collect::<Vec<_>>(), [Some(UpdateTiming::Immediate), Some(UpdateTiming::OnQuit)]);
+    }
+
+    #[test]
+    fn the_whole_app_report_fits_above_its_actions_even_with_a_long_unbroken_path() {
+        // Like DrawText(DT_CALCRECT), a word wider than the offered space can demand a wider rectangle.
+        let measure = |text: &str, font, width| {
+            if width == 0 {
+                return fit(text, font, 0);
+            }
+            let widest = text.split_whitespace().map(|word| fit(word, font, 0).0).max().unwrap_or(0);
+            (widest.max(fit(text, font, width).0), text.split('\n').map(|line| fit(line, font, width).1).sum())
+        };
+        let report = format!("Installed on disk: 0.3.0\nPending for Quit: none\nLast app result: check failed in C:\\{}", "測abcdefgh".repeat(32));
+        let p = SettingsPage { app_update_status: &report, ..settings(Ok(&Startup::Off)) };
+        for w in [303, 344, 900] {
+            let s = settings_page(&p, w, &measure);
+            fits_in(&s, w);
+            let status = item(&s, id::APP_STATUS);
+            let [_, y, width, height] = status.at;
+            let expected = format!("Running tray build: 0.2.0.\n{report}");
+            assert_eq!(status.text.replace('\n', ""), expected.replace('\n', ""), "wrapping must not discard part of a status or a file name");
+            let (needed_w, needed_h) = measure(&status.text, Font::Caption, width);
+            assert!(needed_w <= width && needed_h <= height);
+            for id in [id::APP_INSTALL, id::APP_CHECK] {
+                assert!(item(&s, id).at[1] >= y + height, "the report gets the full card width; actions go underneath");
+            }
+        }
+    }
+
+    #[test]
+    fn start_with_windows_is_a_switch_that_says_how_it_is_and_is_greyed_out_when_it_cant_be_changed() {
+        let page = |startup: Result<&Startup, &str>| settings_page(&settings(startup), 700, &fit);
         let switch = |s: &Surface| {
             let i = item(s, id::STARTUP);
             (i.look.clone(), i.enabled)

@@ -63,6 +63,8 @@ pub fn job_label(job: &Job) -> &'static str {
         Job::Look => "job-look",
         Job::Poll => "job-poll",
         Job::Check(_) => "job-check",
+        Job::AppUpdate(_) | Job::ScheduledUpdate => "job-app-update",
+        Job::InstallOnQuit { .. } => "job-quit-install",
         Job::Resolve { .. } => "job-resolve",
         Job::DeleteGone(_) => "job-delete-gone",
         Job::Remove { .. } => "job-remove",

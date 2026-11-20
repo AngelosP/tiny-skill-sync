@@ -6,6 +6,7 @@
 //! change; safety never depends on it, because every check compares the disk with the record first.
 
 use std::cell::{Cell, RefCell};
+use std::ffi::OsStr;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -16,7 +17,7 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{Duration, Instant};
 
 use windows_sys::Win32::Foundation::{
-    ERROR_ALREADY_EXISTS, GetLastError, HANDLE, HWND, INVALID_HANDLE_VALUE, LPARAM, LRESULT, WAIT_FAILED, WAIT_OBJECT_0, WPARAM,
+    CloseHandle, ERROR_ALREADY_EXISTS, GetLastError, HANDLE, HWND, INVALID_HANDLE_VALUE, LPARAM, LRESULT, WAIT_FAILED, WAIT_OBJECT_0, WPARAM,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     FILE_NOTIFY_CHANGE_DIR_NAME, FILE_NOTIFY_CHANGE_FILE_NAME, FILE_NOTIFY_CHANGE_LAST_WRITE, FILE_NOTIFY_CHANGE_SIZE, FindCloseChangeNotification,
@@ -31,7 +32,7 @@ use windows_sys::Win32::UI::Shell::{NIN_SELECT, NINF_KEY};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     AllowSetForegroundWindow, AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow, DispatchMessageW, FindWindowW,
     GetWindowThreadProcessId, IDCANCEL, IsChild, IsDialogMessageW, KillTimer, MB_ICONERROR, MB_OK, MF_SEPARATOR, MF_STRING, MSG, MWMO_INPUTAVAILABLE,
-    MessageBoxW, MsgWaitForMultipleObjectsEx, PBT_APMRESUMEAUTOMATIC, PM_REMOVE, PeekMessageW, PostMessageW, PostQuitMessage, QS_ALLINPUT,
+    MessageBoxW, MsgWaitForMultipleObjectsEx, PBT_APMRESUMEAUTOMATIC, PM_NOREMOVE, PM_REMOVE, PeekMessageW, PostMessageW, PostQuitMessage, QS_ALLINPUT,
     RegisterWindowMessageW, SetForegroundWindow, SetMenuDefaultItem, SetTimer, TPM_BOTTOMALIGN, TPM_RIGHTBUTTON, TrackPopupMenu, TranslateMessage, WM_APP,
     WM_CLOSE, WM_COMMAND, WM_CONTEXTMENU, WM_DESTROY, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_ENDSESSION, WM_NULL, WM_POWERBROADCAST, WM_QUERYENDSESSION, WM_QUIT,
     WM_SETTINGCHANGE, WM_TIMECHANGE, WM_TIMER, WS_EX_TOOLWINDOW, WS_POPUP,
@@ -39,29 +40,46 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 
 use super::page::{self, Note};
 use super::{bench, dialogs, register_class, sentence, tray, trim_memory, window};
-use crate::app::{App, Done, Job, Order, SettingsSource, Shown, perform};
+use crate::app::{App, Done, Job, Order, SettingsSource, Shown, UpdateState, perform_with_updates};
 use crate::autostart::BACKGROUND;
 use crate::board::{APP_NAME, Level, RepoView, span};
 use crate::cli::{Host, SystemHost};
 use crate::config::{CONFIG_FILE, Config, Paths, instance_tag};
 use crate::engine::{Engine, EngineError, Stamp, stamp_of};
 use crate::interval::{UnixSecs, now_secs};
-use crate::win::{wide, wide_os};
+use crate::replacement::VerifiedTray;
+use crate::win::{proc, wide, wide_os};
 
 /// Tray menu and remote-control commands, sent as `WM_COMMAND`.
 pub const CMD_SETTINGS: usize = 1001;
 pub const CMD_CHECK: usize = 1002;
 pub const CMD_QUIT: usize = 1003;
+/// Debug builds only, for `scripts\relaunch-smoke.ps1`: restart as after an install, with the right or a wrong digest.
+#[cfg(debug_assertions)]
+pub const CMD_TEST_RESTART: usize = 1098;
+#[cfg(debug_assertions)]
+pub const CMD_TEST_RESTART_WRONG: usize = 1099;
 /// The worker finished an order.
 const WM_WORKER: u32 = WM_APP + 2;
 /// Something changed: start the next job, set the timer, update the icon and the window.
 const WM_KICK: u32 = WM_APP + 3;
 const TIMER_LOOK: usize = 1;
+/// A restart waits while a question, the tray menu or a sign-out is pending, and tries again this often.
+const TIMER_RESTART: usize = 2;
+const RESTART_RETRY_MS: u32 = 500;
 /// A look at the skills folder waits until it has been quiet this long.
 const LOOK_DELAY_MS: u32 = 2000;
 const STARTUP_OFFER_FILE: &str = "startup-offer-seen";
 /// How long quitting waits for the job that is running and for saving what is waiting to be saved.
 const QUIT_WAIT: Duration = Duration::from_secs(2);
+/// How a tray that installed an app update starts the new one, which takes over when this one has quit. Older builds
+/// pass these to newer ones, so they never change meaning. `-open` opens the window, as it was open before.
+const RESTARTED: &str = "--restarted";
+const RESTARTED_OPEN: &str = "--restarted-open";
+/// How long the new tray must keep running before the old one quits for it.
+const RESTART_CHECK: Duration = Duration::from_secs(1);
+/// How long a restarted tray waits for the one before it to quit. Then it goes quietly.
+const RESTART_WAIT: Duration = Duration::from_secs(120);
 const CLASS: &str = "TinySkillSyncTray";
 const SKILL_CHANGES: u32 = FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_DIR_NAME | FILE_NOTIFY_CHANGE_LAST_WRITE | FILE_NOTIFY_CHANGE_SIZE;
 const HOME_CHANGES: u32 = FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_LAST_WRITE | FILE_NOTIFY_CHANGE_SIZE;
@@ -119,6 +137,13 @@ struct Shell {
     sent_at: Option<Instant>,
     /// The differences of a skill the worker read, until the window takes them.
     diff: Option<Shown>,
+    finishing_install: bool,
+    transactions: crate::updater::Transactions,
+    quit_error: Option<String>,
+    /// An app update this tray installed, for it to restart into once it is not busy with the user.
+    restart: Option<Result<VerifiedTray, String>>,
+    /// Started by the tray before it, which had its window open: open it again once settings are loaded.
+    reopen: bool,
 }
 
 thread_local! {
@@ -127,6 +152,11 @@ thread_local! {
     static KICK_POSTED: Cell<bool> = const { Cell::new(false) };
     static SHUT_DOWN: Cell<bool> = const { Cell::new(false) };
     static TASKBAR_CREATED: Cell<u32> = const { Cell::new(0) };
+    static MENU_OPEN: Cell<bool> = const { Cell::new(false) };
+    /// Windows asked whether it may end the session, and has not said it changed its mind.
+    static ENDING: Cell<bool> = const { Cell::new(false) };
+    /// The new tray this one started and is quitting for. It waits for this process to end, so it can still be stopped.
+    static HANDOFF: Cell<Option<proc::Started>> = const { Cell::new(None) };
 }
 
 fn with_shell<R>(f: impl FnOnce(&mut Shell) -> R) -> Option<R> {
@@ -140,30 +170,61 @@ pub fn main_window() -> HWND {
     MAIN.with(Cell::get)
 }
 
+/// How the tray was started.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Start {
+    /// By the user: opens the window of a copy that is already running.
+    Normal,
+    /// By Windows at sign-in (autostart::BACKGROUND): in the tray only, and quietly.
+    SignIn,
+    /// By the tray before it, after installing an app update: waits for it to quit, then takes over.
+    Restarted { open: bool },
+    /// `--quit`: asks the copy that is running to quit.
+    Quit,
+}
+
+fn start_of(args: &[String]) -> Option<Start> {
+    let [only] = args else { return args.is_empty().then_some(Start::Normal) };
+    [("--quit", Start::Quit), (BACKGROUND, Start::SignIn), (RESTARTED, Start::Restarted { open: false }), (RESTARTED_OPEN, Start::Restarted { open: true })]
+        .into_iter()
+        .find_map(|(flag, start)| only.eq_ignore_ascii_case(flag).then_some(start))
+}
+
 /// Runs the tray app until it quits. The process exit code.
 pub fn run() -> i32 {
     let home = Paths::home_dir();
     let title = format!("{APP_NAME} {}", instance_tag(&home));
     let args: Vec<String> = std::env::args().skip(1).collect();
-    // How Windows starts it at sign-in (autostart::BACKGROUND): in the tray only, and quietly.
-    let mut background = false;
-    match args.as_slice() {
-        [] => {}
-        [only] if only.eq_ignore_ascii_case("--quit") => return quit_other(&title),
-        [only] if only.eq_ignore_ascii_case(BACKGROUND) => background = true,
-        _ => {
-            message_box(&format!(
-                "'{}' is not understood. {APP_NAME} takes no options, except {BACKGROUND} to start in the tray without opening its window, and --quit to close the copy that is running.",
-                args.join(" ")
-            ));
-            return 2;
-        }
+    let Some(start) = start_of(&args) else {
+        message_box(&format!(
+            "'{}' is not understood. {APP_NAME} takes no options, except {BACKGROUND} to start in the tray without opening its window, and --quit to close the copy that is running.",
+            args.join(" ")
+        ));
+        return 2;
+    };
+    if start == Start::Quit {
+        return quit_other(&title);
     }
+    let background = start != Start::Normal;
+    let restarted = matches!(start, Start::Restarted { .. });
     // One copy per app folder. The mutex is never closed: Windows releases it when the process ends.
-    let mutex = unsafe { CreateMutexW(null(), 0, wide(&format!("Local\\tiny-skill-sync-{}", instance_tag(&home))).as_ptr()) };
-    if !mutex.is_null() && unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
-        // Already running: a start at sign-in has nothing to show.
-        return if background { 0 } else { wake_other(&title) };
+    let waiting_since = Instant::now();
+    loop {
+        let mutex = unsafe { CreateMutexW(null(), 0, wide(&format!("Local\\tiny-skill-sync-{}", instance_tag(&home))).as_ptr()) };
+        if mutex.is_null() || unsafe { GetLastError() } != ERROR_ALREADY_EXISTS {
+            break;
+        }
+        if !restarted {
+            // Already running: a start at sign-in has nothing to show.
+            return if background { 0 } else { wake_other(&title) };
+        }
+        // The tray that started this one is still quitting. If it has not gone after RESTART_WAIT, this copy leaves
+        // and that one keeps running.
+        unsafe { CloseHandle(mutex) };
+        if waiting_since.elapsed() >= RESTART_WAIT {
+            return 0;
+        }
+        unsafe { Sleep(100) };
     }
     if let Err(e) = std::fs::create_dir_all(&home) {
         message_box(&format!("The folder {} cannot be created: {e}", home.display()));
@@ -220,7 +281,8 @@ pub fn run() -> i32 {
     let (orders, inbox) = mpsc::channel();
     let (outbox, done) = mpsc::channel();
     let cancel = Arc::new(AtomicBool::new(false));
-    if let Err(e) = spawn_worker(engine, inbox, outbox, hwnd) {
+    let transactions = crate::updater::Transactions::default();
+    if let Err(e) = spawn_worker(engine, inbox, outbox, hwnd, transactions.clone()) {
         message_box(&format!("The worker thread cannot be started: {e}"));
         return 2;
     }
@@ -229,8 +291,11 @@ pub fn run() -> i32 {
     let mut app = App::new(cfg, skills.clone());
     app.set_settings_source(SettingsSource::new(cfg_file.clone(), executable_dir));
     app.queue_initial_settings_load();
-    if background {
+    if start == Start::SignIn {
         app.started_by_windows(now);
+    }
+    if restarted {
+        app.restarted(env!("CARGO_PKG_VERSION"), now);
     }
     for problem in app.cfg().problems() {
         app.board.say(now, Level::Attention, format!("Settings problem: {problem}"));
@@ -255,6 +320,11 @@ pub fn run() -> i32 {
         feedback: None,
         sent_at: None,
         diff: None,
+        finishing_install: false,
+        transactions,
+        quit_error: None,
+        restart: None,
+        reopen: start == Start::Restarted { open: true },
         home,
     };
     SHELL.with(|s| *s.borrow_mut() = Some(shell));
@@ -262,7 +332,7 @@ pub fn run() -> i32 {
     bench::mark("tray", None);
     on_kick();
     let code = pump(None);
-    shutdown();
+    shutdown(false);
     SHELL.with(|s| s.borrow_mut().take());
     bench::mark("exit", None);
     code
@@ -301,9 +371,17 @@ fn message_box(text: &str) {
     unsafe { MessageBoxW(null_mut(), wide(text).as_ptr(), wide(APP_NAME).as_ptr(), MB_OK | MB_ICONERROR) };
 }
 
-fn spawn_worker(mut engine: Engine, orders: Receiver<(Order, Arc<AtomicBool>)>, done: Sender<Done>, hwnd: HWND) -> std::io::Result<()> {
+fn spawn_worker(
+    mut engine: Engine,
+    orders: Receiver<(Order, Arc<AtomicBool>)>,
+    done: Sender<Done>,
+    hwnd: HWND,
+    transactions: crate::updater::Transactions,
+) -> std::io::Result<()> {
     let hwnd = hwnd as usize;
     std::thread::Builder::new().name("worker".into()).stack_size(1 << 20).spawn(move || {
+        let mut updates = crate::updater::Updates::system();
+        updates.transactions = transactions;
         for (order, cancel) in orders {
             // Background work (a timed check, the first look after sign-in) runs at lower CPU, I/O and memory
             // priority, so it never gets in the way.
@@ -311,7 +389,7 @@ fn spawn_worker(mut engine: Engine, orders: Receiver<(Order, Arc<AtomicBool>)>, 
             if background {
                 unsafe { SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_BEGIN) };
             }
-            let answer = perform(&mut engine, &order, &cancel);
+            let answer = perform_with_updates(&mut engine, &order, &cancel, Some(&mut updates), now_secs());
             if background {
                 unsafe { SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_END) };
             }
@@ -355,6 +433,7 @@ impl Shell {
                     settings: None,
                     config_saves: Vec::new(),
                     settings_checked: false,
+                    update: None,
                 };
                 self.on_done(failed);
             }
@@ -364,7 +443,7 @@ impl Shell {
             match at {
                 Some(at) => {
                     // Absolute UTC: it follows clock changes, and fires at once on waking if the time passed.
-                    let due = (at + FILETIME_UNIX_OFFSET) * 10_000_000;
+                    let due = at.saturating_add(FILETIME_UNIX_OFFSET).saturating_mul(10_000_000);
                     SetWaitableTimer(self.timer, &due, 0, None, null(), 0);
                 }
                 None => {
@@ -374,8 +453,21 @@ impl Shell {
         }
     }
 
-    fn on_done(&mut self, mut done: Done) {
+    fn on_done(&mut self, mut done: Done) -> bool {
         let job = done.job.clone();
+        if !self.app.accepts_update(&done) {
+            // An older read must not undo the switch the user just turned off.
+            done.settings = None;
+        }
+        if self.finishing_install {
+            self.finishing_install = false;
+            self.quit_error = done.result.as_ref().err().map(|e| e.to_string());
+            unsafe { PostMessageW(main_window(), WM_CLOSE, 0, 0) };
+        }
+        if done.settings.as_ref().and_then(|s| s.result.as_ref().ok()).is_some_and(|s| !s.matches_local_file(&self.cfg_file())) {
+            done.settings = None;
+            self.app.reload_before_next_job();
+        }
         if let Some(settings) = done.settings.take() {
             let initial = self.initial_load;
             let first_run = settings.first_run;
@@ -384,7 +476,7 @@ impl Shell {
                 Ok(loaded) => {
                     self.cfg_error = false;
                     self.portable_mode = loaded.portable;
-                    self.cfg_stamp = stamp_of(&self.cfg_file());
+                    self.cfg_stamp = loaded.local_stamp;
                     if self.app.cfg() != &loaded.config {
                         for problem in loaded.config.problems() {
                             self.app.board.say(now_secs(), Level::Attention, format!("Settings problem: {problem}"));
@@ -401,14 +493,18 @@ impl Shell {
                     self.app.board.say(now_secs(), Level::Error, format!("{}. Nothing is checked until it is fixed.", sentence(&error)));
                 }
             }
-            if initial && (self.cfg_error || (first_run && !self.background)) {
+            if initial && (self.cfg_error || self.reopen || (first_run && !self.background)) {
                 self.open_after_initial = true;
             }
         }
 
         bench::mark(bench::job_label(&job), self.sent_at.take().map(|t| t.elapsed()));
         let config_saves = done.config_saves.clone();
+        let restart = done.update.as_mut().and_then(UpdateState::take_restart);
         let settled = self.app.finish(done, now_secs());
+        if settled.restart && !SHUT_DOWN.with(Cell::get) && restart.is_some() {
+            self.restart = restart;
+        }
         if !config_saves.is_empty() {
             self.saving_settings = false;
         }
@@ -417,12 +513,13 @@ impl Shell {
                 self.app.set_cfg(saved.after.clone(), self.app.skills_dir().clone());
             }
         }
-        if !config_saves.is_empty() && config_saves.iter().all(|saved| saved.result.is_ok()) && self.feedback.as_deref() == Some("Saving shared settings…") {
+        if !config_saves.is_empty()
+            && config_saves.iter().all(|saved| saved.result.is_ok())
+            && matches!(self.feedback.as_deref(), Some("Saving shared settings…" | "Saving app update settings…"))
+        {
             self.feedback = None;
         }
-        if let Some(id) = settled.removed {
-            self.drop_from_config(&id);
-        }
+        let saved = settled.removed.is_none_or(|id| self.drop_from_config(&id));
         if settled.feedback.is_some() {
             self.feedback = settled.feedback;
         } else if settled.stale_feedback {
@@ -432,7 +529,7 @@ impl Shell {
             self.diff = settled.diff;
         }
         // The job's own changes signalled the watch; a new one starts clean. Edits made while it ran show at the next look.
-        if !matches!(job, Job::Look | Job::Plan | Job::Flush) {
+        if !matches!(job, Job::Look | Job::Plan | Job::Flush | Job::AppUpdate(_) | Job::ScheduledUpdate | Job::InstallOnQuit { .. }) {
             self.skills_watch = None;
         }
         if self.skills_watch.is_none() {
@@ -441,13 +538,14 @@ impl Shell {
         if self.home_watch.is_none() {
             self.home_watch = Watch::open(&self.home, false, HOME_CHANGES);
         }
-        if matches!(job, Job::Startup | Job::Poll) && self.app.is_idle() && !window::is_open() {
+        if matches!(job, Job::Startup | Job::Poll | Job::AppUpdate(_) | Job::ScheduledUpdate) && self.app.is_idle() && !window::is_open() {
             trim_memory();
         }
+        saved && config_saves.iter().all(|s| s.result.is_ok())
     }
 
     /// The engine let go of a repository; it leaves the settings too.
-    fn drop_from_config(&mut self, id: &str) {
+    fn drop_from_config(&mut self, id: &str) -> bool {
         if self.portable_mode {
             let before = self.app.cfg().clone();
             let mut cfg = before.clone();
@@ -455,17 +553,19 @@ impl Shell {
             if cfg != before {
                 self.save_portable_config(before, cfg, false);
             }
-            return;
+            return true;
         }
         let file = self.cfg_file();
         let saved = Config::load(&file).and_then(|mut cfg| {
+            let before = cfg.clone();
             cfg.repos.retain(|r| r.id != id);
-            cfg.save(&file).map(|()| cfg)
+            cfg.save_if_unchanged(&file, &before).map(|()| cfg)
         });
         match saved {
             Ok(cfg) => {
                 self.cfg_stamp = stamp_of(&file);
                 self.apply_cfg(cfg, false);
+                true
             }
             Err(e) => {
                 // Not checked again in this session, whatever the file says.
@@ -478,11 +578,15 @@ impl Shell {
                     file.display()
                 );
                 self.app.board.say(now_secs(), Level::Error, text);
+                false
             }
         }
     }
 
     fn save_portable_config(&mut self, before: Config, after: Config, revert_on_failure: bool) {
+        if before.app_update != after.app_update && matches!(self.app.busy(), Some(Job::ScheduledUpdate)) {
+            self.cancel.store(true, Ordering::Release);
+        }
         let skills = self.app.skills_dir().clone();
         self.app.set_cfg(after.clone(), skills);
         self.app.queue_config_save(before, after, true, revert_on_failure);
@@ -541,6 +645,8 @@ impl Shell {
             let text = match job {
                 Job::Startup => "Looking at the skills folder…",
                 Job::Poll | Job::Check(_) => "Checking for updates…",
+                Job::AppUpdate(crate::updater::Action::Check) => "Checking the app release…",
+                Job::AppUpdate(_) | Job::ScheduledUpdate | Job::InstallOnQuit { .. } => "Updating the app…",
                 Job::Remove { .. } => "Removing…",
                 _ => "Working…",
             };
@@ -590,6 +696,7 @@ pub struct Snapshot {
     pub work_dir: PathBuf,
     pub notes: Vec<Note>,
     pub status: String,
+    pub app_update_status: String,
     pub problem: Option<String>,
     pub news: bool,
 }
@@ -605,6 +712,7 @@ pub fn snapshot() -> Option<Snapshot> {
             work_dir: s.paths().work_dir(),
             notes: page::activity_of(&s.app.board),
             status: s.status(now),
+            app_update_status: s.app.release_summary(),
             problem: s.problem(),
             news: s.news(),
         }
@@ -705,10 +813,11 @@ pub fn edit_config(change: impl FnOnce(&mut Config) -> Result<bool, String>) -> 
 
         let file = s.cfg_file();
         let mut cfg = Config::load(&file)?;
+        let before = cfg.clone();
         if !change(&mut cfg)? {
             return Ok(false);
         }
-        cfg.save(&file)?;
+        cfg.save_if_unchanged(&file, &before)?;
         s.cfg_stamp = stamp_of(&file);
         s.cfg_error = false;
         s.feedback = None;
@@ -719,6 +828,38 @@ pub fn edit_config(change: impl FnOnce(&mut Config) -> Result<bool, String>) -> 
     match &result {
         Err(e) => tell(sentence(e)),
         Ok(_) => kick(),
+    }
+    result
+}
+
+/// Update preferences are revocable immediately; compare-before-save runs on the worker.
+pub fn edit_app_update(change: impl FnOnce(&mut Config) -> Result<bool, String>) -> Result<bool, String> {
+    let result: Result<bool, String> = with_shell(|s| {
+        if s.saving_settings {
+            return Err("App update choice not saved. Wait for the previous save to finish and try again.".into());
+        }
+        if s.cfg_error || !s.app.settings_initialized() || s.app.portable_probe_pending() {
+            return Err("App update choice not saved. Wait for settings to finish loading or fix the settings error first.".into());
+        }
+        let before = s.app.cfg().clone();
+        let mut after = before.clone();
+        if !change(&mut after)? {
+            return Ok(false);
+        }
+        if s.app.busy() == Some(&Job::ScheduledUpdate) {
+            s.cancel.store(true, Ordering::Release);
+        }
+        s.app.set_cfg(after.clone(), s.app.skills_dir().clone());
+        s.app.queue_config_save(before, after, s.portable_mode, true);
+        s.saving_settings = true;
+        s.feedback = Some("Saving app update settings…".into());
+        Ok(true)
+    })
+    .unwrap_or_else(|| Err("The app is busy; try again".into()));
+    if let Err(why) = &result {
+        tell(sentence(why));
+    } else {
+        kick();
     }
     result
 }
@@ -865,31 +1006,82 @@ pub fn pump(done: Option<&dyn Fn() -> bool>) -> i32 {
 
 /// Quitting: the main window closes, the job that runs gets two seconds, what waits to be saved is saved, and
 /// the icon goes. Safe to call more than once.
-fn shutdown() {
+fn shutdown(clean: bool) -> bool {
     if SHUT_DOWN.with(|s| s.replace(true)) {
-        return;
+        let ready = with_shell(|s| {
+            if !clean {
+                s.cancel.store(true, Ordering::Release);
+                s.transactions.close();
+            }
+            !s.finishing_install
+        })
+        .unwrap_or(false);
+        if ready {
+            if let Some(error) = with_shell(|s| s.quit_error.take()).flatten() {
+                message_box(&format!("The app update did not finish: {error}"));
+            }
+            tray::remove();
+        }
+        return ready;
     }
     bench::mark("quit", None);
     window::close();
-    with_shell(|s| {
-        s.cancel.store(true, Ordering::Relaxed);
+    let waiting = with_shell(|s| {
+        s.cancel.store(true, Ordering::Release);
+        if !clean {
+            s.transactions.close();
+        }
         s.app.quit();
         let deadline = Instant::now() + QUIT_WAIT;
-        loop {
+        let mut saves_ok = true;
+        let flushed = loop {
             if s.app.busy().is_none() {
-                let Some(order) = s.app.next_order() else { break };
+                let Some(order) = s.app.next_order() else { break false };
                 if s.orders.send((order, Arc::new(AtomicBool::new(false)))).is_err() {
-                    break;
+                    break false;
                 }
             }
             match s.done.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
-                Ok(done) => s.on_done(done),
-                Err(_) => break,
+                Ok(done) => {
+                    let flush = done.job == Job::Flush;
+                    let ok = done.result.is_ok();
+                    saves_ok &= s.on_done(done);
+                    if flush {
+                        break ok;
+                    }
+                }
+                Err(_) => break false,
             }
-        }
+        };
         unsafe { CancelWaitableTimer(s.timer) };
-    });
-    tray::remove();
+        if s.app.finish_on_quit(install_allowed(clean, flushed, saves_ok, s.cfg_error), deadline) {
+            // Still use the normal worker. Once replacement starts, a timeout is not permission
+            // to tear down a half-written pair. Keep pumping messages until its result arrives.
+            s.finishing_install = true;
+            s.dispatch();
+            true
+        } else {
+            if clean && s.app.has_quit_update() && (!flushed || !saves_ok || s.cfg_error || Instant::now() >= deadline) {
+                s.quit_error = Some("Could not confirm a clean Quit in time. The pending app update was not installed.".into());
+            }
+            // This also seals the race with a last-minute entry. Wait for filesystem work already
+            // in progress, not an outstanding request to GitHub. No new transaction can start.
+            s.finishing_install = s.transactions.close();
+            s.finishing_install
+        }
+    })
+    .unwrap_or(false);
+    if !waiting {
+        if let Some(error) = with_shell(|s| s.quit_error.take()).flatten() {
+            message_box(&error);
+        }
+        tray::remove();
+    }
+    !waiting
+}
+
+fn install_allowed(explicit_quit: bool, flushed: bool, saves_ok: bool, settings_error: bool) -> bool {
+    explicit_quit && flushed && saves_ok && !settings_error
 }
 
 fn show_menu(hwnd: HWND, x: i32, y: i32) {
@@ -902,9 +1094,88 @@ fn show_menu(hwnd: HWND, x: i32, y: i32) {
         SetMenuDefaultItem(menu, CMD_SETTINGS as u32, 0);
         // Without this the menu does not close when the user clicks elsewhere.
         SetForegroundWindow(hwnd);
+        MENU_OPEN.with(|m| m.set(true));
         TrackPopupMenu(menu, TPM_RIGHTBUTTON | TPM_BOTTOMALIGN, x, y, 0, hwnd, null());
+        MENU_OPEN.with(|m| m.set(false));
         PostMessageW(hwnd, WM_NULL, 0, 0);
         DestroyMenu(menu);
+    }
+}
+
+/// Restarts into the app update this tray installed, once no question, menu or sign-out is pending: starts the new
+/// tray, which waits for this one, and quits. Quit, a close or a sign-out wins, and then the new tray is not started
+/// or is stopped before it takes over. True when this tray is going away.
+fn restart(hwnd: HWND) -> bool {
+    let Some(pending) = with_shell(|s| s.restart.is_some()) else {
+        // The shell is in use further up the stack.
+        unsafe { SetTimer(hwnd, TIMER_RESTART, RESTART_RETRY_MS, None) };
+        return false;
+    };
+    if !pending {
+        return false;
+    }
+    let leaving = quit_or_close_queued(hwnd) || SHUT_DOWN.with(Cell::get);
+    if !leaving && (ENDING.with(Cell::get) || !dialogs::active().is_null() || MENU_OPEN.with(Cell::get)) {
+        unsafe { SetTimer(hwnd, TIMER_RESTART, RESTART_RETRY_MS, None) };
+        return false;
+    }
+    let Some(Some(tray)) = with_shell(|s| s.restart.take()) else { return false };
+    if leaving {
+        return false;
+    }
+    let flag = OsStr::new(if window::is_open() { RESTARTED_OPEN } else { RESTARTED });
+    // The proven file stays held until the start returns, so the program started is the one that was checked.
+    let started = tray.and_then(|tray| proc::start(tray.path(), &[flag]).map_err(|e| format!("the new copy could not be started: {e}")));
+    let why = match started {
+        Ok(child) => match child.ended_within(RESTART_CHECK) {
+            Some(code) => format!("the new copy stopped at once (exit code {code})"),
+            // Looking at the queue also lets Windows deliver a sign-out it sent meanwhile.
+            None if quit_or_close_queued(hwnd) || SHUT_DOWN.with(Cell::get) => {
+                child.stop();
+                return false;
+            }
+            None if ENDING.with(Cell::get) => {
+                child.stop();
+                "Windows began to sign out".to_string()
+            }
+            None => {
+                HANDOFF.with(|h| h.set(Some(child)));
+                if shutdown(false) {
+                    if quit_or_close_queued(hwnd) {
+                        stop_handoff();
+                    }
+                    unsafe { DestroyWindow(hwnd) };
+                }
+                return true;
+            }
+        },
+        Err(why) => why,
+    };
+    with_shell(|s| s.feedback = Some(s.app.restart_failed(&why, now_secs())));
+    kick();
+    false
+}
+
+/// True if Quit or a close is waiting for the tray. The commands are taken out and posted again in their order, behind
+/// other messages already waiting; a flood of them is looked at only so far.
+fn quit_or_close_queued(hwnd: HWND) -> bool {
+    let mut msg: MSG = unsafe { std::mem::zeroed() };
+    let close = unsafe { PeekMessageW(&mut msg, hwnd, WM_CLOSE, WM_CLOSE, PM_NOREMOVE) } != 0;
+    let mut waiting = Vec::new();
+    while waiting.len() < 256 && unsafe { PeekMessageW(&mut msg, hwnd, WM_COMMAND, WM_COMMAND, PM_REMOVE) } != 0 {
+        waiting.push((msg.wParam, msg.lParam));
+    }
+    for &(wp, lp) in &waiting {
+        unsafe { PostMessageW(hwnd, WM_COMMAND, wp, lp) };
+    }
+    close || waiting.iter().any(|&(wp, _)| wp & 0xFFFF == CMD_QUIT)
+}
+
+/// The user or Windows asked this tray to go while it hands over to a new one: the new one, still waiting for this
+/// process to end, is stopped, so the app stays closed.
+fn stop_handoff() {
+    if let Some(child) = HANDOFF.with(Cell::take) {
+        child.stop();
     }
 }
 
@@ -936,6 +1207,12 @@ fn open_window() {
 }
 
 fn on_command(hwnd: HWND, id: usize) {
+    if SHUT_DOWN.with(Cell::get) {
+        if id == CMD_QUIT {
+            stop_handoff();
+        }
+        return;
+    }
     let ask = dialogs::active();
     match id {
         CMD_SETTINGS if !ask.is_null() => unsafe {
@@ -950,9 +1227,13 @@ fn on_command(hwnd: HWND, id: usize) {
             PostMessageW(ask, WM_COMMAND, IDCANCEL as usize, 0);
             PostMessageW(hwnd, WM_COMMAND, CMD_QUIT, 0);
         },
-        CMD_QUIT => {
-            shutdown();
-            unsafe { DestroyWindow(hwnd) };
+        CMD_QUIT if shutdown(true) => unsafe {
+            DestroyWindow(hwnd);
+        },
+        #[cfg(debug_assertions)]
+        CMD_TEST_RESTART | CMD_TEST_RESTART_WRONG => {
+            crate::updater::TEST_RESTART.store(if id == CMD_TEST_RESTART { 1 } else { 2 }, Ordering::Release);
+            want(Job::AppUpdate(crate::updater::Action::Install));
         }
         _ => {}
     }
@@ -968,6 +1249,9 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
                 }
                 std::mem::take(&mut s.open_after_initial)
             });
+            if restart(hwnd) {
+                return 0;
+            }
             if open_window_after_initial == Some(true) {
                 open_window();
             } else if open_window_after_initial.is_none() {
@@ -987,6 +1271,10 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
                 },
             }
         }
+        WM_TIMER if wp == TIMER_RESTART => {
+            unsafe { KillTimer(hwnd, TIMER_RESTART) };
+            restart(hwnd);
+        }
         WM_POWERBROADCAST => {
             if wp == PBT_APMRESUMEAUTOMATIC as usize {
                 with_shell(|s| s.app.resumed(now_secs()));
@@ -995,15 +1283,23 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
             return 1;
         }
         WM_TIMECHANGE => kick(),
-        WM_QUERYENDSESSION => return 1,
+        WM_QUERYENDSESSION => {
+            ENDING.with(|e| e.set(true));
+            return 1;
+        }
         WM_ENDSESSION => {
             if wp != 0 {
-                shutdown();
+                stop_handoff();
+                shutdown(false);
+            } else {
+                ENDING.with(|e| e.set(false));
             }
         }
         WM_CLOSE => {
-            shutdown();
-            unsafe { DestroyWindow(hwnd) };
+            stop_handoff();
+            if shutdown(false) {
+                unsafe { DestroyWindow(hwnd) };
+            }
         }
         WM_DESTROY => unsafe { PostQuitMessage(0) },
         // The scale or the display changed: the tray icon is drawn again if the taskbar wants another size.
@@ -1025,10 +1321,43 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_failed_completion_side_save_or_an_unclean_exit_never_authorizes_the_install_order() {
+        let base = std::env::var_os("TSS_TEST_ROOT").map(PathBuf::from).unwrap_or_else(std::env::temp_dir);
+        let home = base.join(format!("tss-it-quit-save-{}", crate::fsx::unique_suffix()));
+        std::fs::create_dir(&home).unwrap();
+        let path = home.join(CONFIG_FILE);
+        let before = Config::default();
+        let mut off = before.clone();
+        off.app_update.enabled = false;
+        off.save(&path).unwrap();
+        let saved = before.save_if_unchanged(&path, &before).is_ok();
+        assert!(!saved);
+        assert!(!install_allowed(true, true, saved, false));
+        assert!(!install_allowed(false, true, true, false));
+        assert!(!install_allowed(true, false, true, false));
+        assert!(!install_allowed(true, true, true, true));
+        assert!(install_allowed(true, true, true, false));
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
     fn one_copy_per_app_folder_whatever_its_case() {
         let tag = instance_tag(Path::new(r"C:\Users\Someone\AppData\Local\tiny-skill-sync"));
         assert_eq!(tag, instance_tag(Path::new(r"c:\users\someone\appdata\local\TINY-SKILL-SYNC")));
         assert_ne!(tag, instance_tag(Path::new(r"C:\Temp\tss-home")));
         assert_eq!(tag.len(), 16);
+    }
+
+    #[test]
+    fn a_restarted_tray_is_told_apart_from_one_the_user_or_windows_started() {
+        let start = |args: &[&str]| start_of(&args.iter().map(|a| a.to_string()).collect::<Vec<_>>());
+        assert_eq!(start(&[]), Some(Start::Normal));
+        assert_eq!(start(&["--BACKGROUND"]), Some(Start::SignIn));
+        assert_eq!(start(&["--Quit"]), Some(Start::Quit));
+        // Older trays start newer ones with these, so their meaning never changes.
+        assert_eq!(start(&["--restarted"]), Some(Start::Restarted { open: false }));
+        assert_eq!(start(&["--RESTARTED-OPEN"]), Some(Start::Restarted { open: true }));
+        assert_eq!(start(&["--restarted", "--quit"]), None);
+        assert_eq!(start(&["--restart"]), None);
     }
 }
