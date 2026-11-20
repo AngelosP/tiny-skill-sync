@@ -1,6 +1,6 @@
 [package]
 name = "tiny-skill-sync"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2024"
 rust-version = "1.85"
 description = "A tiny Windows tray app that keeps user-level Copilot skills in sync with GitHub repositories."
