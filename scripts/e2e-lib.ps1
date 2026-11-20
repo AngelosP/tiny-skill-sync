@@ -455,6 +455,7 @@ $UiId = @{
     Sync = 200; HeroTitle = 201; HeroSub = 202
     NavAdd = 300; NavActivity = 301; NavSettings = 302; NavHead = 303; NavRepo = 1000
     WelcomeAdd = 305; More = 310; Every = 311; Enabled = 312; Retry = 313; OpenSettings = 314
+    ConfirmSource = 315; CancelSource = 316; RetrySource = 317; EditSource = 318
     DefaultEvery = 320; OpenSkills = 321; OpenBackups = 322; Startup = 325; StartupText = 413
     AppHeading = 420; AppStatus = 421; AppCheck = 422; AppInstall = 423; AppAuto = 424; AppEvery = 425; AppWhen = 426
     Title = 400; Private = 401; Sub = 402; InfoLead = 403; InfoText = 404; SkillsDir = 410; TokenText = 411; Empty = 412

@@ -1768,8 +1768,8 @@ function Test-Ui {
         $ping = [TssLive]::Ping($win, 2000)
         Check 'the window answers at once' ($ping -ge 0 -and $ping -lt 200) "$ping ms"
         $hero = Read-Hero $win
-        Check 'the top of the window says what to do' ($hero.Title -eq 'Add a repository to start') "$($hero.Title) / $($hero.Sub)"
-        Check 'the list of repositories is empty, and the page offers Add repository' (@(Read-Nav $win).Count -eq 0 -and $null -ne (Read-Ui $win $UiPanel.Page $UiId.WelcomeAdd)) (Read-Panel $win $UiPanel.Page)
+        Check 'the top of the window says what to do' ($hero.Title -eq 'Add a source to start') "$($hero.Title) / $($hero.Sub)"
+        Check 'the list of sources is empty, and the page offers Add source' (@(Read-Nav $win).Count -eq 0 -and $null -ne (Read-Ui $win $UiPanel.Page $UiId.WelcomeAdd)) (Read-Panel $win $UiPanel.Page)
         Check 'Sync now is greyed out, as there is nothing to sync' (-not [TssLive]::IsWindowEnabled((Get-Ui $win $UiPanel.Hero $UiId.Sync)))
         $pic = Save-Shot $win '01-first-start'
         Test-Painted $pic $win 'first start' @(@($UiPanel.Hero, $UiId.HeroTitle), @($UiPanel.Nav, $UiId.NavAdd), @($UiPanel.Nav, $UiId.NavSettings), @($UiPanel.Page, $UiId.WelcomeAdd))
@@ -1797,26 +1797,40 @@ function Test-Ui {
         Test-Layout $win 'Settings'
         Test-TabOrder $win 'Settings'
 
-        # ---- add a repository through its question, the answers slowed down so that the check can be watched
+        # ---- add a source through its question and its preview, the answers slowed down so that the check can be watched
         Click-Ui $win $UiPanel.Nav $UiId.NavAdd
         $ask = Wait-Maybe { $d = Find-Ask $tray; if ($d -ne [IntPtr]::Zero) { $d } } 8
-        Check 'Add repository asks for the repository' ($null -ne $ask)
+        Check 'Add source asks for the source' ($null -ne $ask)
         if ($null -eq $ask) { return }
         Start-Sleep -Milliseconds 400
         $said = Read-Panel $ask $AskPanel
         Note "the question: $said"
         $note = Read-Ui $ask $AskPanel $AskId.Note
         Check 'it has no box for a token; a note says private repositories work by themselves' ($note -like 'Private repositories work automatically*' -and $said -notmatch 'Use my token|Private repository$') $note
+        $types = @(0, 1, 2 | ForEach-Object { Read-Ui $ask $AskPanel ($AskId.Choice + $_) }) -join ','
+        Check 'it offers the three types, with Skills chosen' ($types -eq 'Skills,Agents,Instructions' -and (Get-Checked $ask $AskPanel $AskId.Choice)) $types
         Check 'it offers how often to check, starting at the default' ((Read-Ui $ask $AskPanel $AskId.Combo) -eq 'Default (1 day)') (Read-Ui $ask $AskPanel $AskId.Combo)
         Set-UiText (Get-Ui $ask $AskPanel $AskId.Edit) (Get-Address $c)
         $hint = Wait-Maybe { $t = Read-Ui $ask $AskPanel $AskId.Hint; if ($t -match [regex]::Escape($c.Repo) -and $t -match 'skills folder on') { $t } } 5
         Check 'as the address is typed, the question says what it reads it as' ($null -ne $hint) (Read-Ui $ask $AskPanel $AskId.Hint)
         $pic = Save-Shot $ask '03-add'
-        Test-Painted $pic $ask 'the Add question' @(@($AskPanel, $AskId.Heading), @($AskPanel, $AskId.Edit), @($AskPanel, $AskId.Ok), @($AskPanel, $AskId.Cancel))
+        Test-Painted $pic $ask 'the Add question' @(@($AskPanel, $AskId.Heading), @($AskPanel, $AskId.Edit), @($AskPanel, $AskId.Choice), @($AskPanel, $AskId.Note), @($AskPanel, $AskId.Ok), @($AskPanel, $AskId.Cancel))
         Test-Layout $ask 'the Add question'
         Test-TabOrder $ask 'the Add question'
-        $c.Proxy.SetMode('api', 'slow:2500')
         Click-Ui $ask $AskPanel $AskId.Ok
+        Check 'the question closed once Preview was clicked' ($null -ne (Wait-Maybe { if ((Find-Ask $tray) -eq [IntPtr]::Zero) { $true } } 5))
+        $preview = Wait-Maybe { if ((Read-Ui $win $UiPanel.Page $UiId.ConfirmSource) -eq 'Add and check') { Read-Ui $win $UiPanel.Page $UiId.InfoText } } 60
+        Note "the preview: $($preview -replace '\s+', ' ')"
+        Check 'the preview names the type, the skills folder and the three skills, and saves and installs nothing' (
+            $preview -match 'Type: Skills' -and $preview -match "Destination: $([regex]::Escape($c.Skills))\r?\n" -and $preview -match 'Matched 3 skills:\s+alpha\s+beta\s+gamma' -and
+            (Get-Entries $c.Skills) -eq '' -and @(Read-Nav $win).Count -eq 0
+        ) "$(Get-Entries $c.Skills); $(@(Read-Nav $win).Count) source(s)"
+        $pic = Save-Shot $win '03b-preview'
+        Test-Painted $pic $win 'the preview' @(@($UiPanel.Page, $UiId.Title), @($UiPanel.Page, $UiId.InfoText), @($UiPanel.Page, $UiId.ConfirmSource), @($UiPanel.Page, $UiId.CancelSource))
+        Test-Layout $win 'the preview'
+        Test-TabOrder $win 'the preview'
+        $c.Proxy.SetMode('api', 'slow:2500')
+        Click-Ui $win $UiPanel.Page $UiId.ConfirmSource
         $seen = New-Object System.Collections.Generic.List[string]
         $sample = { $t = Read-Ui $win $UiPanel.Hero $UiId.HeroSub; if ($t -and -not $seen.Contains($t)) { $seen.Add($t) } }
 
@@ -1852,14 +1866,13 @@ function Test-Ui {
             Start-Sleep -Milliseconds 100
         }
         $c.Proxy.SetMode('api', 'pass')
-        Check 'the question closed once Add was clicked' ((Find-Ask $tray) -eq [IntPtr]::Zero)
         Check 'while it checked, the top of the window said "Checking for updates"' (@($seen | Where-Object { $_ -match 'Checking for updates' }).Count -ge 1) ($seen -join ' / ')
         Check 'the window kept answering while it checked' ($worst -lt 500) "slowest answer $worst ms over $([int]$watch.Elapsed.TotalSeconds) s"
         Check 'the check ends with the list saying "3 skills, up to date"' ($done -and @(Read-Nav $win)[0].Sub -eq "3 skills $dot up to date") (Show-Nav $win)
         $title = Read-Ui $win $UiPanel.Page $UiId.Title
         $sub = Read-Ui $win $UiPanel.Page $UiId.Sub
         Note "the page: $title / $sub"
-        Check 'the page of the new repository is shown: its name, public, its folder and branch, when it was checked' ($title -eq $c.Repo -and $sub -match '^Public' -and $sub -match "the skills folder on $([regex]::Escape($c.Ref))" -and $sub -match 'checked') "$title / $sub"
+        Check 'the page of the new source is shown: its type and ID, public, its folder and branch, when it was checked' ($title -eq $c.Repo -and $sub -match "^Skills \[[^\]]+\] $dot Public $dot" -and $sub -match "the skills folder on $([regex]::Escape($c.Ref))" -and $sub -match 'checked') "$title / $sub"
         $skills = @(Read-Skills $win)
         Note ('the skills: ' + (($skills | ForEach-Object { "$($_.Name) / $($_.Tag)" }) -join ' ;; '))
         Check 'alpha, beta and gamma each show installed status and facts without repair buttons' ((($skills | ForEach-Object { $_.Name }) -join ',') -eq 'alpha,beta,gamma' -and @($skills | Where-Object { $_.Tag -notmatch '^(Installed|Up to date)$' -or -not $_.Facts -or $_.Buttons.Count }).Count -eq 0)
@@ -1883,7 +1896,7 @@ function Test-Ui {
         Choose-Ui $win $UiPanel.Page $UiId.Every '12 hours'
         $cfg = Wait-Maybe { $x = Get-Config $c; if ($x -and $x.repos[0].interval -eq '12h') { $x } } 8
         Check 'choosing 12 hours in "Check every" is saved for that repository, and shown' ($null -ne $cfg -and (Read-Ui $win $UiPanel.Page $UiId.Every) -eq '12 hours') (Read-Ui $win $UiPanel.Page $UiId.Every)
-        $hero = Wait-Maybe { $h = Read-Hero $win; if ($h.Sub -like "3 skills from 1 repository $dot checked * $dot next check in *") { $h } } 5
+        $hero = Wait-Maybe { $h = Read-Hero $win; if ($h.Sub -like "3 skills from 1 source $dot checked * $dot next check in *") { $h } } 5
         Check 'once the user does something else, the top of the window sums up: the skills, when they were checked, the next check' ($null -ne $hero) ((Read-Hero $win).Sub)
         Click-Ui $win $UiPanel.Nav $UiId.NavSettings
         [void](Wait-Maybe { Read-Ui $win $UiPanel.Page $UiId.DefaultEvery } 5)
@@ -2048,7 +2061,7 @@ function Test-Ui {
         $nav = Wait-Maybe { $n = @(Read-Nav $win); if ($n.Count -ge 1 -and $n[0].Sub -eq 'No connection') { $n[0] } } 30
         Check 'with the network down, Sync now ends with the list saying "No connection"' ($null -ne $nav) (Show-Nav $win)
         $hero = Read-Hero $win
-        Check 'the top of the window says the repository can not be read, and why' ($hero.Title -match '^1 repository can.t be read$' -and $hero.Sub -match 'connection') "$($hero.Title) / $($hero.Sub)"
+        Check 'the top of the window says the source can not be read, and why' ($hero.Title -match '^1 source can.t be read$' -and $hero.Sub -match 'connection') "$($hero.Title) / $($hero.Sub)"
         $lead = Read-Ui $win $UiPanel.Page $UiId.InfoLead
         $why = Read-Ui $win $UiPanel.Page $UiId.InfoText
         Check 'its page says it can not be read and why, with Open Settings and Try again' ($lead -match '^Can.t read this repository\.$' -and $why -match 'connection' -and $null -ne (Read-Ui $win $UiPanel.Page $UiId.Retry) -and $null -ne (Read-Ui $win $UiPanel.Page $UiId.OpenSettings)) "$lead $why"
@@ -2119,7 +2132,7 @@ function Test-Ui {
             # ---- bad input in the Add question
             Click-Ui $win $UiPanel.Nav $UiId.NavAdd
             $ask = Wait-Maybe { $d = Find-Ask $tray; if ($d -ne [IntPtr]::Zero) { $d } } 8
-            Check 'Add repository asks again' ($null -ne $ask)
+            Check 'Add source asks again' ($null -ne $ask)
             if ($null -ne $ask) {
                 $edit = Get-Ui $ask $AskPanel $AskId.Edit
                 Set-UiText $edit 'not a repo'
@@ -2128,25 +2141,35 @@ function Test-Ui {
                 Start-Sleep -Milliseconds 600
                 Check 'an address that is not a repository is refused: the question stays, says why, and keeps what was typed' ($null -ne $hint -and (Find-Ask $tray) -ne [IntPtr]::Zero -and [TssLive]::Text($edit) -eq 'not a repo' -and @(Read-Nav $win).Count -eq 1) $hint
                 Set-UiText $edit (Get-Address $c)
-                $hint = Wait-Maybe { $t = Read-Ui $ask $AskPanel $AskId.Hint; if ($t -match 'already set up') { $t } } 5
+                [void](Wait-Maybe { $t = Read-Ui $ask $AskPanel $AskId.Hint; if ($t -match 'skills folder on') { $t } } 5)
                 Click-Ui $ask $AskPanel $AskId.Ok
-                Start-Sleep -Milliseconds 600
-                Check 'adding the same repository twice is refused, and says so' ($null -ne $hint -and (Find-Ask $tray) -ne [IntPtr]::Zero -and @(Read-Nav $win).Count -eq 1) $hint
-                [void](Save-Shot $ask '15-refused')
+                $told = Wait-Maybe { $s = (Read-Hero $win).Sub; if ($s -match 'already set up') { $s } } 5
+                Check 'previewing the same source twice is refused, and says so' ($null -ne $told -and (Find-Ask $tray) -eq [IntPtr]::Zero -and @(Read-Nav $win).Count -eq 1) $(if ($told) { $told } else { (Read-Hero $win).Sub })
+                [void](Save-Shot $win '15-refused')
+            }
 
-                # ---- a repository with no skills at its top: what the window says
+            # ---- a repository with no skills at its top: the preview says so and offers no way to add it
+            Click-Ui $win $UiPanel.Nav $UiId.NavAdd
+            $ask = Wait-Maybe { $d = Find-Ask $tray; if ($d -ne [IntPtr]::Zero) { $d } } 8
+            if ($null -ne $ask) {
+                $edit = Get-Ui $ask $AskPanel $AskId.Edit
+                Check 'Add source opens again with what was typed' ([TssLive]::Text($edit) -eq (Get-Address $c)) ([TssLive]::Text($edit))
                 Set-UiText $edit "https://github.com/$($c.Repo)"
                 [void](Wait-Maybe { $t = Read-Ui $ask $AskPanel $AskId.Hint; if ($t -match 'top of the repository') { $t } } 5)
                 Click-Ui $ask $AskPanel $AskId.Ok
-                $nav = Wait-Maybe { $n = @(Read-Nav $win); if ($n.Count -eq 2 -and $n[1].Sub -eq 'No skills found') { $n[1] } } 40
-                Check 'a repository with no skills at its top says "No skills found" in the list' ($null -ne $nav) (Show-Nav $win)
-                $lead = Read-Ui $win $UiPanel.Page $UiId.InfoLead
-                $why = Read-Ui $win $UiPanel.Page $UiId.InfoText
-                Note "its page: $lead $($why -replace '\s+', ' ')"
-                Check 'its page says so, and what to do about it, with Try again' ($lead -eq 'No skills found.' -and $why -match 'No skills were found' -and $null -ne (Read-Ui $win $UiPanel.Page $UiId.Retry)) "$lead $why"
+                $why = Wait-Maybe { $t = Read-Ui $win $UiPanel.Page $UiId.InfoText; if ($t -match 'No matching items were found') { $t } } 40
+                Note "the preview: $($why -replace '\s+', ' ')"
+                $offered = @($UiId.ConfirmSource, $UiId.RetrySource, $UiId.EditSource, $UiId.CancelSource | Where-Object { $null -ne (Read-Ui $win $UiPanel.Page $_) }) -join ','
+                $want = "$($UiId.RetrySource),$($UiId.EditSource),$($UiId.CancelSource)"
+                Check 'a repository with no skills at its top: the preview says nothing matched and offers Retry, Edit and Cancel, not Add' ($null -ne $why -and $offered -eq $want -and @(Read-Nav $win).Count -eq 1) "buttons $offered"
                 $pic = Save-Shot $win '16-no-skills-found'
-                Test-Painted $pic $win 'a repository without skills' @(@($UiPanel.Page, $UiId.InfoLead), @($UiPanel.Page, $UiId.InfoText), @($UiPanel.Nav, ($UiId.NavRepo + 1)))
-                Test-Layout $win 'a repository without skills'
+                Test-Painted $pic $win 'a preview without skills' @(@($UiPanel.Page, $UiId.InfoText), @($UiPanel.Page, $UiId.RetrySource), @($UiPanel.Page, $UiId.EditSource), @($UiPanel.Page, $UiId.CancelSource))
+                Test-Layout $win 'a preview without skills'
+                Click-Ui $win $UiPanel.Page $UiId.CancelSource
+                $gone = Wait-Maybe { if ($null -eq (Read-Ui $win $UiPanel.Page $UiId.CancelSource)) { $true } } 5
+                Check 'Cancel closes the preview and keeps only the first source' ($null -ne $gone -and @(Read-Nav $win).Count -eq 1) (Show-Nav $win)
+            } else {
+                Check 'Add source opens again with what was typed' $false 'the question did not open'
             }
         }
 

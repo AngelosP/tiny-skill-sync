@@ -31,7 +31,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 use super::control::{self, BN_CLICKED, CBN_SELENDOK, RowCmd, Surface};
 use super::dialogs::{self, Ask, Check, Field};
 use super::page::{self, CUSTOM, DIFF_FILES_W, DiffView, Fit, HERO_H, Hit, NAV_W, Page, Part, RepoPage, Report, SYNC_TIP, SettingsPage, id};
-use super::paint::{self, Font, Rect};
+use super::paint::{self, Font, Rect, glyph};
 use super::shell::{self, Snapshot};
 use super::theme::{self, Role};
 use super::{bench, local_time, open_folder, place, register_class, scale, sentence, text_of, tray, trim_memory};
@@ -658,6 +658,10 @@ fn add_question(default: Interval, form: &AddForm) -> Ask {
         }),
         combo: Some(("Check every".to_string(), items, shown)),
         choices: add_choices(form.kind).map(|kind| kind.heading().into()).collect(),
+        note: Some((
+            glyph::LOCK,
+            "Private repositories work automatically when you are signed in with the GitHub CLI or have saved a token in Settings.".to_string(),
+        )),
         ok: "Preview".to_string(),
         ..Ask::default()
     }
