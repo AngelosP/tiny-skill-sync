@@ -31,7 +31,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 use super::control::{self, BN_CLICKED, CBN_SELENDOK, RowCmd, Surface};
 use super::dialogs::{self, Ask, Check, Field};
 use super::page::{self, CUSTOM, DIFF_FILES_W, DiffView, Fit, HERO_H, Hit, NAV_W, Page, Part, RepoPage, Report, SYNC_TIP, SettingsPage, id};
-use super::paint::{self, Font, Rect, glyph};
+use super::paint::{self, Font, Rect};
 use super::shell::{self, Snapshot};
 use super::theme::{self, Role};
 use super::{bench, local_time, open_folder, place, register_class, scale, sentence, text_of, tray, trim_memory};
@@ -43,6 +43,7 @@ use crate::github::web_url;
 use crate::interval::{Interval, MIN_POLL_MINUTES};
 use crate::logo;
 use crate::pathsafe::printable;
+use crate::source::SourceKind;
 use crate::win::{autorun, clip, cred, proc, wide};
 
 const CLASS: &str = "TinySkillSyncWindow";
@@ -97,6 +98,9 @@ struct Win {
     snap: Option<Snapshot>,
     /// The page on the right; `None` is the welcome page.
     page: Option<Page>,
+    add_form: Option<(u64, AddForm)>,
+    /// Keep a rejected source's details for the next Add Source attempt.
+    retry_add_form: Option<AddForm>,
     /// The skills of the repository shown that the user opened or closed, by name.
     toggled: HashSet<String>,
     diff: Option<DiffView>,
@@ -266,6 +270,8 @@ pub fn open() {
         icons,
         snap: None,
         page: None,
+        add_form: None,
+        retry_add_form: None,
         toggled: HashSet::new(),
         diff: None,
         from_card: false,
@@ -331,7 +337,7 @@ fn update(hwnd: HWND) {
     let moved = with_state(|st| {
         if let Some(shown) = shown {
             let waiting =
-                st.diff.as_mut().filter(|d| d.repo_id == shown.repo && d.skill == shown.skill && d.preview == shown.preview && d.report == Report::Loading);
+                st.diff.as_mut().filter(|d| d.source.id == shown.repo && d.skill == shown.skill && d.preview == shown.preview && d.report == Report::Loading);
             if let Some(d) = waiting {
                 d.report = match shown.result {
                     Ok(report) => Report::Ready(report),
@@ -340,7 +346,21 @@ fn update(hwnd: HWND) {
             }
         }
         let snap = snap?;
-        let page = page::settle(st.page.clone(), &snap.views);
+        if snap.draft.is_none() {
+            st.add_form = None;
+            if st.snap.as_ref().is_some_and(|s| s.draft.is_some()) {
+                st.retry_add_form = None;
+            }
+        }
+        if st.diff.as_ref().is_some_and(|d| snap.cfg.find(&d.source.id) != Some(&d.source)) {
+            st.diff = None;
+        }
+        let wanted = if st.page == Some(Page::Add) && snap.draft.is_none() {
+            st.snap.as_ref().and_then(|s| s.draft.as_ref()).map(|d| Page::Repo(d.input.source.id.clone()))
+        } else {
+            st.page.clone()
+        };
+        let page = page::settle(wanted, &snap.views);
         let moved = page != st.page;
         if moved {
             st.page = page;
@@ -427,6 +447,7 @@ fn page_of(st: &Win, snap: &Snapshot, w: i32, fit: Fit) -> Surface {
             _ => page::welcome(w, fit),
         },
         Some(Page::Activity) => page::activity_page(&snap.notes, &local_time, w, fit),
+        Some(Page::Add) => snap.draft.as_ref().map_or_else(|| page::welcome(w, fit), |draft| page::source_preview(draft, w, fit)),
         Some(Page::Settings) => {
             let skills_dir = snap.skills_dir.display().to_string();
             let startup = match &st.startup {
@@ -563,6 +584,12 @@ fn on_rested(hwnd: HWND) {
 
 /// Shows another page on the right.
 fn go(hwnd: HWND, page: Option<Page>) {
+    if page != Some(Page::Add) {
+        if !escape_cancels_source(shell::saving_source()) {
+            return;
+        }
+        shell::dismiss_source();
+    }
     // Read before the state is borrowed, and again each time: it may have been changed in Task Manager meanwhile.
     let startup = (page == Some(Page::Settings)).then(startup_now);
     let read = startup.is_some();
@@ -602,68 +629,90 @@ fn shown_repo<R>(f: impl FnOnce(&RepoConfig, &RepoView) -> R) -> Option<R> {
     .flatten()
 }
 
-fn repo_mut<'a>(cfg: &'a mut Config, id: &str) -> Result<&'a mut RepoConfig, String> {
-    cfg.repos.iter_mut().find(|r| r.id == id).ok_or_else(|| "that repository is no longer in the settings".to_string())
+fn repo_mut<'a>(cfg: &'a mut Config, shown: &RepoConfig) -> Result<&'a mut RepoConfig, String> {
+    cfg.repos.iter_mut().find(|r| *r == shown).ok_or_else(|| "The source changed. Choose it again.".to_string())
 }
 
-fn add(hwnd: HWND) {
-    let Some((repos, default)) = with_state(|st| st.snap.as_ref().map(|s| (s.cfg.repos.clone(), s.cfg.default_interval))).flatten() else { return };
-    let (mut items, shown) = page::every_choices(None, Some(default));
+#[derive(Clone, Default)]
+struct AddForm {
+    address: String,
+    kind: SourceKind,
+    every: Option<Interval>,
+}
+
+fn add_choices(kind: SourceKind) -> impl Iterator<Item = SourceKind> {
+    std::iter::once(kind).chain(page::SOURCE_TYPES.iter().copied().filter(move |k| *k != kind))
+}
+
+fn add_question(default: Interval, form: &AddForm) -> Ask {
+    let (mut items, shown) = page::every_choices(form.every, Some(default));
     items.retain(|item| item != CUSTOM);
-    let check: Check = Box::new(move |text| page::spec_hint(text, &repos));
-    let question = Ask {
-        heading: "Add a repository".to_string(),
-        text: "Its skills are installed in your skills folder and kept up to date.".to_string(),
+    Ask {
+        heading: "Add source".to_string(),
+        text: "Choose one type to look for. Previewing a source does not install anything.".to_string(),
         field: Some(Field::Text {
             label: "GitHub repository or folder".to_string(),
             hint: "owner/name, or the address of a folder on GitHub".to_string(),
-            initial: String::new(),
-            check: Some(check),
+            initial: form.address.clone(),
+            check: Some(Box::new(page::spec_hint)),
         }),
         combo: Some(("Check every".to_string(), items, shown)),
-        note: Some((
-            glyph::LOCK,
-            "Private repositories work automatically when you are signed in with the GitHub CLI or have saved a token in Settings.".to_string(),
-        )),
-        ok: "Add".to_string(),
+        choices: add_choices(form.kind).map(|kind| kind.heading().into()).collect(),
+        ok: "Preview".to_string(),
         ..Ask::default()
+    }
+}
+
+fn add(hwnd: HWND, initial: AddForm) {
+    if shell::saving_source() {
+        return;
+    }
+    let Some(default) = with_state(|st| st.snap.as_ref().map(|s| s.cfg.default_interval)).flatten() else { return };
+    let question = add_question(default, &initial);
+    let Some(reply) = dialogs::ask(hwnd, question) else {
+        update(hwnd);
+        return;
     };
-    let Some(reply) = dialogs::ask(hwnd, question) else { return };
-    let spec = match RepoSpec::parse(&reply.text) {
+    if hwnd != window() {
+        return;
+    }
+    let Some(kind) = add_choices(initial.kind).nth(reply.choice) else { return };
+    let Ok(every) = page::parse_every(&reply.combo) else { return };
+    preview_source(hwnd, AddForm { address: reply.text, kind, every });
+}
+
+fn preview_source(hwnd: HWND, form: AddForm) {
+    let retry_form = form.clone();
+    with_state(|st| st.retry_add_form = Some(retry_form.clone()));
+    let spec = match RepoSpec::parse(&form.address) {
         Ok(spec) => spec,
         Err(e) => {
             shell::tell(sentence(&e));
             return;
         }
     };
-    let every = page::parse_every(&reply.combo).unwrap_or(None);
-    let mut added = None;
-    let mut first = false;
-    let result = shell::edit_config(|cfg| {
-        let full_name = spec.full_name();
-        if let Some(existing) = cfg.repos.iter().find(|r| r.repo.eq_ignore_ascii_case(&full_name) && r.branch == spec.branch && r.path == spec.path) {
-            return Err(format!("{} is already set up", existing.label()));
+    match shell::preview_source(&spec, form.kind, form.every) {
+        Ok(ticket) => {
+            with_state(|st| st.add_form = Some((ticket, form)));
+            go(hwnd, Some(Page::Add));
         }
-        first = cfg.repos.is_empty();
-        added = Some(cfg.add_repo(&spec, every, false).id.clone());
-        Ok(true)
-    });
-    let saved = matches!(result, Ok(true));
-    if let (true, Some(id)) = (saved, added) {
-        let panel = with_state(|st| {
-            st.page = Some(Page::Repo(id.clone()));
-            st.toggled.clear();
-            st.p.page
-        });
-        if let Some(panel) = panel {
-            control::scroll_top(panel);
+        Err(e) => {
+            shell::tell(sentence(&e));
         }
-        shell::want(Job::Check(Some(id)));
     }
     update(hwnd);
-    if saved && first {
-        offer_startup(hwnd);
-    }
+}
+
+fn current_add_form() -> Option<AddForm> {
+    with_state(|st| {
+        if st.page != Some(Page::Add) {
+            return None;
+        }
+        let draft = st.snap.as_ref()?.draft.as_ref()?;
+        let (ticket, form) = st.add_form.as_ref()?;
+        (*ticket == draft.input.ticket).then(|| form.clone())
+    })
+    .flatten()
 }
 
 /// Offers once per machine to start with Windows, when the first repository was just added.
@@ -706,6 +755,7 @@ fn offer_startup(hwnd: HWND) {
 
 /// Check every, of the repository shown or (`default`) in Settings: an entry was chosen.
 fn every(hwnd: HWND, combo: HWND, default: bool) {
+    let source = shown_repo(|r, _| r.clone());
     let mut text = text_of(combo);
     if text == CUSTOM {
         match custom_interval(hwnd, default) {
@@ -728,7 +778,7 @@ fn every(hwnd: HWND, combo: HWND, default: bool) {
             }
             Err(e) => shell::tell(format!("Default check interval: {e}")),
         }
-    } else if let Some(repo) = shown_repo(|r, _| r.id.clone()) {
+    } else if let Some(repo) = source.filter(|s| shown_repo(|r, _| r == s) == Some(true)) {
         match page::parse_every(&text) {
             Ok(every) => {
                 let _ = shell::edit_config(|cfg| {
@@ -755,7 +805,7 @@ fn custom_interval(hwnd: HWND, default: bool) -> Option<String> {
         })
     };
     let question = Ask {
-        heading: "Check for skill updates every".to_string(),
+        heading: "Check for updates every".to_string(),
         text: "Type how often, such as 45 minutes, 2 hours, 3 days or 2 weeks.".to_string(),
         field: Some(Field::Text {
             label: "Interval".to_string(),
@@ -772,17 +822,13 @@ fn custom_interval(hwnd: HWND, default: bool) -> Option<String> {
 /// Keep in sync was switched.
 fn set_enabled(toggle: HWND) {
     let on = unsafe { SendMessageW(toggle, BM_GETCHECK, 0, 0) } != 0;
-    let Some(repo) = shown_repo(|r, _| r.id.clone()) else { return };
-    let result = shell::edit_config(|cfg| {
+    let Some(repo) = shown_repo(|r, _| r.clone()) else { return };
+    let _ = shell::edit_config(|cfg| {
         let r = repo_mut(cfg, &repo)?;
         let changed = r.enabled != on;
         r.enabled = on;
         Ok(changed)
     });
-    // Turned on, it is checked now: it was not while it was off.
-    if on && matches!(result, Ok(true)) {
-        shell::want(Job::Check(Some(repo)));
-    }
     refresh();
 }
 
@@ -819,8 +865,15 @@ fn more(hwnd: HWND, button: HWND) {
     if repo.enabled {
         items.push(SYNC_ONE);
     }
-    items.extend([ON_GITHUB, SKILLS_FOLDER, "-", REMOVE]);
+    items.push(ON_GITHUB);
+    if repo.kind == SourceKind::Skills {
+        items.push(SKILLS_FOLDER);
+    }
+    items.extend(["-", REMOVE]);
     let Some(chosen) = control::menu(button, &items, None, true) else { return };
+    if shown_repo(|r, _| r == &repo) != Some(true) {
+        return;
+    }
     match items[chosen] {
         SYNC_ONE => {
             shell::want(Job::Check(Some(repo.id)));
@@ -846,22 +899,29 @@ fn open_url(url: &str) {
 }
 
 fn remove(hwnd: HWND, repo: &RepoConfig) {
+    let skills = repo.kind == SourceKind::Skills;
     let question = Ask {
-        heading: format!("Remove {}?", printable(&repo.label())),
-        text: "Its skills are no longer kept up to date.".to_string(),
-        choices: vec!["Leave its skills installed; they become yours".to_string(), "Delete its skills too; skills you edited are kept".to_string()],
+        heading: format!("Remove {}: {} [{}]?", repo.kind.heading(), printable(&repo.label()), printable(&repo.id)),
+        text: format!("Its {} will no longer be kept up to date.{}", repo.kind.nouns().1, if skills { "" } else { " Its files stay installed." }),
+        choices: if skills {
+            vec!["Leave its skills installed; they become yours".into(), "Delete its skills too; skills you edited are kept".into()]
+        } else {
+            Vec::new()
+        },
         ok: "Remove".to_string(),
         ..Ask::default()
     };
     if let Some(reply) = dialogs::ask(hwnd, question) {
-        shell::want(Job::Remove { repo: repo.id.clone(), delete_skills: reply.choice == 1 });
+        if shown_repo(|r, _| r == repo) == Some(true) {
+            shell::want(Job::Remove { repo: repo.id.clone(), delete_skills: skills && reply.choice == 1 });
+        }
     }
 }
 
 fn row_command(hwnd: HWND, button: HWND, index: usize, code: u32) {
     let Some((repo, name, commands)) = shown_repo(|r, v| {
         let row = v.skills.get(index)?;
-        Some((r.id.clone(), row.name.clone(), page::row_commands(row, web_url(r, None).is_some())))
+        Some((r.clone(), row.name.clone(), page::row_commands(row, r.kind, web_url(r, None).is_some())))
     })
     .flatten() else {
         return;
@@ -869,8 +929,8 @@ fn row_command(hwnd: HWND, button: HWND, index: usize, code: u32) {
     let cmd = if code == control::ROW_MENU && !commands.is_empty() {
         let labels: Vec<_> = commands.iter().map(|cmd| cmd.label()).collect();
         let picked = control::menu(button, &labels, None, false).map(|i| commands[i]);
-        if unsafe { GetFocus() } == button && shown_repo(|r, _| r.id == repo) == Some(true) {
-            focus_skill(hwnd, &repo, &name, false);
+        if unsafe { GetFocus() } == button && shown_repo(|r, _| r == &repo) == Some(true) {
+            focus_skill(hwnd, &repo.id, &name, false);
         }
         picked
     } else {
@@ -878,18 +938,18 @@ fn row_command(hwnd: HWND, button: HWND, index: usize, code: u32) {
     };
     let Some(cmd) = cmd else { return };
     // The popup runs a message loop: a refresh can remove, reorder, or resolve this skill.
-    let target = shown_repo(|r, v| command_target(&r.id, &v.skills, web_url(r, None).is_some(), &repo, &name, cmd)).flatten();
+    let target = shown_repo(|r, v| command_target(r, &v.skills, &repo, &name, cmd)).flatten();
     if let Some((index, part)) = target {
         skill(hwnd, index, part);
     }
 }
 
-fn command_target(shown: &str, rows: &[Row], linkable: bool, repo: &str, name: &str, cmd: RowCmd) -> Option<(usize, Part)> {
+fn command_target(shown: &RepoConfig, rows: &[Row], repo: &RepoConfig, name: &str, cmd: RowCmd) -> Option<(usize, Part)> {
     if shown != repo {
         return None;
     }
     let (index, row) = rows.iter().enumerate().find(|(_, row)| row.name == name)?;
-    if !page::row_commands(row, linkable).contains(&cmd) {
+    if !page::row_commands(row, shown.kind, web_url(shown, None).is_some()).contains(&cmd) {
         return None;
     }
     let part = match cmd {
@@ -906,7 +966,8 @@ fn command_target(shown: &str, rows: &[Row], linkable: bool, repo: &str, name: &
 
 /// A part of a skill's row was clicked.
 fn skill(hwnd: HWND, index: usize, part: Part) {
-    let Some((repo, label, row)) = shown_repo(|r, v| Some((r.clone(), v.label.clone(), v.skills.get(index)?.clone()))).flatten() else { return };
+    let Some((repo, row)) = shown_repo(|r, v| Some((r.clone(), v.skills.get(index)?.clone()))).flatten() else { return };
+    let label = format!("{}: {} [{}]", repo.kind.heading(), repo.label(), repo.id);
     match part {
         Part::Row => {
             if !page::expandable(&row) {
@@ -919,54 +980,58 @@ fn skill(hwnd: HWND, index: usize, part: Part) {
             });
             render(hwnd);
         }
-        Part::Compare => compare(hwnd, repo.id, label, row, false),
-        Part::Open => open_skill(&row.name),
+        Part::Compare => compare(hwnd, repo, row, false),
+        Part::Open if repo.kind == SourceKind::Skills => open_skill(&row.name),
         Part::Action(k) => {
             if let Some(&action) = row.actions.get(k) {
-                act(hwnd, repo.id, &label, row.name, action);
+                act(hwnd, &repo, &label, row.name, action);
             }
         }
-        Part::Preview => compare(hwnd, repo.id, label, row, true),
-        Part::CopyPath => {
+        Part::Preview => compare(hwnd, repo, row, true),
+        Part::CopyPath if repo.kind == SourceKind::Skills => {
             if let Some(dir) = skill_dir(&row.name) {
                 copy(hwnd, dir.as_os_str());
             }
         }
-        Part::CopyLink => match web_url(&repo, Some(&row.name)) {
+        Part::CopyLink if repo.kind == SourceKind::Skills => match web_url(&repo, Some(&row.name)) {
             Some(url) => copy(hwnd, url.as_ref()),
             None => shell::tell(format!("{} can’t be opened on GitHub.", printable(&row.name))),
         },
-        Part::OnGitHub => match web_url(&repo, Some(&row.name)) {
+        Part::OnGitHub if repo.kind == SourceKind::Skills => match web_url(&repo, Some(&row.name)) {
             Some(url) => open_url(&url),
             None => shell::tell(format!("{} can’t be opened on GitHub.", printable(&row.name))),
         },
+        _ => {}
     }
 }
 
-fn act(hwnd: HWND, repo: String, label: &str, skill: String, action: Action) {
+fn act(hwnd: HWND, repo: &RepoConfig, label: &str, skill: String, action: Action) {
     match action.resolution() {
         Some(how) => {
-            shell::want(Job::Resolve { repo, skill, how });
+            shell::want(Job::Resolve { repo: repo.id.clone(), skill, how });
         }
         None => {
             let question = Ask {
-                heading: format!("Delete the skills that are gone from {}?", printable(label)),
-                text: "It lists no skills at all now, which can be a mistake upstream. Skills you edited are kept.".to_string(),
+                heading: format!("Delete the {} that are gone from {}?", repo.kind.nouns().1, printable(label)),
+                text: "It lists no matching items now, which can be a mistake upstream. Items you edited are kept.".to_string(),
                 ok: "Delete them".to_string(),
                 ..Ask::default()
             };
-            if dialogs::ask(hwnd, question).is_some() {
-                shell::want(Job::DeleteGone(repo));
+            if dialogs::ask(hwnd, question).is_some()
+                && shown_repo(|r, v| r == repo && v.skills.iter().any(|row| row.name == skill && row.actions.contains(&action))) == Some(true)
+            {
+                shell::want(Job::DeleteGone(repo.id.clone()));
             }
         }
     }
 }
 
 /// Show changes, or a Preview: the window shows the differences, or the files, of one skill, read by the worker.
-fn compare(hwnd: HWND, repo: String, repo_label: String, row: Row, preview: bool) {
+fn compare(hwnd: HWND, source: RepoConfig, row: Row, preview: bool) {
     let from_card = !preview && page::expandable(&row);
     let actions = if preview { Vec::new() } else { row.actions };
-    let view = DiffView { repo_id: repo.clone(), repo_label, skill: row.name.clone(), preview, actions, report: Report::Loading, file: 0, gaps: Vec::new() };
+    let repo = source.id.clone();
+    let view = DiffView { source, skill: row.name.clone(), preview, actions, report: Report::Loading, file: 0, gaps: Vec::new() };
     let Some(p) = with_state(|st| {
         st.diff = Some(view);
         st.from_card = from_card;
@@ -987,7 +1052,7 @@ fn compare(hwnd: HWND, repo: String, repo_label: String, row: Row, preview: bool
 fn leave_diff(hwnd: HWND) {
     let Some((d, from_card)) = with_state(|st| st.diff.take().map(|d| (d, st.from_card))).flatten() else { return };
     render(hwnd);
-    focus_skill(hwnd, &d.repo_id, &d.skill, from_card);
+    focus_skill(hwnd, &d.source.id, &d.skill, from_card);
 }
 
 fn focus_skill(hwnd: HWND, repo: &str, name: &str, from_card: bool) {
@@ -1029,15 +1094,17 @@ fn open_gap(hwnd: HWND, row: usize) {
 /// One of the choices in the diff view's header: it is made, and the window goes back to the repository.
 fn diff_action(hwnd: HWND, index: usize) {
     let Some((repo, skill, action)) = with_state(|st| {
-        let d = st.diff.as_ref()?;
-        Some((d.repo_id.clone(), d.skill.clone(), *d.actions.get(index)?))
+        let d = st.diff.as_ref().filter(|d| !d.preview && matches!(d.report, Report::Ready(_)))?;
+        Some((d.source.clone(), d.skill.clone(), *d.actions.get(index)?))
     })
     .flatten() else {
         return;
     };
     leave_diff(hwnd);
-    if let Some(how) = action.resolution() {
-        shell::want(Job::Resolve { repo, skill, how });
+    if shown_repo(|r, v| r == &repo && v.skills.iter().any(|row| row.name == skill && row.actions.contains(&action))) == Some(true) {
+        if let Some(how) = action.resolution() {
+            shell::want(Job::Resolve { repo: repo.id, skill, how });
+        }
     }
 }
 
@@ -1133,10 +1200,17 @@ fn copy(hwnd: HWND, text: &std::ffi::OsStr) {
     }
 }
 
-/// Escape: back from the diff view, else the window closes.
+fn escape_cancels_source(saving: bool) -> bool {
+    !saving
+}
+
+/// Escape: back from the diff view, cancel an unsaved preview, or close the window.
 fn escape(hwnd: HWND) {
     if DIFF_MODE.with(Cell::get) {
         leave_diff(hwnd);
+    } else if with_state(|st| st.page == Some(Page::Add)) == Some(true) {
+        go(hwnd, None);
+        update(hwnd);
     } else {
         unsafe { DestroyWindow(hwnd) };
     }
@@ -1184,7 +1258,28 @@ fn on_command(hwnd: HWND, wp: WPARAM, lp: LPARAM) {
             id::SYNC => {
                 shell::want(Job::Check(None));
             }
-            id::NAV_ADD | id::WELCOME_ADD => add(hwnd),
+            id::NAV_ADD | id::WELCOME_ADD => add(hwnd, with_state(|st| st.retry_add_form.clone().unwrap_or_default()).unwrap_or_default()),
+            id::RETRY_SOURCE | id::EDIT_SOURCE => {
+                if let Some(form) = current_add_form() {
+                    if n == id::EDIT_SOURCE {
+                        add(hwnd, form);
+                    } else {
+                        preview_source(hwnd, form);
+                    }
+                }
+            }
+            id::CONFIRM_SOURCE => {
+                let ticket =
+                    with_state(|st| (st.page == Some(Page::Add)).then(|| st.snap.as_ref()?.draft.as_ref().map(|d| d.input.ticket)).flatten()).flatten();
+                if let Some(ticket) = ticket {
+                    shell::confirm_source(ticket);
+                    update(hwnd);
+                }
+            }
+            id::CANCEL_SOURCE => {
+                go(hwnd, None);
+                update(hwnd);
+            }
             id::NAV_ACTIVITY => go(hwnd, Some(Page::Activity)),
             id::NAV_SETTINGS | id::OPEN_SETTINGS => go(hwnd, Some(Page::Settings)),
             id::MORE => more(hwnd, ctl),
@@ -1255,6 +1350,7 @@ fn on_theme(hwnd: HWND) {
 }
 
 fn on_destroyed(hwnd: HWND) {
+    shell::dismiss_source();
     unsafe {
         KillTimer(hwnd, TIMER_REFRESH);
         KillTimer(hwnd, TIMER_LIST);
@@ -1340,15 +1436,34 @@ mod tests {
     use super::*;
 
     #[test]
+    fn continuation_edit_preselects_the_drafts_address_type_and_interval() {
+        let address = "https://github.com/team/tools/tree/main/custom-agents?from=link";
+        let form = AddForm { address: address.into(), kind: SourceKind::Agents, every: Some(Interval::parse("6h").unwrap()) };
+        let question = add_question(Interval::parse("1d").unwrap(), &form);
+        assert!(matches!(question.field, Some(Field::Text { initial, .. }) if initial == form.address));
+        assert_eq!(question.choices.first().map(String::as_str), Some(form.kind.heading()));
+        assert_eq!(page::parse_every(&question.combo.unwrap().2), Ok(form.every));
+    }
+
+    #[test]
+    fn continuation_escape_leaves_an_in_progress_source_save_showing() {
+        assert!(escape_cancels_source(false));
+        assert!(!escape_cancels_source(true), "Escape would dismiss a save that is still in progress");
+    }
+
+    #[test]
     fn row_menu_dispatch_follows_identity_and_rechecks_availability() {
         let cfg = Config { repos: vec![RepoConfig { id: "one".into(), repo: "owner/repo".into(), ..Default::default() }], ..Default::default() };
         let mut board = crate::board::Board::new();
         board.note_kept("one", &["alpha".into(), "beta".into()]);
         let mut rows = board.views(&cfg, 0).remove(0).skills;
         rows.swap(0, 1);
-        let resolve = |shown, rows: &[Row]| command_target(shown, rows, true, "one", "alpha", RowCmd::ManageAgain);
+        let repo = &cfg.repos[0];
+        let resolve = |shown: &str, rows: &[Row]| command_target(&RepoConfig { id: shown.into(), ..repo.clone() }, rows, repo, "alpha", RowCmd::ManageAgain);
         assert_eq!(resolve("one", &rows), Some((1, Part::Action(0))));
         assert_eq!(resolve("other", &rows), None);
+        let repurposed = RepoConfig { kind: SourceKind::Agents, ..repo.clone() };
+        assert_eq!(command_target(&repurposed, &rows, repo, "alpha", RowCmd::ManageAgain), None);
         assert_eq!(resolve("one", &rows[..1]), None);
         rows[1].actions.clear();
         assert_eq!(resolve("one", &rows), None);

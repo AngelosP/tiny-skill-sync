@@ -30,7 +30,9 @@
     "Any command that prints, logs, or saves a token",
     "tss startup on or off without TSS_HOME",
     "Direct app execution without both TSS_HOME and TSS_SKILLS_DIR pointing at disposable folders",
-    "Any command that accesses the real skills, settings, or work folders",
+    "Any command that accesses real %USERPROFILE%\\.copilot\\skills, %USERPROFILE%\\.copilot\\agents, %USERPROFILE%\\.copilot\\instructions, .tss-work beside Skills, .tss-leaf-work beside Agents or Instructions, or %LOCALAPPDATA%\\tiny-skill-sync",
+    "Tests that resolve Agents or Instructions roots from the real user profile instead of disposable roots",
+    "Engine tests without TSS_TEST_ROOT set to a disposable folder or explicit disposable Paths::with_file_roots",
     "Any command that writes Windows' Run or StartupApproved\\Run keys",
     "Pushing to fixture main branches or running live scripts against repositories not owned by the user",
     "scripts\\dev.ps1 clean while another worktree or live run is active"

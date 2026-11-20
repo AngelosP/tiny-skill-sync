@@ -5,5 +5,6 @@
 jobs = 4
 
 [target.x86_64-pc-windows-msvc]
-# Static C runtime: no Visual C++ redistributable needed, and measured as fast as the dynamic one (spike S3).
+# Static C runtime: no Visual C++ redistributable needed, and measured as fast as the dynamic one (spike S3). build.rs
+# then links the exes' Universal C Runtime part from Windows, which Windows 10 and 11 include.
 rustflags = ["-C", "target-feature=+crt-static"]

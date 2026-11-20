@@ -9,11 +9,13 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
+use crate::config::{RepoConfig, legacy_version};
 use crate::fsx;
 use crate::pathsafe;
+use crate::source::{DestinationBinding, SourceKind};
 use crate::tree::SkillFile;
 
-pub const STATE_VERSION: u32 = 1;
+pub const STATE_VERSION: u32 = 2;
 
 /// What Windows reported about a file when its content was last known to match the manifest.
 /// Stored as `[file id (2 numbers), size, last write, change time, USN]`.
@@ -92,6 +94,8 @@ pub struct OwnedSkill {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
+#[non_exhaustive]
+#[allow(clippy::manual_non_exhaustive)]
 pub struct RepoState {
     /// The ETag of the last tree listing that was fully applied. Empty while work is held, so the next poll fetches again.
     pub etag: Option<String>,
@@ -114,6 +118,16 @@ pub struct RepoState {
     pub history_retry_at: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub history_head: Option<String>,
+    // This namespace, including `set_aside`, is permanently skills-only. Never extend Pending with loose-file operations.
+    #[serde(skip_serializing, deserialize_with = "skills_marker")]
+    kind: (),
+}
+
+fn skills_marker<'de, D: Deserializer<'de>>(d: D) -> Result<(), D::Error> {
+    match SourceKind::deserialize(d)? {
+        SourceKind::Skills => Ok(()),
+        _ => Err(serde::de::Error::custom("loose-file records do not belong in skills state")),
+    }
 }
 
 /// Progress, not authority to replace anything. Adoption always reads the complete matched version again.
@@ -177,7 +191,7 @@ impl RepoState {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct State {
-    pub version: u32,
+    version: u32,
     /// The skills folder the records describe. Files written before it was kept have none.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub skills_dir: Option<String>,
@@ -186,12 +200,219 @@ pub struct State {
     /// The records of skills folders used before, most recent first, in case one is used again.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub set_aside: Vec<SetAside>,
+    // Outside BOTH v1 repo maps: that reader decodes all Pending values *before* checking the version.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty", deserialize_with = "read_loose_sources")]
+    loose_sources: BTreeMap<String, LooseSourceState>,
 }
 
 impl Default for State {
     fn default() -> Self {
-        State { version: STATE_VERSION, skills_dir: None, volume: None, repos: BTreeMap::new(), set_aside: Vec::new() }
+        State { version: legacy_version(), skills_dir: None, volume: None, repos: BTreeMap::new(), set_aside: Vec::new(), loose_sources: BTreeMap::new() }
     }
+}
+
+/// A leaf journal never contains a path to move to or delete. The binding selects the directory,
+/// the record selects ONE component, and the transaction ID selects two private work names.
+pub type DiskId = [u8; 24]; // volume serial + 128-bit file ID
+
+pub(crate) fn check_leaf_name(kind: SourceKind, name: &str) -> Result<(), String> {
+    pathsafe::check_component(name).map_err(|e| e.to_string())?;
+    let suffix = match kind {
+        SourceKind::Agents => ".agent.md",
+        SourceKind::Instructions => ".instructions.md",
+        SourceKind::Skills => return Err("skills cannot own loose files".into()),
+    };
+    if !name.ends_with(suffix) || name.len() == suffix.len() {
+        return Err(format!("expected a file named *{suffix}"));
+    }
+    Ok(())
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LeafOrigin {
+    repo: String,
+    branch: String,
+    path: String,
+}
+
+impl From<&RepoConfig> for LeafOrigin {
+    fn from(s: &RepoConfig) -> Self {
+        Self { repo: s.repo.clone(), branch: s.branch.clone(), path: s.path.clone() }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct LeafPoll {
+    pub etag: Option<String>,
+    pub last_check: Option<i64>,
+    pub lists_nothing: bool,
+    pub needs_token: bool,
+    pub source: String,
+    pub ignored: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LeafVersion {
+    pub file: ManagedFile,
+    pub commit: String,
+    pub updated: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct LeafStamp {
+    pub id: DiskId,
+    /// Actual bytes, including any text-equivalent differences in the old copy.
+    pub blob: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct LeafTxn {
+    pub txn: String,
+    pub work: DiskId,
+    pub before: Option<LeafStamp>,
+    pub after: Option<(DiskId, LeafVersion)>,
+    /// Explicit replace retains the original object, even if it wasn't owned.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub keep_backup: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OwnedLeaf {
+    pub name: String,
+    pub installed: Option<LeafVersion>,
+    pub(crate) pending: Option<LeafTxn>,
+}
+
+impl OwnedLeaf {
+    pub fn interrupted(&self) -> bool {
+        self.pending.is_some()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LooseSourceState {
+    binding: DestinationBinding,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    origin: Option<LeafOrigin>,
+    #[serde(default)]
+    pub poll: LeafPoll,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) directory_id: Option<DiskId>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) leaves: Vec<OwnedLeaf>,
+}
+
+impl LooseSourceState {
+    /// Reconstruct the recorded scope (not the user's current settings) for recovery, checking a
+    /// listing, or explicitly unmanaging an orphan. Binding-only format-2 records may predate this field.
+    pub fn recorded_source(&self, id: &str) -> Option<RepoConfig> {
+        let s = self.origin.as_ref()?;
+        Some(RepoConfig {
+            id: id.into(),
+            kind: self.binding.kind(),
+            repo: s.repo.clone(),
+            branch: s.branch.clone(),
+            path: s.path.clone(),
+            ..Default::default()
+        })
+    }
+
+    pub fn binding(&self) -> &DestinationBinding {
+        &self.binding
+    }
+
+    pub fn leaves(&self) -> &[OwnedLeaf] {
+        &self.leaves
+    }
+
+    pub fn leaf(&self, name: &str) -> Option<&OwnedLeaf> {
+        self.leaves.iter().find(|r| pathsafe::fold(&r.name) == pathsafe::fold(name))
+    }
+
+    pub(crate) fn set_leaf(&mut self, name: &str, record: Option<OwnedLeaf>) {
+        self.leaves.retain(|r| pathsafe::fold(&r.name) != pathsafe::fold(name));
+        self.leaves.extend(record);
+        self.poll.etag = None;
+    }
+
+    pub(crate) fn validate(&self) -> Result<(), String> {
+        use crate::hash::is_sha1_hex;
+        self.binding.validate()?;
+        let valid_id = |id: &DiskId| id[8..].iter().any(|b| *b != 0);
+        if self.directory_id.as_ref().is_some_and(|id| !valid_id(id)) || (!self.leaves.is_empty() && (self.directory_id.is_none() || self.origin.is_none())) {
+            return Err("missing or invalid loose destination identity".into());
+        }
+        let mut names = std::collections::HashSet::new();
+        for r in &self.leaves {
+            check_leaf_name(self.binding.kind(), &r.name)?;
+            if !names.insert(pathsafe::fold(&r.name)) || (r.installed.is_none() && r.pending.is_none()) {
+                return Err("duplicate or empty loose file record".into());
+            }
+            for v in r.installed.iter().chain(r.pending.iter().filter_map(|p| p.after.as_ref().map(|(_, v)| v))) {
+                if v.file.path != r.name
+                    || !is_sha1_hex(&v.commit)
+                    || !is_sha1_hex(&v.file.blob)
+                    || v.file.size > crate::tree::MAX_FILE_BYTES
+                    || !v.file.canon.as_deref().is_some_and(|c| c.is_empty() || is_sha1_hex(c))
+                {
+                    return Err("invalid loose file evidence".into());
+                }
+            }
+            if let Some(p) = &r.pending {
+                check_txn(&p.txn)?;
+                if !valid_id(&p.work)
+                    || (!p.keep_backup && p.before.is_some() != r.installed.is_some())
+                    || (p.keep_backup && p.after.is_none())
+                    || (p.before.is_none() && p.after.is_none())
+                    || p.before.as_ref().is_some_and(|b| !valid_id(&b.id) || !is_sha1_hex(&b.blob))
+                    || p.after.as_ref().is_some_and(|(id, _)| !valid_id(id) || p.before.as_ref().is_some_and(|b| b.id == *id))
+                {
+                    return Err("invalid loose transaction evidence".into());
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+// A duplicate map key must not silently replace an immutable binding with the last one read.
+fn read_loose_sources<'de, D: Deserializer<'de>>(d: D) -> Result<BTreeMap<String, LooseSourceState>, D::Error> {
+    struct Sources;
+    impl<'de> serde::de::Visitor<'de> for Sources {
+        type Value = BTreeMap<String, LooseSourceState>;
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("loose source records keyed by unique ID")
+        }
+        fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+            let mut records = BTreeMap::new();
+            while let Some((id, record)) = map.next_entry()? {
+                if records.insert(id, record).is_some() {
+                    return Err(serde::de::Error::custom("two loose sources share an ID"));
+                }
+            }
+            Ok(records)
+        }
+    }
+    d.deserialize_map(Sources)
+}
+
+#[derive(Deserialize)]
+struct StateFormat {
+    #[serde(default = "legacy_version")]
+    version: u32,
+    #[serde(default, deserialize_with = "present")]
+    loose_sources: bool,
+}
+
+fn present<'de, D: Deserializer<'de>>(d: D) -> Result<bool, D::Error> {
+    serde::de::IgnoredAny::deserialize(d).map(|_| true)
 }
 
 /// The records of a skills folder the app no longer uses.
@@ -234,16 +455,46 @@ impl State {
     /// With `quarantine` false nothing on disk changes: a damaged file is reported and left in place. Used by
     /// read-only sessions, which must not write anything.
     pub fn load_with(path: &Path, quarantine: bool) -> io::Result<Loaded> {
+        let loaded = Self::load_sources_with(path, quarantine)?;
+        if !loaded.state.loose_sources.is_empty() {
+            return Err(io::Error::other("state.json contains loose-file sources; the skills engine cannot use it"));
+        }
+        Ok(loaded)
+    }
+
+    /// Typed data access. The skills engine uses `load_with`, which refuses an entire typed record,
+    /// including when settings disappeared or a legacy caller supplies only an ID to remove/recover.
+    pub fn load_sources_with(path: &Path, quarantine: bool) -> io::Result<Loaded> {
         let bytes = match std::fs::read(path) {
             Ok(b) => b,
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Loaded { state: State::default(), warning: None }),
             Err(e) => return Err(e),
         };
-        match serde_json::from_slice::<State>(&bytes) {
-            Ok(state) if state.version > STATE_VERSION => Err(io::Error::other(format!(
-                "state.json was written by a newer version of the app (format {}, this app understands {STATE_VERSION}); not touching it",
-                state.version
-            ))),
+        let decoded = match serde_json::from_slice::<StateFormat>(&bytes) {
+            Ok(format) => {
+                if format.version > STATE_VERSION {
+                    return Err(io::Error::other(format!(
+                        "state.json was written by a newer version of the app (format {}, this app understands {STATE_VERSION}); not touching it",
+                        format.version
+                    )));
+                }
+                if format.loose_sources && format.version < 2 {
+                    return Err(io::Error::other("loose-file state requires state.json format 2"));
+                }
+                match serde_json::from_slice::<State>(&bytes) {
+                    Ok(mut state) => {
+                        state.check_bindings().map_err(io::Error::other)?;
+                        state.version = state.wire_version();
+                        Ok(state)
+                    }
+                    Err(e) if format.version >= 2 || (e.is_data() && Self::tagged_skill_records(&bytes)) => return Err(io::Error::other(e)),
+                    other => other,
+                }
+            }
+            Err(e) if e.is_data() => return Err(io::Error::other(e)),
+            Err(e) => Err(e),
+        };
+        match decoded {
             Ok(state) => Ok(Loaded { state, warning: None }),
             // Starting empty is safe: installed skills then look unmanaged and are protected, never deleted.
             Err(e) if !quarantine => Ok(Loaded {
@@ -265,12 +516,104 @@ impl State {
     }
 
     pub fn save(&self, path: &Path) -> io::Result<()> {
+        self.check_bindings().map_err(io::Error::other)?;
+        if self.version != self.wire_version() {
+            return Err(io::Error::other("state format does not match the recorded sources"));
+        }
         let json = serde_json::to_vec_pretty(self).map_err(io::Error::other)?;
         fsx::write_atomic(path, &json)
     }
 
+    fn wire_version(&self) -> u32 {
+        if self.loose_sources.is_empty() { 1 } else { 2 }
+    }
+
+    fn has_skills_record(&self, id: &str) -> bool {
+        self.repos.contains_key(id) || self.set_aside.iter().any(|a| a.repos.contains_key(id))
+    }
+
+    fn check_bindings(&self) -> Result<(), String> {
+        for (id, record) in &self.loose_sources {
+            if id.trim().is_empty() || self.has_skills_record(id) {
+                return Err(format!("invalid or conflicting loose source ID '{id}' in state.json"));
+            }
+            record.validate()?;
+        }
+        Ok(())
+    }
+
+    /// An ID cannot borrow ownership, pending work, held edits or schedule from another kind.
+    pub fn binding_for(&self, source: &RepoConfig) -> Result<Option<&DestinationBinding>, String> {
+        if source.id.trim().is_empty() {
+            return Err("a destination binding requires a stable source ID".into());
+        }
+        if !source.kind.is_skills() && self.has_skills_record(&source.id) {
+            return Err(format!("source '{}' already has a skills record", source.id));
+        }
+        let Some(record) = self.loose_sources.get(&source.id) else { return Ok(None) };
+        record.binding.check_source(source)?;
+        if record.origin.as_ref().is_some_and(|o| o.repo != source.repo || o.branch != source.branch || o.path != source.path) {
+            return Err(format!("source '{}' no longer describes the recorded repository, branch and folder", source.id));
+        }
+        Ok(Some(&record.binding))
+    }
+
+    /// Record the first resolved destination; subsequent checks may confirm it, never relocate it.
+    pub fn bind_destination(&mut self, source: &RepoConfig, binding: DestinationBinding) -> Result<(), String> {
+        binding.check_source(source)?;
+        if let Some(old) = self.binding_for(source)? {
+            return if *old == binding { Ok(()) } else { Err(format!("source '{}' already has a different destination", source.id)) };
+        }
+        self.loose_sources.insert(
+            source.id.clone(),
+            LooseSourceState { binding, origin: Some(source.into()), poll: LeafPoll::default(), directory_id: None, leaves: Vec::new() },
+        );
+        self.version = self.wire_version();
+        Ok(())
+    }
+
+    /// Includes disabled sources and orphans. Settings are not an ownership index.
+    pub fn loose_sources(&self) -> &BTreeMap<String, LooseSourceState> {
+        &self.loose_sources
+    }
+
+    pub fn leaf_poll_mut(&mut self, source: &RepoConfig) -> Result<&mut LeafPoll, String> {
+        Ok(&mut self.bound_loose_mut(source)?.poll)
+    }
+
+    pub(crate) fn last_check_mut(&mut self, id: &str) -> Option<&mut Option<i64>> {
+        if let Some(r) = self.loose_sources.get_mut(id) { Some(&mut r.poll.last_check) } else { self.repos.get_mut(id).map(|r| &mut r.last_check) }
+    }
+
+    pub(crate) fn bound_loose_mut(&mut self, source: &RepoConfig) -> Result<&mut LooseSourceState, String> {
+        self.binding_for(source)?;
+        let record = self.loose_sources.get_mut(&source.id).ok_or("the loose destination is not bound")?;
+        record.origin.get_or_insert_with(|| source.into());
+        Ok(record)
+    }
+
+    /// Explicit unmanage only. Never release a journal's claim, even for an orphan.
+    pub fn forget_loose_source(&mut self, source: &RepoConfig) -> Result<(), String> {
+        if self.bound_loose_mut(source)?.leaves.iter().any(OwnedLeaf::interrupted) {
+            return Err("finish the interrupted file change before forgetting this source".into());
+        }
+        self.loose_sources.remove(&source.id);
+        self.version = self.wire_version();
+        Ok(())
+    }
+
     pub fn repo(&self, id: &str) -> Option<&RepoState> {
         self.repos.get(id)
+    }
+
+    /// Only on a failed v1 payload decode. A misplaced kind marker is not a damaged ownership
+    /// record to quarantine; even another bad field earlier in the document must not hide it.
+    fn tagged_skill_records(bytes: &[u8]) -> bool {
+        use serde_json::Value;
+        fn tagged(group: &Value) -> bool {
+            group.get("repos").and_then(Value::as_object).is_some_and(|repos| repos.values().any(|r| r.get("kind").is_some()))
+        }
+        serde_json::from_slice::<Value>(bytes).is_ok_and(|v| tagged(&v) || v.get("set_aside").and_then(Value::as_array).is_some_and(|a| a.iter().any(tagged)))
     }
 
     pub fn repo_mut(&mut self, id: &str) -> &mut RepoState {
@@ -449,7 +792,8 @@ mod tests {
     }
 
     fn temp(name: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("tss-state-{name}-{}", fsx::unique_suffix()));
+        let base = std::env::var_os("TSS_TEST_ROOT").filter(|s| !s.is_empty()).map(PathBuf::from).unwrap_or_else(std::env::temp_dir);
+        let d = base.join(format!("tss-state-{name}-{}", fsx::unique_suffix()));
         std::fs::create_dir_all(&d).unwrap();
         d
     }
@@ -511,6 +855,172 @@ mod tests {
         st.repo_mut("r").upsert_skill(skill("alpha"));
         st.save(&path).unwrap();
         assert_eq!(State::load(&path).unwrap().state, st);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    // Frozen v1: the payload must decode, including every pending operation, to reach the version check.
+    #[allow(dead_code)]
+    mod v1_reader {
+        use super::{BTreeMap, Deserialize, HistorySearch, Path, VolumeId};
+
+        #[derive(Deserialize)]
+        struct Record {
+            #[serde(default = "one")]
+            version: u32,
+            skills_dir: Option<String>,
+            volume: Option<VolumeId>,
+            #[serde(default)]
+            repos: BTreeMap<String, Repo>,
+            #[serde(default)]
+            set_aside: Vec<Aside>,
+        }
+        fn one() -> u32 {
+            1
+        }
+        #[derive(Deserialize, Default)]
+        #[serde(default)]
+        struct Aside {
+            skills_dir: String,
+            volume: Option<VolumeId>,
+            repos: BTreeMap<String, Repo>,
+        }
+        #[derive(Deserialize, Default)]
+        #[serde(default)]
+        struct Repo {
+            etag: Option<String>,
+            last_check: Option<i64>,
+            ignored: Vec<String>,
+            skills: Vec<Skill>,
+            lists_nothing: bool,
+            needs_token: bool,
+            source: String,
+            searches: BTreeMap<String, HistorySearch>,
+            history_retry_at: Option<i64>,
+            history_head: Option<String>,
+        }
+        #[derive(Deserialize)]
+        struct Skill {
+            name: String,
+            commit: String,
+            files: Vec<File>,
+            updated: Option<i64>,
+            pending: Option<Pending>,
+        }
+        #[derive(Deserialize)]
+        struct File {
+            path: String,
+            blob: String,
+            size: u64,
+            fp: Option<[u64; 6]>,
+            canon: Option<String>,
+        }
+        #[derive(Deserialize)]
+        #[serde(tag = "op", rename_all = "snake_case")]
+        enum Pending {
+            Update { txn: String, commit: String, files: Vec<File> },
+            Delete { txn: String },
+        }
+        pub fn load(path: &Path) -> &'static str {
+            match serde_json::from_slice::<Record>(&std::fs::read(path).unwrap()) {
+                Ok(record) if record.version > 1 => "refused",
+                Ok(_) => "usable",
+                Err(_) => {
+                    std::fs::rename(path, path.with_file_name("state.json.damaged-v1")).unwrap();
+                    "quarantined"
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn loose_state_and_future_leaf_operations_do_not_enter_a_v1_pending_shape() {
+        use crate::source::{Entry, resolve_destination};
+        let dir = temp("v1-reader");
+        let path = dir.join("state.json");
+        let mut state = State::default();
+        state.repo_mut("legacy").upsert_skill(OwnedSkill {
+            pending: Some(Pending::Update { txn: "t1".into(), commit: "c".into(), files: vec![file("old", true)] }),
+            ..skill("old")
+        });
+        state.save(&path).unwrap();
+        assert_eq!(v1_reader::load(&path), "usable");
+        let legacy = std::fs::read(&path).unwrap();
+        assert!(!String::from_utf8_lossy(&legacy).contains("loose_sources"));
+        let source = RepoConfig { id: "new".into(), repo: "o/r".into(), kind: SourceKind::Agents, ..Default::default() };
+        let binding = resolve_destination(&source, &dir.join("agents"), &["tool.agent.md".into()], None, |_| Ok(Entry::Missing)).unwrap();
+        state.bind_destination(&source, binding.clone()).unwrap();
+        state.save(&path).unwrap();
+        assert_eq!(State::load_sources_with(&path, true).unwrap().state.binding_for(&source).unwrap(), Some(&binding));
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(v1_reader::load(&path), "refused");
+        assert!(State::load(&path).is_err(), "even an orphan or a reused ID cannot reach skills recovery");
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        let mut wire: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(wire["repos"], serde_json::from_slice::<serde_json::Value>(&legacy).unwrap()["repos"]);
+        let operation = serde_json::json!({"op":"replace_leaf","txn":"a2"});
+        wire["loose_sources"]["new"]["pending"] = operation.clone();
+        let future = serde_json::to_vec(&wire).unwrap();
+        std::fs::write(&path, &future).unwrap();
+        assert_eq!(v1_reader::load(&path), "refused", "v1 skips the whole loose namespace");
+        assert!(State::load_sources_with(&path, true).is_err(), "A does not understand leaf operations yet");
+        assert_eq!(std::fs::read(&path).unwrap(), future);
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+        // Negative control: merely bumping the header and extending the old enum would have damaged this file.
+        wire["repos"]["legacy"]["skills"][0]["pending"] = operation;
+        std::fs::write(&path, serde_json::to_vec(&wire).unwrap()).unwrap();
+        assert_eq!(v1_reader::load(&path), "quarantined");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn bindings_are_local_immutable_and_cannot_reuse_an_old_id() {
+        use crate::source::{Entry, resolve_destination};
+        let dir = temp("bindings");
+        let root = dir.join("agents");
+        let source = RepoConfig { id: "id".into(), repo: "o/r".into(), kind: SourceKind::Agents, ..Default::default() };
+        let fresh = |r: &Path| resolve_destination(&source, r, &["tool.agent.md".into()], None, |_| Ok(Entry::Missing)).unwrap();
+        let binding = fresh(&root);
+        let mut state = State::default();
+        state.repo_mut("id").last_check = Some(50);
+        assert!(state.bind_destination(&source, binding.clone()).is_err());
+        let old = std::mem::take(&mut state.repos);
+        state.set_aside.push(SetAside { repos: old, ..Default::default() });
+        assert!(state.bind_destination(&source, binding.clone()).is_err());
+        let mut state = State::default();
+        state.bind_destination(&source, binding.clone()).unwrap();
+        let before = state.clone();
+        state.bind_destination(&source, binding).unwrap();
+        assert!(state.bind_destination(&source, fresh(&dir.join("other"))).is_err());
+        for kind in [SourceKind::Skills, SourceKind::Instructions] {
+            assert!(state.binding_for(&RepoConfig { kind, ..source.clone() }).is_err());
+        }
+        assert_eq!(state, before);
+        assert_eq!(State::default().binding_for(&source).unwrap(), None, "another machine is not bound");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn misplaced_or_unknown_typed_state_is_not_quarantined_or_reinterpreted() {
+        let dir = temp("typed-errors");
+        let path = dir.join("state.json");
+        for bad in [
+            r#"{"version":1,"loose_sources":{}}"#,
+            r#"{"loose_sources":null}"#,
+            r#"{"version":2,"loose_sources":{"s":{"binding":{"kind":null,"root":"C:\\isolated"}}}}"#,
+            r#"{"version":2,"loose_sources":{"s":{"binding":{"kind":"plugins","root":"C:\\isolated"}}}}"#,
+            r#"{"version":2,"loose_sources":{"s":{"binding":{"kind":"agents","root":"C:\\isolated","child":".."}}}}"#,
+            r#"{"version":2,"repos":{"s":{}},"loose_sources":{"s":{"binding":{"kind":"agents","root":"C:\\isolated"}}}}"#,
+            r#"{"version":2,"loose_sources":{"s":{"binding":{"kind":"agents","root":"C:\\a"}},"s":{"binding":{"kind":"instructions","root":"C:\\b"}}}}"#,
+            r#"{"version":1,"repos":{"s":{"kind":null}}}"#,
+            r#"{"version":1,"set_aside":[{"repos":{"s":{"kind":"instructions"}}}]}"#,
+        ] {
+            std::fs::write(&path, bad).unwrap();
+            for quarantine in [false, true] {
+                assert!(State::load_sources_with(&path, quarantine).is_err(), "{bad}");
+                assert_eq!(std::fs::read(&path).unwrap(), bad.as_bytes());
+            }
+        }
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -576,6 +1086,21 @@ mod tests {
     }
 
     #[test]
+    fn future_state_is_refused_before_decoding_an_unrecognized_operation() {
+        let dir = temp("future-op");
+        let path = dir.join("state.json");
+        let bytes = br#"{"repos":{"id":{"skills":[{"name":"mine","commit":"c","files":[],"pending":{"op":"future"}}]}},"version":99}"#;
+        std::fs::write(&path, bytes).unwrap();
+        let refused = State::load(&path).is_err();
+        let kept = std::fs::read(&path).ok();
+        let entries = std::fs::read_dir(&dir).unwrap().count();
+        std::fs::remove_dir_all(dir).unwrap();
+        assert!(refused, "not a damaged v1 record");
+        assert_eq!(kept.as_deref(), Some(bytes.as_slice()));
+        assert_eq!(entries, 1);
+    }
+
+    #[test]
     fn names_are_matched_without_regard_to_case() {
         let mut repo = RepoState::default();
         repo.upsert_skill(skill("Alpha"));
@@ -587,6 +1112,100 @@ mod tests {
         assert!(repo.is_ignored("mine"));
         repo.remove_skill("alpha");
         assert!(repo.skills.is_empty());
+    }
+
+    #[test]
+    fn idless_legacy_settings_still_find_the_edited_owner_and_its_schedule() {
+        use crate::config::Config;
+        use crate::{reconcile, scheduler::Schedule, verify, win::fs::FileHasher};
+        let dir = temp("legacy-owner");
+        let path = dir.join("state.json");
+        let config_path = dir.join("config.json");
+        std::fs::write(&config_path, br#"{"repos":[{"repo":"O/R","path":"one","enabled":false},{"repo":"O/R","path":"two","interval":"6h"}]}"#).unwrap();
+        let bytes = br#"{"version":1,"repos":{"o-r-2":{"etag":"tree","last_check":1000,"ignored":["mine"],"skills":[{"name":"old","commit":"c","files":[{"path":"SKILL.md","blob":"original","size":8}]}]}}}"#;
+        std::fs::write(&path, bytes).unwrap();
+        let cfg = Config::load(&config_path).unwrap();
+        let st = State::load(&path).unwrap().state;
+        let source = &cfg.repos[1];
+        assert_eq!((&source.kind, source.id.as_str()), (&SourceKind::Skills, "o-r-2"));
+        let record = st.repo(&source.id).unwrap();
+        assert!(record.is_ignored("mine"));
+        assert_eq!(Schedule::new().next_wake(&cfg, &st, 1001), Some(1000 + 6 * 3600));
+        let owned = record.skill("old").unwrap();
+        let folder = dir.join(&owned.name);
+        std::fs::create_dir(&folder).unwrap();
+        std::fs::write(folder.join("SKILL.md"), b"my edit").unwrap();
+        let local = verify::verify_skill(&folder, owned, verify::Check::Full, &mut FileHasher::default()).local;
+        let changes = reconcile::plan(&reconcile::Input {
+            desired: &[],
+            rejected: &[],
+            owned: &[reconcile::OwnedView { skill: owned, local, matches_upstream: false }],
+            other_owners: &Default::default(),
+            unmanaged: &Default::default(),
+            ignored: &Default::default(),
+            confirm_mass_delete: true,
+            interrupted: &[],
+        });
+        assert!(matches!(changes[0].verdict, reconcile::Verdict::Held(reconcile::Hold::DeleteBlocked(_))));
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_typed_config_cannot_verify_or_release_an_old_skill_with_the_same_id() {
+        use crate::config::{Config, Paths};
+        use crate::engine::{Access, Engine, Resolution};
+        use crate::github::{Remote, RemoteError, RepoRef, TokenProvider, TreeReply};
+        use crate::secret::Secret;
+        use crate::tree::Snapshot;
+        use std::sync::atomic::AtomicBool;
+
+        struct NoServices;
+        impl TokenProvider for NoServices {
+            fn token(&self) -> Result<Secret, String> {
+                unreachable!()
+            }
+        }
+        impl Remote for NoServices {
+            fn tree(&self, _: &RepoRef, _: Option<&str>, _: Option<&Secret>, _: &AtomicBool) -> Result<TreeReply, RemoteError> {
+                unreachable!()
+            }
+            fn commit(&self, _: &RepoRef, _: Option<&Secret>, _: &AtomicBool) -> Result<String, RemoteError> {
+                unreachable!()
+            }
+            fn history(&self, _: &RepoRef, _: &str, _: &str, _: u32, _: Option<&Secret>, _: &AtomicBool) -> Result<Vec<String>, RemoteError> {
+                unreachable!()
+            }
+            fn historical_tree(&self, _: &RepoRef, _: &str, _: &str, _: Option<&Secret>, _: &AtomicBool) -> Result<Option<Snapshot>, RemoteError> {
+                unreachable!()
+            }
+            fn file(
+                &self,
+                _: &RepoRef,
+                _: &str,
+                _: &str,
+                _: u64,
+                _: Option<&Secret>,
+                _: &AtomicBool,
+                _: &mut dyn FnMut(&[u8]) -> bool,
+            ) -> Result<(), RemoteError> {
+                unreachable!()
+            }
+        }
+
+        let dir = temp("reused-id");
+        let path = dir.join("state.json");
+        let bytes = br#"{"version":1,"repos":{"old":{"skills":[{"name":"mine","commit":"c","files":[]}]}}}"#;
+        std::fs::write(&path, bytes).unwrap();
+        let cfg = Config::parse(br#"{"version":2,"repos":[{"id":"old","repo":"o/r","kind":"agents"}]}"#).unwrap();
+        let paths = Paths::new(dir.clone(), dir.join("skills")).with_file_roots(dir.join("agents"), dir.join("instructions"));
+        let mut engine = Engine::new(paths, Box::new(NoServices), Box::new(NoServices));
+        let verify = engine.verify(&cfg, Access::ReadOnly);
+        let release = engine.resolve(&cfg, "old", "mine", Resolution::KeepMine, &AtomicBool::new(false));
+        let after = std::fs::read(&path).unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+        assert!(verify.is_err() && release.is_err(), "do not enter the skills session with a typed ID");
+        assert_eq!(after, bytes);
     }
 
     #[test]

@@ -6,8 +6,9 @@ These rules keep that from happening. Read [ARCHITECTURE.md](ARCHITECTURE.md) be
 
 ## Never touch real data
 
-- Never read, write or delete anything in the real skills folder (`%USERPROFILE%\.copilot\skills`), the real settings
-  (`%LOCALAPPDATA%\tiny-skill-sync`) or the real work folder (`%USERPROFILE%\.copilot\.tss-work`).
+- Never read, write or delete anything in the real Copilot folders (`%USERPROFILE%\.copilot\skills`,
+  `%USERPROFILE%\.copilot\agents`, `%USERPROFILE%\.copilot\instructions`), their work folders (`.tss-work` beside
+  Skills and `.tss-leaf-work` beside Agents or Instructions), or the real settings (`%LOCALAPPDATA%\tiny-skill-sync`).
 - Never run `tss token set` or `tss token clear`, and never start the app with the real settings. The saved GitHub token
   is shared by every copy of the app.
 - Never print, log or save a token.
@@ -22,8 +23,12 @@ These rules keep that from happening. Read [ARCHITECTURE.md](ARCHITECTURE.md) be
   before the app starts. If you run an exe directly, set both `TSS_` variables first.
 - The live scripts (`e2e`, `soak`) push only to their own branches of the fixture repositories (`e2e-*`, `soak-*`), and
   delete them afterwards. Never push to a fixture's `main`, and never point a live script at a repository you do not own.
-- Tests make their own folders under `%TEMP%` (or `TSS_TEST_ROOT`). A new test must do the same, through
-  `tests\common\mod.rs` (`World`) or the helpers in the module it tests.
+- Tests make their own folders under `%TEMP%` (or `TSS_TEST_ROOT`). The test runner sets `TSS_TEST_ROOT` to that base
+  by default so missing typed roots fail closed. A new engine test must use `tests\common\mod.rs` (`World`) or the
+  module's disposable helpers, and inject roots with `Paths::with_file_roots` or set
+  `TSS_AGENTS_DIR` and `TSS_INSTRUCTIONS_DIR` under the test root. Never let a test resolve these roots from the real
+  user profile; outside the runner, engine tests must set `TSS_TEST_ROOT` to a disposable folder or inject explicit
+  disposable roots.
 
 ## The safety rules the code keeps
 

@@ -686,7 +686,8 @@ mod tests {
             let file = w.home.join(CONFIG_FILE);
             cfg.save(&file).unwrap();
             let remote = GitHubRemote::with_bases("http://127.0.0.1:1", "http://127.0.0.1:1").unwrap();
-            let mut engine = Engine::new(Paths::new(w.home.clone(), w.skills.clone()), Box::new(remote), Box::new(NoCredentials));
+            let paths = Paths::new(w.home.clone(), w.skills.clone()).with_file_roots(w.root.join("agents"), w.root.join("instructions"));
+            let mut engine = Engine::new(paths, Box::new(remote), Box::new(NoCredentials));
             let mut app = App::new(cfg.clone(), w.skills.clone());
             app.set_settings_source(SettingsSource::new(file.clone(), w.bin.clone()));
             let mut dispatch = |app: &mut App| {
@@ -771,7 +772,8 @@ mod tests {
         let mut u = f.worker(false);
         u.files = Box::new(BeforeDecision { off: off.clone(), path: path.clone() });
         let remote = GitHubRemote::with_bases("http://127.0.0.1:1", "http://127.0.0.1:1").unwrap();
-        let mut engine = Engine::new(Paths::new(w.home.clone(), w.skills.clone()), Box::new(remote), Box::new(NoCredentials));
+        let paths = Paths::new(w.home.clone(), w.skills.clone()).with_file_roots(w.root.join("agents"), w.root.join("instructions"));
+        let mut engine = Engine::new(paths, Box::new(remote), Box::new(NoCredentials));
         let mut app = App::new(cfg, w.skills.clone());
         app.set_settings_source(SettingsSource::new(path.clone(), w.bin.clone()));
         let mut next = |app: &mut App| {

@@ -2,7 +2,7 @@
 //! (the name and version Windows shows for the program, as in Task Manager's startup apps) and the icon
 //! (`assets\tiny-skill-sync.ico`, which Explorer, a taskbar pin and Settings show) into the executables with the MSVC
 //! linker. No resource compiler or extra crate is needed: the resources are written here as a `.res` file, which the
-//! linker takes as it is.
+//! linker takes as it is. With the static C runtime, the executables take its Universal C Runtime part from Windows.
 
 use std::path::Path;
 
@@ -31,6 +31,12 @@ fn main() {
         println!("cargo:rustc-link-arg-{kind}=/MANIFEST:EMBED");
         println!("cargo:rustc-link-arg-{kind}=/MANIFESTUAC:NO");
         println!("cargo:rustc-link-arg-{kind}=/MANIFESTINPUT:{dir}\\app.manifest");
+    }
+    // Windows 10 and 11 include the Universal C Runtime (ucrtbase.dll); only the Visual C++ runtime part needs to be
+    // static to avoid the redistributable. Linking the rest from Windows saves about 75 KB per exe.
+    if std::env::var("CARGO_CFG_TARGET_FEATURE").is_ok_and(|features| features.split(',').any(|f| f == "crt-static")) {
+        println!("cargo:rustc-link-arg-bins=/NODEFAULTLIB:libucrt.lib");
+        println!("cargo:rustc-link-arg-bins=/DEFAULTLIB:ucrt.lib");
     }
     let icon = icon_res(&std::fs::read(Path::new(&dir).join(ICON)).expect("assets\\tiny-skill-sync.ico can be read"));
     let out = env("OUT_DIR");

@@ -18,8 +18,9 @@ use crate::config::{Config, RepoConfig};
 use crate::engine::{ApplyResult, Failure, LocalStatus, Outcome, RepoReport, Resolution, SkillFacts, SkillReport, StartupReport, SyncReport, VerifyReport};
 use crate::github::FailureKind;
 use crate::interval::UnixSecs;
-use crate::pathsafe::fold;
+use crate::pathsafe::{fold, printable};
 use crate::reconcile::{Hold, LocalState, Skip, Verdict};
+use crate::source::{PreviewDestination, SourceKind, SourcePreview};
 
 pub const APP_NAME: &str = "Tiny Skill Sync";
 /// A tray tooltip holds 127 UTF-16 units (128 with the closing zero).
@@ -29,6 +30,72 @@ const MAX_MESSAGES: usize = 30;
 /// "owner/repo" from a label such as "owner/repo@main : skills"; neither part of a repository name has '@' or a space.
 pub fn repo_name(label: &str) -> &str {
     label.split(['@', ' ']).next().unwrap_or(label)
+}
+
+impl SourceKind {
+    pub(crate) fn heading(self) -> &'static str {
+        match self {
+            Self::Skills => "Skills",
+            Self::Agents => "Agents",
+            Self::Instructions => "Instructions",
+        }
+    }
+
+    pub(crate) fn nouns(self) -> (&'static str, &'static str) {
+        match self {
+            Self::Skills => ("skill", "skills"),
+            Self::Agents => ("agent", "agents"),
+            Self::Instructions => ("instruction file", "instruction files"),
+        }
+    }
+}
+
+pub(crate) fn source_folder(source: &RepoConfig) -> &str {
+    if source.path.is_empty() { "repository root" } else { &source.path }
+}
+
+pub(crate) fn item_nouns(mut kinds: impl Iterator<Item = SourceKind>) -> (&'static str, &'static str) {
+    let first = kinds.next().unwrap_or_default();
+    if kinds.all(|k| k == first) { first.nouns() } else { ("item", "items") }
+}
+
+impl SourcePreview {
+    pub(crate) fn blocker(&self, source: &RepoConfig) -> Option<&'static str> {
+        if self.kind != source.kind {
+            Some("The preview is for a different source type.")
+        } else if !self.errors.is_empty() {
+            Some("The listing contains rejected items. Choose a different source or fix the listing first.")
+        } else if self.names.is_empty() {
+            Some(match source.kind {
+                SourceKind::Skills => "No matching items were found. Check the source type and folder.",
+                SourceKind::Agents => "No *.agent.md files were found directly in this folder. Check the source type and folder.",
+                SourceKind::Instructions => "No *.instructions.md files were found directly in this folder. Check the source type and folder.",
+            })
+        } else if !matches!(self.destination, PreviewDestination::Resolved(_)) {
+            Some("The destination could not be confirmed.")
+        } else {
+            None
+        }
+    }
+
+    pub(crate) fn description(&self) -> String {
+        use std::fmt::Write;
+        let destination = match &self.destination {
+            PreviewDestination::Resolved(dir) => printable(&dir.to_string_lossy()).into_owned(),
+            PreviewDestination::Held(why) => format!("not available: {}", printable(why)),
+            PreviewDestination::NotChecked => "not checked".into(),
+        };
+        let (one, many) = self.kind.nouns();
+        let n = self.count();
+        let mut text = format!("Type: {}\nDestination: {destination}\nMatched {n} {}:", self.kind.heading(), if n == 1 { one } else { many });
+        for name in &self.names {
+            let _ = write!(text, "\n  {}", printable(name));
+        }
+        for why in &self.errors {
+            let _ = write!(text, "\nRejected: {}", printable(why));
+        }
+        text
+    }
 }
 
 /// How serious something is. The worst one wins when levels are rolled up.
@@ -119,6 +186,7 @@ pub struct Row {
 pub struct RepoView {
     pub id: String,
     pub label: String,
+    pub kind: SourceKind,
     pub enabled: bool,
     /// Short: "Up to date", "Needs attention (2)", "No connection".
     pub status: String,
@@ -213,8 +281,16 @@ impl SkillBoard {
         Some(SkillBoard { name: name.clone(), local: hint_of(verdict), fact })
     }
 
-    fn row(&self) -> Row {
-        let shown = present(self.local.as_ref(), self.fact.as_ref());
+    fn row(&self, kind: SourceKind) -> Row {
+        let mut shown = present(self.local.as_ref(), self.fact.as_ref());
+        if kind != SourceKind::Skills {
+            match (&self.fact, shown.tag) {
+                (Some(Fact::NameTaken), DIFFERENT_TAG) => shown.text = "A file with this name already exists and differs from GitHub.".into(),
+                (Some(Fact::Newer), DELETED_TAG) => shown.text = "Update held: the file was deleted on this PC.".into(),
+                (Some(Fact::EmptyListing), LISTS_NOTHING_TAG) => shown.text = format!("Removal held: GitHub lists no {}.", kind.nouns().1),
+                _ => {}
+            }
+        }
         let listed = !matches!(self.fact, Some(Fact::Removed | Fact::EmptyListing | Fact::NotSafe(_)));
         let folder_missing = matches!(self.local, Some(LocalStatus::Checked(LocalState::FolderMissing)));
         Row { name: self.name.clone(), text: shown.text, tag: shown.tag, level: shown.level, actions: shown.actions, facts: None, listed, folder_missing }
@@ -345,6 +421,9 @@ fn size_text(bytes: u64) -> String {
 /// Puts what is known about the disk and about upstream together. An edit or a deletion is the user's doing and is
 /// shown the same way whatever upstream says; the choices differ only where upstream has no version to offer.
 fn present(local: Option<&LocalStatus>, fact: Option<&Fact>) -> Shown {
+    if let Some(LocalStatus::Unavailable(why)) = local {
+        return shown(format!("Could not check the file: {why}"), "Not checked", Level::Error, &[]);
+    }
     use Level::{Attention, Ok};
     if let Some(LocalStatus::Interrupted) = local {
         return shown(Verdict::Held(Hold::Interrupted).message(), INTERRUPTED_TAG, Attention, &[]);
@@ -417,8 +496,8 @@ struct RepoBoard {
 }
 
 impl RepoBoard {
-    fn rows(&self) -> Vec<Row> {
-        let mut rows: Vec<Row> = self.skills.iter().map(|(key, skill)| Row { facts: self.facts.get(key).cloned(), ..skill.row() }).collect();
+    fn rows(&self, kind: SourceKind) -> Vec<Row> {
+        let mut rows: Vec<Row> = self.skills.iter().map(|(key, skill)| Row { facts: self.facts.get(key).cloned(), ..skill.row(kind) }).collect();
         rows.sort_by_key(|row| std::cmp::Reverse(row.level));
         rows
     }
@@ -499,6 +578,10 @@ impl Board {
 
     /// Only real checks belong here, not dry runs.
     pub fn note_sync(&mut self, report: &SyncReport, now: UnixSecs) {
+        self.note_source_sync(report, now, &Config::default());
+    }
+
+    pub(crate) fn note_source_sync(&mut self, report: &SyncReport, now: UnixSecs, cfg: &Config) {
         for repo_report in &report.repos {
             let repo = self.repos.entry(repo_report.repo_id.clone()).or_default();
             // A listing replaces the rows, even one with nothing in it. No listing at all means the check did not get
@@ -513,14 +596,19 @@ impl Board {
             repo.check = Some(repo_report.outcome.clone());
         }
         for repo_report in &report.repos {
-            self.tell_changes(now, repo_report);
+            self.tell_changes(now, repo_report, cfg);
         }
         self.tell(now, &report.notes, &report.warnings);
     }
 
     /// One message for each kind of change a check made on this PC. Up to three skills are named, more are counted.
-    fn tell_changes(&mut self, now: UnixSecs, report: &RepoReport) {
-        let from = repo_name(&report.label);
+    fn tell_changes(&mut self, now: UnixSecs, report: &RepoReport, cfg: &Config) {
+        let source = cfg.find(&report.repo_id);
+        let kind = source.map_or(SourceKind::Skills, |s| s.kind);
+        let label = source
+            .filter(|s| kind != SourceKind::Skills || cfg.repos.iter().any(|r| r.id != s.id && r.repo.eq_ignore_ascii_case(&s.repo)))
+            .map(|s| format!("{}: {} [{}]", kind.heading(), s.label(), s.id));
+        let from = label.as_deref().unwrap_or_else(|| repo_name(&report.label));
         for verdict in [Verdict::Install, Verdict::Update, Verdict::Delete, Verdict::Adopt, Verdict::AdoptHistorical, Verdict::CatchUp] {
             let names: Vec<&str> = report.skills.iter().filter(|s| s.result == ApplyResult::Done && s.verdict == verdict).map(|s| s.name.as_str()).collect();
             let what = match names.as_slice() {
@@ -528,7 +616,7 @@ impl Board {
                 [one] => one.to_string(),
                 [a, b] => format!("{a} and {b}"),
                 [a, b, c] => format!("{a}, {b} and {c}"),
-                many => format!("{} skills", many.len()),
+                many => format!("{} {}", many.len(), kind.nouns().1),
             };
             let (them, they) = if names.len() == 1 { ("it", "it is") } else { ("them", "they are") };
             let text = match verdict {
@@ -669,20 +757,21 @@ impl Board {
     pub fn tooltip(&self, cfg: &Config) -> String {
         let views = self.views(cfg, 0);
         let enabled = || views.iter().filter(|view| view.enabled);
+        let (one_item, many_items) = item_nouns(enabled().map(|v| v.kind));
         let body = match self.health(cfg) {
             Health::Working => "checking for updates…".to_string(),
             Health::Waiting => "waiting for Windows to finish starting".to_string(),
             Health::NotConfigured => "no repositories are set up".to_string(),
-            Health::Ok => "all skills are up to date".to_string(),
+            Health::Ok => format!("all {many_items} are up to date"),
             Health::Attention => {
                 let count: usize = enabled().map(|view| view.skills.iter().filter(|row| row.level >= Level::Attention).count()).sum();
                 // A repository that needs attention without a single skill to blame is one that lists none.
                 let empty: Vec<&RepoView> = enabled().filter(|view| view.level >= Level::Attention && view.skills.is_empty()).collect();
                 match (count, empty.as_slice()) {
                     (0, [one]) => format!("{}: {}", one.label, one.status),
-                    (0, many) if !many.is_empty() => format!("{} repositories have no skills", many.len()),
-                    (1, _) => "1 skill needs attention".to_string(),
-                    (n, _) => format!("{n} skills need attention"),
+                    (0, many) if !many.is_empty() => format!("{} repositories have no {many_items}", many.len()),
+                    (1, _) => format!("1 {one_item} needs attention"),
+                    (n, _) => format!("{n} {many_items} need attention"),
                 }
             }
             Health::Error => {
@@ -699,11 +788,12 @@ impl Board {
 
     fn view_of(&self, repo: &RepoConfig, now: UnixSecs) -> RepoView {
         let board = self.repos.get(&repo.id);
-        let skills = board.map(RepoBoard::rows).unwrap_or_default();
+        let skills = board.map(|b| b.rows(repo.kind)).unwrap_or_default();
         let (level, status, detail) = judge(repo, board, &skills, now);
         RepoView {
             id: repo.id.clone(),
             label: repo.label(),
+            kind: repo.kind,
             enabled: repo.enabled,
             status,
             detail,
@@ -752,6 +842,10 @@ fn judge(repo: &RepoConfig, board: Option<&RepoBoard>, rows: &[Row], now: UnixSe
     // listing tells: a repository whose skills were all held or skipped has no rows after a restart either.
     let lists_nothing = board.is_some_and(|b| b.lists_nothing);
     if lists_nothing && rows.is_empty() && matches!(outcome, None | Some(Outcome::Unchanged | Outcome::Synced)) {
+        if repo.kind != SourceKind::Skills {
+            let status = format!("No {} found", repo.kind.nouns().1);
+            return (Level::Attention, status.clone(), Some(format!("{status} in {}. Check the source type, branch and folder.", repo.label())));
+        }
         return (Level::Attention, NO_SKILLS.to_string(), Some(no_skills_advice(repo)));
     }
     let status = match outcome {
@@ -860,6 +954,16 @@ mod tests {
 
     use super::*;
     use crate::engine::{LocalReport, Tracking};
+
+    #[test]
+    fn continuation_an_empty_loose_source_does_not_say_it_was_looking_for_skills() {
+        let source = RepoConfig { kind: SourceKind::Instructions, ..Default::default() };
+        let empty = SourcePreview { kind: source.kind, names: vec![], destination: PreviewDestination::NotChecked, errors: vec![] };
+        assert!(empty.blocker(&source).unwrap().contains("*.instructions.md"), "{:?}", empty.blocker(&source));
+        let source = RepoConfig { kind: SourceKind::Agents, ..Default::default() };
+        let empty = SourcePreview { kind: source.kind, ..empty };
+        assert!(empty.blocker(&source).unwrap().contains("*.agent.md"), "{:?}", empty.blocker(&source));
+    }
     use crate::reconcile::DirtyInfo;
     use crate::tree::Rejected;
     use crate::verify::{Check, Stats};

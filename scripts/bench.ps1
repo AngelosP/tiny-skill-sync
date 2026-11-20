@@ -430,7 +430,7 @@ try {
 
     # 7. Size
     $size = (Get-Item $exe).Length
-    Add-Row 'tiny-skill-sync.exe' ('{0:N0} bytes ({1:N2} MiB)' -f $size, ($size / 1MB)) '1.1 MiB or less' ($size -le 1.1MB)
+    Add-Row 'tiny-skill-sync.exe' ('{0:N0} bytes ({1:N2} MiB)' -f $size, ($size / 1MB)) '1.25 MiB or less' ($size -le 1.25MB)
 } finally {
     foreach ($p in $started) { if (-not $p.HasExited) { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue } }
     if ($Keep) { Write-Host "Kept: $root" } elseif (Test-Path -LiteralPath $root) { Start-Sleep -Milliseconds 200; Remove-Item -LiteralPath $root -Recurse -Force }

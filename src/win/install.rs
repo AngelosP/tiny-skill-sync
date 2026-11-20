@@ -212,6 +212,15 @@ pub(crate) fn create(path: &Path) -> io::Result<File> {
 
 /// Same-volume rename, not copy/delete, not replace. The source is the very handle that was verified.
 pub(crate) fn rename(f: &File, to: &Path) -> io::Result<()> {
+    rename_handle(f, to, false)
+}
+
+/// Publish a newly written settings temp file without closing or reopening its name.
+pub(crate) fn rename_replacing(f: &File, to: &Path) -> io::Result<()> {
+    rename_handle(f, to, true)
+}
+
+fn rename_handle(f: &File, to: &Path, replace: bool) -> io::Result<()> {
     let name = wide_os(to.as_os_str());
     let bytes = (name.len() - 1) * 2;
     // Keep an actual trailing NUL as well as the byte count. The Win32 wrapper converts a DOS
@@ -219,9 +228,10 @@ pub(crate) fn rename(f: &File, to: &Path) -> io::Result<()> {
     let size = offset_of!(FILE_RENAME_INFO, FileName) + bytes + 2;
     let mut storage = vec![0usize; size.div_ceil(size_of::<usize>())];
     let p = storage.as_mut_ptr().cast::<FILE_RENAME_INFO>();
-    // SAFETY: word-aligned, zeroed storage (ReplaceIfExists = false, RootDirectory = NULL);
+    // SAFETY: word-aligned, zeroed storage (RootDirectory = NULL);
     // The byte count excludes the terminating NUL.
     unsafe {
+        (*p).Anonymous.ReplaceIfExists = replace;
         (*p).FileNameLength = bytes as u32;
         std::ptr::copy_nonoverlapping(name.as_ptr(), std::ptr::addr_of_mut!((*p).FileName).cast::<u16>(), name.len());
         if SetFileInformationByHandle(f.as_raw_handle(), FileRenameInfo, p.cast(), size as u32) == 0 {

@@ -6,7 +6,7 @@
   The same checks a change must pass before it is done (see CONTRIBUTING.md).
   Tests work only in their own folders under %TEMP% (or under -Root); they never touch the real skills folder,
   the real settings or the saved GitHub token. A failing test may leave its folder behind: 'scripts\dev.ps1 clean'
-  removes those.
+  removes those. TSS_TEST_ROOT is set to this test base by default so engine tests fail closed on missing file roots.
 
 .PARAMETER Quick
   Only run the tests: no formatting check and no clippy.
@@ -42,10 +42,9 @@ try {
         Write-Host '== cargo clippy' -ForegroundColor Cyan
         Invoke-Native cargo @('clippy', '--all-targets', '--', '-D', 'warnings')
     }
-    if ($Root) {
-        New-Item -ItemType Directory -Force $Root | Out-Null
-        $env:TSS_TEST_ROOT = $Root
-    }
+    $testRoot = if ($Root) { $Root } elseif ($env:TSS_TEST_ROOT) { $env:TSS_TEST_ROOT } else { $env:TEMP }
+    New-Item -ItemType Directory -Force $testRoot | Out-Null
+    $env:TSS_TEST_ROOT = $testRoot
     Write-Host '== cargo test' -ForegroundColor Cyan
     $testArgs = @('test', '--no-fail-fast')
     if ($Filter) { $testArgs += @('--', $Filter) }

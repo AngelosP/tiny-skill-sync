@@ -51,7 +51,7 @@ impl World {
     }
 
     pub fn paths(&self) -> Paths {
-        Paths::new(self.home.clone(), self.skills.clone())
+        Paths::new(self.home.clone(), self.skills.clone()).with_file_roots(self.root.join("agents"), self.root.join("instructions"))
     }
 
     pub fn engine(&self, remote: &Arc<FakeRemote>) -> Engine {
@@ -81,7 +81,7 @@ impl World {
 
     /// The recorded state, read from the file.
     pub fn state(&self) -> State {
-        State::load(&self.state_file()).expect("state.json can be read").state
+        State::load_sources_with(&self.state_file(), false).expect("state.json can be read").state
     }
 
     pub fn read(&self, rel: &str) -> String {
@@ -551,7 +551,11 @@ impl Remote for Client {
         } else {
             format!("{}/{rel}", repo.path)
         };
-        Ok(listing(files, &path).map(|entries| Snapshot { sha: etag_of(&entries), truncated: r.truncated, entries }))
+        Ok(listing(files, &path).map(|entries| {
+            let tag = etag_of(&entries);
+            let sha = tag.trim_matches('"').to_string();
+            Snapshot { sha, truncated: r.truncated, entries }
+        }))
     }
 
     fn tree(&self, repo: &RepoRef, etag: Option<&str>, token: Option<&Secret>, cancel: &AtomicBool) -> Result<TreeReply, RemoteError> {
@@ -579,7 +583,8 @@ impl Remote for Client {
         if etag == Some(current.as_str()) {
             return Ok(TreeReply::NotModified);
         }
-        Ok(TreeReply::Snapshot { etag: Some(current.clone()), snapshot: Snapshot { sha: current, truncated: r.truncated, entries } })
+        let sha = current.trim_matches('"').to_string();
+        Ok(TreeReply::Snapshot { etag: Some(current), snapshot: Snapshot { sha, truncated: r.truncated, entries } })
     }
 
     fn commit(&self, repo: &RepoRef, token: Option<&Secret>, cancel: &AtomicBool) -> Result<String, RemoteError> {

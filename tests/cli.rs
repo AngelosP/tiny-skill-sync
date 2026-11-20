@@ -14,10 +14,11 @@ use common::*;
 use tiny_skill_sync::autostart::{Keys, Startup, TEST_ROOT, VALUE_NAME, program};
 use tiny_skill_sync::board::APP_NAME;
 use tiny_skill_sync::cli::{self, Host};
-use tiny_skill_sync::config::{CONFIG_FILE, Config, Paths, UpdateInterval, UpdatePrefs, UpdateTiming};
+use tiny_skill_sync::config::{CONFIG_FILE, Config, Paths, RepoSpec, UpdateInterval, UpdatePrefs, UpdateTiming};
 use tiny_skill_sync::github::{FailureKind, Remote, RemoteError, TokenProvider};
 use tiny_skill_sync::logo;
 use tiny_skill_sync::portable::{SETTINGS_FILE, SOURCES_FILE};
+use tiny_skill_sync::source::SourceKind;
 use tiny_skill_sync::updater::Action as AppAction;
 use tiny_skill_sync::win::{autorun, wide};
 use windows_sys::Win32::Foundation::ERROR_SUCCESS;
@@ -36,6 +37,7 @@ struct TestHost {
     app: Option<FakeApp>,
     change_before_second_home_read: Mutex<Option<Config>>,
     home_reads: std::cell::Cell<u32>,
+    confirm_add: std::cell::Cell<Option<bool>>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -69,6 +71,10 @@ impl Host for TestHost {
         self.world.skills.clone()
     }
 
+    fn source_paths(&self, skills: PathBuf) -> Paths {
+        Paths::new(self.home(), skills).with_file_roots(self.world.root.join("agents"), self.world.root.join("instructions"))
+    }
+
     fn installed_app_version(&self, directory: &Path) -> Result<String, String> {
         assert_eq!(directory, self.world.root.join("exe"));
         let app = self.app.as_ref().expect("a skill command inspected the app binaries");
@@ -100,6 +106,10 @@ impl Host for TestHost {
     fn tokens(&self) -> Box<dyn TokenProvider> {
         self.skill_services_only();
         self.tokens.provider()
+    }
+
+    fn confirm_source(&self) -> Result<bool, String> {
+        Ok(self.confirm_add.take().expect("a command not adding a typed source asked for confirmation"))
     }
 
     fn token_saved(&self) -> bool {
@@ -158,9 +168,10 @@ impl TestHost {
     fn empty(name: &str) -> TestHost {
         let world = World::new(name);
         std::fs::create_dir_all(world.root.join("exe")).unwrap();
+        let remote = FakeRemote::new();
         TestHost {
             world,
-            remote: FakeRemote::new(),
+            remote,
             tokens: FakeTokens::none(),
             saved: Mutex::new(None),
             gh: Err("the GitHub CLI is not signed in".to_string()),
@@ -169,6 +180,7 @@ impl TestHost {
             app: None,
             change_before_second_home_read: Mutex::new(None),
             home_reads: std::cell::Cell::new(0),
+            confirm_add: std::cell::Cell::new(None),
         }
     }
 
@@ -189,7 +201,7 @@ impl TestHost {
     }
 
     fn config(&self) -> Config {
-        Config::load(&self.config_file()).unwrap()
+        Config::load_sources(&self.config_file()).unwrap()
     }
 }
 
@@ -541,6 +553,79 @@ fn repositories_are_added_once_and_named_unambiguously() {
 }
 
 #[test]
+fn source_preview_is_read_only_and_typed_add_requires_consent() {
+    let host = TestHost::empty("cli-source-preview");
+    host.remote.put(REPO, "caf\u{e9}/SKILL.md", "one");
+    let before = host.world.snapshot();
+    let preview = tss(&host, "add o/fixtures --preview");
+    expect(&preview, 0, &["Read-only preview", "Matched 1 skill:", "caf\\u{e9}", "Destination:", "Type: Skills"]);
+    assert!(preview.out.is_ascii());
+    assert_eq!(host.world.snapshot(), before);
+    host.confirm_add.set(Some(false));
+    expect(&tss(&host, "add o/fixtures --type skills"), 0, &["Matched 1 skill:", "Cancelled. Nothing was saved or installed."]);
+    assert_eq!(host.world.snapshot(), before);
+
+    host.remote.set_truncated(REPO, true);
+    expect(&tss(&host, "add o/fixtures --type skills"), 2, &[]);
+    assert_eq!(host.world.snapshot(), before);
+    host.remote.set_truncated(REPO, false);
+    host.confirm_add.set(Some(true));
+    expect(&tss(&host, "add o/fixtures --type skills"), 0, &["Matched 1 skill:", "Added o/fixtures"]);
+    assert_eq!(host.config().repos[0].kind, SourceKind::Skills);
+    assert!(host.world.skill_names().is_empty() && !host.world.state_file().exists());
+}
+
+#[test]
+fn source_preview_rechecks_listing_before_saving() {
+    let host = TestHost::empty("cli-source-stale");
+    host.remote.put(REPO, "first/SKILL.md", "one");
+    let remote = Arc::downgrade(&host.remote);
+    let mut listings = 0;
+    host.remote.on_call(move |line| {
+        if line.starts_with("tree ") {
+            listings += 1;
+            if listings == 2 {
+                remote.upgrade().unwrap().put(REPO, "second/SKILL.md", "two");
+            }
+        }
+    });
+    host.confirm_add.set(Some(true));
+    let before = host.world.snapshot();
+    expect(&tss(&host, "add o/fixtures --type skills"), 2, &["Matched 1 skill:", "changed"]);
+    assert_eq!(host.world.snapshot(), before);
+}
+
+#[test]
+fn source_preview_reports_only_the_selected_type_and_its_rejections() {
+    let host = TestHost::empty("cli-source-rejected");
+    host.remote.put(REPO, "ordinary.agent.md", "one");
+    host.remote.put(REPO, "CON.agent.md", "bad");
+    host.remote.put(REPO, "other.instructions.md", "other");
+    let before = host.world.snapshot();
+    let ran = tss(&host, "add o/fixtures --type agents --preview");
+    expect(&ran, 2, &["Type: Agents", "Matched 1 agent:", "ordinary.agent.md", "Rejected:", "CON.agent.md", "Nothing was saved or installed"]);
+    assert!(!ran.out.contains("other.instructions.md"));
+    assert_eq!(host.world.snapshot(), before);
+}
+
+#[test]
+fn source_ids_disambiguate_types_and_delete_skills_never_means_files() {
+    let host = TestHost::empty("cli-source-select");
+    let spec = RepoSpec::parse(REPO).unwrap();
+    let mut cfg = Config::default();
+    let skills = cfg.add_source(SourceKind::Skills, &spec, None, false).id.clone();
+    let agents = cfg.add_source(SourceKind::Agents, &spec, None, false).id.clone();
+    host.save(&cfg);
+    let before = host.world.snapshot();
+    expect(&tss(&host, "resolve o/fixtures mine.agent.md keep"), 3, &["matches several", &skills, &agents]);
+    expect(&tss(&host, "remove o/fixtures --delete-skills"), 3, &["matches several", &skills, &agents]);
+    expect(&tss(&host, &format!("remove {agents} --delete-skills")), 3, &["only for a Skills source"]);
+    assert_eq!(cli::find_repo(&cfg, &agents).unwrap().kind, SourceKind::Agents);
+    assert_eq!(host.world.snapshot(), before);
+    assert!(host.remote.log().is_empty());
+}
+
+#[test]
 fn a_repository_whose_skills_are_in_a_subfolder_is_not_reported_as_fine() {
     let host = TestHost::empty("cli-subfolder");
     host.remote.seed_standard("o/fixtures");
@@ -618,7 +703,7 @@ fn skills_of_a_repository_gone_from_the_settings_can_be_let_go() {
     let host = TestHost::new("cli-orphan");
     expect(&tss(&host, "check"), 0, &[]);
     host.save(&Config::default());
-    expect(&tss(&host, "status"), 0, &["Skills recorded for 'fx', which is no longer in the settings, are left alone.", "tss remove fx"]);
+    expect(&tss(&host, "status"), 0, &["Items recorded for 'fx', which is no longer in the settings, are left alone.", "tss remove fx"]);
     expect(&tss(&host, "remove fx"), 0, &["Stopped tracking the skills recorded for 'fx'.", "now yours: alpha, beta, gamma"]);
     let ran = tss(&host, "status");
     assert!(!ran.out.contains("'fx'"), "{ran:?}");
@@ -935,6 +1020,44 @@ fn both_executables_tell_windows_their_name_and_version() {
         assert_eq!(info.text("FileVersion").as_deref(), Some(env!("CARGO_PKG_VERSION")));
         assert_eq!(info.text("ProductVersion").as_deref(), Some(env!("CARGO_PKG_VERSION")));
         assert_eq!(info.numbers(), Some(numbers), "{file}");
+    }
+}
+
+/// The DLLs an exe imports, lowercase, read from its PE import table.
+fn imported_dlls(exe: &str) -> Vec<String> {
+    let data = std::fs::read(exe).unwrap();
+    let u16_at = |at: usize| u16::from_le_bytes([data[at], data[at + 1]]) as usize;
+    let u32_at = |at: usize| u32::from_le_bytes([data[at], data[at + 1], data[at + 2], data[at + 3]]) as usize;
+    let pe = u32_at(0x3C);
+    assert_eq!(&data[pe..pe + 4], b"PE\0\0", "{exe} is a PE file");
+    let optional = pe + 24;
+    assert_eq!(u16_at(optional), 0x20B, "{exe} is a 64-bit exe");
+    let sections = optional + u16_at(pe + 20);
+    let file_offset = |rva: usize| {
+        (0..u16_at(pe + 6))
+            .map(|i| sections + 40 * i)
+            .find_map(|s| (u32_at(s + 12)..u32_at(s + 12) + u32_at(s + 8)).contains(&rva).then(|| u32_at(s + 20) + rva - u32_at(s + 12)))
+            .unwrap_or_else(|| panic!("{exe}: address {rva:#x} is in a section"))
+    };
+    // The import directory is the second data directory; each descriptor is 20 bytes, its DLL name at offset 12.
+    let mut at = file_offset(u32_at(optional + 120));
+    let mut dlls = Vec::new();
+    while u32_at(at + 12) != 0 {
+        let name = file_offset(u32_at(at + 12));
+        let end = name + data[name..].iter().position(|&b| b == 0).unwrap();
+        dlls.push(String::from_utf8_lossy(&data[name..end]).to_ascii_lowercase());
+        at += 20;
+    }
+    dlls
+}
+
+#[test]
+fn both_executables_use_the_c_runtime_windows_includes() {
+    for exe in [env!("CARGO_BIN_EXE_tiny-skill-sync"), env!("CARGO_BIN_EXE_tss")] {
+        let dlls = imported_dlls(exe);
+        assert!(dlls.iter().any(|dll| dll.starts_with("api-ms-win-crt-")), "{exe} links the Universal C Runtime from Windows: {dlls:?}");
+        let redistributable = ["vcruntime", "msvcp", "ucrtbased", "concrt", "vccorlib"];
+        assert!(!dlls.iter().any(|dll| redistributable.iter().any(|r| dll.starts_with(r))), "{exe} needs no Visual C++ redistributable: {dlls:?}");
     }
 }
 

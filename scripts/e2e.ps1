@@ -18,6 +18,7 @@
     install       first start: what is installed, how the idle app behaves, how fast it quits
     places        with no TSS_ folders: skills go to %USERPROFILE%\.copilot\skills, beside skills written by hand
     portable      export settings once, then run two copies with separate state and skills folders
+    mixed         two disposable profiles share Skills, Agents and Instructions sources via the CLI and tray
     changes       six kinds of upstream change reach the disk through the tray's "Sync now"
     local-edit    an edit made while the app runs, then an upstream change to the same skill
     converged     an edit made here that GitHub has too is marked as in sync; one GitHub does not have stays held
@@ -305,8 +306,11 @@ function Test-Places {
         Check 'the work folder is beside the skills folder: .copilot\.tss-work' ($around -eq '.tss-work,config.json,skills') $around
         $app = Get-Entries $appDir
         Check 'the settings and the record are in %LOCALAPPDATA%\tiny-skill-sync' ((Test-Path -LiteralPath (Join-Path $appDir 'config.json')) -and (Test-Path -LiteralPath (Join-Path $appDir 'state.json'))) $app
-        $elsewhere = "user: $(Get-Entries $user); local: $(Get-Entries $local); TSS_SKILLS_DIR: $(Get-Entries $c.Skills); TSS_HOME: $(Get-Entries $c.Home)"
-        Check 'nothing was written anywhere else' ($elsewhere -eq 'user: .copilot; local: tiny-skill-sync; TSS_SKILLS_DIR: ; TSS_HOME: ') $elsewhere
+        $userEntries = Get-Entries $user
+        $localEntries = Get-Entries $local
+        $localOkay = $localEntries -eq 'tiny-skill-sync' -or $localEntries -eq 'GitHub CLI,tiny-skill-sync'
+        $elsewhere = "user: $userEntries; local: $localEntries; TSS_SKILLS_DIR: $(Get-Entries $c.Skills); TSS_HOME: $(Get-Entries $c.Home)"
+        Check 'only the throwaway profile, app settings and optional GitHub CLI state were written' ($userEntries -eq '.copilot' -and $localOkay -and -not (Get-Entries $c.Skills) -and -not (Get-Entries $c.Home)) $elsewhere
 
         Stop-LiveTray $c.Tray
         $r = Tss $c @('status') $real
@@ -418,6 +422,175 @@ function Test-Portable {
         Check 'both local config files and shared companions remain unchanged' ((Get-BlobId $localConfig) -eq $localHash -and (Get-BlobId (Join-Path $secondHome 'config.json')) -eq $localHash -and (Get-BlobId $settings) -eq $settingsHash -and (Get-BlobId $sources) -eq $sourcesHash) ''
         $binEntries = Get-Entries (Join-Path $c.Root 'bin')
         Check 'state and skills are not written beside the shared executables' ($binEntries -eq 'tiny-skill-sync.exe,tiny-skill-sync.settings.json,tiny-skill-sync.sources.json,tss.exe') $binEntries
+    } finally { Close-Env $c }
+}
+
+function Test-Mixed {
+    $c = New-Env 'mixed' -Repo 'AngelosP/tiny-skill-sync-fixtures-public'
+    try {
+        $skill = "---`nname: sample`ndescription: Mixed-source fixture`n---`nFixture skill.`n"
+        $agent = "---`ndescription: Mixed-source fixture`n---`nFixture agent.`n"
+        $rule = "---`napplyTo: '**/*.rs'`n---`nFixture instruction.`n"
+        $pin = Push-Upstream $c.Repo $c.Ref @(
+            @{ Path = 'issue7/skills/sample/SKILL.md'; Text = $skill }
+            @{ Path = 'issue7/custom-agents/review.agent.md'; Text = $agent }
+            @{ Path = 'issue7/custom-agents/ignore.instructions.md'; Text = 'ignore' }
+            @{ Path = 'issue7/instructions/style.instructions.md'; Text = $rule }
+            @{ Path = 'issue7/instructions/ignore.agent.md'; Text = 'ignore' }
+        ) 'mixed-source live fixture'
+        if (-not (Wait-Maybe { (Get-PublicCommit $c.Repo $c.Ref) -eq $pin } 90 5000)) { throw 'public branch did not reach the fixture commit' }
+
+        $profiles = @(foreach ($name in 'machine-1', 'machine-2') {
+            $base = Join-Path $c.Root $name
+            $copilot = Join-Path $base 'copilot'
+            $envForApp = Get-AnonymousAppEnv $c.Root
+            $envForApp.USERPROFILE = Join-Path $base 'user'
+            $envForApp.LOCALAPPDATA = Join-Path $base 'local'
+            $envForApp.TSS_HOME = Join-Path $base 'home'
+            $envForApp.TSS_SKILLS_DIR = Join-Path $copilot 'skills'
+            $envForApp.TSS_AGENTS_DIR = Join-Path $copilot 'agents'
+            $envForApp.TSS_INSTRUCTIONS_DIR = Join-Path $copilot 'instructions'
+            $envForApp.TSS_BENCH_REPORT = Join-Path $c.Root "out\$name-marks.txt"
+            foreach ($key in 'USERPROFILE', 'LOCALAPPDATA', 'TSS_HOME', 'TSS_SKILLS_DIR', 'TSS_AGENTS_DIR', 'TSS_INSTRUCTIONS_DIR') {
+                if (-not ([IO.Path]::GetFullPath($envForApp[$key])).StartsWith("$($c.Root)\", [StringComparison]::OrdinalIgnoreCase)) {
+                    throw "refusing to use $key outside the mixed fixture"
+                }
+                New-Item -ItemType Directory -Force $envForApp[$key] | Out-Null
+            }
+            [IO.File]::WriteAllText((Join-Path $envForApp.TSS_HOME 'startup-offer-seen'), "seen`n")
+            $envForApp
+        })
+        $first, $second = $profiles
+        $firstState = Join-Path $first.TSS_HOME 'state.json'
+        $secondState = Join-Path $second.TSS_HOME 'state.json'
+        $configFile = Join-Path $first.TSS_HOME 'config.json'
+        $sources = Join-Path $c.Root 'bin\tiny-skill-sync.sources.json'
+        $skillsUrl = Get-Address $c 'issue7/skills'
+        $agentsUrl = Get-Address $c 'issue7/custom-agents'
+        $rulesUrl = Get-Address $c 'issue7/instructions'
+        if ((Tss $c @('add', $skillsUrl, '--every', '6h') $first).Code -ne 0) { throw 'could not add the legacy Skills source' }
+        $legacy = [IO.File]::ReadAllText($configFile) | ConvertFrom-Json
+        $skillsId = $legacy.repos[0].id
+        $installed = Tss $c @('check', $skillsId) $first
+        $localSkill = Join-Path $first.TSS_SKILLS_DIR 'sample\SKILL.md'
+        Check 'legacy Skills source installs with a format-1 config' ($installed.Code -eq 0 -and $legacy.version -eq 1 -and [IO.File]::ReadAllText($localSkill) -ceq $skill)
+        $edit = "My local skill edit.`r`n"
+        [IO.File]::WriteAllText($localSkill, $edit)
+
+        $repoName = ($c.Repo -split '/')[-1]
+        $nested = Join-Path $first.TSS_AGENTS_DIR $repoName
+        New-Item -ItemType Directory $nested | Out-Null
+        $existing = Join-Path $nested 'review.agent.md'
+        $neighbor = Join-Path $nested 'personal.agent.md'
+        [IO.File]::WriteAllText($existing, $agent.Replace("`n", "`r`n"))
+        [IO.File]::WriteAllText($neighbor, "Hand-written neighbor.`r`n")
+        $existingHash = Get-BlobId $existing
+        $neighborHash = Get-BlobId $neighbor
+        $configHash = Get-BlobId $configFile
+        $stateHash = Get-BlobId $firstState
+        $preview = Tss $c @('add', $agentsUrl, '--type', 'agents', '--preview') $first
+        Check 'CLI preview names the type, match and exact existing destination without writing' (
+            $preview.Code -eq 0 -and $preview.Text -match 'Matched 1 agent:' -and $preview.Text.Contains("Destination: $nested") -and
+            (Get-BlobId $configFile) -eq $configHash -and (Get-BlobId $firstState) -eq $stateHash -and (Get-Entries $nested) -eq 'personal.agent.md,review.agent.md'
+        )
+        if ((Tss $c @('portable') $first).Code -ne 0) { throw 'could not export the legacy source' }
+        $sourceHash = Get-BlobId $sources
+        $c.Tray = Start-LiveTray $c.Root @() $second
+        [void](Wait-Live { Test-Path -LiteralPath (Join-Path $second.TSS_SKILLS_DIR 'sample\SKILL.md') } 'the tray to install the shared skill' 90)
+        $win = Open-Window $c.Tray
+        [void](Wait-Quiet $second.TSS_BENCH_REPORT 4)
+        $chooseAddType = {
+            param($Dialog, [string]$Kind)
+            foreach ($id in @($AskId.Choice, ($AskId.Choice + 1), ($AskId.Choice + 2))) {
+                if ((Read-Ui $Dialog $AskPanel $id) -eq $Kind) {
+                    Click-Ui $Dialog $AskPanel $id
+                    return
+                }
+            }
+            throw "the Add Source question has no '$Kind' choice"
+        }
+        $previewInTray = {
+            param($Url, [string]$Kind)
+            Click-Ui $win $UiPanel.Nav $UiId.NavAdd
+            $ask = Wait-Live { $d = Find-Ask $c.Tray; if ($d -ne [IntPtr]::Zero) { $d } } 'the Add source question' 10
+            Set-UiText (Get-Ui $ask $AskPanel $AskId.Edit) $Url
+            & $chooseAddType $ask $Kind
+            Click-Ui $ask $AskPanel $AskId.Ok
+            [void](Wait-Live { (Read-Ui $win $UiPanel.Page 315) -eq 'Add and check' } 'the read-only source preview' 60)
+            Read-Ui $win $UiPanel.Page $UiId.InfoText
+        }
+
+        $previewText = & $previewInTray $agentsUrl 'Agents'
+        [void](Save-Shot $win 'mixed-agent-preview')
+        Check 'tray preview offers only the selected agent and writes nothing' (
+            $previewText -match 'Type:\s*Agents' -and $previewText -match 'Matched\s+1\s+agent' -and
+            (Get-BlobId $sources) -eq $sourceHash -and (Get-Entries $second.TSS_AGENTS_DIR) -eq ''
+        )
+        Click-Ui $win $UiPanel.Page 316 # Cancel source
+        [void](Wait-Live { $null -eq (Read-Ui $win $UiPanel.Page 315) } 'the preview to close')
+        Check 'cancel leaves the shared settings and installed files alone' ((Get-BlobId $sources) -eq $sourceHash -and (Get-Entries $second.TSS_AGENTS_DIR) -eq '')
+        [void](& $previewInTray $agentsUrl 'Agents')
+        $checks = Get-MarkCount $second.TSS_BENCH_REPORT 'job-check'
+        Click-Ui $win $UiPanel.Page 315
+        $flatAgent = Join-Path $second.TSS_AGENTS_DIR 'review.agent.md'
+        [void](Wait-Live { (Test-Path -LiteralPath $flatAgent) -and (Get-MarkCount $second.TSS_BENCH_REPORT 'job-check') -gt $checks } 'tray installation of the agent' 90)
+        Check 'the agent source does not install instructions' ((Get-Entries $second.TSS_INSTRUCTIONS_DIR) -eq '')
+        Click-Ui $win $UiPanel.Nav $UiId.NavAdd
+        $duplicateAsk = Wait-Live { $d = Find-Ask $c.Tray; if ($d -ne [IntPtr]::Zero) { $d } } 'the duplicate Agent source question' 10
+        Set-UiText (Get-Ui $duplicateAsk $AskPanel $AskId.Edit) $agentsUrl
+        & $chooseAddType $duplicateAsk 'Agents'
+        Click-Ui $duplicateAsk $AskPanel $AskId.Ok
+        [void](Wait-Live { (Find-Ask $c.Tray) -eq [IntPtr]::Zero } 'the duplicate Agent source question to close')
+        Click-Ui $win $UiPanel.Nav $UiId.NavAdd
+        $reopenedAsk = Wait-Live { $d = Find-Ask $c.Tray; if ($d -ne [IntPtr]::Zero) { $d } } 'Add Source to reopen after the duplicate error' 10
+        $reopenedAddress = [TssLive]::Text((Get-Ui $reopenedAsk $AskPanel $AskId.Edit))
+        $reopenedAgentSelected = (Read-Ui $reopenedAsk $AskPanel $AskId.Choice) -eq 'Agents' -and (Get-Checked $reopenedAsk $AskPanel $AskId.Choice)
+        Check 'duplicate Agent source keeps its typed URL and type when Add Source is reopened' (
+            $reopenedAddress -eq $agentsUrl -and $reopenedAgentSelected
+        ) "URL: '$reopenedAddress'; Agents selected: $reopenedAgentSelected"
+        Click-Ui $reopenedAsk $AskPanel $AskId.Cancel
+        [void](Wait-Live { (Find-Ask $c.Tray) -eq [IntPtr]::Zero } 'the reopened Add Source question to close')
+        [void](& $previewInTray $rulesUrl 'Instructions')
+        $checks = Get-MarkCount $second.TSS_BENCH_REPORT 'job-check'
+        Click-Ui $win $UiPanel.Page 315
+        $flatRule = Join-Path $second.TSS_INSTRUCTIONS_DIR 'style.instructions.md'
+        [void](Wait-Live { (Test-Path -LiteralPath $flatRule) -and (Get-MarkCount $second.TSS_BENCH_REPORT 'job-check') -gt $checks } 'tray installation of the instruction' 90)
+        [void](Wait-Live { @(Read-Nav $win).Count -eq 3 } 'three source rows in the tray')
+        [void](Save-Shot $win 'mixed-sources')
+
+        $shared = [IO.File]::ReadAllText($sources) | ConvertFrom-Json
+        $agentId = ($shared.repos | Where-Object { $_.kind -eq 'agents' }).id
+        $ruleId = ($shared.repos | Where-Object { $_.kind -eq 'instructions' }).id
+        if (-not $agentId -or -not $ruleId) { throw 'the tray did not save both typed source IDs' }
+        $ambiguous = Tss $c @('check', $c.Repo) $first
+        $adopt = Tss $c @('check', $agentId) $first
+        $rules = Tss $c @('check', $ruleId) $first
+        Check 'CLI needs exact IDs and adopts the repo-namespaced agent' (
+            $ambiguous.Code -eq 3 -and $ambiguous.Text -match 'use the id' -and $adopt.Code -eq 0 -and
+            $adopt.Text -match 'Now managing review.agent.md' -and $rules.Code -eq 0
+        )
+        Check 'both profiles have only the expected files in all three destinations' (
+            (Get-Entries $first.TSS_AGENTS_DIR) -eq (Split-Path -Leaf $nested) -and (Get-Entries $nested) -eq 'personal.agent.md,review.agent.md' -and
+            (Get-Entries $second.TSS_AGENTS_DIR) -eq 'review.agent.md' -and [IO.File]::ReadAllText($flatAgent) -ceq $agent -and
+            (Get-Entries $first.TSS_INSTRUCTIONS_DIR) -eq 'style.instructions.md' -and (Get-Entries $second.TSS_INSTRUCTIONS_DIR) -eq 'style.instructions.md' -and
+            [IO.File]::ReadAllText($flatRule) -ceq $rule -and [IO.File]::ReadAllText((Join-Path $first.TSS_INSTRUCTIONS_DIR 'style.instructions.md')) -ceq $rule -and
+            (Get-Entries $first.TSS_SKILLS_DIR) -eq 'sample' -and (Get-Entries $second.TSS_SKILLS_DIR) -eq 'sample'
+        )
+        Check 'the adopted copy, local skill edit and handwritten neighbor retain their exact bytes' (
+            (Get-BlobId $existing) -eq $existingHash -and (Get-BlobId $neighbor) -eq $neighborHash -and [IO.File]::ReadAllText($localSkill) -ceq $edit
+        )
+        $a = [IO.File]::ReadAllText($firstState) | ConvertFrom-Json
+        $b = [IO.File]::ReadAllText($secondState) | ConvertFrom-Json
+        Check 'shared IDs, independent ownership and work folders' (
+            $shared.version -eq 2 -and $a.version -eq 2 -and $b.version -eq 2 -and $null -ne $a.repos.$skillsId -and $null -ne $b.repos.$skillsId -and
+            $a.skills_dir -eq $first.TSS_SKILLS_DIR -and $b.skills_dir -eq $second.TSS_SKILLS_DIR -and
+            $a.loose_sources.$agentId.binding.root -eq $first.TSS_AGENTS_DIR -and $a.loose_sources.$agentId.binding.child -eq (Split-Path -Leaf $nested) -and
+            $b.loose_sources.$agentId.binding.root -eq $second.TSS_AGENTS_DIR -and -not $b.loose_sources.$agentId.binding.child -and
+            $a.loose_sources.$ruleId.binding.root -eq $first.TSS_INSTRUCTIONS_DIR -and $b.loose_sources.$ruleId.binding.root -eq $second.TSS_INSTRUCTIONS_DIR -and
+            (Test-Path -LiteralPath (Join-Path (Split-Path -Parent $first.TSS_AGENTS_DIR) '.tss-leaf-work\.owner')) -and
+            (Test-Path -LiteralPath (Join-Path (Split-Path -Parent $second.TSS_AGENTS_DIR) '.tss-leaf-work\.owner')) -and
+            (Get-BlobId $configFile) -eq $configHash
+        )
     } finally { Close-Env $c }
 }
 
@@ -2189,6 +2362,7 @@ $scenarios = [ordered]@{
     'install'      = 'Test-Install'
     'places'       = 'Test-Places'
     'portable'     = 'Test-Portable'
+    'mixed'        = 'Test-Mixed'
     'changes'      = 'Test-Changes'
     'local-edit'   = 'Test-LocalEdit'
     'converged'    = 'Test-Converged'

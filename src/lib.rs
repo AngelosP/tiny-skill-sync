@@ -23,6 +23,7 @@ pub mod release;
 pub mod replacement;
 pub mod scheduler;
 pub mod secret;
+pub mod source;
 pub mod state;
 pub mod text;
 pub mod tree;

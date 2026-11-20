@@ -7,11 +7,12 @@
 
 use std::ffi::OsString;
 use std::fs::{File, OpenOptions};
-use std::io::{self, Read};
+use std::io::{self, Read, Seek};
 use std::mem::offset_of;
 use std::os::windows::ffi::OsStringExt;
 use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
-use std::path::{Path, PathBuf};
+use std::os::windows::io::AsRawHandle;
+use std::path::{Component, Path, PathBuf, Prefix};
 use std::ptr::{null, null_mut};
 
 use windows_sys::Win32::Foundation::{CloseHandle, ERROR_FILE_NOT_FOUND, ERROR_NO_MORE_FILES, HANDLE, INVALID_HANDLE_VALUE};
@@ -74,6 +75,126 @@ fn kind_of(attributes: u32) -> Kind {
     } else {
         Kind::File
     }
+}
+
+fn invalid(message: &'static str) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, message)
+}
+
+pub(crate) fn same_win_name(a: &str, b: &str) -> bool {
+    use windows_sys::Win32::Globalization::{CSTR_EQUAL, CompareStringOrdinal};
+    let (a, b) = (crate::win::wide(a), crate::win::wide(b));
+    unsafe { CompareStringOrdinal(a.as_ptr(), -1, b.as_ptr(), -1, 1) == CSTR_EQUAL }
+}
+
+pub(crate) fn check_leaf_path(path: &Path) -> io::Result<()> {
+    if !path.is_absolute() || !matches!(path.components().next(), Some(Component::Prefix(p)) if matches!(p.kind(), Prefix::Disk(_) | Prefix::UNC(_, _))) {
+        return Err(invalid("expected a full drive or share path"));
+    }
+    for c in path.components() {
+        match c {
+            Component::Normal(s) => crate::pathsafe::check_component(s.to_str().ok_or_else(|| invalid("invalid path name"))?)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?,
+            Component::ParentDir | Component::CurDir => return Err(invalid("expected a path without relative components")),
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// Check the normalized name of THIS open object, not another lookup through a possibly
+/// redirected path. In particular a short DOS name cannot claim somebody else's long name.
+fn ordinary_name(file: &File, path: &Path) -> io::Result<()> {
+    use windows_sys::Win32::Storage::FileSystem::{FILE_NAME_NORMALIZED, GetFinalPathNameByHandleW, VOLUME_NAME_DOS};
+    let mut buf = vec![0u16; 512];
+    loop {
+        let n = unsafe { GetFinalPathNameByHandleW(file.as_raw_handle(), buf.as_mut_ptr(), buf.len() as u32, FILE_NAME_NORMALIZED | VOLUME_NAME_DOS) } as usize;
+        if n == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if n < buf.len() {
+            let actual = String::from_utf16(&buf[..n]).map_err(|_| invalid("cannot verify the path name"))?;
+            let name = path.to_str().ok_or_else(|| invalid("invalid path name"))?.replace('/', "\\");
+            let expected = if let Some(unc) = name.strip_prefix(r"\\") { format!(r"\\?\UNC\{unc}") } else { format!(r"\\?\{name}") };
+            return if same_win_name(actual.trim_end_matches('\\'), expected.trim_end_matches('\\')) { Ok(()) } else { Err(invalid("refusing a path alias")) };
+        }
+        buf.resize(n + 1, 0);
+    }
+}
+
+/// Pin each component against rename, from the volume root down. A component that is a reparse
+/// point (including a cloud placeholder) is never traversed, even for a status check.
+pub(crate) struct LeafDirectory {
+    handles: Vec<File>,
+}
+
+impl LeafDirectory {
+    pub(crate) fn separate(&self, other: &Self) -> io::Result<()> {
+        for (one, chain) in [(self, other), (other, self)] {
+            let id = one.id()?;
+            for f in &chain.handles {
+                if crate::win::install::id(f)? == id {
+                    return Err(invalid("the folders overlap"));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn pin(path: &Path, create: bool) -> io::Result<Self> {
+        check_leaf_path(path)?;
+        let mut handles = Vec::new();
+        for dir in path.ancestors().collect::<Vec<_>>().into_iter().rev() {
+            // An attributes-only handle does NOT participate in Windows share checks. Request
+            // data access (without ever listing names) so withholding SHARE_DELETE pins the dir.
+            let open = || {
+                OpenOptions::new()
+                    .access_mode(FILE_READ_ATTRIBUTES | FILE_LIST_DIRECTORY)
+                    .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+                    .custom_flags(NO_FOLLOW)
+                    .open(dir)
+            };
+            let f = match open() {
+                Err(e) if create && !handles.is_empty() && e.kind() == io::ErrorKind::NotFound => {
+                    match std::fs::create_dir(dir) {
+                        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+                        r => r?,
+                    }
+                    open()?
+                }
+                r => r?,
+            };
+            if kind_of(f.metadata()?.file_attributes()) != Kind::Dir {
+                return Err(invalid("the path or a parent is not a plain folder"));
+            }
+            ordinary_name(&f, dir)?;
+            handles.push(f);
+        }
+        Ok(Self { handles })
+    }
+
+    pub(crate) fn id(&self) -> io::Result<crate::state::DiskId> {
+        crate::win::install::id(self.handles.last().expect("an absolute path has a root"))
+    }
+}
+
+/// Caller holds the directory chain. No writable or delete-sharing handle may coexist during
+/// the proof. Rename and disposition use the checked handle, not a second open by name.
+pub(crate) fn open_leaf(path: &Path, movable: bool) -> io::Result<File> {
+    let file = crate::win::install::open(path, movable)?; // rejects multiple hard links
+    checked_leaf(file, path)
+}
+
+pub(crate) fn create_leaf(path: &Path) -> io::Result<File> {
+    checked_leaf(crate::win::install::create(path)?, path)
+}
+
+fn checked_leaf(file: File, path: &Path) -> io::Result<File> {
+    if kind_of(file.metadata()?.file_attributes()) != Kind::File {
+        return Err(invalid("expected a plain file"));
+    }
+    ordinary_name(&file, path)?;
+    Ok(file)
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -208,7 +329,18 @@ impl FileHasher {
         Ok(FileRead { blob, len, bytes })
     }
 
-    fn hash(&mut self, file: &mut File, len: u64, mut keep: Option<&mut Vec<u8>>) -> io::Result<String> {
+    pub(crate) fn read_leaf(&mut self, mut file: &File) -> io::Result<FileRead> {
+        file.rewind()?;
+        let len = file.metadata()?.len();
+        if len > crate::tree::MAX_FILE_BYTES {
+            return Err(io::ErrorKind::FileTooLarge.into());
+        }
+        let mut bytes = (len <= crate::text::TEXT_LIMIT).then(|| Vec::with_capacity(len as usize));
+        let blob = self.hash(&mut file, len, bytes.as_mut())?;
+        Ok(FileRead { blob, len, bytes })
+    }
+
+    fn hash(&mut self, file: &mut impl Read, len: u64, mut keep: Option<&mut Vec<u8>>) -> io::Result<String> {
         let mut hasher = BlobHasher::new(len);
         let mut total = 0u64;
         loop {

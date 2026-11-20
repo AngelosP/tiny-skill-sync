@@ -1,6 +1,6 @@
 //! Small file helpers on top of `std::fs` that the rest of the app relies on for safety.
 
-use std::fs::{self, File};
+use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -23,15 +23,21 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
     }
     let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
     let tmp = path.with_file_name(format!("{name}.{}.tmp", unique_suffix()));
+    write_atomic_via(path, &tmp, bytes, || {})
+}
+
+fn write_atomic_via(path: &Path, tmp: &Path, bytes: &[u8], before_publish: impl FnOnce()) -> io::Result<()> {
+    use crate::win::install as os;
+    let dest = std::path::absolute(path)?;
+    let mut f = os::create(tmp)?;
     let result = (|| {
-        let mut f = File::create(&tmp)?;
         f.write_all(bytes)?;
         f.sync_all()?;
-        drop(f);
-        rename_retry(&tmp, path)
+        before_publish();
+        retry(|| os::rename_replacing(&f, &dest))
     })();
     if result.is_err() {
-        let _ = fs::remove_file(&tmp);
+        let _ = os::delete(&f);
     }
     result
 }
@@ -181,5 +187,33 @@ mod tests {
     #[test]
     fn join_rel_splits_on_forward_slashes() {
         assert_eq!(join_rel(Path::new(r"C:\x"), "a/b/c.md"), PathBuf::from(r"C:\x\a\b\c.md"));
+    }
+
+    #[test]
+    fn occupied_state_temp_is_neither_truncated_nor_unlinked() {
+        let dir = temp("occupied-temp");
+        let state = dir.join("state.json");
+        let tmp = dir.join("state.tmp");
+        fs::write(&tmp, b"existing").unwrap();
+        assert_eq!(write_atomic_via(&state, &tmp, b"record", || {}).unwrap_err().kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(fs::read(tmp).unwrap(), b"existing");
+        assert!(!state.exists());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn continuation_the_exact_temporary_file_is_published_without_reopening_by_name() {
+        let dir = temp("publish");
+        let state = dir.join("state.json");
+        let tmp = dir.join("state.tmp");
+        let mut blocked = false;
+        write_atomic_via(&state, &tmp, b"record", || {
+            blocked = fs::write(&tmp, b"not the record").is_err();
+        })
+        .unwrap();
+        let bytes = fs::read(state).unwrap();
+        assert!(!tmp.exists());
+        fs::remove_dir_all(dir).unwrap();
+        assert!(blocked && bytes == b"record", "published temporary bytes changed: {bytes:?}");
     }
 }

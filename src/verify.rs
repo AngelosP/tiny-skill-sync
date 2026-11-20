@@ -26,6 +26,8 @@ use crate::text::{self, TEXT_LIMIT};
 use crate::tree::Skill;
 use crate::win::fs::{FileHasher, Kind, Probe, kind_at, probe};
 
+pub mod leaf;
+
 const THE_FOLDER_ITSELF: &str = "(the folder itself)";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -385,6 +387,37 @@ pub fn compare_owned(dir: &Path, skill: &Skill, recorded: &[ManagedFile], theirs
         }
     }
     compare_unmanaged(dir, skill, theirs, hasher)
+}
+
+/// Byte evidence from Show changes, not the text-equivalence test for ordinary sync.
+pub(crate) struct SkillReview {
+    pub(crate) here: bool,
+    pub(crate) files: Vec<(String, ReviewFile)>,
+}
+
+pub(crate) enum ReviewFile {
+    Missing,
+    Read { len: u64, blob: String },
+    Unreadable,
+}
+
+impl SkillReview {
+    pub(crate) fn matches(&self, dir: &Path, hasher: &mut FileHasher) -> bool {
+        match kind_at(dir) {
+            Ok(None) => return !self.here,
+            Ok(Some(Kind::Dir)) if self.here => {}
+            _ => return false,
+        }
+        let mut spots = Spots::new(dir);
+        let mut stats = Stats::default();
+        self.files.iter().all(|(path, evidence)| match (spots.find(path, &mut stats), evidence) {
+            (Spot::Missing, ReviewFile::Missing) => true,
+            (Spot::Found(p), ReviewFile::Read { len, blob }) if p.kind == Kind::File => {
+                hasher.read(&join_rel(dir, path), 0, *len).is_ok_and(|read| read.len == *len && read.blob == *blob)
+            }
+            _ => false,
+        })
+    }
 }
 
 #[cfg(test)]

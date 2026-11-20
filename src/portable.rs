@@ -16,14 +16,15 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::config::{
-    CONFIG_VERSION, Config, DEFAULT_INTERVAL, RepoConfig, UpdatePrefs, parse_json_object, read_optional, settings_write_lock, write_json_atomic,
+    Config, DEFAULT_INTERVAL, Format, RepoConfig, UpdatePrefs, legacy_version, parse_json_object, read_optional, settings_write_lock, source_version,
+    write_json_atomic,
 };
 use crate::interval::Interval;
 
 pub const SETTINGS_FILE: &str = "tiny-skill-sync.settings.json";
 pub const SOURCES_FILE: &str = "tiny-skill-sync.sources.json";
 pub const SETTINGS_VERSION: u32 = 1;
-pub const SOURCES_VERSION: u32 = 1;
+pub const SOURCES_VERSION: u32 = 2;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct WriteResult {
@@ -75,25 +76,20 @@ struct Sources {
 
 impl Default for Sources {
     fn default() -> Self {
-        Sources { version: SOURCES_VERSION, repos: Vec::new() }
+        Sources { version: legacy_version(), repos: Vec::new() }
     }
 }
 
 impl Sources {
     fn from_config(config: &Config) -> Sources {
-        Sources { version: SOURCES_VERSION, repos: config.repos.clone() }
-    }
-
-    fn validate_version(&mut self, file: &str) -> Result<(), String> {
-        validate_version(file, self.version, SOURCES_VERSION)?;
-        self.version = SOURCES_VERSION;
-        Ok(())
+        Sources { version: config.wire_version(), repos: config.repos.clone() }
     }
 }
 
 /// Exports a local configuration without replacing either companion file. The skills folder is
 /// deliberately omitted because its default belongs to each machine.
 pub fn export(directory: &Path, config: &Config) -> Result<(), String> {
+    config.check_typed_ids()?;
     let _lock = settings_write_lock(directory)?;
     check_export_target(directory)?;
     let settings_path = directory.join(SETTINGS_FILE);
@@ -149,10 +145,19 @@ fn parse_settings(bytes: &[u8], path: &Path) -> Result<Settings, String> {
 }
 
 fn parse_sources(bytes: &[u8], path: &Path) -> Result<Sources, String> {
-    let mut sources: Sources = parse_json_object(bytes).map_err(|error| format!("{} is not valid: {error} ({})", SOURCES_FILE, path.display()))?;
-    sources.validate_version(SOURCES_FILE).map_err(|error| format!("{error} ({})", path.display()))?;
+    let invalid = |error| format!("{} is not valid: {error} ({})", SOURCES_FILE, path.display());
+    let Format { version } = parse_json_object(bytes).map_err(invalid)?;
+    if version != legacy_version() {
+        validate_version(SOURCES_FILE, version, SOURCES_VERSION).map_err(|error| format!("{error} ({})", path.display()))?;
+    }
+    let mut sources: Sources = parse_json_object(bytes).map_err(invalid)?;
+    sources.version = source_version(&sources.repos);
+    if version < sources.version {
+        return Err(format!("typed sources require {SOURCES_FILE} format 2 ({})", path.display()));
+    }
     let mut config = Config { repos: sources.repos, ..Config::default() };
     config.assign_missing_ids();
+    config.check_typed_ids()?;
     sources.repos = config.repos;
     Ok(sources)
 }
@@ -161,6 +166,11 @@ fn parse_sources(bytes: &[u8], path: &Path) -> Result<Sources, String> {
 /// should remain active; a present but unreadable, malformed, unknown-key, or unsupported file is
 /// an error and must not be replaced.
 pub fn load(directory: &Path) -> Result<Option<Config>, String> {
+    load_sources(directory)?.map(Config::skills_only).transpose()
+}
+
+/// The typed settings model. Only the guarded [`load`] is used by today's skills-only consumers.
+pub fn load_sources(directory: &Path) -> Result<Option<Config>, String> {
     let settings_path = directory.join(SETTINGS_FILE);
     let sources_path = directory.join(SOURCES_FILE);
     let settings_bytes = read_optional(&settings_path)?;
@@ -170,16 +180,9 @@ pub fn load(directory: &Path) -> Result<Option<Config>, String> {
     }
 
     let settings = settings_bytes.as_deref().map(|bytes| parse_settings(bytes, &settings_path)).transpose()?.unwrap_or_default();
-    let mut sources = sources_bytes.as_deref().map(|bytes| parse_sources(bytes, &sources_path)).transpose()?.unwrap_or_default();
+    let sources = sources_bytes.as_deref().map(|bytes| parse_sources(bytes, &sources_path)).transpose()?.unwrap_or_default();
 
-    let mut config = Config {
-        version: CONFIG_VERSION,
-        skills_dir: settings.skills_dir,
-        default_interval: settings.default_interval,
-        app_update: settings.app_update,
-        repos: std::mem::take(&mut sources.repos),
-    };
-    config.assign_missing_ids();
+    let config = Config { skills_dir: settings.skills_dir, default_interval: settings.default_interval, app_update: settings.app_update, repos: sources.repos };
     Ok(Some(config))
 }
 
@@ -187,6 +190,7 @@ pub fn load(directory: &Path) -> Result<Option<Config>, String> {
 /// Existing companions are parsed before any write, and a changed file must still match `before`;
 /// this prevents malformed or concurrently edited settings from being overwritten.
 pub fn save_changes(directory: &Path, before: &Config, after: &Config) -> Result<WriteResult, String> {
+    after.check_typed_ids()?;
     let settings_path = directory.join(SETTINGS_FILE);
     let sources_path = directory.join(SOURCES_FILE);
     let _lock = (before != after).then(|| settings_write_lock(directory)).transpose()?;
@@ -294,6 +298,61 @@ mod tests {
 
     fn write_json(dir: &Path, file: &str, json: &str) {
         fs::write(dir.join(file), json).unwrap();
+    }
+
+    #[test]
+    fn typed_sources_gate_only_the_sources_companion() {
+        use crate::config::v1_reader::accepts_sources;
+        use crate::source::SourceKind;
+        let dir = temp_dir("typed");
+        let settings = r#"{ "version":1, "default_interval":"12h" }"#;
+        write_json(&dir, SETTINGS_FILE, settings);
+        write_json(&dir, SOURCES_FILE, r#"{"version":1,"repos":[{"repo":"o/r"}]}"#);
+        let old = load(&dir).unwrap().unwrap();
+        let mut mixed = old.clone();
+        mixed.add_source(SourceKind::Instructions, &RepoSpec::parse("https://github.com/o/r/tree/main/instructions").unwrap(), None, false);
+        assert_eq!(save_changes(&dir, &old, &mixed).unwrap(), WriteResult { settings_written: false, sources_written: true });
+        assert_eq!(fs::read(dir.join(SETTINGS_FILE)).unwrap(), settings.as_bytes());
+        let typed = fs::read(dir.join(SOURCES_FILE)).unwrap();
+        assert!(!accepts_sources(&typed));
+        assert_eq!(load_sources(&dir).unwrap().unwrap(), mixed);
+        assert!(load(&dir).is_err());
+        assert!(save_changes(&dir, &old, &mixed).is_err(), "stale v1 writer");
+        assert_eq!(fs::read(dir.join(SOURCES_FILE)).unwrap(), typed);
+        save_changes(&dir, &mixed, &old).unwrap();
+        assert!(accepts_sources(&fs::read(dir.join(SOURCES_FILE)).unwrap()));
+        assert_eq!(fs::read(dir.join(SETTINGS_FILE)).unwrap(), settings.as_bytes());
+        let shared = temp_dir("typed-export");
+        export(&shared, &mixed).unwrap();
+        assert!(!accepts_sources(&fs::read(shared.join(SOURCES_FILE)).unwrap()));
+        assert_eq!(load_sources(&shared).unwrap().unwrap(), mixed);
+        fs::remove_dir_all(shared).unwrap();
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn unsupported_sources_cannot_cause_even_a_settings_only_write() {
+        let dir = temp_dir("source-gate");
+        let settings = r#"{ "version":1 }"#;
+        write_json(&dir, SETTINGS_FILE, settings);
+        let old = load(&dir).unwrap().unwrap();
+        let after = Config { default_interval: Interval::new(1, Unit::Week), ..old.clone() };
+        for bad in [
+            r#"{"version":1,"repos":[{"kind":"instructions"}]}"#,
+            r#"{"version":2,"repos":[{"kind":"plugins"}]}"#,
+            r#"{"version":2,"repos":[{"kind":null}]}"#,
+            r#"{"repos":[{"kind":null}],"version":99}"#,
+        ] {
+            write_json(&dir, SOURCES_FILE, bad);
+            let err = load_sources(&dir).unwrap_err();
+            if bad.contains("99") {
+                assert!(err.contains("newer version"), "{err}");
+            }
+            assert!(save_changes(&dir, &old, &after).is_err());
+            assert_eq!(fs::read(dir.join(SETTINGS_FILE)).unwrap(), settings.as_bytes());
+            assert_eq!(fs::read(dir.join(SOURCES_FILE)).unwrap(), bad.as_bytes());
+        }
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

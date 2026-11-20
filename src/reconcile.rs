@@ -17,7 +17,7 @@ use std::fmt;
 
 use crate::pathsafe::fold;
 use crate::state::{ManagedFile, OwnedSkill};
-use crate::tree::{Rejected, Skill};
+use crate::tree::{Rejected, Skill, SkillFile};
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct DirtyInfo {
@@ -194,6 +194,36 @@ pub fn needs_comparison(desired: &Skill, owned: &OwnedSkill, local: &LocalState)
     matches!(local, LocalState::Dirty(_)) && !same_files(desired, &owned.files)
 }
 
+fn gate(interrupted: bool, ignored: bool, owner: Option<&str>) -> Option<Verdict> {
+    if interrupted {
+        Some(Verdict::Held(Hold::Interrupted))
+    } else if ignored {
+        Some(Verdict::Skipped(Skip::Ignored))
+    } else {
+        owner.map(|o| Verdict::Skipped(Skip::Collision { owner: o.into() }))
+    }
+}
+
+fn unmanaged_verdict(local: Option<UnmanagedState>) -> Verdict {
+    match local {
+        Some(UnmanagedState::Identical) => Verdict::Adopt,
+        Some(UnmanagedState::Historical) => Verdict::AdoptHistorical,
+        Some(UnmanagedState::Searching) => Verdict::Held(Hold::HistorySearching),
+        Some(UnmanagedState::Paused) => Verdict::Held(Hold::HistoryPaused),
+        Some(UnmanagedState::Different) => Verdict::Held(Hold::UnmanagedDiffers),
+        None => Verdict::Install,
+    }
+}
+
+fn remove_verdict(local: &LocalState, hold_empty: bool) -> Verdict {
+    match local {
+        LocalState::Clean if hold_empty => Verdict::Held(Hold::MassDeletion),
+        LocalState::Clean => Verdict::Delete,
+        LocalState::Dirty(info) => Verdict::Held(Hold::DeleteBlocked(info.clone())),
+        LocalState::FolderMissing => Verdict::Forget,
+    }
+}
+
 pub fn plan(input: &Input) -> Vec<Decision> {
     let mut out = Vec::new();
     let desired_keys: HashSet<String> = input.desired.iter().map(|s| fold(&s.name)).collect();
@@ -203,25 +233,14 @@ pub fn plan(input: &Input) -> Vec<Decision> {
 
     for skill in input.desired {
         let key = fold(&skill.name);
-        let verdict = if interrupted_keys.contains(&key) {
-            Verdict::Held(Hold::Interrupted)
-        } else if input.ignored.contains(&key) {
-            Verdict::Skipped(Skip::Ignored)
-        } else if let Some(owner) = input.other_owners.get(&key) {
-            Verdict::Skipped(Skip::Collision { owner: owner.clone() })
+        let verdict = if let Some(v) = gate(interrupted_keys.contains(&key), input.ignored.contains(&key), input.other_owners.get(&key).map(String::as_str)) {
+            v
         } else if input.unmanaged.get(&key) == Some(&UnmanagedState::Paused) {
             Verdict::Held(Hold::HistoryPaused)
         } else if let Some(owned) = owned_by_key.get(&key) {
-            owned_verdict(skill, owned)
+            owned_verdict(&owned.local, same_files(skill, &owned.skill.files), owned.matches_upstream)
         } else {
-            match input.unmanaged.get(&key) {
-                Some(UnmanagedState::Identical) => Verdict::Adopt,
-                Some(UnmanagedState::Historical) => Verdict::AdoptHistorical,
-                Some(UnmanagedState::Searching) => Verdict::Held(Hold::HistorySearching),
-                Some(UnmanagedState::Paused) => Verdict::Held(Hold::HistoryPaused),
-                Some(UnmanagedState::Different) => Verdict::Held(Hold::UnmanagedDiffers),
-                None => Verdict::Install,
-            }
+            unmanaged_verdict(input.unmanaged.get(&key).copied())
         };
         out.push(Decision { name: skill.name.clone(), verdict });
     }
@@ -241,12 +260,7 @@ pub fn plan(input: &Input) -> Vec<Decision> {
         let verdict = if let Some(r) = rejected_by_key.get(&key) {
             Verdict::Skipped(Skip::Rejected { reason: r.reason.clone() })
         } else {
-            match &owned.local {
-                LocalState::Clean if hold_all_deletions => Verdict::Held(Hold::MassDeletion),
-                LocalState::Clean => Verdict::Delete,
-                LocalState::Dirty(info) => Verdict::Held(Hold::DeleteBlocked(info.clone())),
-                LocalState::FolderMissing => Verdict::Forget,
-            }
+            remove_verdict(&owned.local, hold_all_deletions)
         };
         out.push(Decision { name: owned.skill.name.clone(), verdict });
     }
@@ -261,16 +275,109 @@ pub fn plan(input: &Input) -> Vec<Decision> {
     out
 }
 
-fn owned_verdict(desired: &Skill, owned: &OwnedView) -> Verdict {
-    let same = same_files(desired, &owned.skill.files);
-    match (&owned.local, same) {
+fn owned_verdict(local: &LocalState, same: bool, matches_upstream: bool) -> Verdict {
+    match (local, same) {
         (LocalState::Clean, true) => Verdict::InSync,
         (LocalState::Clean, false) => Verdict::Update,
         (LocalState::Dirty(info), true) => Verdict::ModifiedLocally(info.clone()),
-        (LocalState::Dirty(_), false) if owned.matches_upstream => Verdict::CatchUp,
+        (LocalState::Dirty(_), false) if matches_upstream => Verdict::CatchUp,
         (LocalState::Dirty(info), false) => Verdict::Held(Hold::UpdateBlocked(info.clone())),
         (LocalState::FolderMissing, true) => Verdict::MissingLocally,
         (LocalState::FolderMissing, false) => Verdict::Held(Hold::UpdateBlockedMissing),
+    }
+}
+
+/// Upstream evidence for exactly one loose file. No constructor treats a failed or partial
+/// listing as absence. A removal requested by the user does not imply consent to discard an edit.
+#[derive(Clone, Copy)]
+pub struct LeafListing<'a> {
+    pub(crate) name: &'a str,
+    scope: Option<&'a crate::config::RepoConfig>,
+    fact: LeafFact<'a>,
+}
+
+#[derive(Clone, Copy)]
+enum LeafFact<'a> {
+    Listed(&'a SkillFile),
+    Rejected(&'a str),
+    Absent { hold_empty: bool },
+}
+
+impl<'a> LeafListing<'a> {
+    /// Positive evidence only (also useful for a historical copy proven by the engine).
+    pub fn listed(file: &'a SkillFile) -> Self {
+        Self { name: &file.path, scope: None, fact: LeafFact::Listed(file) }
+    }
+
+    /// Only B's validated, fresh discovery of the recorded scope can authorize an inferred
+    /// removal. A preview, failed request, partial listing or listing with refusals cannot.
+    pub fn from_discovery(
+        name: &'a str,
+        discovery: &'a crate::tree::SourceDiscovery,
+        recorded: &'a crate::config::RepoConfig,
+        confirm_empty: bool,
+    ) -> Result<Self, String> {
+        if !discovery.covers_leaf(recorded, name) {
+            return Err("the listing does not cover this name in the recorded source".into());
+        }
+        let crate::tree::SourceItems::Files(files) = discovery.items() else { return Err("expected a loose-file listing".into()) };
+        let key = fold(name);
+        let fact = if let Ok(i) = files.binary_search_by(|f| fold(&f.path).cmp(&key)) {
+            let file = &files[i];
+            if file.path == name || crate::win::fs::same_win_name(&file.path, name) {
+                LeafFact::Listed(file)
+            } else {
+                LeafFact::Rejected("another spelling has the same folded name")
+            }
+        } else if let Ok(i) = discovery.rejected().binary_search_by(|r| r.name.as_str().cmp(name)) {
+            LeafFact::Rejected(&discovery.rejected()[i].reason)
+        } else if discovery.confirms_leaf_absent(recorded, name) {
+            LeafFact::Absent { hold_empty: files.is_empty() && !confirm_empty }
+        } else {
+            return Err("the listing does not prove this file is absent from the recorded source".into());
+        };
+        Ok(Self { name, scope: Some(recorded), fact })
+    }
+
+    pub fn confirmed_removal(name: &'a str) -> Self {
+        Self { name, scope: None, fact: LeafFact::Absent { hold_empty: false } }
+    }
+
+    pub(crate) fn applies_to(self, source: &crate::config::RepoConfig) -> bool {
+        self.scope.is_none_or(|s| s.id == source.id && s.kind == source.kind && s.repo == source.repo && s.branch == source.branch && s.path == source.path)
+    }
+
+    pub fn desired(self) -> Option<&'a SkillFile> {
+        if let LeafFact::Listed(f) = self.fact { Some(f) } else { None }
+    }
+}
+
+pub(crate) struct LeafFacts<'a> {
+    pub owned: Option<(&'a ManagedFile, LocalState)>,
+    pub exists: bool,
+    pub matches_upstream: bool,
+    pub interrupted: bool,
+    pub ignored: bool,
+    pub other_owner: Option<&'a str>,
+}
+
+/// File-level inputs feed the same table as folder-level inputs. A missing *file* remains a
+/// conflict on removal; there is no directory disappearance from which to infer a forget.
+pub(crate) fn plan_leaf(listing: LeafListing, facts: LeafFacts) -> Verdict {
+    if let Some(v) = gate(facts.interrupted, facts.ignored, facts.other_owner) {
+        return v;
+    }
+    match (listing.fact, facts.owned) {
+        (LeafFact::Rejected(reason), _) => Verdict::Skipped(Skip::Rejected { reason: reason.into() }),
+        (LeafFact::Listed(f), Some((old, local))) => owned_verdict(&local, old.blob == f.blob, facts.matches_upstream),
+        (LeafFact::Listed(_), None) => {
+            unmanaged_verdict(facts.exists.then_some(if facts.matches_upstream { UnmanagedState::Identical } else { UnmanagedState::Different }))
+        }
+        (LeafFact::Absent { .. }, Some((_, LocalState::FolderMissing))) => {
+            Verdict::Held(Hold::DeleteBlocked(DirtyInfo { missing: vec![listing.name.into()], ..Default::default() }))
+        }
+        (LeafFact::Absent { hold_empty }, Some((_, local))) => remove_verdict(&local, hold_empty),
+        (LeafFact::Absent { .. }, None) => Verdict::InSync,
     }
 }
 

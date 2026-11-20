@@ -309,9 +309,18 @@ fn historical_absence_needs_a_complete_parent_and_404_is_never_absence() {
 }
 
 /// A small listing in GitHub's format: one skill folder with its `SKILL.md`.
-const LISTING: &str = r#"{"sha":"abc","url":"u","tree":[
-    {"path":"alpha","mode":"040000","type":"tree","sha":"11","url":"u"},
-    {"path":"alpha/SKILL.md","mode":"100644","type":"blob","sha":"22","size":5,"url":"u"}],"truncated":false}"#;
+fn http_listing() -> String {
+    json!({
+        "sha": SHA,
+        "url": "u",
+        "tree": [
+            {"path": "alpha", "mode": "040000", "type": "tree", "sha": SHA, "url": "u"},
+            {"path": "alpha/SKILL.md", "mode": "100644", "type": "blob", "sha": SHA, "size": 5, "url": "u"}
+        ],
+        "truncated": false
+    })
+    .to_string()
+}
 
 fn at<'a>(branch: &'a str, path: &'a str) -> RepoRef<'a> {
     RepoRef { owner: "o", name: "n", branch, path }
@@ -361,13 +370,14 @@ fn a_listing_is_requested_as_github_documents_it_and_its_etag_is_sent_back_verba
     let etag = "\"5f1c0e7a\"";
     let server = FakeServer::start(move |req| match req.header("if-none-match") {
         Some(sent) if sent == etag => answer(304, "").header("ETag", etag),
-        _ => answer(200, LISTING).header("ETag", etag).header("Content-Type", "application/json; charset=utf-8"),
+        _ => answer(200, http_listing()).header("ETag", etag).header("Content-Type", "application/json; charset=utf-8"),
     });
     let remote = server.remote();
 
     let Ok(TreeReply::Snapshot { etag: got, snapshot }) = remote.tree(&at("", "skills"), None, None, &go()) else { panic!("expected a listing") };
     assert_eq!(got.as_deref(), Some(etag), "the ETag is kept with its quotes");
-    assert_eq!((snapshot.sha.as_str(), snapshot.entries.len()), ("abc", 2));
+    assert_eq!((snapshot.sha.as_str(), snapshot.entries.len()), (SHA, 2));
+    assert!(snapshot.entries.iter().all(|entry| entry.sha == SHA));
     let Ok(TreeReply::NotModified) = remote.tree(&at("", "skills"), Some(etag), None, &go()) else { panic!("expected 'not modified'") };
     assert!(remote.tree(&at("feature/x", "my skills/set"), None, None, &go()).is_ok());
 
@@ -401,7 +411,7 @@ fn a_token_goes_in_a_bearer_header_on_every_kind_of_request_and_only_when_given(
         } else if req.target.starts_with("/raw/") {
             answer(200, "hello")
         } else {
-            answer(200, LISTING)
+            answer(200, http_listing())
         }
     });
     let remote = server.remote();
@@ -467,15 +477,16 @@ fn compressed_and_chunked_answers_read_the_same_as_plain_ones() {
     let server = FakeServer::start(|req| {
         let gzip_welcome = req.header("accept-encoding").is_some_and(|v| v.contains("gzip"));
         match (req.target.contains("HEAD%3Agzip"), gzip_welcome) {
-            (true, true) => answer(200, gzip_stored(LISTING.as_bytes())).header("Content-Encoding", "gzip"),
+            (true, true) => answer(200, gzip_stored(http_listing().as_bytes())).header("Content-Encoding", "gzip"),
             (true, false) => answer(406, r#"{"message":"the client did not ask for gzip"}"#),
-            (false, _) => answer(200, LISTING).chunked(true),
+            (false, _) => answer(200, http_listing()).chunked(true),
         }
     });
     let remote = server.remote();
     for folder in ["gzip", "chunked"] {
         let Ok(TreeReply::Snapshot { snapshot, .. }) = remote.tree(&at("", folder), None, None, &go()) else { panic!("{folder}: expected a listing") };
-        assert_eq!((snapshot.sha.as_str(), snapshot.entries.len()), ("abc", 2), "{folder}");
+        assert_eq!((snapshot.sha.as_str(), snapshot.entries.len()), (SHA, 2), "{folder}");
+        assert!(snapshot.entries.iter().all(|entry| entry.sha == SHA), "{folder}");
     }
 }
 
@@ -484,7 +495,7 @@ fn a_redirect_is_reported_and_never_followed() {
     for status in [301, 302, 307, 308] {
         let server = FakeServer::start(move |req| {
             if req.target.starts_with("/api/moved") {
-                answer(200, LISTING)
+                answer(200, http_listing())
             } else {
                 answer(status, "").header("Location", "/api/moved/repos/o/n2/git/trees/HEAD%3A?recursive=1")
             }
@@ -564,7 +575,7 @@ fn answers_larger_than_allowed_are_refused_however_they_are_framed() {
 fn a_connection_that_breaks_in_the_middle_of_an_answer_is_a_network_failure() {
     let server = FakeServer::start(|req| {
         let body: Vec<u8> = if req.target.contains("/git/trees/") {
-            LISTING.into()
+            http_listing().into_bytes()
         } else if req.target.contains("/commits/") {
             SHA.into()
         } else {
@@ -723,6 +734,7 @@ fn fake_github(upstream: Arc<Mutex<Upstream>>) -> impl Fn(&Seen) -> Reply + Send
             }
         }
         let (body, etag, commit) = listing(&up.files);
+        let tree_sha = serde_json::from_str::<serde_json::Value>(&body).unwrap()["sha"].as_str().unwrap().to_string();
         if req.target == TREE {
             return if req.header("if-none-match") == Some(etag.as_str()) {
                 answer(304, "").header("ETag", &etag)
@@ -732,6 +744,22 @@ fn fake_github(upstream: Arc<Mutex<Upstream>>) -> impl Fn(&Seen) -> Reply + Send
         }
         if req.target == COMMIT {
             return answer(200, commit);
+        }
+        if let Some(tree) = req.target.strip_prefix("/api/repos/o/fixtures/git/trees/") {
+            if tree == commit {
+                return answer(
+                    200,
+                    json!({
+                        "sha": SHA,
+                        "tree": [{"path": "skills", "mode": "040000", "type": "tree", "sha": tree_sha}],
+                        "truncated": false
+                    })
+                    .to_string(),
+                );
+            }
+            if tree == format!("{tree_sha}?recursive=1") {
+                return answer(200, body).header("Content-Type", "application/json; charset=utf-8");
+            }
         }
         let file = req.target.strip_prefix(&format!("/raw/o/fixtures/{commit}/")).map(decode).and_then(|path| up.files.get(&path));
         match file {

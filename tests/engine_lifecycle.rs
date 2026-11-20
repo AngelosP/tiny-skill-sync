@@ -422,6 +422,46 @@ fn a_plain_check_sorts_out_an_interrupted_update_before_it_decides_anything() {
 }
 
 #[test]
+fn pending_skill_transaction_recovers_after_its_source_is_removed_or_rebound() {
+    let mut failures = Vec::new();
+    for (name, change) in [("removed", 0), ("identity", 1), ("repository", 2), ("path", 3), ("branch", 4)] {
+        let mut s = Setup::fresh(&format!("pending-source-{name}"));
+        assert!(matches!(only(&s.sync()).outcome, Outcome::Synced));
+        s.remote.put(REPO, "skills/alpha/SKILL.md", ALPHA_V2);
+        s.engine.set_step_hook(crash_once_at(Step::OldMoved));
+        let interrupted = s.sync();
+        assert!(matches!(&skill(only(&interrupted), "alpha").result, ApplyResult::Failed(_)));
+        let mut cfg = s.cfg.clone();
+        match change {
+            0 => cfg.repos.clear(),
+            1 => cfg.repos[0].id = "renamed".into(),
+            2 => cfg.repos[0].repo = "o/another".into(),
+            3 => cfg.repos[0].path = "elsewhere".into(),
+            4 => cfg.repos[0].branch = "other".into(),
+            _ => unreachable!(),
+        }
+
+        let started = s.restarted().startup(&cfg).unwrap();
+
+        let state = s.w.state();
+        if alpha(&s.w) != "v1"
+            || state.has_pending()
+            || !started.verify.notes.iter().any(|n| n.text.contains("the previous version is back"))
+            || !s.w.work_leftovers().is_empty()
+        {
+            failures.push(format!(
+                "{name}: alpha={}, pending={}, notes={:?}, work={:?}",
+                alpha(&s.w),
+                state.has_pending(),
+                started.verify.notes,
+                s.w.work_leftovers()
+            ));
+        }
+    }
+    assert!(failures.is_empty(), "pending recovery did not finish: {failures:#?}");
+}
+
+#[test]
 fn a_removal_cut_off_at_any_step_is_sorted_out_at_the_next_start() {
     // Where the folder is after recovery, and what recovery says.
     let cuts =

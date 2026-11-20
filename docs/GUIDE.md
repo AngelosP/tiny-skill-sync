@@ -2,7 +2,7 @@
 
 [Back to the short introduction](../README.md)
 
-A tiny Windows tray app that keeps your user-level Copilot skills in sync with GitHub repositories.
+A tiny Windows tray app that keeps your user-level Copilot skills, agents and modular instructions in sync with GitHub.
 
 You tell it which repositories (or which folder of a repository) hold skills. It installs them into your Copilot skills
 folder, checks GitHub on a schedule, and installs, updates and removes skills as they change upstream. It adopts an
@@ -88,14 +88,19 @@ allows the same current-or-historical adoption checks.
    notification area. The first start of a new exe can take up to a second while Microsoft Defender scans it. The exes
    are not signed, so if a browser downloaded them, Windows may ask before the first start (**More info**, **Run
    anyway**).
-3. Click the icon to open the window. Click **Add repository**, paste the address of a GitHub folder that holds skills,
-   and click **Add**. For example:
+3. Click the icon to open the window. Click **Add source**, paste the address of the GitHub folder, choose
+   **Skills** (the default), **Agents** or **Instructions**, and click **Preview**. For example:
 
    ```text
    https://github.com/anthropics/skills/tree/main/skills
    ```
 
-4. The app installs the skills at once and then checks once a day. It also asks whether to start with Windows.
+4. Check the type, matches and destination. **Cancel** saves and installs nothing. If the preview was rejected
+   or found nothing, use **Retry** with the same details, or **Edit** to change them. If a source attempt is rejected
+   (for example, because that source is already set up), the next **Add source** attempt keeps the address and type
+   you entered. **Add and check**
+   saves the source and starts the first check, then checks once a day by default. Esc does not cancel a save
+   already in progress. The app also asks whether to start with Windows.
 
 ### Updating the app
 
@@ -150,8 +155,8 @@ tss portable
 This creates two files beside `tss.exe` and refuses to replace either one if it already exists:
 
 - `tiny-skill-sync.settings.json` holds the default skill interval, optional skills folder and app-update preferences.
-- `tiny-skill-sync.sources.json` holds the repositories, including their branch, folder, enabled state, interval and
-  `use_token` choice.
+- `tiny-skill-sync.sources.json` holds the sources, including their IDs, type, branch, folder, enabled state,
+  interval and `use_token` choice.
 
 The files are deliberately separate, so you can copy or update one without replacing the other. The command does not
 change the local `config.json`. To change shared settings later, edit the companion JSON files or copy in reviewed
@@ -159,17 +164,38 @@ versions; `tss portable` is an export, not a merge command. Each file has a form
 unsupported or malformed companion is reported rather than silently ignored.
 
 The settings and sources are shared; `state.json`, `engine.lock`, window size, the one-time startup-offer marker,
-mutex, saved GitHub token and skills folder remain local to each machine. The default skills folder is resolved
+mutex, saved GitHub token, destination bindings and work folders remain local to each machine. The default skills folder is resolved
 separately on each machine as `%USERPROFILE%\.copilot\skills`. A portable `skills_dir` may use Windows environment
 variables such as `%USERPROFILE%`; they are expanded locally and the stored value is not rewritten. `TSS_SKILLS_DIR`
-still overrides it on that machine. Do not set `skills_dir` to a folder shared by machines: concurrent installs and
-per-machine ownership records are not supported.
+still overrides it on that machine. Agents and Instructions use their own local Copilot folders, not paths derived
+from `skills_dir`. Do not share destinations or work folders between machines. Skills-only data can remain in
+format 1. Typed local settings, portable sources and their ownership records use format 2; upgrade older copies
+before adding a typed source. Do not relabel format-2 files as format 1 to use an older copy.
 
 The app reads and writes companion files on its worker, so a slow or unavailable share does not block the window.
 Changes made on another machine are picked up at the next poll, **Sync now** or check, or when the window opens. There
 is no cross-machine lock or transaction across the two files: avoid editing them from multiple machines at once, and
 check for OneDrive conflict copies before continuing. If the share is unavailable, the check fails and installed
 skills are left alone.
+
+### Agents and modular instructions
+
+Select one type per source. **Agents** looks only for regular `*.agent.md` files directly in the folder you gave it.
+**Instructions** looks only for regular `*.instructions.md` files there. It does not import `AGENTS.md`,
+`copilot-instructions.md`, unrelated Markdown or files in subfolders.
+
+The default destinations are `%USERPROFILE%\.copilot\agents` and `%USERPROFILE%\.copilot\instructions`. The app
+can reuse a single existing layout, either flat in that folder or in a child named after the GitHub repository.
+When both layouts contain matching names, the app holds the source rather than making more copies. Once bound,
+the source stays in that layout; a blocked file does not move it or stop safe sibling changes. A file is adopted
+only when its contents match upstream under the normal text rules. It is not adopted just because its name matches.
+
+Loose files are tracked individually. The app never removes their containing folder or an unrelated file. It
+needs a complete, safe listing confirmed at a GitHub commit to remove an unedited managed file. A listing with no
+matches still needs your confirmation. Removing the source from settings leaves loose files in place. There
+is no watcher on the Agents or Instructions folders. Local status refreshes at startup, **Sync now**, or an
+existing local look triggered by a settings/state or Skills folder notification. A scheduled check looks at these
+files when it gets a fresh listing; opening the window reloads settings but does not itself rescan the files.
 
 You may turn on **Start with Windows** with `tss startup on`. When Windows can resolve the executable's final network
 path, the startup entry uses its UNC path; the executable also opts into Windows' network image-loading behavior.
@@ -243,7 +269,7 @@ checked and when the next check is; after something you asked for, it says what 
 updated", "Checked: nothing new on GitHub"). **Sync now** gets new and updated skills from every repository at once.
 Skills you edited or deleted are never changed by it. Hover over it to read the same.
 
-Down the left are your repositories, each with its state, and **Add repository**, **Activity** and **Settings**. When a
+Down the left are your sources, each with its type and state, and **Add source**, **Activity** and **Settings**. When a
 name is too long to show whole, rest the mouse on the list for a moment: it widens, up to half the window, taking the
 room from the page beside it, and narrows again when the mouse leaves.
 
@@ -291,6 +317,9 @@ room from the page beside it, and narrows again when the mouse leaves.
   - The chosen file's lines are on the right: `+` on green for a line only on GitHub, `−` on red for a line only on this
     PC, with three lines around each change. Long unchanged stretches are folded.
   - The skill's choices are at the top. **Back** (or Esc) returns.
+  - If local or upstream evidence changed since **Show changes**, the app does not replace the copy. Open
+    **Show changes** again and confirm only after reviewing the new comparison. If a local file cannot be verified,
+    the app leaves it alone.
   - Only the files whose hash differs are read or downloaded, and nothing is written. A file over 1 MiB, files beyond
     4 MiB from either side, and links (never followed) are named but not shown.
 - **Activity:** what the app did recently, newest first, and what went wrong.
@@ -324,8 +353,10 @@ opens and destroyed when it closes, so it costs nothing while closed.
 | Cancel search | Pause this skill's earlier-version search until you choose Resume search. |
 | Resume search | Continue the saved search, rechecking local evidence first. |
 
-Backups are folders named `backup-<skill>-<number>` in the work folder (**Backups** in Settings opens it). The app never
-deletes them; delete them yourself when you no longer need them.
+Skill backups are folders named `backup-<skill>-<number>` in the skills work folder (**Backups** in Settings
+opens it). Loose-file backups are named `backup-leaf-*.old` in `.tss-leaf-work` beside that type's destination.
+Activity and `tss` report the path when an operation finishes with a retained backup. The app never sweeps retained
+backups; delete them yourself when you no longer need them.
 
 ## Private repositories
 
@@ -354,15 +385,19 @@ also raises GitHub's rate limit: without one, every program on your network shar
 tss status                                   what is installed and what needs attention (no network)
 tss update status                            app versions and preferences (not a skill check)
 tss check [REPO] [--dry-run]                 check GitHub now and apply what is safe
-tss add OWNER/NAME|URL [--every 6h] [--use-token]
+tss add OWNER/NAME|URL [--type skills|agents|instructions] [--preview] [--every 6h] [--use-token]
 tss remove REPO [--delete-skills]
-tss resolve REPO SKILL replace|restore|keep|leave|manage|pause|resume
+tss resolve REPO ITEM replace|restore|keep|leave|manage|pause|resume
 tss token [status|set|clear]                 gh auth token | tss token set
 tss startup [status|on|off]                  start the tray app when you sign in
 tss portable                                 export local settings to companion files
 ```
 
-`REPO` is the id that `tss status` shows, or `owner/name`. Exit codes: 0 all fine, 1 something needs attention,
+Use the source ID that `tss status` shows for `REPO` when one repository has several sources.
+`tss add ... --type agents --preview` checks the source without saving. Omit `--preview` for the
+confirmation prompt; confirming saves settings, then `tss check ID` installs. A bare `tss add` still saves a Skills
+source without a prompt or a download. `--delete-skills` and earlier-version searches are only for Skills sources.
+Exit codes: 0 all fine, 1 something needs attention,
 2 failed, 3 bad command line. The tray notices changes made with `tss` and shows them. Only one of them checks at a
 time; the other one is told to try again in a moment.
 
@@ -388,7 +423,17 @@ was interrupted.
 | What the app installed (the ownership record) | `%LOCALAPPDATA%\tiny-skill-sync\state.json` |
 | The window's size | `%LOCALAPPDATA%\tiny-skill-sync\window.txt` |
 | Skills | `%USERPROFILE%\.copilot\skills`, unless `skills_dir` is set in `config.json` |
-| Work folder: downloads in progress and backups | `.tss-work` beside the skills folder (`%USERPROFILE%\.copilot\.tss-work`) |
+| Agents and modular instructions | `%USERPROFILE%\.copilot\agents` and `%USERPROFILE%\.copilot\instructions` |
+| Work folders: downloads in progress and backups | `.tss-work` beside Skills; `.tss-leaf-work` beside the loose-file destinations |
+
+Use private, user-owned destinations and work folders; the app does not change Windows permissions.
+If a loose-file change is interrupted, keep its state and work files together for recovery. Do not reuse a foreign
+or unmarked `.tss-leaf-work` folder for new work. Recovery waits until the exact source configuration that started
+the change is active again: the same source ID, type, repository, branch and path. Removing a source with interrupted
+work is refused; if settings remove or rebind it, its files, state and work remain untouched until the original
+configuration is restored. Recovery uses the destination recorded for the change, not a destination selected from
+current settings. If an earlier build left one, let that copy's recorded recovery finish first and keep any remaining
+work or backups somewhere private before the next change.
 
 The skills folder contains only skill folders; the app keeps its own files elsewhere so Copilot never sees them. A
 damaged `state.json` is kept as `state.json.damaged-*` and the app starts over with an empty record (it then takes over
@@ -436,8 +481,9 @@ In local mode, `config.json` can be edited by hand while the app runs; it is pic
 
 An empty `branch` means the default branch, and an empty `path` the repository root. `use_token` sends the token with
 every request to that repository; without it, a private repository is still read with the token (see
-[Private repositories](#private-repositories)). Never change an `id`: the installed skills are recorded under it. When
-the app or `tss` saves the settings, it writes only the fields above, so anything else you added by hand is dropped.
+[Private repositories](#private-repositories)). A missing `kind` means Skills; use `"agents"` or `"instructions"`
+for loose-file sources in format 2. An unknown or null kind is an error. Never change an `id`: the installed
+items are recorded under it. Unknown local settings fields are not preserved when the settings are saved.
 
 In local `config.json`, `skills_dir`, when set, must be a full path such as `D:\skills`. In portable settings it may
 also contain `%VARIABLE%` references, which are expanded on each machine; unknown variables and relative results are
@@ -449,6 +495,7 @@ Environment variables, mainly for tests and scripts:
 | --- | --- |
 | `TSS_HOME` | Use this folder instead of `%LOCALAPPDATA%\tiny-skill-sync`. One copy of the tray runs per folder. Such a copy keeps its Start with Windows entry under `HKCU\Software\tiny-skill-sync-test`, which Windows does not read. |
 | `TSS_SKILLS_DIR` | Use this skills folder, whatever the settings say. |
+| `TSS_AGENTS_DIR`, `TSS_INSTRUCTIONS_DIR` | Explicit disposable destinations for isolated copies syncing either loose-file type. Set them outside the active profile's `.copilot` folder. |
 | `TSS_BENCH_REPORT` | Write timing marks to this file (used by `scripts\bench.ps1`). |
 | `TSS_NO_SAVED_TOKEN` | Skip reading the saved app token (isolated live tests); GitHub CLI sign-in still works. |
 | `TSS_API_BASE`, `TSS_RAW_BASE` | Other GitHub addresses (used by the HTTP tests). |
@@ -505,9 +552,10 @@ updating and removing a skill, taking over a folder of yours, and **Show changes
 
 ## Measured cost
 
-With the app updater built in, the tray exe measured **1,173,504 bytes** (1.12 MiB), over its 1.1 MiB budget.
-On the three-skill, five-file public fixture, the tray appeared in 8.2 ms median, Settings painted in 33.5 ms
-median, and ordinary Quit took at most 0.9 ms. Ten idle seconds showed zero CPU, I/O and page faults. The
+With Agents and Instructions sources and the Universal C Runtime taken from Windows, the tray exe measured
+**1,287,680 bytes** (1.23 MiB), within its 1.25 MiB budget. On the three-skill, five-file public fixture, the tray
+appeared in 8.4 ms median, Settings painted in 47.0 ms median, an unchanged poll used 31.3 ms of CPU, and ordinary Quit
+took at most 0.9 ms. Ten idle seconds showed zero CPU, I/O and page faults. The
 benchmark suppressed release checks; it does not measure retaining an offered update or installing on a slow share.
 
 Measured with `scripts\bench.ps1` on a Ryzen 7 5800X3D with Windows 11, files in the cache, real installs of
@@ -526,7 +574,7 @@ historical adoption; the larger install is an earlier baseline.
 | Window open: working set | 13.6 MiB | 14.4 MiB | 40 MiB |
 | Window closed: working set (trimmed) | 1.5 MiB | 1.5 MiB | 2 MiB |
 | Unchanged check: CPU, file reads and writes | 0 ms, 0, 0 | 16 ms, 0, 0 | 50 ms, 0 |
-| Exe size | 1,057,280 bytes (1.01 MiB) | 0.93 MiB | 1.1 MiB |
+| Exe size | 1,057,280 bytes (1.01 MiB) | 0.93 MiB | 1.25 MiB |
 
 Every budget row passed in those earlier runs. The 442-file startup check took 48.2 microseconds per file; an unchanged poll took 438 ms
 wall time and changed no files. The eight-candidate historical quick slice took 11.4 seconds in the live fixture

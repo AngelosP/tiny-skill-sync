@@ -36,7 +36,8 @@ case by case. Code that talks to Windows is kept in `src\win\`.
 | --- | --- | --- |
 | `config` | Configuration model and local `config.json` parsing and writing. | file I/O |
 | `portable` | Versioned settings and repository companion files beside the executables; portable skills-path expansion. | file I/O |
-| `tree` | Reads a GitHub tree listing and decides which folders are skills. | yes |
+| `tree` | Reads a GitHub tree listing and finds entries of the selected type. | yes |
+| `source` | Source kinds, preview data and per-machine selection of flat or repo-named file destinations. | yes, except root lookup |
 | `pathsafe` | Rules for names and paths that come from GitHub (no `..`, no `CON`, no case clashes, length). | yes |
 | `reconcile` | The decision table: given upstream, the record and the disk, what may be done to each skill? | yes |
 | `scheduler` | When is each repository due; how long to wait after a failure. | yes |
@@ -75,7 +76,8 @@ The tray app has two threads.
 - The **worker thread** owns the engine and runs one job at a time: loading settings, the start-up look, a check, a
   resolution. Network calls, hashing, portable companion-file I/O and file changes never run on the UI thread.
   Settings load at startup and are reloaded before a poll or explicit check, and when the window opens; no
-  shared-folder watcher is added.
+  shared-folder or per-source watcher is added. Loose-file status is refreshed by the existing local look, startup,
+  an explicit check, or a fresh listing on a scheduled check. An unchanged conditional poll does not read the files.
 
 ```mermaid
 sequenceDiagram
@@ -310,10 +312,39 @@ stateDiagram-v2
   copy that differs only in line endings or blank lines is replaced or deleted like the original), and to hold nothing
   else. Anything else is kept as `backup-<skill>-<txn>` in the work folder, and backups are never deleted
   automatically.
-- If the app or the computer stops between two steps, `recover` reads the pending marker at the next start and
-  finishes or undoes the change. It finishes an update only when the new folder is a plain folder in place and the old
-  one is still clean; otherwise it moves the user's files back (`uncarry`) and puts the old folder back. Tests stop the
-  code at every step, including between two carried files, to prove it (`engine_lifecycle`, `apply` tests).
+- For Skills transactions, if the app or the computer stops between two steps, `recover` reads the pending marker at
+  the next start and finishes or undoes the change, even if its source was removed or changed in settings. It finishes
+  an update only when the new folder is a plain folder in place and the old one is still clean; otherwise it moves the
+  user's files back (`uncarry`) and puts the old folder back. Tests stop the code at every step, including between two
+  carried files, to prove it (`engine_lifecycle`, `apply` tests). Loose-file recovery uses the separate source-identity
+  rule below.
+
+### Loose files and reviewed changes
+
+`engine::loose` checks Agents and Instructions sources with the same scheduler, but owns one file at a time.
+Before accepting any absence it checks a complete, safe listing at the recorded source and pinned commit.
+A refusal or failed lookup is not absence. The empty-listing confirmation is separate from the full local check.
+Remote planning and downloads finish before changing files. After a local binding is recorded, a blocked leaf is
+held without moving the binding or holding unrelated leaves. The alternate layout is still checked for that exact
+name; an ambiguous unbound layout is never selected.
+
+`apply::leaf` stages verified bytes in `.tss-leaf-work` on the destination volume, outside the installed files.
+New work requires the directory's owner marker to match its physical identity and the settings home. The journal
+and opened file identities authorize only its named live, staged and backup objects. Recovery restores a proven
+original or finishes an already proven change; it never installs a stage on its own or sweeps unrelated contents.
+At the next writable start, pending leaf work is recovered only when the active source has the same ID, kind,
+repository, branch and path as its recorded origin. If the source was removed or rebound, its files, state and work
+remain untouched until the original source configuration is restored. Recovery uses the transaction's immutable
+destination binding, bounded paths and identity proofs; it does not choose a destination from current settings.
+If the change is already committed and the old file cannot be retired, the result reports success with a retained
+backup. Atomic settings/state writes flush, publish and clean up their own temporary file through its open handle.
+The directories still rely on the caller's Windows permissions.
+
+**Show changes** keeps the evidence for the displayed comparison in memory. A later overwrite must still match
+the source, selected upstream file hashes, relevant local byte hashes and presence. The transaction rechecks the
+local evidence before publication. A mismatch requires a new comparison and choice; a successful overwrite discards
+the comparison, so it cannot authorize a later retry. This does not change the
+text comparison rules used for ordinary sync, or make unrelated files part of a comparison.
 
 ## Finding edits: quick and full checks
 
@@ -444,6 +475,9 @@ flowchart TD
   portable poll or explicit check and when the window opens. Saves compare the changed portion with the version last
   loaded and write only that portion; separate files are not a cross-file transaction, so simultaneous writers are
   unsupported.
+- A missing source `kind` is Skills, preserving old IDs and skill records. Typed local config, portable sources
+  and state use format 2, which old Skills-only readers refuse; the portable settings companion stays separate.
+  Binding and loose-file ownership are stored only in local state, not in portable sources.
 - `state.json`, `engine.lock`, window size, the startup-offer marker, mutex and saved token stay per machine. Shared
   repository records include their enabled state and interval. A missing shared repository becomes an orphan in the
   local ownership record; it is not a request to delete its skills.

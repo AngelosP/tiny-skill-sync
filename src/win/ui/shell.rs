@@ -40,14 +40,15 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 
 use super::page::{self, Note};
 use super::{bench, dialogs, register_class, sentence, tray, trim_memory, window};
-use crate::app::{App, Done, Job, Order, SettingsSource, Shown, UpdateState, perform_with_updates};
+use crate::app::{App, Done, Job, Order, SettingsSource, Shown, SourceDraft, UpdateState, perform_with_updates};
 use crate::autostart::BACKGROUND;
 use crate::board::{APP_NAME, Level, RepoView, span};
 use crate::cli::{Host, SystemHost};
-use crate::config::{CONFIG_FILE, Config, Paths, instance_tag};
+use crate::config::{CONFIG_FILE, Config, Paths, RepoSpec, instance_tag};
 use crate::engine::{Engine, EngineError, Stamp, stamp_of};
-use crate::interval::{UnixSecs, now_secs};
+use crate::interval::{Interval, UnixSecs, now_secs};
 use crate::replacement::VerifiedTray;
+use crate::source::SourceKind;
 use crate::win::{proc, wide, wide_os};
 
 /// Tray menu and remote-control commands, sent as `WM_COMMAND`.
@@ -422,7 +423,7 @@ impl Shell {
                 let why = "the worker thread stopped; quit and start Tiny Skill Sync again".to_string();
                 let failed = Done {
                     job: order.job,
-                    result: Err(EngineError::Failed(why)),
+                    result: Err(EngineError::Failed(why.clone())),
                     next_wake: None,
                     last_checks: Vec::new(),
                     kept: Vec::new(),
@@ -431,7 +432,7 @@ impl Shell {
                     private: Vec::new(),
                     stamp: None,
                     settings: None,
-                    config_saves: Vec::new(),
+                    config_saves: order.config_saves.into_iter().map(|save| save.outcome(Err(why.clone()))).collect(),
                     settings_checked: false,
                     update: None,
                 };
@@ -508,18 +509,15 @@ impl Shell {
         if !config_saves.is_empty() {
             self.saving_settings = false;
         }
-        for saved in &config_saves {
-            if saved.result.is_ok() && self.app.cfg() == &saved.before {
-                self.app.set_cfg(saved.after.clone(), self.app.skills_dir().clone());
-            }
-        }
         if !config_saves.is_empty()
             && config_saves.iter().all(|saved| saved.result.is_ok())
-            && matches!(self.feedback.as_deref(), Some("Saving shared settings…" | "Saving app update settings…"))
+            && matches!(self.feedback.as_deref(), Some("Saving settings…" | "Saving app update settings…"))
         {
             self.feedback = None;
         }
-        let saved = settled.removed.is_none_or(|id| self.drop_from_config(&id));
+        if let Some(id) = settled.removed {
+            self.drop_from_config(&id);
+        }
         if settled.feedback.is_some() {
             self.feedback = settled.feedback;
         } else if settled.stale_feedback {
@@ -529,7 +527,17 @@ impl Shell {
             self.diff = settled.diff;
         }
         // The job's own changes signalled the watch; a new one starts clean. Edits made while it ran show at the next look.
-        if !matches!(job, Job::Look | Job::Plan | Job::Flush | Job::AppUpdate(_) | Job::ScheduledUpdate | Job::InstallOnQuit { .. }) {
+        if !matches!(
+            job,
+            Job::Look
+                | Job::Plan
+                | Job::Flush
+                | Job::PreviewSource(_)
+                | Job::SaveSource(..)
+                | Job::AppUpdate(_)
+                | Job::ScheduledUpdate
+                | Job::InstallOnQuit { .. }
+        ) {
             self.skills_watch = None;
         }
         if self.skills_watch.is_none() {
@@ -541,73 +549,19 @@ impl Shell {
         if matches!(job, Job::Startup | Job::Poll | Job::AppUpdate(_) | Job::ScheduledUpdate) && self.app.is_idle() && !window::is_open() {
             trim_memory();
         }
-        saved && config_saves.iter().all(|s| s.result.is_ok())
+        config_saves.iter().all(|s| s.result.is_ok())
     }
 
     /// The engine let go of a repository; it leaves the settings too.
-    fn drop_from_config(&mut self, id: &str) -> bool {
-        if self.portable_mode {
-            let before = self.app.cfg().clone();
-            let mut cfg = before.clone();
-            cfg.repos.retain(|r| r.id != id);
-            if cfg != before {
-                self.save_portable_config(before, cfg, false);
-            }
-            return true;
-        }
-        let file = self.cfg_file();
-        let saved = Config::load(&file).and_then(|mut cfg| {
-            let before = cfg.clone();
-            cfg.repos.retain(|r| r.id != id);
-            cfg.save_if_unchanged(&file, &before).map(|()| cfg)
-        });
-        match saved {
-            Ok(cfg) => {
-                self.cfg_stamp = stamp_of(&file);
-                self.apply_cfg(cfg, false);
-                true
-            }
-            Err(e) => {
-                // Not checked again in this session, whatever the file says.
-                let mut cfg = self.app.cfg().clone();
-                cfg.repos.retain(|r| r.id != id);
-                self.apply_cfg(cfg, false);
-                let text = format!(
-                    "{}. The skills of '{id}' are no longer managed, but it is still in the settings: remove it from {} by hand.",
-                    sentence(&e),
-                    file.display()
-                );
-                self.app.board.say(now_secs(), Level::Error, text);
-                false
-            }
-        }
-    }
-
-    fn save_portable_config(&mut self, before: Config, after: Config, revert_on_failure: bool) {
-        if before.app_update != after.app_update && matches!(self.app.busy(), Some(Job::ScheduledUpdate)) {
-            self.cancel.store(true, Ordering::Release);
-        }
-        let skills = self.app.skills_dir().clone();
-        self.app.set_cfg(after.clone(), skills);
-        self.app.queue_config_save(before, after, true, revert_on_failure);
-        self.saving_settings = true;
-        self.feedback = Some("Saving shared settings…".to_string());
-    }
-
-    /// Uses new settings. `tell` says what is wrong with them, for settings changed outside the app.
-    fn apply_cfg(&mut self, cfg: Config, tell: bool) {
-        self.cancel.store(true, Ordering::Relaxed);
-        if tell {
-            let now = now_secs();
-            for problem in cfg.problems() {
-                self.app.board.say(now, Level::Attention, format!("Settings problem: {problem}"));
-            }
-        }
-        let skills = Paths::skills_dir(&cfg);
-        let moved = skills != *self.app.skills_dir();
-        self.app.set_cfg(cfg, skills);
-        if moved {
-            self.skills_watch = Watch::open(self.app.skills_dir(), true, SKILL_CHANGES);
+    fn drop_from_config(&mut self, id: &str) {
+        let before = self.app.cfg().clone();
+        let mut after = before.clone();
+        after.repos.retain(|r| r.id != id);
+        if before != after {
+            // Stop scheduling it immediately even if the worker cannot update the settings.
+            self.app.set_cfg(after.clone(), self.app.skills_dir().clone());
+            self.app.queue_config_save(before, after, self.portable_mode, false);
+            self.saving_settings = true;
         }
     }
 
@@ -618,17 +572,11 @@ impl Shell {
         if stamp.is_some() && stamp != self.cfg_stamp {
             self.cfg_stamp = stamp;
             if !self.portable_mode {
-                match Config::load(&file) {
-                    Ok(cfg) => {
-                        self.cfg_error = false;
-                        self.apply_cfg(cfg, true);
-                    }
-                    Err(e) => {
-                        self.cfg_error = true;
-                        let text = format!("{}. The settings in use are unchanged, and nothing is saved to the file until it is fixed.", sentence(&e));
-                        self.app.board.say(now_secs(), Level::Error, text);
-                    }
+                // A source save also signals this watch. Reload on the worker, after its CAS reply.
+                if !matches!(self.app.busy(), Some(Job::SaveSource(..))) {
+                    self.cancel.store(true, Ordering::Release);
                 }
+                self.app.reload_before_next_job();
             }
         }
         let state = stamp_of(&self.paths().state_file());
@@ -662,7 +610,7 @@ impl Shell {
             return "Loading settings…".to_string();
         }
         if !self.app.cfg().repos.iter().any(|r| r.enabled) {
-            return "Add a repository to start".to_string();
+            return "Add a source to start".to_string();
         }
         match self.app.next_wake() {
             Some(at) if at > now => format!("Next check in {}", span(at - now)),
@@ -692,6 +640,7 @@ pub struct Snapshot {
     pub now: UnixSecs,
     pub cfg: Config,
     pub views: Vec<RepoView>,
+    pub draft: Option<SourceDraft>,
     pub skills_dir: PathBuf,
     pub work_dir: PathBuf,
     pub notes: Vec<Note>,
@@ -708,6 +657,7 @@ pub fn snapshot() -> Option<Snapshot> {
             now,
             cfg: s.app.cfg().clone(),
             views: s.app.board.views(s.app.cfg(), now),
+            draft: s.app.draft().cloned(),
             skills_dir: s.app.skills_dir().clone(),
             work_dir: s.paths().work_dir(),
             notes: page::activity_of(&s.app.board),
@@ -719,6 +669,41 @@ pub fn snapshot() -> Option<Snapshot> {
     })
 }
 
+fn with_source_edit<T>(edit: impl FnOnce(&mut App) -> Result<T, String>) -> Result<T, String> {
+    let result = with_shell(|s| {
+        if s.cfg_error || !s.app.settings_initialized() || s.saving_settings || s.app.portable_probe_pending() {
+            return Err("Settings are unavailable or still being checked. Try again after they load.".into());
+        }
+        edit(&mut s.app)
+    })
+    .unwrap_or_else(|| Err("The app is busy. Try again.".into()));
+    match &result {
+        Err(why) => tell(sentence(why)),
+        Ok(_) => kick(),
+    }
+    result
+}
+
+pub fn preview_source(spec: &RepoSpec, kind: SourceKind, every: Option<Interval>) -> Result<u64, String> {
+    with_source_edit(|app| app.preview_source(spec, kind, every))
+}
+
+pub fn confirm_source(ticket: u64) {
+    let _ = with_source_edit(|app| app.confirm_source(ticket));
+}
+
+pub fn saving_source() -> bool {
+    with_shell(|s| s.app.saving_source()).unwrap_or(true)
+}
+
+pub fn dismiss_source() {
+    with_shell(|s| {
+        if matches!(s.app.busy(), Some(Job::PreviewSource(_))) {
+            s.cancel.store(true, Ordering::Release);
+        }
+        s.app.dismiss_source();
+    });
+}
 /// The differences of a skill the worker read since this was last asked.
 pub fn take_diff() -> Option<Shown> {
     with_shell(|s| s.diff.take()).flatten()
@@ -785,8 +770,7 @@ pub fn reload_settings() {
     kick();
 }
 
-/// Changes settings and uses them. Local config keeps its immediate save behavior; portable companions are saved on
-/// the worker so a slow shared folder never blocks the UI.
+/// The worker compares and saves the edit before it takes effect, in both storage modes.
 pub fn edit_config(change: impl FnOnce(&mut Config) -> Result<bool, String>) -> Result<bool, String> {
     let result = with_shell(|s| {
         if !s.app.settings_initialized() {
@@ -795,33 +779,20 @@ pub fn edit_config(change: impl FnOnce(&mut Config) -> Result<bool, String>) -> 
         if s.cfg_error {
             return Err("Settings could not be loaded; fix them before editing".to_string());
         }
-        if s.saving_settings {
-            return Err("Shared settings are still being saved; try again in a moment".to_string());
+        if s.saving_settings || s.app.saving_source() {
+            return Err("Settings are still being saved; try again in a moment".to_string());
         }
-        if !s.app.portable_mode() && s.app.portable_probe_pending() {
+        if s.app.portable_probe_pending() {
             return Err("Settings are being checked; try again in a moment".to_string());
         }
-        if s.portable_mode {
-            let before = s.app.cfg().clone();
-            let mut cfg = before.clone();
-            if !change(&mut cfg)? {
-                return Ok(false);
-            }
-            s.save_portable_config(before, cfg, true);
-            return Ok(true);
-        }
-
-        let file = s.cfg_file();
-        let mut cfg = Config::load(&file)?;
-        let before = cfg.clone();
+        let before = s.app.cfg().clone();
+        let mut cfg = before.clone();
         if !change(&mut cfg)? {
             return Ok(false);
         }
-        cfg.save_if_unchanged(&file, &before)?;
-        s.cfg_stamp = stamp_of(&file);
-        s.cfg_error = false;
-        s.feedback = None;
-        s.apply_cfg(cfg, false);
+        s.app.queue_config_save(before, cfg, s.portable_mode, false);
+        s.saving_settings = true;
+        s.feedback = Some("Saving settings…".into());
         Ok(true)
     })
     .unwrap_or_else(|| Err("the app is busy; try again".to_string()));
@@ -835,7 +806,7 @@ pub fn edit_config(change: impl FnOnce(&mut Config) -> Result<bool, String>) -> 
 /// Update preferences are revocable immediately; compare-before-save runs on the worker.
 pub fn edit_app_update(change: impl FnOnce(&mut Config) -> Result<bool, String>) -> Result<bool, String> {
     let result: Result<bool, String> = with_shell(|s| {
-        if s.saving_settings {
+        if s.saving_settings || s.app.saving_source() {
             return Err("App update choice not saved. Wait for the previous save to finish and try again.".into());
         }
         if s.cfg_error || !s.app.settings_initialized() || s.app.portable_probe_pending() {

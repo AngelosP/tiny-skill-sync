@@ -12,14 +12,15 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 
 use crate::autostart::{Exe, Keys, Startup, Via};
-use crate::board::{Action, Board, Level, RepoView, Row};
+use crate::board::{Action, Board, Level, RepoView, Row, source_folder};
 use crate::config::{CONFIG_FILE, Config, Paths, RepoConfig, RepoSpec, UpdateInterval, UpdatePrefs, UpdateTiming};
 use crate::engine::{Access, ApplyResult, Engine, EngineError, Outcome, Resolution, SkillReport, SyncOptions, Tracking, Which};
 use crate::github::{GitHubRemote, Remote, SystemTokens, TokenProvider};
 use crate::interval::{Interval, now_secs};
-use crate::pathsafe::{fold, printable_lines};
+use crate::pathsafe::{check_component, fold, printable, printable_lines};
 use crate::portable;
 use crate::reconcile::Verdict;
+use crate::source::SourceKind;
 use crate::state::State;
 use crate::updater::Action as AppAction;
 use crate::verify::Check;
@@ -36,17 +37,17 @@ const TRAY_EXE: &str = "tiny-skill-sync.exe";
 const NO_REPOS: &str = "No repositories are set up. Add one with: tss add OWNER/NAME";
 
 const HELP: &str = "\
-tss - keeps Copilot skills in sync with GitHub repositories, one command at a time.
+tss - keeps Copilot skills, agents and instructions in sync with GitHub sources.
 The tray app does the same work on a schedule; both follow the same safety rules.
 
 Usage:
   tss status
       What is installed and what needs attention. Reads only local files.
   tss check [REPO] [--dry-run] [--full-listing] [--delete-all]
-      Check skills only. Ask GitHub now and apply what is safe: install, update, remove.
+      Check sources, not the app. Apply what is safe: install, update, remove.
         --dry-run       show what would change, and change nothing
         --full-listing  fetch the whole listing even if GitHub says nothing changed
-        --delete-all    REPO lists no skills at all any more: delete its skills anyway
+        --delete-all    REPO lists no matching items any more: confirm their removal
   tss update [status | check | install | on | off]
   tss update every 1d|7d|30d
   tss update when immediate|quit
@@ -57,20 +58,26 @@ Usage:
       then restarts into it. 'quit' waits until you choose Quit from the tray
       menu, and the tray stays closed. 'tss update install' does not restart a
       running tray: quit it and open it again to use the new build.
-  tss resolve REPO SKILL ACTION
-      Settle a skill that needs you. ACTION is one of:
+  tss resolve REPO ITEM ACTION
+      Settle a skill or a file from this source. ACTION is one of:
         replace   take upstream's version; what is there now is kept as a backup
-        restore   bring back a skill that was deleted here (same as replace)
-        keep      the folder is yours: never change or remove it
-        leave     a skill that was deleted here stays deleted (same as keep)
+        restore   bring back an item deleted here (same as replace)
+        keep      the item is yours: never change or remove it
+        leave     an item deleted here stays deleted (same as keep)
         manage    undo keep
-  tss add OWNER/NAME [--every INTERVAL] [--use-token]
+  tss add OWNER/NAME [--type skills|agents|instructions] [--preview]
+                     [--every INTERVAL] [--use-token]
   tss add https://github.com/OWNER/NAME/tree/BRANCH/FOLDER [...]
-      Follow a repository, or one folder of it. A private repository is read with
-      the GitHub token by itself; --use-token sends it for every request.
+      Follow one type from a repository or folder. --preview only lists matches
+      and their destination. It does not save settings or install anything.
+      With --type, review the preview and type yes to save. Without --type or
+      --preview, add a Skills source without a prompt or a request to GitHub.
+      Adding never installs files. Check now with 'tss check ID', or let the
+      tray check later. Private repositories use the GitHub token when needed;
+      --use-token sends it for every request.
   tss remove REPO [--delete-skills]
-      Stop following a repository. Its skills stay installed and become yours,
-      unless --delete-skills is given (edited skills are kept even then).
+      Stop following a source. Its files stay installed. --delete-skills is
+      only for Skills sources (edited skills are kept even then).
   tss token [status | set | clear]
       The GitHub token, saved in Windows Credential Manager. Without one, the
       GitHub CLI's token is used (gh auth login). 'set' reads the token without
@@ -94,6 +101,9 @@ Environment:
   TSS_HOME        settings and state (default: %LOCALAPPDATA%\\tiny-skill-sync)
   TSS_SKILLS_DIR  the skills folder (default: from the settings, else
                   %USERPROFILE%\\.copilot\\skills)
+  TSS_AGENTS_DIR  agents folder (normally %USERPROFILE%\\.copilot\\agents)
+  TSS_INSTRUCTIONS_DIR  instructions folder (normally %USERPROFILE%\\.copilot\\instructions)
+                  Set these to isolated folders when testing file sources.
 ";
 
 /// Everything the commands need from outside, so tests can run them against a fake GitHub and a fake credential
@@ -107,12 +117,17 @@ pub trait Host {
     fn portable_skills_dir(&self, cfg: &Config) -> Result<PathBuf, String> {
         Ok(self.skills_dir(cfg))
     }
+    fn source_paths(&self, skills: PathBuf) -> Paths {
+        Paths::new(self.home(), skills)
+    }
     /// Reads the version of the installed tray and CLI pair, not the build running this command.
     fn installed_app_version(&self, directory: &Path) -> Result<String, String>;
     /// Explicit app release operation, separate from the skills engine and its credential sources.
     fn manual_app_update(&self, paths: &Paths, directory: &Path, action: AppAction) -> Result<String, String>;
     fn remote(&self) -> Result<Box<dyn Remote>, String>;
     fn tokens(&self) -> Box<dyn TokenProvider>;
+    /// Called only after a typed add displayed its preview; EOF or anything but an explicit yes cancels.
+    fn confirm_source(&self) -> Result<bool, String>;
     fn token_saved(&self) -> bool;
     fn save_token(&self, token: &str) -> Result<(), String>;
     /// True when a token was saved and is now gone.
@@ -169,6 +184,12 @@ impl Host for SystemHost {
 
     fn tokens(&self) -> Box<dyn TokenProvider> {
         Box::new(SystemTokens)
+    }
+
+    fn confirm_source(&self) -> Result<bool, String> {
+        let mut line = String::new();
+        io::stdin().read_line(&mut line).map_err(|e| format!("could not read the answer: {e}"))?;
+        Ok(line.trim().eq_ignore_ascii_case("yes"))
     }
 
     fn token_saved(&self) -> bool {
@@ -228,11 +249,21 @@ pub enum Command {
     Update(UpdateCommand),
     Check { repo: Option<String>, dry_run: bool, full_listing: bool, delete_all: bool },
     Resolve { repo: String, skill: String, how: Resolution },
-    Add { spec: String, every: Option<Interval>, use_token: bool },
+    Add(AddSource),
     Remove { repo: String, delete_skills: bool },
     Token(TokenAction),
     Startup(StartupAction),
     Portable,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AddSource {
+    pub spec: String,
+    pub every: Option<Interval>,
+    pub use_token: bool,
+    /// None preserves the original, offline Skills add used by scripts.
+    pub kind: Option<SourceKind>,
+    pub preview: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -294,7 +325,7 @@ fn usage_of(command: &str) -> &'static str {
         "check" => "tss check [REPO] [--dry-run] [--full-listing] [--delete-all]",
         "update" => "tss update [status|check|install|on|off|every 1d|7d|30d|when immediate|quit]",
         "resolve" => "tss resolve REPO SKILL replace|restore|keep|leave|manage|pause|resume",
-        "add" => "tss add OWNER/NAME [--every INTERVAL] [--use-token]",
+        "add" => "tss add OWNER/NAME [--type skills|agents|instructions] [--preview] [--every INTERVAL] [--use-token]",
         "remove" => "tss remove REPO [--delete-skills]",
         "token" => "tss token [status|set|clear]",
         "startup" => "tss startup [status|on|off]",
@@ -360,6 +391,7 @@ pub fn parse(args: &[String]) -> Result<Command, String> {
                 };
                 let value = match value {
                     None if name == "every" => Some(rest.next().cloned().ok_or("--every needs an interval, for example --every 6h")?),
+                    None if name == "type" => Some(rest.next().cloned().ok_or("--type needs skills, agents or instructions")?),
                     value => value,
                 };
                 flags.0.push((name.to_string(), value));
@@ -416,7 +448,12 @@ pub fn parse(args: &[String]) -> Result<Command, String> {
                 Some(text) => Some(Interval::parse(&text).and_then(Interval::validate_poll).map_err(|e| format!("--every: {e}"))?),
                 None => None,
             };
-            Command::Add { spec: words[0].clone(), every, use_token: flags.switch("use-token")? }
+            let kind = match flags.remove("type").as_slice() {
+                [] => None,
+                [Some(value)] => Some(SourceKind::try_from(value.clone())?),
+                _ => return Err("choose exactly one --type: skills, agents or instructions".into()),
+            };
+            Command::Add(AddSource { spec: words[0].clone(), every, use_token: flags.switch("use-token")?, kind, preview: flags.switch("preview")? })
         }
         "remove" => {
             expect_words(&name, words, 1, 1)?;
@@ -454,11 +491,7 @@ pub fn parse(args: &[String]) -> Result<Command, String> {
 
 /// Finds a repository by its id, or by `owner/name` when only one entry has it. Case does not matter.
 pub fn find_repo<'a>(cfg: &'a Config, query: &str) -> Result<&'a RepoConfig, String> {
-    if let Some(repo) = cfg.find(query) {
-        return Ok(repo);
-    }
-    let wanted = query.trim().trim_end_matches('/');
-    let hits: Vec<&RepoConfig> = cfg.repos.iter().filter(|r| r.id.eq_ignore_ascii_case(wanted) || r.repo.eq_ignore_ascii_case(wanted)).collect();
+    let hits = repo_matches(cfg, query);
     let ids = |repos: &mut dyn Iterator<Item = &RepoConfig>| repos.map(|r| r.id.as_str()).collect::<Vec<_>>().join(", ");
     match hits.as_slice() {
         [one] => Ok(one),
@@ -466,6 +499,15 @@ pub fn find_repo<'a>(cfg: &'a Config, query: &str) -> Result<&'a RepoConfig, Str
         [] => Err(format!("no repository '{query}' is set up; the ids are: {}", ids(&mut cfg.repos.iter()))),
         many => Err(format!("'{query}' matches several repositories ({}); use the id", ids(&mut many.iter().copied()))),
     }
+}
+
+fn repo_matches<'a>(cfg: &'a Config, query: &str) -> Vec<&'a RepoConfig> {
+    let exact: Vec<_> = cfg.repos.iter().filter(|r| r.id == query).collect();
+    if !exact.is_empty() {
+        return exact;
+    }
+    let wanted = query.trim().trim_end_matches('/');
+    cfg.repos.iter().filter(|r| r.id.eq_ignore_ascii_case(wanted) || r.repo.eq_ignore_ascii_case(wanted)).collect()
 }
 
 enum Fail {
@@ -494,9 +536,9 @@ fn gap(out: &mut String) {
     }
 }
 
-/// Release reports can include a localized Windows error or a path. Unlike skill names in a command to paste,
-/// these can be written out in ASCII without changing what the user needs to type.
-fn app_lines(text: &str) -> Cow<'_, str> {
+/// Reports may contain localized Windows errors, paths, or upstream names. Commands suggested for
+/// copying use ASCII words only: escaping a non-ASCII word would make it name a different item.
+fn ascii_lines(text: &str) -> Cow<'_, str> {
     let safe = printable_lines(text);
     if safe.is_ascii() {
         return safe;
@@ -520,30 +562,29 @@ pub fn run(args: &[String], host: &dyn Host, out: &mut dyn Write, err: &mut dyn 
     let command = match parse(args) {
         Ok(command) => command,
         Err(e) => {
-            let why = if args.first().is_some_and(|c| c.eq_ignore_ascii_case("update")) { app_lines(&e) } else { printable_lines(&e) };
+            let why = ascii_lines(&printable(&e)).into_owned();
             let _ = writeln!(err, "tss: {why}\nRun 'tss help' to see the commands.");
             return EXIT_USAGE;
         }
     };
-    let lines = if matches!(command, Command::Update(_)) { app_lines } else { printable_lines };
     let mut text = String::new();
-    let result = execute(command, host, &mut text);
+    let result = execute(command, host, &mut text, out);
     // Output that cannot be written (a closed pipe) is not a reason to fail the command.
-    let _ = out.write_all(lines(&text).as_bytes()).and_then(|()| out.flush());
+    let _ = out.write_all(ascii_lines(&text).as_bytes()).and_then(|()| out.flush());
     match result {
         Ok(code) => code,
         Err(Fail::Usage(e)) => {
-            let _ = writeln!(err, "tss: {}", lines(&e));
+            let _ = writeln!(err, "tss: {}", ascii_lines(&printable(&e)));
             EXIT_USAGE
         }
         Err(Fail::Failed(e)) => {
-            let _ = writeln!(err, "tss: {}", lines(&e));
+            let _ = writeln!(err, "tss: {}", ascii_lines(&printable(&e)));
             EXIT_FAILED
         }
     }
 }
 
-fn execute(command: Command, host: &dyn Host, out: &mut String) -> Result<i32, Fail> {
+fn execute(command: Command, host: &dyn Host, out: &mut String, screen: &mut dyn Write) -> Result<i32, Fail> {
     match command {
         Command::Help => {
             out.push_str(HELP);
@@ -557,7 +598,7 @@ fn execute(command: Command, host: &dyn Host, out: &mut String) -> Result<i32, F
         Command::Update(command) => update(host, out, command),
         Command::Check { repo, dry_run, full_listing, delete_all } => check(host, out, repo.as_deref(), dry_run, full_listing, delete_all),
         Command::Resolve { repo, skill, how } => resolve(host, out, &repo, &skill, how),
-        Command::Add { spec, every, use_token } => add(host, out, &spec, every, use_token),
+        Command::Add(options) => add(host, out, screen, options),
         Command::Remove { repo, delete_skills } => remove(host, out, &repo, delete_skills),
         Command::Token(action) => token(host, out, action),
         Command::Startup(action) => startup(host, out, action),
@@ -576,9 +617,9 @@ fn load_config(host: &dyn Host) -> Result<(Config, Option<PathBuf>), Fail> {
 }
 
 fn load_config_at(host: &dyn Host, directory: &Path) -> Result<(Config, bool), Fail> {
-    match portable::load(directory).map_err(Fail::Failed)? {
+    match portable::load_sources(directory).map_err(Fail::Failed)? {
         Some(config) => Ok((config, true)),
-        None => Config::load(&config_path(host)).map(|config| (config, false)).map_err(Fail::Failed),
+        None => Config::load_sources(&config_path(host)).map(|config| (config, false)).map_err(Fail::Failed),
     }
 }
 
@@ -586,7 +627,7 @@ fn save_config(host: &dyn Host, directory: Option<&Path>, before: &Config, after
     match directory {
         Some(directory) => portable::save_changes(directory, before, after).map(|_| ()),
         None => {
-            if portable::load(&host.executable_dir()?)?.is_some() {
+            if portable::load_sources(&host.executable_dir()?)?.is_some() {
                 return Err("portable settings appeared since the local settings were loaded; try the command again".into());
             }
             after.save_if_unchanged(&config_path(host), before)
@@ -597,7 +638,7 @@ fn save_config(host: &dyn Host, directory: Option<&Path>, before: &Config, after
 fn export_portable(host: &dyn Host, out: &mut String) -> Result<i32, Fail> {
     let directory = host.executable_dir().map_err(Fail::Failed)?;
     portable::check_export_target(&directory).map_err(Fail::Failed)?;
-    let local = Config::load(&config_path(host)).map_err(Fail::Failed)?;
+    let local = Config::load_sources(&config_path(host)).map_err(Fail::Failed)?;
     portable::export(&directory, &local).map_err(Fail::Failed)?;
     say!(out, "Exported shared settings and repositories beside tss.exe. The local config.json was not changed.");
     Ok(EXIT_OK)
@@ -605,7 +646,7 @@ fn export_portable(host: &dyn Host, out: &mut String) -> Result<i32, Fail> {
 
 fn paths(host: &dyn Host, cfg: &Config, portable: bool) -> Result<Paths, Fail> {
     let skills = if portable { host.portable_skills_dir(cfg) } else { Ok(host.skills_dir(cfg)) }.map_err(Fail::Failed)?;
-    Ok(Paths::new(host.home(), skills))
+    Ok(host.source_paths(skills))
 }
 
 fn update_preferences(out: &mut String, prefs: UpdatePrefs) {
@@ -662,14 +703,16 @@ fn update(host: &dyn Host, out: &mut String, command: UpdateCommand) -> Result<i
 
 fn open_engine(host: &dyn Host, cfg: &Config, portable: bool) -> Result<Engine, Fail> {
     let remote = host.remote().map_err(Fail::Failed)?;
-    Ok(Engine::new(paths(host, cfg, portable)?, remote, host.tokens()))
+    let mut engine = Engine::new(paths(host, cfg, portable)?, remote, host.tokens());
+    engine.settings_at(host.executable_dir().map_err(Fail::Failed)?, portable);
+    Ok(engine)
 }
 
 /// What is recorded, read without the engine's lock and without changing anything. Only used to check names
 /// typed on the command line; the engine reads it again under its lock before acting.
 fn load_state(host: &dyn Host, cfg: &Config, portable: bool) -> Result<State, Fail> {
     let file = paths(host, cfg, portable)?.state_file();
-    State::load_with(&file, false).map(|loaded| loaded.state).map_err(|e| Fail::Failed(format!("cannot read {}: {e}", file.display())))
+    State::load_sources_with(&file, false).map(|loaded| loaded.state).map_err(|e| Fail::Failed(format!("cannot read {}: {e}", file.display())))
 }
 
 /// The board judges a disabled repository as "Disabled" and nothing else. Here the user asked about it, so it is
@@ -699,7 +742,7 @@ fn exit_code(level: Level) -> i32 {
 /// app's window for any other.
 fn quote(word: &str) -> Option<String> {
     let plain = |c: char| c.is_ascii_alphanumeric() || "-_./:".contains(c);
-    if word.is_empty() || !word.chars().all(|c| plain(c) || c.is_alphanumeric() || c == ' ' || c == '+') {
+    if word.is_empty() || !word.chars().all(|c| plain(c) || c == ' ' || c == '+') {
         return None;
     }
     Some(if word.chars().all(plain) { word.to_string() } else { format!("\"{word}\"") })
@@ -739,7 +782,8 @@ fn hints(repo_id: &str, row: &Row) -> (Vec<(String, &'static str)>, Vec<&'static
 
 fn header(out: &mut String, view: &RepoView, repo: &RepoConfig) {
     let off = if repo.enabled { "" } else { " (disabled)" };
-    say!(out, "{} [{}]{off}: {}", view.label, view.id, view.status);
+    say!(out, "{} [{}]{off}: {}", printable(&view.label), printable(&view.id), view.status);
+    say!(out, "  Type: {}. Source folder: {}.", repo.kind.heading(), printable(source_folder(repo)));
     if let Some(detail) = &view.detail {
         say!(out, "  {detail}");
     }
@@ -752,7 +796,7 @@ fn rows(out: &mut String, repo_id: &str, rows: &[Row], all: bool) {
             continue;
         }
         let mark = if row.level == Level::Ok { ' ' } else { '!' };
-        say!(out, "  {mark} {}: {}", row.name, row.text);
+        say!(out, "  {mark} {}: {}", printable(&row.name), printable(&row.text));
         let (typed, untyped) = hints(repo_id, row);
         let width = typed.iter().map(|(cmd, _)| cmd.len()).max().unwrap_or(0);
         for (cmd, label) in typed {
@@ -772,7 +816,7 @@ fn messages(out: &mut String, board: &Board) {
             first = false;
         }
         let kind = if message.level == Level::Ok { "Note" } else { "Warning" };
-        say!(out, "{kind}: {}", message.text);
+        say!(out, "{kind}: {}", printable(&message.text));
     }
 }
 
@@ -815,8 +859,28 @@ fn status(host: &dyn Host, out: &mut String) -> Result<i32, Fail> {
         level = Level::Attention;
     }
 
-    let mut engine = open_engine(host, &cfg, portable_mode)?;
-    let report = engine.verify(&cfg, Access::ReadOnly)?;
+    let verified = open_engine(host, &cfg, portable_mode).and_then(|mut engine| {
+        let report = engine.verify(&cfg, Access::ReadOnly)?;
+        Ok((engine, report))
+    });
+    let (engine, report) = match verified {
+        Ok(pair) => pair,
+        Err(error) => {
+            // Even when verification cannot run, the configured IDs are known and may be
+            // needed to disambiguate two sources. Do not invent item or installation status.
+            for r in &cfg.repos {
+                say!(
+                    out,
+                    "{} [{}]: not verified. Type: {}. Source folder: {}.",
+                    printable(&r.label()),
+                    printable(&r.id),
+                    r.kind.heading(),
+                    printable(source_folder(r))
+                );
+            }
+            return Err(error);
+        }
+    };
     let now = now_secs();
     let mut board = Board::new();
     board.note_verify(&report, now);
@@ -837,7 +901,7 @@ fn status(host: &dyn Host, out: &mut String) -> Result<i32, Fail> {
         header(out, view, repo);
         say!(out, "  Last check: {}. {}", view.last_check_text(now), schedule_text(&cfg, repo, repo.use_token || engine.needs_token(&repo.id)));
         if view.skills.is_empty() {
-            say!(out, "  No skills from it are installed.");
+            say!(out, "  No {} from it are installed.", repo.kind.nouns().1);
         }
         rows(out, &view.id, &view.skills, true);
         if repo.enabled {
@@ -846,7 +910,7 @@ fn status(host: &dyn Host, out: &mut String) -> Result<i32, Fail> {
     }
     for id in board.orphans() {
         gap(out);
-        say!(out, "Skills recorded for '{id}', which is no longer in the settings, are left alone.");
+        say!(out, "Items recorded for '{}', which is no longer in the settings, are left alone.", printable(id));
         say!(
             out,
             "  To stop tracking them (the files stay): {}",
@@ -931,7 +995,7 @@ fn check(host: &dyn Host, out: &mut String, query: Option<&str>, dry_run: bool, 
             report.warnings.push(format!("the time of this check was not saved: {e}"));
         }
     }
-    board.note_sync(&report, now);
+    board.note_source_sync(&report, now, &cfg);
 
     let views = board.views(&all_enabled(&cfg), now);
     let mut level = Level::Ok;
@@ -971,6 +1035,12 @@ fn resolve(host: &dyn Host, out: &mut String, query: &str, skill: &str, how: Res
     // The engine checks `replace` against upstream itself. The other two only change a list, so a typo would be
     // recorded as it is: the name is checked here.
     let name = match how {
+        _ if repo.kind != SourceKind::Skills => {
+            // Loose files are keyed by this source ID. Only the engine knows its binding and
+            // ownership under lock; do not look for a similarly named folder under skills.
+            check_component(skill).map_err(|e| Fail::Usage(format!("invalid item name: {e}")))?;
+            skill.to_owned()
+        }
         Resolution::Overwrite | Resolution::PauseHistory | Resolution::ResumeHistory => skill.to_string(),
         Resolution::KeepMine => installed_name(host, &cfg, portable_mode, repo, skill)?,
         Resolution::ManageAgain => kept_name(host, &cfg, portable_mode, repo, skill)?,
@@ -1017,18 +1087,49 @@ fn kept_name(host: &dyn Host, cfg: &Config, portable: bool, repo: &RepoConfig, s
     })
 }
 
-fn add(host: &dyn Host, out: &mut String, spec: &str, every: Option<Interval>, use_token: bool) -> Result<i32, Fail> {
-    let spec = RepoSpec::parse(spec).map_err(Fail::Usage)?;
+fn add(host: &dyn Host, out: &mut String, screen: &mut dyn Write, options: AddSource) -> Result<i32, Fail> {
+    let spec = RepoSpec::parse(&options.spec).map_err(Fail::Usage)?;
     let (mut cfg, portable_directory) = load_config(host)?;
-    let before = cfg.clone();
-    let full_name = spec.full_name();
-    if let Some(existing) = cfg.repos.iter().find(|r| r.repo.eq_ignore_ascii_case(&full_name) && r.branch == spec.branch && r.path == spec.path) {
-        return Err(Fail::Usage(format!("{} is already set up, as '{}'", existing.label(), existing.id)));
+    let kind = options.kind.unwrap_or_default();
+    let added = match crate::app::existing_source(&cfg, &spec, kind) {
+        Some(saved) if options.preview => RepoConfig { use_token: saved.use_token || options.use_token, ..saved.clone() },
+        _ => crate::app::new_source(&cfg, &spec, kind, options.every, options.use_token).map_err(Fail::Usage)?,
+    };
+    if options.preview || options.kind.is_some() {
+        say!(out, "Read-only preview: {} [{}]\nSource folder: {}", printable(&added.label()), printable(&added.id), printable(source_folder(&added)));
+        let cancel = AtomicBool::new(false);
+        let mut engine = open_engine(host, &cfg, portable_directory.is_some())?;
+        let preview = engine
+            .preview_source(&cfg, &added, &cancel)
+            .map_err(|why| Fail::Failed(format!("Could not preview {}: {why}. Nothing was saved or installed.", kind.heading())))?;
+        say!(out, "{}", preview.description());
+        if let Some(why) = preview.blocker(&added) {
+            return Err(Fail::Failed(format!("{why} Nothing was saved or installed.")));
+        }
+        if options.preview {
+            say!(out, "Nothing was saved or installed.");
+            return Ok(EXIT_OK);
+        }
+        say!(out, "Save this source? Type yes to save, or press Enter to cancel.");
+        screen.write_all(ascii_lines(out).as_bytes()).and_then(|()| screen.flush()).map_err(|e| Fail::Failed(format!("could not show the preview: {e}")))?;
+        out.clear();
+        if !host.confirm_source().map_err(Fail::Failed)? {
+            say!(out, "Cancelled. Nothing was saved or installed.");
+            return Ok(EXIT_OK);
+        }
+        crate::app::recheck_preview(&mut engine, &cfg, &added, &preview, &cancel)?;
+        let (active, directory) = load_config(host)?;
+        if active != cfg || directory != portable_directory || paths(host, &active, directory.is_some())?.skills != engine.paths().skills {
+            return Err(Fail::Failed("The settings changed. Preview the source again.".into()));
+        }
     }
-    let added = cfg.add_repo(&spec, every, use_token).clone();
+    let before = cfg.clone();
+    cfg.repos.push(added.clone());
     save_config(host, portable_directory.as_deref(), &before, &cfg).map_err(Fail::Failed)?;
-    say!(out, "Added {} as '{}'. {}", added.label(), added.id, schedule_text(&cfg, &added, added.use_token));
-    say!(out, "Install its skills now with: {}", command_line("check", &[&added.id], &[]).unwrap_or_else(|| "tss check".to_string()));
+    say!(out, "Added {} as '{}'. {}", printable(&added.label()), added.id, schedule_text(&cfg, &added, added.use_token));
+    if let Some(command) = command_line("check", &[&added.id], &[]) {
+        say!(out, "Install its {} with: {command}", added.kind.nouns().1);
+    }
     Ok(EXIT_OK)
 }
 
@@ -1037,15 +1138,25 @@ fn remove(host: &dyn Host, out: &mut String, query: &str, delete_skills: bool) -
     let portable_mode = portable_directory.is_some();
     let before = cfg.clone();
     // A repository that left the settings while its skills stayed on record can be let go of too.
-    let (id, in_settings) = match find_repo(&cfg, query) {
-        Ok(repo) => (repo.id.clone(), true),
-        Err(e) => match load_state(host, &cfg, portable_mode)?.repo(query) {
-            Some(r) if !r.skills.is_empty() => (query.to_string(), false),
-            _ => return Err(Fail::Usage(e)),
-        },
+    let (id, kind, in_settings) = match find_repo(&cfg, query) {
+        Ok(repo) => (repo.id.clone(), repo.kind, true),
+        Err(e) if repo_matches(&cfg, query).is_empty() => {
+            let record = load_state(host, &cfg, portable_mode)?;
+            let kind = match record.loose_sources().get(query) {
+                Some(r) => r.binding().kind(),
+                None if record.repo(query).is_some_and(|r| !r.skills.is_empty()) => SourceKind::Skills,
+                None => return Err(Fail::Usage(e)),
+            };
+            (query.to_string(), kind, false)
+        }
+        Err(e) => return Err(Fail::Usage(e)),
     };
+    if delete_skills && kind != SourceKind::Skills {
+        return Err(Fail::Usage("--delete-skills is only for a Skills source. Remove this source without it to keep its files.".into()));
+    }
+    let items = kind.nouns().1;
     let mut engine = open_engine(host, &cfg, portable_mode)?;
-    let report = engine.remove_repo(&id, delete_skills)?;
+    let report = crate::app::remove_source(&mut engine, &cfg, &id, delete_skills)?;
 
     let mut saved = Ok(());
     if in_settings {
@@ -1056,7 +1167,7 @@ fn remove(host: &dyn Host, out: &mut String, query: &str, delete_skills: bool) -
             say!(out, "Removed {label} [{id}] from the settings.");
         }
     } else {
-        say!(out, "Stopped tracking the skills recorded for '{id}'.");
+        say!(out, "Stopped tracking the {items} recorded for '{}'.", printable(&id));
     }
     if !report.deleted.is_empty() {
         say!(out, "Deleted: {}", report.deleted.join(", "));
@@ -1067,7 +1178,7 @@ fn remove(host: &dyn Host, out: &mut String, query: &str, delete_skills: bool) -
         }
     } else if !report.kept.is_empty() {
         let names: Vec<&str> = report.kept.iter().map(|(name, _)| name.as_str()).collect();
-        say!(out, "These skills stay installed and are now yours: {}", names.join(", "));
+        say!(out, "These {items} stay installed and are now yours: {}", names.join(", "));
     }
     if let Err(e) = saved {
         let next_step = if let Some(directory) = &portable_directory {
@@ -1075,7 +1186,7 @@ fn remove(host: &dyn Host, out: &mut String, query: &str, delete_skills: bool) -
         } else {
             format!("remove it from {} by hand", config_path(host).display())
         };
-        return Err(Fail::Failed(format!("{e}. The skills of '{id}' are no longer managed, but it is still in the settings: {next_step}")));
+        return Err(Fail::Failed(format!("{e}. The {items} of '{id}' are no longer managed, but it is still in the settings: {next_step}")));
     }
     Ok(if delete_skills && !report.kept.is_empty() { EXIT_ATTENTION } else { EXIT_OK })
 }
@@ -1119,7 +1230,9 @@ fn token(host: &dyn Host, out: &mut String, action: TokenAction) -> Result<i32, 
             // The repositories the user marked, and those found to be private. A state that cannot be read only hides
             // the second kind, so it is not a failure here.
             let state = load_state(host, &cfg, portable_mode).unwrap_or_default();
-            let sends = |r: &RepoConfig| r.use_token || state.repo(&r.id).is_some_and(|s| s.needs_token);
+            let sends = |r: &RepoConfig| {
+                r.use_token || state.repo(&r.id).is_some_and(|s| s.needs_token) || state.loose_sources().get(&r.id).is_some_and(|s| s.poll.needs_token)
+            };
             let users: Vec<&str> = cfg.repos.iter().filter(|r| sends(r)).map(|r| r.id.as_str()).collect();
             if users.is_empty() {
                 say!(out, "No repository sends the token. It is tried by itself when GitHub cannot find a repository without it.");
@@ -1183,10 +1296,15 @@ mod tests {
         assert_eq!(parsed("resolve fx alpha keep"), Command::Resolve { repo: "fx".into(), skill: "alpha".into(), how: Resolution::KeepMine });
         assert_eq!(parsed("resolve fx alpha leave"), Command::Resolve { repo: "fx".into(), skill: "alpha".into(), how: Resolution::KeepMine });
         assert_eq!(parsed("resolve fx alpha manage"), Command::Resolve { repo: "fx".into(), skill: "alpha".into(), how: Resolution::ManageAgain });
-        assert_eq!(parsed("add o/r"), Command::Add { spec: "o/r".into(), every: None, use_token: false });
+        let add = AddSource { spec: "o/r".into(), ..Default::default() };
+        assert_eq!(parsed("add o/r"), Command::Add(add.clone()));
         let every = Some(Interval::new(6, Unit::Hour));
-        assert_eq!(parsed("add o/r --every 6h --use-token"), Command::Add { spec: "o/r".into(), every, use_token: true });
-        assert_eq!(parsed("add --every=6h o/r"), Command::Add { spec: "o/r".into(), every, use_token: false });
+        assert_eq!(parsed("add o/r --every 6h --use-token"), Command::Add(AddSource { every, use_token: true, ..add.clone() }));
+        assert_eq!(parsed("add --every=6h o/r"), Command::Add(AddSource { every, ..add.clone() }));
+        assert_eq!(parsed("add --type skills o/r"), Command::Add(AddSource { kind: Some(SourceKind::Skills), ..add.clone() }));
+        assert_eq!(parsed("add o/r --type=agents --preview"), Command::Add(AddSource { kind: Some(SourceKind::Agents), preview: true, ..add.clone() }));
+        assert_eq!(parsed("add --preview o/r"), Command::Add(AddSource { preview: true, ..add.clone() }));
+        assert_eq!(parsed("add o/r --type instructions"), Command::Add(AddSource { kind: Some(SourceKind::Instructions), ..add }));
         assert_eq!(parsed("remove fx"), Command::Remove { repo: "fx".into(), delete_skills: false });
         assert_eq!(parsed("remove fx --delete-skills"), Command::Remove { repo: "fx".into(), delete_skills: true });
         assert_eq!(parsed("token"), Command::Token(TokenAction::Status));
@@ -1229,6 +1347,9 @@ mod tests {
         assert!(refused("add o/r --every").contains("needs an interval"));
         assert!(refused("add o/r --every 1m").contains("--every: polling more often"));
         assert!(refused("add o/r --every soon").contains("--every:"));
+        assert!(refused("add o/r --type").contains("needs skills, agents or instructions"));
+        assert!(refused("add o/r --type agents --type skills").contains("exactly one"));
+        assert!(refused("add o/r --type plugins").contains("expected skills, agents or instructions"));
         assert!(refused("remove").contains("something is missing"));
         assert!(refused("token show").contains("'show' is not a token action"));
         assert!(refused("startup maybe").contains("'maybe' is not a startup action; use: tss startup [status|on|off]"));
@@ -1315,8 +1436,8 @@ mod tests {
         }
         // The repository id is a word too.
         assert_eq!(command_line("check", &["a$(b)"], &["--delete-all"]), None);
-        // Letters, digits and spaces from any language are fine; a word is quoted when it is not plain ASCII.
-        assert_eq!(command_line("resolve", &["fx", "caf\u{e9}", "keep"], &[]).unwrap(), "tss resolve fx \"caf\u{e9}\" keep");
+        // The CLI is ASCII. An escaped name would not select the same item if pasted.
+        assert_eq!(command_line("resolve", &["fx", "caf\u{e9}", "keep"], &[]), None);
         assert_eq!(command_line("resolve", &["fx", "my skill 2", "keep"], &[]).unwrap(), "tss resolve fx \"my skill 2\" keep");
         assert_eq!(command_line("resolve", &["fx", "c++", "keep"], &[]).unwrap(), "tss resolve fx \"c++\" keep");
         assert_eq!(command_line("resolve", &["fx", "a_b-c.d", "keep"], &[]).unwrap(), "tss resolve fx a_b-c.d keep");

@@ -13,6 +13,7 @@ use super::control::{Deco, Item, Kind, Look, Mark, RowCmd, Surface, two_lines};
 use super::paint::{Font, Rect, Tone, glyph};
 use super::sentence;
 use super::theme::Role;
+use crate::app::{DraftStage, SourceDraft};
 use crate::autostart::{Startup, Via};
 use crate::board::{self, Action, Board, Level, RepoView, Row, ago, repo_name};
 use crate::config::{RepoConfig, RepoSpec, UpdateInterval, UpdatePrefs, UpdateTiming};
@@ -20,6 +21,7 @@ use crate::diff::{Body, FileChange, Presence, Row as Line, TextDiff};
 use crate::engine::DiffReport;
 use crate::interval::{Interval, UnixSecs};
 use crate::pathsafe::{printable, printable_lines};
+use crate::source::SourceKind;
 use crate::updater::Action as AppAction;
 
 /// Measures text in DIPs: (width, height), on one line when the width given is 0, else wrapped at it.
@@ -28,7 +30,7 @@ pub type Fit<'a> = &'a dyn Fn(&str, Font, i32) -> (i32, i32);
 pub const NAV_W: i32 = 248;
 pub const HERO_H: i32 = 66;
 pub const SYNC_NOW: &str = "Sync now";
-pub const SYNC_TIP: &str = "Gets new and updated skills from every repository now. Skills you edited or deleted are never changed.";
+pub const SYNC_TIP: &str = "Checks every enabled source now. Items you edited or deleted are never replaced without asking.";
 pub const CUSTOM: &str = "Custom…";
 pub const PRESETS: &[&str] = &["30 minutes", "1 hour", "6 hours", "12 hours", "1 day", "1 week", "1 month"];
 const PAD_X: i32 = 24;
@@ -60,6 +62,10 @@ pub mod id {
     pub const ENABLED: i32 = 312;
     pub const RETRY: i32 = 313;
     pub const OPEN_SETTINGS: i32 = 314;
+    pub const CONFIRM_SOURCE: i32 = 315;
+    pub const CANCEL_SOURCE: i32 = 316;
+    pub const RETRY_SOURCE: i32 = 317;
+    pub const EDIT_SOURCE: i32 = 318;
     pub const DEFAULT_EVERY: i32 = 320;
     pub const OPEN_SKILLS: i32 = 321;
     pub const OPEN_BACKUPS: i32 = 322;
@@ -161,6 +167,7 @@ pub fn skill_id(index: usize, k: i32) -> i32 {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Page {
     Repo(String),
+    Add,
     Activity,
     Settings,
 }
@@ -170,7 +177,7 @@ pub enum Page {
 pub fn settle(shown: Option<Page>, views: &[RepoView]) -> Option<Page> {
     match shown {
         Some(Page::Repo(id)) if views.iter().any(|v| v.id == id) => Some(Page::Repo(id)),
-        Some(page @ (Page::Activity | Page::Settings)) => Some(page),
+        Some(page @ (Page::Activity | Page::Settings | Page::Add)) => Some(page),
         _ => views.iter().find(|v| v.enabled && v.level >= Level::Attention).or(views.first()).map(|v| Page::Repo(v.id.clone())),
     }
 }
@@ -314,26 +321,23 @@ pub fn hero_of(views: &[RepoView], problem: Option<&str>, status: &str, news: bo
     };
     let calm = |text: &str| if news { status.to_string() } else { text.to_string() };
     let hero = |tone, glyph, title: String, sub: String| Hero { tone, glyph, title, sub };
+    let sources = |n| plural(n, "source", "sources");
     let place = |views: &[&RepoView]| match views {
         [one] => format!("In {}", printable(repo_name(&one.label))),
-        many => format!("In {} repositories", many.len()),
+        many => format!("In {}", sources(many.len())),
     };
     if let Some(problem) = problem {
         return hero(Tone::Err, glyph::ERR, "Tiny Skill Sync has a problem".to_string(), calm(&sentence(&printable(problem))));
     }
     if views.is_empty() {
-        let text = "Skills from the repositories you add are installed in your skills folder and kept up to date.";
-        return hero(Tone::Off, glyph::INFO, "Add a repository to start".to_string(), calm(text));
+        return hero(Tone::Off, glyph::INFO, "Add a source to start".to_string(), calm("Preview skills, agents or instructions from a GitHub repository."));
     }
     if on.is_empty() {
         return hero(Tone::Off, glyph::PAUSE, "Every repository is paused".to_string(), calm("Turn on Keep in sync for one to check it again."));
     }
     let unreadable: Vec<&RepoView> = on.iter().copied().filter(|v| v.level == Level::Error && v.detail.is_some()).collect();
     if !unreadable.is_empty() {
-        let title = match unreadable.len() {
-            1 => "1 repository can’t be read".to_string(),
-            n => format!("{n} repositories can’t be read"),
-        };
+        let title = format!("{} can’t be read", sources(unreadable.len()));
         return hero(Tone::Err, glyph::ERR, title, sub(place(&unreadable)));
     }
     let needs = |row: &Row| row.level >= Level::Attention;
@@ -341,24 +345,28 @@ pub fn hero_of(views: &[RepoView], problem: Option<&str>, status: &str, news: bo
     if count > 0 {
         let with: Vec<&RepoView> = on.iter().copied().filter(|v| v.skills.iter().any(needs)).collect();
         let failed = on.iter().any(|v| v.skills.iter().any(|r| r.level == Level::Error));
-        let title = if count == 1 { "1 skill needs your attention".to_string() } else { format!("{count} skills need your attention") };
+        let (one, many) = board::item_nouns(with.iter().map(|v| v.kind));
+        let title = if count == 1 { format!("1 {one} needs your attention") } else { format!("{count} {many} need your attention") };
         let (tone, mark) = if failed { (Tone::Err, glyph::ERR) } else { (Tone::Warn, glyph::WARN) };
         return hero(tone, mark, title, sub(place(&with)));
     }
     let empty: Vec<&RepoView> = on.iter().copied().filter(|v| v.level >= Level::Attention).collect();
     if !empty.is_empty() {
         let title = match empty.len() {
-            1 => "1 repository needs your attention".to_string(),
-            n => format!("{n} repositories need your attention"),
+            1 => "1 source needs your attention".to_string(),
+            n => format!("{n} sources need your attention"),
         };
         return hero(Tone::Warn, glyph::WARN, title, sub(place(&empty)));
     }
-    if checked.is_none() {
-        return hero(Tone::Off, glyph::SYNC, "Waiting for the first check".to_string(), sub(String::new()));
+    let pending = on.iter().filter(|v| v.last_check.is_none()).count();
+    if pending > 0 {
+        let title = if pending == on.len() { "Waiting for the first check".to_string() } else { format!("Waiting to check {}", sources(pending)) };
+        return hero(Tone::Off, glyph::SYNC, title, sub(String::new()));
     }
     let skills: usize = on.iter().map(|v| v.skills.len()).sum();
-    let head = format!("{} from {}", plural(skills, "skill", "skills"), plural(on.len(), "repository", "repositories"));
-    hero(Tone::Ok, glyph::OK, "All skills are up to date".to_string(), sub(head))
+    let (one, many) = board::item_nouns(on.iter().map(|v| v.kind));
+    let head = format!("{} from {}", plural(skills, one, many), sources(on.len()));
+    hero(Tone::Ok, glyph::OK, format!("All {many} are up to date"), sub(head))
 }
 
 pub fn hero(h: &Hero, can_sync: bool, w: i32, fit: Fit) -> Surface {
@@ -385,7 +393,8 @@ pub fn nav_sub(v: &RepoView) -> String {
     if v.detail.is_some() || n == 0 {
         return v.status.clone();
     }
-    let skills = plural(n, "skill", "skills");
+    let (one, many) = v.kind.nouns();
+    let skills = plural(n, one, many);
     match v.skills.iter().filter(|r| r.level >= Level::Attention).count() {
         0 => format!("{skills} · {}", lower_first(&v.status)),
         1 => format!("{skills} · 1 needs you"),
@@ -407,16 +416,16 @@ fn nav_mark(v: &RepoView) -> Mark {
 pub fn nav(views: &[RepoView], page: &Page, w: i32, h: i32, fit: Fit) -> Surface {
     let mut o = Out::new(fit);
     let iw = w - 16;
-    o.label(id::NAV_HEAD, [16, 4, w - 32, 20], "Repositories", Font::Strong, Role::Text);
+    o.label(id::NAV_HEAD, [16, 4, w - 32, 20], "Sources", Font::Strong, Role::Text);
     let mut y = 30;
     for (i, v) in views.iter().enumerate() {
         let selected = *page == Page::Repo(v.id.clone());
         let look = Look::Nav { mark: nav_mark(v), ink: Role::Text, selected };
-        o.item(id::NAV_REPO + i as i32, [8, y + 1, iw, 48], two_lines(&printable(&v.label), &nav_sub(v)), look, true);
+        o.item(id::NAV_REPO + i as i32, [8, y + 1, iw, 48], two_lines(&nav_label(v), &nav_sub(v)), look, true);
         y += 50;
     }
     let plain = |ch, ink, selected| Look::Nav { mark: Mark::Glyph(ch, ink), ink, selected };
-    o.item(id::NAV_ADD, [8, y + 1, iw, 36], "Add repository", plain(glyph::ADD, Role::AccentText, false), true);
+    o.item(id::NAV_ADD, [8, y + 1, iw, 36], "Add source", plain(glyph::ADD, Role::AccentText, *page == Page::Add), true);
     let bottom = (y + 38 + 12).max(h - 82);
     o.item(id::NAV_ACTIVITY, [8, bottom + 1, iw, 36], "Activity", plain(glyph::HISTORY, Role::Text, *page == Page::Activity), true);
     o.item(id::NAV_SETTINGS, [8, bottom + 39, iw, 36], "Settings", plain(glyph::SETTINGS, Role::Text, *page == Page::Settings), true);
@@ -427,10 +436,14 @@ pub fn nav(views: &[RepoView], page: &Page, w: i32, h: i32, fit: Fit) -> Surface
 /// repository, with room for a scroll bar of `bar` DIPs, but never more than half the window `w`. Never narrower than
 /// [`NAV_W`], so names that fit leave it as it is.
 pub fn nav_width(views: &[RepoView], w: i32, bar: i32, fit: Fit) -> i32 {
-    let text = views.iter().map(|v| nav_text_width(&v.label, &nav_sub(v), fit)).max().unwrap_or(0);
+    let text = views.iter().map(|v| nav_text_width(&nav_label(v), &nav_sub(v), fit)).max().unwrap_or(0);
     // An entry is 8 DIPs in from each side, and draws its lines from 40 DIPs in to 8 before its end; 2 more for rounding.
     let wanted = text + 16 + 40 + 8 + 2 + bar;
     wanted.min(w / 2).max(NAV_W)
+}
+
+fn nav_label(v: &RepoView) -> String {
+    format!("{}: {} [{}]", v.kind.heading(), printable(&v.label), printable(&v.id))
 }
 
 fn nav_text_width(label: &str, sub: &str, fit: Fit) -> i32 {
@@ -440,10 +453,8 @@ fn nav_text_width(label: &str, sub: &str, fit: Fit) -> i32 {
 /// The page when no repository is set up yet.
 pub fn welcome(w: i32, fit: Fit) -> Surface {
     let mut o = Out::new(fit);
-    let text = "Tiny Skill Sync installs Copilot skills from GitHub repositories into your skills folder and keeps them up to date. \
-                Skills you edit or delete on this PC are never changed without asking.";
-    let y = o.head(w, "Add your first repository", text);
-    let bottom = o.flow(PAD_X, y, w - PAD_X, 32, vec![btn(id::WELCOME_ADD, "Add repository", Kind::Accent, Some(glyph::ADD))]);
+    let y = o.head(w, "Add your first source", "Choose skills, agents or instructions and preview what matches before adding anything.");
+    let bottom = o.flow(PAD_X, y, w - PAD_X, 32, vec![btn(id::WELCOME_ADD, "Add source", Kind::Accent, Some(glyph::ADD))]);
     o.done(bottom + 16)
 }
 
@@ -465,16 +476,52 @@ pub fn repo_sub(repo: &RepoConfig, view: &RepoView, now: UnixSecs) -> String {
     }
 }
 
-/// What a repository typed into Add reads as, or what is wrong with it, such as being set up already.
-pub fn spec_hint(text: &str, repos: &[RepoConfig]) -> Result<String, String> {
-    let spec = RepoSpec::parse(text).map_err(|e| sentence(&e))?;
+/// Type and folder together identify a source; typing here validates the URL, not a kind not yet chosen.
+pub fn spec_hint(text: &str) -> Result<String, String> {
+    let spec = RepoSpec::parse(text).map_err(|e| sentence(&printable(&e)))?;
     let full = spec.full_name();
-    if let Some(r) = repos.iter().find(|r| r.repo.eq_ignore_ascii_case(&full) && r.branch == spec.branch && r.path == spec.path) {
-        return Err(format!("{} is already set up", printable(&r.label())));
-    }
     let folder = if spec.path.is_empty() { "the top of the repository".to_string() } else { format!("the {} folder", printable(&spec.path)) };
     let branch = if spec.branch.is_empty() { "the default branch".to_string() } else { printable(&spec.branch).into_owned() };
     Ok(format!("{} · {folder} on {branch}", printable(&full)))
+}
+
+pub const SOURCE_TYPES: &[SourceKind] = &[SourceKind::Skills, SourceKind::Agents, SourceKind::Instructions];
+
+pub fn source_preview(draft: &SourceDraft, w: i32, fit: Fit) -> Surface {
+    let mut o = Out::new(fit);
+    let source = &draft.input.source;
+    let sub = format!(
+        "{}: {} [{}]\nSource folder: {}",
+        source.kind.heading(),
+        printable(&source.label()),
+        printable(&source.id),
+        printable(board::source_folder(source))
+    );
+    let mut y = o.head(w, "Add source", &sub);
+    let (body, can_save) = match &draft.stage {
+        DraftStage::Loading => ("Reading the source. Nothing has been saved or installed.".into(), false),
+        DraftStage::Failed(why) => (printable(why).into_owned(), false),
+        DraftStage::Saving => ("Checking the preview again and saving the source…".into(), false),
+        DraftStage::Reviewed(preview) => {
+            let blocker = preview.blocker(source);
+            let note = blocker.unwrap_or("Nothing has been installed. Add this source to save it and start its first check.");
+            (format!("{}\n\n{note}", preview.description()), blocker.is_none())
+        }
+    };
+    let cw = w - 2 * PAD_X;
+    y += o.para(id::INFO_TEXT, [PAD_X, y, cw], wrap_report(body, cw, fit), Font::Body, Role::Text) + GAP;
+    let mut buttons = Vec::new();
+    if can_save {
+        buttons.push(btn(id::CONFIRM_SOURCE, "Add and check", Kind::Accent, None));
+    } else if matches!(draft.stage, DraftStage::Reviewed(_) | DraftStage::Failed(_)) {
+        buttons.push(btn(id::RETRY_SOURCE, "Retry", Kind::Accent, None));
+        buttons.push(btn(id::EDIT_SOURCE, "Edit", Kind::Standard, None));
+    }
+    if !matches!(draft.stage, DraftStage::Saving) {
+        buttons.push(btn(id::CANCEL_SOURCE, "Cancel", Kind::Standard, None));
+    }
+    let bottom = o.flow(PAD_X, y, w - PAD_X, 32, buttons);
+    o.done(bottom + 16)
 }
 
 /// The entries of a Check every list, and the one shown. With a `default`, the first entry is "Default (…)" and stands
@@ -521,16 +568,20 @@ pub fn is_open(row: &Row, toggled: &HashSet<String>) -> bool {
 }
 
 /// Commands shared by the inline icons and the row's menu, in display order.
-pub fn row_commands(row: &Row, linkable: bool) -> Vec<RowCmd> {
+pub fn row_commands(row: &Row, kind: SourceKind, linkable: bool) -> Vec<RowCmd> {
     let mut commands = Vec::new();
     if row.has_folder() {
-        commands.push(RowCmd::Open);
+        if kind == SourceKind::Skills {
+            commands.push(RowCmd::Open);
+        }
         if row.facts.is_some() {
             commands.push(RowCmd::Preview);
         }
-        commands.push(RowCmd::CopyPath);
+        if kind == SourceKind::Skills {
+            commands.push(RowCmd::CopyPath);
+        }
     }
-    if row.listed && linkable {
+    if row.listed && linkable && kind == SourceKind::Skills {
         commands.extend([RowCmd::CopyLink, RowCmd::OnGitHub]);
     }
     if !expandable(row) {
@@ -575,7 +626,8 @@ pub fn repo_page(p: &RepoPage, w: i32, fit: Fit) -> Surface {
     if p.view.private {
         o.item(id::PRIVATE, [x + title_w + 10, y, pill_w, 28], "Private", Look::Pill { tone: Tone::Off, glyph: Some(glyph::LOCK) }, true);
     }
-    let h = o.para(id::SUB, [x, y + 28, room], repo_sub(p.repo, p.view, p.now), Font::Caption, Role::Text2);
+    let sub = format!("{} [{}] · {}", p.repo.kind.heading(), printable(&p.repo.id), repo_sub(p.repo, p.view, p.now));
+    let h = o.para(id::SUB, [x, y + 28, room], sub, Font::Caption, Role::Text2);
     y = (y + 28 + h).max(y + 32) + GAP + 4;
     if let Some(detail) = &p.view.detail {
         y = infobar(&mut o, p.view, detail, x, y, cw) + GAP;
@@ -646,19 +698,21 @@ fn interval_card(o: &mut Out, p: &RepoPage, x: i32, y: i32, cw: i32) -> i32 {
 fn skills(o: &mut Out, p: &RepoPage, x: i32, mut y: i32, cw: i32) -> i32 {
     let rows = &p.view.skills;
     if rows.is_empty() {
+        let items = p.repo.kind.nouns().1;
         let text = if !p.repo.enabled {
-            "Its skills are not kept up to date while Keep in sync is off."
+            format!("Its {items} are not kept up to date while Keep in sync is off.")
         } else if p.view.detail.is_some() {
             return y - GAP;
         } else if p.view.last_check.is_none() {
-            "Its skills are listed here after the first check."
+            format!("Its {items} are listed here after the first check.")
         } else {
-            "There are no skills to show."
+            format!("There are no {items} to show.")
         };
         return y + o.para(id::EMPTY, [x, y, cw], text, Font::Body, Role::Text2);
     }
-    let head_w = o.width("Skills", Font::Strong) + 2;
-    o.text([x, y, head_w, 20], "Skills", Font::Strong, Role::Text, ONE_LINE);
+    let head = p.repo.kind.heading();
+    let head_w = o.width(head, Font::Strong) + 2;
+    o.text([x, y, head_w, 20], head, Font::Strong, Role::Text, ONE_LINE);
     o.text([x + head_w + 8, y, 60, 20], rows.len().to_string(), Font::Caption, Role::Text2, ONE_LINE);
     y += 28;
     let (mark, top) = (o.s.decos.len(), y);
@@ -670,7 +724,7 @@ fn skills(o: &mut Out, p: &RepoPage, x: i32, mut y: i32, cw: i32) -> i32 {
         let base = skill_id(j, 0);
         let (tone, pill) = pill_of(row);
         let open = is_open(row, p.toggled);
-        let look = Look::Row { tone, glyph: pill, commands: row_commands(row, linkable), disclosure: expandable(row).then_some(open) };
+        let look = Look::Row { tone, glyph: pill, commands: row_commands(row, p.repo.kind, linkable), disclosure: expandable(row).then_some(open) };
         let facts = row.facts.as_ref().map(|f| printable(&board::facts_text(f, p.now)).into_owned()).unwrap_or_default();
         let explanation = if !row.plain() || row.facts.is_none() { printable_lines(&row.text) } else { "".into() };
         let text = format!("{}\n{}\n{facts}\n{explanation}", printable(&row.name), row.tag);
@@ -914,7 +968,7 @@ pub fn activity_of(board: &Board) -> Vec<Note> {
     }
     if !board.orphans().is_empty() {
         let text = format!(
-            "Skills recorded for repositories that are no longer in the settings are left alone: {}. To stop tracking them, run: tss remove ID",
+            "Items recorded for sources that are no longer in the settings are left alone: {}. To stop tracking them, run: tss remove ID",
             printable(&board.orphans().join(", "))
         );
         notes.push(Note { glyph: glyph::INFO, ink: Role::Text2, at: None, text });
@@ -1019,10 +1073,9 @@ pub enum Report {
 }
 
 /// The diff view of one skill, which also shows a Preview: the files GitHub put there, whole, as they are on this PC.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct DiffView {
-    pub repo_id: String,
-    pub repo_label: String,
+    pub source: RepoConfig,
     pub skill: String,
     /// A Preview rather than a comparison: no choices, no legend, and one column of line numbers.
     pub preview: bool,
@@ -1071,8 +1124,10 @@ pub fn diff_sub(v: &DiffView) -> String {
     match &v.report {
         Report::Loading => v.reading().to_string(),
         Report::Failed(why) => sentence(&printable(why)),
+        Report::Ready(_) if v.preview && v.source.kind != SourceKind::Skills => "The installed file, as it is on this PC. Nothing is changed.".to_string(),
         Report::Ready(_) if v.preview => "The files GitHub put in this skill, as they are on this PC. Files you added are not shown.".to_string(),
         Report::Ready(r) if r.files.is_empty() => "The copy on this PC is the same as GitHub.".to_string(),
+        Report::Ready(r) if !r.here && v.source.kind != SourceKind::Skills => "The file is missing on this PC.".to_string(),
         Report::Ready(r) if !r.here => "Its folder is not on this PC, so every file shows as only on GitHub.".to_string(),
         Report::Ready(r) if !r.on_github => "GitHub no longer lists it, so every file shows as only on this PC.".to_string(),
         Report::Ready(_) => "How the copy on this PC would change to match GitHub. Nothing changes until you choose.".to_string(),
@@ -1086,7 +1141,7 @@ pub fn diff_head(v: &DiffView, l: &DiffLayout, fit: Fit) -> Surface {
     o.item(id::BACK, [12, 10, 32, 32], "Back", Look::Button { kind: Kind::Icon, glyph: Some(glyph::BACK) }, true);
     // From the right: the first choice, which takes GitHub's version, ends the row. A Preview changes nothing, so it
     // offers none.
-    let actions: &[Action] = if v.preview { &[] } else { &v.actions };
+    let actions: &[Action] = if !v.preview && matches!(v.report, Report::Ready(_)) { &v.actions } else { &[] };
     let mut right = w - 20;
     for (k, action) in actions.iter().enumerate() {
         if *action == Action::RemoveThem {
@@ -1103,7 +1158,7 @@ pub fn diff_head(v: &DiffView, l: &DiffLayout, fit: Fit) -> Surface {
         right -= 8;
     }
     let room = (right - 8 - 56).max(0);
-    let repo = printable(&v.repo_label).into_owned();
+    let repo = format!("{}: {} [{}]", v.source.kind.heading(), printable(&v.source.label()), printable(&v.source.id));
     let skill = printable(&v.skill).into_owned();
     let repo_w = (o.width(&repo, Font::Title) + 2).min(room / 2);
     o.text([56, 12, repo_w, 28], repo, Font::Title, Role::Text2, ONE_LINE);
@@ -1421,6 +1476,7 @@ mod tests {
         RepoView {
             id: label.to_string(),
             label: label.to_string(),
+            kind: SourceKind::Skills,
             enabled: true,
             status: "Up to date".to_string(),
             detail: None,
@@ -1486,7 +1542,7 @@ mod tests {
 
         let got = hero(&[fine.clone(), other.clone()], None);
         assert_eq!((got.tone, got.title.as_str()), (Tone::Ok, "All skills are up to date"));
-        assert_eq!(got.sub, "3 skills from 2 repositories · checked 2 minutes ago · next check in 1 hour");
+        assert_eq!(got.sub, "3 skills from 2 sources · checked 2 minutes ago · next check in 1 hour");
 
         let needy = view("o/\u{202e}b@main : skills", vec![edited("e"), ok("z")]);
         let got = hero(&[fine.clone(), needy.clone()], None);
@@ -1496,16 +1552,16 @@ mod tests {
         let got = hero(&[needy.clone(), unreadable("o/c"), unreadable("o/d")], None);
         assert_eq!(
             (got.tone, got.title.as_str(), got.sub.as_str()),
-            (Tone::Err, "2 repositories can’t be read", "In 2 repositories · checked 2 minutes ago · next check in 1 hour")
+            (Tone::Err, "2 sources can’t be read", "In 2 sources · checked 2 minutes ago · next check in 1 hour")
         );
 
         let got = hero(std::slice::from_ref(&fine), Some("the skills folder is a file"));
         assert_eq!((got.title.as_str(), got.sub.as_str()), ("Tiny Skill Sync has a problem", "The skills folder is a file"));
 
-        assert_eq!(hero(&[], None).title, "Add a repository to start");
+        assert_eq!(hero(&[], None).title, "Add a source to start");
         assert_eq!(hero(&[RepoView { enabled: false, ..fine.clone() }], None).title, "Every repository is paused");
         let empty = RepoView { level: Level::Attention, status: "No skills found".to_string(), detail: Some("…".to_string()), ..view("o/e", Vec::new()) };
-        assert_eq!(hero(&[fine.clone(), empty], None).title, "1 repository needs your attention");
+        assert_eq!(hero(&[fine.clone(), empty], None).title, "1 source needs your attention");
         let fresh = RepoView { last_check: None, ..view("o/f", Vec::new()) };
         assert_eq!(
             hero(&[fresh], None),
@@ -1518,6 +1574,22 @@ mod tests {
             ("1 skill needs your attention", "Checking for updates…"),
             "news replaces the summary, not the title"
         );
+    }
+
+    #[test]
+    fn issue7_dashboard_waits_for_both_same_repo_sources() {
+        let mut sources = [
+            RepoView { id: "agents".into(), kind: SourceKind::Agents, ..view("team/tools@main : agents", vec![ok("review.agent.md")]) },
+            RepoView { id: "rules".into(), kind: SourceKind::Instructions, ..view("team/tools@main : rules", vec![ok("style.instructions.md")]) },
+        ];
+        let complete = hero_of(&sources, None, "", false, NOW);
+        assert_eq!(complete.tone, Tone::Ok, "both sources checked: {complete:?}");
+
+        sources[1].last_check = None;
+        sources[1].status = "Not checked yet".into();
+        sources[1].skills.clear();
+        let partial = hero_of(&sources, None, "", false, NOW);
+        assert!(partial.tone != Tone::Ok && partial.title != complete.title, "one source checked: {partial:?}; both checked: {complete:?}");
     }
 
     #[test]
@@ -1543,8 +1615,8 @@ mod tests {
         // Both lines are the entry's window text, for a screen reader; Add repository has only one.
         let views = [view("o/a", vec![ok("x"), edited("e")])];
         let s = nav(&views, &Page::Activity, NAV_W, 600, &fit);
-        assert_eq!(item(&s, id::NAV_REPO).text, "o/a\n2 skills · 1 needs you");
-        assert_eq!(item(&s, id::NAV_ADD).text, "Add repository");
+        assert_eq!(item(&s, id::NAV_REPO).text, "Skills: o/a [o/a]\n2 skills · 1 needs you");
+        assert_eq!(item(&s, id::NAV_ADD).text, "Add source");
     }
 
     #[test]
@@ -1555,11 +1627,12 @@ mod tests {
         assert_eq!(nav_width(&short, 980, 0, &fit), NAV_W, "names that fit leave the list as it is");
 
         let name = "an-owner/a-repository-with-a-long-name@a-branch : a/folder";
-        let long = [view("o/a", vec![ok("x")]), view(name, vec![ok("x")])];
+        let long = [view("o/a", vec![ok("x")]), RepoView { id: "two".into(), ..view(name, vec![ok("x")]) }];
+        let label = nav_label(&long[1]);
         let w = nav_width(&long, 1400, 0, &fit);
-        assert!(w > NAV_W && w <= fit(name, Font::Body, 0).0 + 64 + 4, "{w}");
+        assert!(w > NAV_W && w <= fit(&label, Font::Body, 0).0 + 64 + 4, "{w}");
         let s = nav(&long, &Page::Activity, w, 600, &fit);
-        assert!(shows_whole(&s, id::NAV_REPO + 1, name, Font::Body), "{:?}", item(&s, id::NAV_REPO + 1).at);
+        assert!(shows_whole(&s, id::NAV_REPO + 1, &label, Font::Body), "{:?}", item(&s, id::NAV_REPO + 1).at);
         fits_in(&s, w);
         assert_eq!(nav_width(&long, 1400, 17, &fit), w + 17, "room is kept for a scroll bar");
 
@@ -1696,12 +1769,17 @@ mod tests {
         assert!(!expandable(&kept));
         assert!(!expandable(&failed));
         assert!(expandable(&deleted));
-        assert_eq!(row_commands(&kept, false), [Open, CopyPath, Compare, ManageAgain]);
-        assert_eq!(row_commands(&failed, false), [Open, CopyPath, Compare]);
-        assert_eq!(row_commands(&deleted, true), [CopyLink, OnGitHub], "a record alone cannot be previewed");
-        assert!(row_commands(&deleted, false).is_empty());
+        assert_eq!(row_commands(&kept, SourceKind::Skills, false), [Open, CopyPath, Compare, ManageAgain]);
+        assert_eq!(row_commands(&failed, SourceKind::Skills, false), [Open, CopyPath, Compare]);
+        assert_eq!(row_commands(&deleted, SourceKind::Skills, true), [CopyLink, OnGitHub], "a record alone cannot be previewed");
+        assert!(row_commands(&deleted, SourceKind::Skills, false).is_empty());
+        assert_eq!(row_commands(&kept, SourceKind::Agents, true), [Compare, ManageAgain], "file actions must not use a skills folder or a guessed URL");
         let absent = Row { folder_missing: true, facts: Some(facts("busy")), ..failed };
-        assert_eq!(row_commands(&absent, true), [CopyLink, OnGitHub], "neither the failure tag nor an install record proves the folder exists");
+        assert_eq!(
+            row_commands(&absent, SourceKind::Skills, true),
+            [CopyLink, OnGitHub],
+            "neither the failure tag nor an install record proves the folder exists"
+        );
     }
 
     #[test]
@@ -1919,8 +1997,7 @@ mod tests {
     fn diff_of(old: &str, new: &str) -> DiffView {
         let change = FileChange { path: "SKILL.md".to_string(), presence: Presence::Both, body: Body::Text(text_diff(old, new)) };
         DiffView {
-            repo_id: "o/a".to_string(),
-            repo_label: "o/a".to_string(),
+            source: RepoConfig { repo: "o/a".into(), id: "o-a".into(), ..Default::default() },
             skill: "beta".to_string(),
             preview: false,
             actions: vec![Action::Overwrite, Action::KeepMine],
@@ -2139,15 +2216,57 @@ mod tests {
     }
 
     #[test]
-    fn add_says_how_it_reads_what_was_typed_and_finds_a_repository_already_set_up() {
-        let repos = vec![repo("Owner/Skills"), RepoConfig { branch: String::new(), path: String::new(), ..repo("Owner/Top") }];
-        assert_eq!(spec_hint(" owner/other ", &repos), Ok("owner/other · the top of the repository on the default branch".to_string()));
-        assert_eq!(spec_hint("https://github.com/o/r/tree/dev/x", &[]), Ok("o/r · the x folder on dev".to_string()));
-        let already = |r: &RepoConfig| Err(format!("{} is already set up", r.label()));
-        assert_eq!(spec_hint("https://github.com/owner/skills/tree/main/skills", &repos), already(&repos[0]), "in any case");
-        assert_eq!(spec_hint("OWNER/top", &repos), already(&repos[1]));
-        assert!(spec_hint("owner/skills", &repos).is_ok(), "the top of a repository whose skills folder is set up is another source");
-        assert_eq!(spec_hint("", &repos), Err("Enter a repository like owner/name".to_string()));
+    fn add_says_how_it_reads_the_source_folder() {
+        assert_eq!(spec_hint(" owner/other "), Ok("owner/other · the top of the repository on the default branch".to_string()));
+        assert_eq!(spec_hint("https://github.com/o/r/tree/dev/x"), Ok("o/r · the x folder on dev".to_string()));
+        assert_eq!(spec_hint(""), Err("Enter a repository like owner/name".to_string()));
+    }
+
+    #[test]
+    fn source_preview_only_offers_to_add_a_confirmable_listing() {
+        use crate::app::DraftInput;
+        use crate::source::{PreviewDestination, SourcePreview};
+        let source = RepoConfig { repo: "team/tools".into(), path: "rules".into(), kind: SourceKind::Instructions, id: "rules".into(), ..Default::default() };
+        let input = std::sync::Arc::new(DraftInput { source, ticket: 1 });
+        let preview = SourcePreview {
+            kind: SourceKind::Instructions,
+            names: vec!["style.instructions.md".into()],
+            errors: vec![],
+            destination: PreviewDestination::Resolved(r"X:\example\rules".into()),
+        };
+        for (stage, add, cancel) in [
+            (DraftStage::Loading, false, true),
+            (DraftStage::Failed("Cannot read the listing.".into()), false, true),
+            (DraftStage::Reviewed(SourcePreview { names: vec![], ..preview.clone() }.into()), false, true),
+            (DraftStage::Reviewed(preview.into()), true, true),
+            (DraftStage::Saving, false, false),
+        ] {
+            let surface = source_preview(&SourceDraft { input: input.clone(), stage }, 360, &fit);
+            assert_eq!(surface.items.iter().any(|i| i.id == id::CONFIRM_SOURCE), add);
+            assert_eq!(surface.items.iter().any(|i| i.id == id::CANCEL_SOURCE), cancel);
+            if add {
+                let body = &item(&surface, id::INFO_TEXT).text;
+                assert!(body.contains("Matched 1 instruction file:") && body.contains("style.instructions.md") && body.contains("Destination:"));
+            }
+            fits_in(&surface, 360);
+        }
+    }
+
+    #[test]
+    fn continuation_empty_and_rejected_previews_offer_both_retry_and_edit() {
+        use crate::app::DraftInput;
+        use crate::source::{PreviewDestination, SourcePreview};
+        let source = RepoConfig { kind: SourceKind::Agents, ..Default::default() };
+        for errors in [vec![], vec!["unsafe file".into()]] {
+            let preview = SourcePreview { kind: source.kind, names: vec![], destination: PreviewDestination::NotChecked, errors };
+            let draft =
+                SourceDraft { input: std::sync::Arc::new(DraftInput { source: source.clone(), ticket: 1 }), stage: DraftStage::Reviewed(preview.into()) };
+            let surface = source_preview(&draft, 360, &fit);
+            assert!(surface.items.iter().any(|i| i.text == "Retry"), "a preview that could not be added needs Retry");
+            assert!(surface.items.iter().any(|i| i.text == "Edit"), "a preview that could not be added needs Edit");
+            assert!(!surface.items.iter().any(|i| i.id == id::CONFIRM_SOURCE));
+            fits_in(&surface, 360);
+        }
     }
 
     #[test]

@@ -946,6 +946,8 @@ pub fn set(panel: HWND, surface: Surface) {
     let old_items = std::mem::take(&mut p.surface.items);
     let index: HashMap<i32, usize> = old_items.iter().enumerate().map(|(i, item)| (item.id, i)).collect();
     let captured = unsafe { GetCapture() };
+    let focus = unsafe { GetFocus() };
+    let mut lost_focus = false;
     let mut old: Vec<Option<(HWND, Item)>> = std::mem::take(&mut p.children).into_iter().zip(old_items).map(Some).collect();
     let mut children = Vec::with_capacity(surface.items.len());
     let (mut reorder, mut last, mut after) = (false, 0, HWND_TOP);
@@ -981,6 +983,7 @@ pub fn set(panel: HWND, surface: Surface) {
                     }
                 }
                 if (unsafe { IsWindowEnabled(hwnd) } != 0) != item.enabled {
+                    lost_focus |= hwnd == focus && !item.enabled;
                     unsafe { EnableWindow(hwnd, item.enabled.into()) };
                     changed = true;
                 }
@@ -1000,8 +1003,6 @@ pub fn set(panel: HWND, surface: Surface) {
     p.children = children.clone();
     p.surface = surface;
     drop(p);
-    let focus = unsafe { GetFocus() };
-    let mut lost_focus = false;
     for (hwnd, _) in old.into_iter().flatten().filter(|(hwnd, _)| !hwnd.is_null()) {
         lost_focus |= hwnd == focus;
         changed = true;
@@ -1500,6 +1501,56 @@ mod tests {
 
         set(panel, long_page());
         assert_eq!(made(panel), asked, "the same page again keeps what was made and makes nothing more");
+        unsafe { DestroyWindow(top) };
+    }
+
+    #[test]
+    fn source_loading_moves_keyboard_focus_off_disabled_retry_and_edit_actions() {
+        let (top, panel) = test_panel();
+        let source_controls = |retry_enabled, edit_enabled| Surface {
+            items: vec![
+                Item {
+                    id: page::id::RETRY_SOURCE,
+                    at: [0, 0, 120, 32],
+                    text: "Retry".into(),
+                    look: Look::Button { kind: Kind::Accent, glyph: None },
+                    enabled: retry_enabled,
+                },
+                Item {
+                    id: page::id::EDIT_SOURCE,
+                    at: [128, 0, 120, 32],
+                    text: "Edit".into(),
+                    look: Look::Button { kind: Kind::Standard, glyph: None },
+                    enabled: edit_enabled,
+                },
+                Item {
+                    id: page::id::CANCEL_SOURCE,
+                    at: [256, 0, 120, 32],
+                    text: "Cancel".into(),
+                    look: Look::Button { kind: Kind::Standard, glyph: None },
+                    enabled: true,
+                },
+            ],
+            height: 48,
+            decos: vec![],
+        };
+        let loading = source_controls(false, false);
+
+        for id in [page::id::RETRY_SOURCE, page::id::EDIT_SOURCE] {
+            set(panel, source_controls(true, true));
+            let action = child(panel, id);
+            unsafe { SetFocus(action) };
+            assert_eq!(unsafe { GetFocus() }, action);
+
+            set(panel, loading.clone());
+            let focus = unsafe { GetFocus() };
+            assert!(
+                loading.items.iter().any(|item| item.enabled && item.look.interactive() && child(panel, item.id) == focus),
+                "loading retained an invalid focus target {focus:?}"
+            );
+            assert_eq!(unsafe { IsWindowEnabled(focus) }, 1);
+        }
+
         unsafe { DestroyWindow(top) };
     }
 

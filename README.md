@@ -1,9 +1,9 @@
 # Tiny Skill Sync App
 
-**Keep your Copilot skills up to date, without copying files by hand.**
+**Keep your Copilot skills, agents and instructions up to date, without copying files by hand.**
 
-Add a GitHub repository, or its skills folder, and this small Windows tray app installs the skills for you.
-It checks for updates on a schedule, keeps unchanged copies in sync, and stops when a skill has your edits.
+Add a GitHub repository or one of its folders, and choose one type of content to sync.
+This small Windows tray app checks on a schedule, updates unchanged copies and holds files with your edits.
 You decide what happens next.
 
 ![Demo: add a repository, install skills, receive an update, inspect a held edit, and keep your version.](docs/demo.gif)
@@ -26,14 +26,14 @@ Windows 10 or 11, x64. No runtime or installer is needed. The exes are not signe
 1. Download the Windows zip from [Releases](https://github.com/AngelosP/tiny-skill-sync/releases).
    Extract both exes into a folder you want to keep.
 2. Start `tiny-skill-sync.exe` and click its tray icon.
-3. Click **Add repository** and paste the address of the folder holding the skills. For example:
+3. Click **Add source** and paste the address of the folder. **Skills** is selected by default. For example:
 
    ```text
    https://github.com/anthropics/skills/tree/main/skills
    ```
 
-4. Click **Add**. Skills install at once; the app then checks once a day by default.
-   Change **Check every** if you prefer, or use **Sync now**. Starting with Windows is optional.
+4. Click **Preview** to see what matched and where it will go. **Cancel** saves and installs nothing.
+   **Add and check** saves the source and starts the first check. The default interval is one day.
 
 Public repositories need no sign-in. For private ones, sign in with `gh auth login` or save a read-only token
 in the app's Settings. See [private repositories](docs/GUIDE.md#private-repositories).
@@ -42,12 +42,17 @@ in the app's Settings. See [private repositories](docs/GUIDE.md#private-reposito
 
 A skill is a folder containing `SKILL.md`. Give the app that folder, or the folder directly containing several
 skills. It copies them into `%USERPROFILE%\.copilot\skills`, where Copilot looks for user-level skills.
+An **Agents** source installs only direct `*.agent.md` files, and an **Instructions** source only direct
+`*.instructions.md` files, under the corresponding `agents` and `instructions` folders. Add each kind as its
+own source, even from the same repository. The app can reuse an existing repo-named folder without duplicating
+its files; it adopts only copies that match.
 
 On each scheduled check, it installs new skills and updates copies you have not edited. When GitHub removes a skill,
 only its proven upstream files are removed; your added files stay. A network failure never counts as a deletion.
 If the whole listing becomes empty, the app asks first.
 
-Edited skills are held for your choice. **Show changes** compares your copy with GitHub.
+Edits are held for your choice. **Show changes** compares your copy with GitHub. If either copy changes
+after the comparison, open **Show changes** again before confirming.
 **Use the GitHub version** keeps the replaced copy as a backup; **Keep my version** stops managing that skill.
 Existing copies are adopted only after a complete match with a current or past upstream version.
 Skill downloads are copied, never run.
@@ -81,7 +86,6 @@ Whether an already-running Copilot session reloads changed skills without restar
 ### Run from a shared folder
 
 You can keep both exes in a NAS or OneDrive folder and use `tss portable` to export the current repositories and
-settings into two companion JSON files beside them. The per-machine state, token and default Copilot skills folder stay
-local. Read [the shared-folder notes](docs/GUIDE.md#run-from-a-shared-folder) before using this mode: settings need a
-single writer, the shared folder must be available when Windows starts the app, and a skills folder must not be shared
-between machines.
+settings into two companion JSON files beside them. Each machine keeps its own state, token and Copilot folders.
+Update older copies before sharing typed sources: versions that only know Skills cannot read the new source format.
+Read [the shared-folder notes](docs/GUIDE.md#run-from-a-shared-folder) before using this mode.

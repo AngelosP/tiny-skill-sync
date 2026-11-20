@@ -67,13 +67,16 @@ refuses to write Windows' own keys from a test.
 | --- | --- |
 | `src\*.rs` (`#[cfg(test)]`) | Unit tests next to the code. The modules that make decisions (`reconcile`, `tree`, `scheduler`, `board`, `app`, `interval`, `pathsafe`, `autostart`) are pure, so every rule is tested without a disk or a network; so are the comparison behind **Show changes** (`diff`) and the window's pages (`win::ui::page`). `apply` and `win::fs` are tested on the real file system, `win::autorun` on the real registry. |
 | `tests\engine_sync.rs`, `engine_failures.rs`, `engine_lifecycle.rs` | The engine end to end, on the real file system, with a fake GitHub (`tests\common\mod.rs`: `FakeRemote`, `World`). Failures, crashes in every step of a change, restarts. |
+| `tests\engine_sources.rs`, `source_preview.rs`, `src\apply\leaf\tests.rs` | Typed discovery and read-only previews, independent file destinations, and per-file transactions on disposable roots. |
 | `tests\downtime.rs` | Edits made while the app was stopped, and drives that cannot vouch for a file. The evidence for [How edits are found](docs/GUIDE.md#how-edits-are-found). |
 | `tests\http.rs` | The real WinHTTP client against a local test server: redirects, timeouts, limits, cancel. |
 | `tests\cli.rs`, `tests\app.rs` | The command line and the tray's logic, with a real engine and a fake GitHub. |
 
 **Another drive.** `scripts\dev.ps1 test -Root FOLDER` sets `TSS_TEST_ROOT`, so the file-system tests make their folders
 there: another drive, a ReFS or Dev Drive volume, or a network share. Run it when you change file-system code. A run on
-an SMB share once found a bug the local NTFS runs could not.
+an SMB share once found a bug the local NTFS runs could not. Without `-Root`, the runner sets `TSS_TEST_ROOT` to
+`%TEMP%`; this makes engine tests fail closed if they do not inject disposable Agents and Instructions roots. The
+`TSS_NO_SAVED_TOKEN` and `TSS_NO_APP_UPDATES` flags do not isolate file-system paths.
 
 **Live GitHub.** The tests never talk to GitHub. To try the real client, use `scripts\dev.ps1 dry-run -Repo ...` or the
 sandbox (`scripts\dev.ps1 tss add ...` then `tss check`), and for everything the tests cannot see, the live runs below.
@@ -121,8 +124,9 @@ ends up on disk, what the app says and what it leaves alone.
 | Scenario | What it checks |
 | --- | --- |
 | `install` | First start: what is installed, how the idle app behaves, how fast it quits. |
-| `places` | With `TSS_HOME` and `TSS_SKILLS_DIR` unset and the profile folders pointed at `%TEMP%`: skills go to `%USERPROFILE%\.copilot\skills` beside a skill written by hand, the settings to `%LOCALAPPDATA%\tiny-skill-sync`, nothing anywhere else. Then `skills_dir` set in `config.json`: the new folder gets its own copies and the old one is left as it is; taken out again while the tray runs, the first folder is managed as before, with an edit made there meanwhile kept and shown. |
+| `places` | With `TSS_HOME` and `TSS_SKILLS_DIR` unset and the profile folders pointed at `%TEMP%`: skills go to `%USERPROFILE%\.copilot\skills` beside a skill written by hand, the settings to `%LOCALAPPDATA%\tiny-skill-sync`, nothing anywhere else except an optional `GitHub CLI` folder when the app asks `gh` for a token. Then `skills_dir` set in `config.json`: the new folder gets its own copies and the old one is left as it is; taken out again while the tray runs, the first folder is managed as before, with an edit made there meanwhile kept and shown. |
 | `portable` | `tss portable` exports two companion files without changing `config.json`; two tray copies read those shared sources but keep separate local state and skills folders. Uses the public fixture's existing branch without pushing. |
+| `mixed` | On a disposable branch of the public fixture, two isolated profiles share one portable Skills, Agents and Instructions source list. Exercises CLI preview and checks, tray preview/cancel and add, exact paths, separate state/work, repo-namespaced adoption and an unchanged neighbor. |
 | `changes` | Six kinds of upstream change reach the disk through the tray's **Sync now**. |
 | `local-edit` | An edit made while the app runs, then an upstream change to the same skill. |
 | `converged` | Three skills edited here, then the edits pushed to GitHub: one with Windows line endings against GitHub's Unix ones, one byte for byte, one differently. The first two are marked as in sync with nothing written and take the next update; the third stays edited. |
@@ -142,6 +146,11 @@ Run it when you change the engine's visible behaviour, the tray, the window or a
 the scenarios that cover the change (`-Only`). `scripts\dev.ps1 soak` is the long run for leaks and idle cost. The screens
 are checked on real screen copies, not on `PrintWindow`, which sometimes returns an unpainted bottom band for a window
 that is fully painted on screen.
+
+For mixed-source work, use `scripts\dev.ps1 e2e -Only mixed` and inspect its screenshots. Each profile needs
+disposable `USERPROFILE`, `LOCALAPPDATA`, `TSS_HOME`, `TSS_SKILLS_DIR`, `TSS_AGENTS_DIR` and `TSS_INSTRUCTIONS_DIR`
+values. Their sibling work folders must also be separate and disposable. The harness disables saved-token reads and
+app updates and never places test files in the real Copilot folders. Run the normal test and benchmark gates too.
 
 ### Fixing a bug
 
@@ -245,10 +254,12 @@ The budgets, agreed before the app was written:
 | Unchanged poll | 50 ms CPU, 0 file reads or writes, 1 request |
 | After a poll | 20 MiB working set, 5 MiB private, 10 threads, 350 handles |
 | Quit | 2 s at most |
-| `tiny-skill-sync.exe` | 1.1 MiB |
+| `tiny-skill-sync.exe` | 1.25 MiB |
 
 The exe's budget was 1 MiB until the shared-folder settings, the new skill rows and the check that marks an edit
-GitHub also has as in sync took it to 1.01 MiB; the owner raised it to 1.1 MiB. The other rows are as first agreed.
+GitHub also has as in sync took it to 1.01 MiB; the owner raised it to 1.1 MiB. Agents and Instructions sources took
+it to 1.30 MiB; taking the Universal C Runtime from Windows brought it back to 1.23 MiB, and the owner raised the
+budget to 1.25 MiB. The other rows are as first agreed.
 
 The recorded results and their test conditions are in [the user guide](docs/GUIDE.md#measured-cost).
 
@@ -268,9 +279,10 @@ The recorded results and their test conditions are in [the user guide](docs/GUID
 ## Release build
 
 `Cargo.toml` and `.cargo\config.toml` set the release profile: `opt-level = "z"`, fat LTO, one codegen unit,
-`panic = "abort"`, stripped symbols and a static C runtime (no Visual C++ redistributable needed). The 1.1 MiB
-tray budget is unchanged. The earlier 1,057,280-byte baseline passed; the build with the app updater measured
-1,168,384 bytes, and 1,173,504 with the tray restart after an update, and does not pass. In the earlier size
+`panic = "abort"`, stripped symbols and a static Visual C++ runtime. `build.rs` links the Universal C Runtime part from
+Windows (`ucrtbase.dll`, part of Windows 10 and 11), which saves about 75 KB per exe; no Visual C++ redistributable is
+needed, and `tests\cli.rs` checks that neither exe imports one. The tray budget is 1.25 MiB; the build with Agents and
+Instructions sources measured 1,287,680 bytes. In the earlier size
 comparison, `opt-level = "s"` made the 0.89 MiB exe
 1.01 MiB, `opt-level = 3` larger still. Building for size costs about 12% of SHA-1 speed (339 MB/s instead of 384).
 `build.rs` embeds

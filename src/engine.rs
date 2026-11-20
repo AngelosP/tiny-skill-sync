@@ -14,6 +14,10 @@
 //! * Verification before a destructive step always reads the files (`Check::Full`); the cheap fingerprint check is
 //!   only used to report status.
 
+mod loose;
+mod roots;
+mod source_preview;
+
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -227,6 +231,7 @@ pub struct SyncReport {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LocalStatus {
     Checked(LocalState),
+    Unavailable(String),
     /// An earlier change was interrupted and is not sorted out yet.
     Interrupted,
     History {
@@ -318,13 +323,27 @@ type StepHook = Box<dyn FnMut(Step) -> Result<(), RemoteError> + Send>;
 /// Tells which drive a folder is on and whether that drive keeps a change journal.
 type VolumeProbe = fn(&Path) -> io::Result<VolumeId>;
 
+struct SkillComparison {
+    source: RepoConfig,
+    dir: PathBuf,
+    name: String,
+    single: bool,
+    desired: Option<tree::Skill>,
+    local: verify::SkillReview,
+}
+
 pub struct Engine {
     paths: Paths,
+    /// Production clients identify the active store; an in-process engine can be driven entirely by its caller.
+    settings: Option<(PathBuf, bool)>,
     remote: Box<dyn Remote>,
     tokens: Box<dyn TokenProvider>,
     clock: Box<dyn Fn() -> UnixSecs + Send + Sync>,
     lock_wait: Duration,
     cache: Cache,
+    skill_review: Option<SkillComparison>,
+    /// The loose file shown by the worker's last comparison, never persisted or refreshed by a poll.
+    file_review: Option<loose::FileReview>,
     /// `last_check` values that were not worth a write on their own. Saved with the next real save, or by `flush`.
     lazy: HashMap<String, UnixSecs>,
     schedule: Schedule,
@@ -364,6 +383,9 @@ struct Volume {
 /// Everything one call works on. Created by `begin`, returned by `end`.
 struct Session {
     _lock: Option<File>,
+    roots: roots::Roots,
+    settings: Option<(PathBuf, bool, Config)>,
+    writer: Option<File>,
     access: Access,
     state: State,
     applier: Applier,
@@ -383,9 +405,33 @@ struct Session {
 }
 
 impl Session {
+    /// Under engine.lock, re-read the active store before a mutation and exclude cooperating settings writers.
+    /// Never acquire this guard just to handle a conditional 304.
+    fn authorize(&mut self) -> Result<(), RemoteError> {
+        let Some((dir, portable, expected)) = &self.settings else { return Ok(()) };
+        if self.writer.is_some() {
+            return Ok(());
+        }
+        let home = self.applier.state_path.parent().expect("state file has a parent");
+        let local = |e| RemoteError::new(FailureKind::Local, e);
+        let lock = crate::config::settings_write_lock(if *portable { dir } else { home }).map_err(local)?;
+        let shared = crate::portable::load_sources(dir).map_err(local)?;
+        if shared.is_some() != *portable
+            || match shared {
+                Some(active) => active != *expected,
+                None => Config::load_sources(&home.join(crate::config::CONFIG_FILE)).map_err(local)? != *expected,
+            }
+        {
+            return Err(local("the source settings changed; reload them and try again".into()));
+        }
+        self.writer = Some(lock);
+        Ok(())
+    }
+
     /// Finishes or undoes the changes a crash interrupted. Only a call that may write does it.
-    fn recover(&mut self) {
+    fn recover(&mut self, cfg: &Config) -> Result<(), EngineError> {
         if self.access == Access::Write && self.state.has_pending() {
+            self.authorize().map_err(|e| failed(e.message))?;
             match self.applier.recover(&mut self.state) {
                 Ok(notes) => self.notes = notes,
                 Err(e) => {
@@ -394,6 +440,10 @@ impl Session {
                 }
             }
         }
+        if self.access == Access::Write {
+            self.recover_files(cfg)?;
+        }
+        Ok(())
     }
 
     /// Writes the state. A failure is remembered as a warning and the state is read from disk again next time.
@@ -445,8 +495,8 @@ impl Session {
 
     /// Remembers a successful check that found nothing new. Not worth a write by itself.
     fn touch_check(&mut self, repo_id: &str, at: UnixSecs) {
-        if let Some(r) = self.state.repos.get_mut(repo_id) {
-            r.last_check = Some(at);
+        if let Some(last) = self.state.last_check_mut(repo_id) {
+            *last = Some(at);
             self.lazy.insert(repo_id.to_string(), at);
         }
     }
@@ -533,8 +583,8 @@ fn wanted_here(upstream: &[SkillFile], recorded: Option<&OwnedSkill>) -> Vec<Str
     upstream.iter().map(|f| &f.path).chain(installed).filter(|path| seen.insert(fold(path))).cloned().collect()
 }
 
-/// The files on this PC that are different from GitHub, and the folded paths of the ones that are the same.
-type ReadHere = (Vec<(String, Content)>, HashSet<String>);
+/// Display rows may discard lines and entire files. Keep separate evidence for an overwrite choice.
+type ReadHere = (Vec<(String, Content)>, HashSet<String>, Vec<(String, verify::ReviewFile)>);
 
 /// Whether there is a plain file at `rel` in a skill's folder, or why it is not read. No link is followed.
 fn spot_file(spots: &mut Spots, rel: &str, stats: &mut Stats) -> Result<bool, &'static str> {
@@ -568,20 +618,26 @@ fn shown_content(read: io::Result<winfs::FileRead>, budget: &mut u64, too_much: 
 /// Reads the files at `rels` on this PC for "Show changes", comparing each with its copy on GitHub (`theirs`, by folded
 /// path). A path with nothing there is left out. Bytes are kept only while there is room.
 fn read_here(dir: &Path, rels: Vec<String>, theirs: &HashMap<String, &SkillFile>, cancel: &AtomicBool) -> Result<ReadHere, EngineError> {
+    use verify::ReviewFile;
     let mut hasher = FileHasher::default();
     let mut spots = Spots::new(dir);
     let mut stats = Stats::default();
     let mut budget = DIFF_TOTAL_BYTES;
     let mut different = Vec::new();
     let mut same = HashSet::new();
+    let mut evidence = Vec::new();
     for rel in rels {
         if cancel.load(Ordering::Relaxed) {
             return Err(failed("showing the changes was stopped"));
         }
         match spot_file(&mut spots, &rel, &mut stats) {
             Ok(true) => {}
-            Ok(false) => continue,
+            Ok(false) => {
+                evidence.push((rel, ReviewFile::Missing));
+                continue;
+            }
             Err(why) => {
+                evidence.push((rel.clone(), ReviewFile::Unreadable));
                 different.push((rel, Content::Hidden(why.into())));
                 continue;
             }
@@ -591,13 +647,18 @@ fn read_here(dir: &Path, rels: Vec<String>, theirs: &HashMap<String, &SkillFile>
         // A file too big to show that is larger than its copy on GitHub is different whatever it holds; it is not read.
         let limit = upstream.map_or(0, |t| t.size).max(DIFF_FILE_BYTES);
         let read = hasher.read(&join_rel(dir, &rel), DIFF_FILE_BYTES.min(budget), limit);
+        let proof = match &read {
+            Ok(r) => ReviewFile::Read { len: r.len, blob: r.blob.clone() },
+            Err(_) => ReviewFile::Unreadable,
+        };
+        evidence.push((rel.clone(), proof));
         if matches!(&read, Ok(read) if upstream.is_some_and(|t| t.blob == read.blob)) {
             same.insert(key);
             continue;
         }
         different.push((rel, shown_content(read, &mut budget, TOO_MUCH)));
     }
-    Ok((different, same))
+    Ok((different, same, evidence))
 }
 
 /// Reads the files at `rels` in a skill's folder for Preview, in order, each whole. A path with nothing there is named
@@ -697,11 +758,14 @@ impl Engine {
     pub fn new(paths: Paths, remote: Box<dyn Remote>, tokens: Box<dyn TokenProvider>) -> Engine {
         Engine {
             paths,
+            settings: None,
             remote,
             tokens,
             clock: Box::new(now_secs),
             lock_wait: DEFAULT_LOCK_WAIT,
             cache: Cache::default(),
+            skill_review: None,
+            file_review: None,
             lazy: HashMap::new(),
             schedule: Schedule::new(),
             step_hook: None,
@@ -717,27 +781,67 @@ impl Engine {
         &self.paths
     }
 
+    pub(crate) fn settings_at(&mut self, executable_dir: PathBuf, portable: bool) {
+        self.settings = Some((executable_dir, portable));
+    }
+
     pub fn schedule(&self) -> &Schedule {
         &self.schedule
     }
 
     /// When the app next needs to wake up, or `None` when nothing is configured. Uses what the last call saw.
     pub fn next_wake(&self, cfg: &Config) -> Option<UnixSecs> {
-        self.schedule.next_wake(cfg, &self.cache.state, self.now())
+        self.deadlines(cfg, &self.cache.state).filter_map(|(_, due)| due).min()
+    }
+
+    /// Only timing enters the scheduler's skills-shaped input; a projected record is never saved or used for ownership.
+    fn deadlines<'a>(&'a self, cfg: &'a Config, state: &'a State) -> impl Iterator<Item = (&'a str, Option<UnixSecs>)> {
+        let now = self.now();
+        cfg.repos.iter().map(move |repo| {
+            let one = Config { repos: vec![repo.clone()], default_interval: cfg.default_interval, ..Default::default() };
+            let mut timing = State::default();
+            let view = if repo.kind.is_skills() {
+                state
+            } else {
+                if let Some(p) = state.loose_sources().get(&repo.id).map(|s| &s.poll) {
+                    let r = timing.repo_mut(&repo.id);
+                    r.last_check = p.last_check;
+                    r.etag.clone_from(&p.etag);
+                }
+                &timing
+            };
+            (repo.id.as_str(), self.schedule.next_wake(&one, view, now))
+        })
     }
 
     pub fn last_check(&self, repo_id: &str) -> Option<UnixSecs> {
-        self.cache.state.repo(repo_id).and_then(|r| r.last_check)
+        self.cache.state.repo(repo_id).and_then(|r| r.last_check).or_else(|| self.cache.state.loose_sources().get(repo_id)?.poll.last_check)
     }
 
     /// The skills of a repository the user keeps as their own, as of the last call.
     pub fn kept(&self, repo_id: &str) -> Vec<String> {
-        self.cache.state.repo(repo_id).map(|r| r.ignored.clone()).unwrap_or_default()
+        self.cache
+            .state
+            .repo(repo_id)
+            .map(|r| r.ignored.clone())
+            .or_else(|| Some(self.cache.state.loose_sources().get(repo_id)?.poll.ignored.clone()))
+            .unwrap_or_default()
     }
 
     /// What the record says about each skill of a repository the app put in place, as of the last call. A skill whose
     /// last change was interrupted has nothing to tell until recovery sorts it out.
     pub fn facts(&self, repo_id: &str) -> Vec<SkillFacts> {
+        if let Some(files) = self.cache.state.loose_sources().get(repo_id) {
+            return files
+                .leaves()
+                .iter()
+                .filter(|l| !l.interrupted())
+                .filter_map(|l| {
+                    let v = l.installed.as_ref()?;
+                    Some(SkillFacts { name: l.name.clone(), commit: v.commit.clone(), files: 1, bytes: v.file.size, updated: Some(v.updated) })
+                })
+                .collect();
+        }
         let Some(repo) = self.cache.state.repo(repo_id) else { return Vec::new() };
         repo.skills
             .iter()
@@ -754,12 +858,12 @@ impl Engine {
 
     /// Whether the last listing read for a repository had no skills in it at all, as of the last call.
     pub fn lists_nothing(&self, repo_id: &str) -> bool {
-        self.cache.state.repo(repo_id).is_some_and(|r| r.lists_nothing)
+        self.cache.state.repo(repo_id).is_some_and(|r| r.lists_nothing) || self.cache.state.loose_sources().get(repo_id).is_some_and(|r| r.poll.lists_nothing)
     }
 
     /// Whether a repository was found to be readable only with the user's GitHub sign-in, as of the last call.
     pub fn needs_token(&self, repo_id: &str) -> bool {
-        self.cache.state.repo(repo_id).is_some_and(|r| r.needs_token)
+        self.cache.state.repo(repo_id).is_some_and(|r| r.needs_token) || self.cache.state.loose_sources().get(repo_id).is_some_and(|r| r.poll.needs_token)
     }
 
     /// The stamp of `state.json` as the last call left it, or `None` when it is not known. A different stamp on disk
@@ -814,7 +918,12 @@ impl Engine {
 
     /// Starts a call: takes the lock, reads the state and ties it to the skills folder. Says whether the records were
     /// made for another skills folder. Changes a crash interrupted are not sorted out yet; `begin` does that.
-    fn open(&mut self, access: Access) -> Result<(Session, bool), EngineError> {
+    fn open(&mut self, cfg: &Config, access: Access) -> Result<(Session, bool), EngineError> {
+        let mut ids = HashSet::new();
+        if cfg.repos.iter().any(|r| r.id.trim().is_empty() || !ids.insert(&r.id)) {
+            return Err(failed("each source needs a distinct, nonempty ID"));
+        }
+        let roots = roots::check(&self.paths, cfg, None).map_err(failed)?;
         let lock = self.acquire(access)?;
         let path = self.paths.state_file();
         let mut warnings = Vec::new();
@@ -827,7 +936,7 @@ impl Engine {
         let mut state = if reusable {
             std::mem::take(&mut self.cache.state)
         } else {
-            let loaded = State::load_with(&path, access == Access::Write).map_err(|e| failed(format!("cannot read {}: {e}", path.display())))?;
+            let loaded = State::load_sources_with(&path, access == Access::Write).map_err(|e| failed(format!("cannot read {}: {e}", path.display())))?;
             let mut state = loaded.state;
             suspect = loaded.warning.is_some() && access == Access::ReadOnly;
             warnings.extend(loaded.warning);
@@ -838,6 +947,7 @@ impl Engine {
         };
         // From here on the state lives in the session; `end` puts it back.
         self.cache.stamp = None;
+        roots.validate_state(&state, cfg).map_err(failed)?;
 
         // Records made for another skills folder must not be applied to this one, nor their interrupted changes
         // finished here. `begin` does that after this, so this comes first.
@@ -874,9 +984,9 @@ impl Engine {
         }
 
         for (id, at) in &self.lazy {
-            if let Some(r) = state.repos.get_mut(id) {
-                if r.last_check.is_none_or(|c| c < *at) {
-                    r.last_check = Some(*at);
+            if let Some(last) = state.last_check_mut(id) {
+                if last.is_none_or(|c| c < *at) {
+                    *last = Some(*at);
                 }
             }
         }
@@ -885,6 +995,9 @@ impl Engine {
         applier.hook = self.step_hook.take();
         let s = Session {
             _lock: lock,
+            roots,
+            settings: self.settings.as_ref().map(|(dir, portable)| (dir.clone(), *portable, cfg.clone())),
+            writer: None,
             access,
             state,
             applier,
@@ -904,23 +1017,22 @@ impl Engine {
     }
 
     /// Starts a call that reports warnings, so it may also take in a change of skills folder.
-    fn begin(&mut self, access: Access) -> Result<Session, EngineError> {
-        let (mut s, _) = self.open(access)?;
-        s.recover();
+    fn begin(&mut self, cfg: &Config, access: Access) -> Result<Session, EngineError> {
+        let (mut s, _) = self.open(cfg, access)?;
+        s.recover(cfg)?;
         Ok(s)
     }
 
     /// Starts a call that changes the records but reports no warnings. If the skills folder changed since the state
     /// was saved, it changes nothing and gives `None`: a check must first take in the change and tell the user.
-    fn begin_settled(&mut self) -> Result<Option<Session>, EngineError> {
-        let (mut s, moved) = self.open(Access::Write)?;
+    fn begin_settled(&mut self, cfg: &Config) -> Result<Option<Session>, EngineError> {
+        let (mut s, moved) = self.open(cfg, Access::Write)?;
         if moved {
             s.must_save = false;
             s.suspect = true;
             self.finish(s);
             return Ok(None);
         }
-        s.recover();
         Ok(Some(s))
     }
 
@@ -956,7 +1068,7 @@ impl Engine {
         if self.lazy.is_empty() {
             return Ok(());
         }
-        let Some(mut s) = self.begin_settled()? else { return Ok(()) };
+        let Some(mut s) = self.begin_settled(&Config::default())? else { return Ok(()) };
         s.must_save = true;
         self.conclude(s, Ok(()))
     }
@@ -964,9 +1076,11 @@ impl Engine {
     /// Run once when the program starts: sorts out changes a crash interrupted, removes leftovers, and checks the
     /// installed skills against what was recorded.
     pub fn startup(&mut self, cfg: &Config) -> Result<StartupReport, EngineError> {
-        let mut s = self.begin(Access::Write)?;
+        let mut s = self.begin(cfg, Access::Write)?;
         let problem = if s.applier.skills_dir.is_dir() { apply::preflight(&s.applier.skills_dir, &s.applier.work_dir).err() } else { None };
-        s.applier.sweep(&s.state);
+        if cfg.repos.iter().all(|r| r.kind.is_skills()) {
+            s.applier.sweep(&s.state);
+        }
         let mut verify = self.verify_in(&mut s, cfg);
         verify.warnings.extend(self.finish(s));
         Ok(StartupReport { verify, problem })
@@ -974,7 +1088,7 @@ impl Engine {
 
     /// Compares every installed skill with what was recorded. Needs no network.
     pub fn verify(&mut self, cfg: &Config, access: Access) -> Result<VerifyReport, EngineError> {
-        let mut s = self.begin(access)?;
+        let mut s = self.begin(cfg, access)?;
         let mut report = self.verify_in(&mut s, cfg);
         report.warnings.extend(self.finish(s));
         Ok(report)
@@ -984,12 +1098,20 @@ impl Engine {
         let before = s.stats;
         let mut skills = Vec::new();
         for repo in &cfg.repos {
-            for (name, status) in verify_repo(s, &repo.id) {
+            let local = if repo.kind.is_skills() { verify_repo(s, &repo.id) } else { s.verify_files(repo) };
+            for (name, status) in local {
                 skills.push(LocalReport { repo_id: repo.id.clone(), name, status });
             }
         }
         let known: HashSet<&str> = cfg.repos.iter().map(|r| r.id.as_str()).collect();
-        let orphans = s.state.repos.iter().filter(|(id, r)| !known.contains(id.as_str()) && !r.skills.is_empty()).map(|(id, _)| id.clone()).collect();
+        let orphans = s
+            .state
+            .repos
+            .iter()
+            .filter(|(id, r)| !known.contains(id.as_str()) && !r.skills.is_empty())
+            .map(|(id, _)| id.clone())
+            .chain(s.state.loose_sources().keys().filter(|id| !known.contains(id.as_str())).cloned())
+            .collect();
         let tracking = s.tracking();
         VerifyReport {
             skills,
@@ -1003,7 +1125,7 @@ impl Engine {
 
     /// Checks repositories against GitHub and applies what is safe to apply.
     pub fn sync(&mut self, cfg: &Config, which: &Which, opts: &SyncOptions, cancel: &AtomicBool) -> Result<SyncReport, EngineError> {
-        let mut s = self.begin(if opts.dry_run { Access::ReadOnly } else { Access::Write })?;
+        let mut s = self.begin(cfg, if opts.dry_run { Access::ReadOnly } else { Access::Write })?;
         let result = self.sync_in(&mut s, cfg, which, opts, cancel);
         let notes = std::mem::take(&mut s.notes);
         let warnings = self.finish(s);
@@ -1012,7 +1134,7 @@ impl Engine {
 
     fn sync_in(&mut self, s: &mut Session, cfg: &Config, which: &Which, opts: &SyncOptions, cancel: &AtomicBool) -> Result<Vec<RepoReport>, EngineError> {
         let ids: Vec<String> = match which {
-            Which::Due => self.schedule.due_repos(cfg, &s.state, self.now()),
+            Which::Due => self.deadlines(cfg, &s.state).filter(|(_, due)| due.is_some_and(|d| d <= self.now())).map(|(id, _)| id.to_owned()).collect(),
             Which::All => cfg.repos.iter().filter(|r| r.enabled).map(|r| r.id.clone()).collect(),
             Which::One(id) => match cfg.find(id) {
                 Some(r) => vec![r.id.clone()],
@@ -1027,7 +1149,7 @@ impl Engine {
             let Some(repo) = cfg.find(&id) else { continue };
             let before = s.stats;
             let downloaded = s.downloaded;
-            let mut report = self.sync_repo(s, repo, opts, cancel);
+            let mut report = if repo.kind.is_skills() { self.sync_repo(s, repo, opts, cancel) } else { self.sync_files(s, repo, opts, cancel) };
             report.stats = since(s.stats, before);
             report.downloaded = s.downloaded - downloaded;
             report.finished_at = self.now();
@@ -1073,39 +1195,45 @@ impl Engine {
         etag: Option<&str>,
         learn: bool,
         cancel: &AtomicBool,
-    ) -> Result<(TreeReply, Option<Arc<Secret>>), Failure> {
-        let tree = |token: Option<&Arc<Secret>>| self.remote.tree(repo_ref, etag, token.map(Arc::as_ref), cancel);
-        if repo.use_token {
-            let token = s.token(self.tokens.as_ref()).map_err(|why| Failure { kind: FailureKind::Auth, message: why, retry_at: None })?;
-            return Ok((tree(Some(&token))?, Some(token)));
+    ) -> Result<(TreeReply, Option<Arc<Secret>>), RemoteError> {
+        let (reply, token, private) = self.request_tree(s, repo, repo_ref, etag, cancel)?;
+        if learn && repo.kind.is_skills() && private != s.state.repo(&repo.id).is_some_and(|r| r.needs_token) {
+            s.state.repo_mut(&repo.id).needs_token = private;
+            s.must_save = true;
         }
-        let remembered = s.state.repo(&repo.id).is_some_and(|r| r.needs_token);
+        Ok((reply, token))
+    }
+
+    fn request_tree(
+        &self,
+        s: &mut Session,
+        repo: &RepoConfig,
+        repo_ref: &RepoRef,
+        etag: Option<&str>,
+        cancel: &AtomicBool,
+    ) -> Result<(TreeReply, Option<Arc<Secret>>, bool), RemoteError> {
+        let tree = |token: Option<&Arc<Secret>>| self.remote.tree(repo_ref, etag, token.map(Arc::as_ref), cancel);
+        let remembered = s.state.repo(&repo.id).is_some_and(|r| r.needs_token) || s.state.loose_sources().get(&repo.id).is_some_and(|r| r.poll.needs_token);
+        if repo.use_token {
+            let token = s.token(self.tokens.as_ref()).map_err(|why| RemoteError::new(FailureKind::Auth, why))?;
+            return Ok((tree(Some(&token))?, Some(token), remembered));
+        }
         if remembered {
             if let Ok(token) = s.token(self.tokens.as_ref()) {
-                return Ok((tree(Some(&token))?, Some(token)));
+                return Ok((tree(Some(&token))?, Some(token), true));
             }
         }
         match tree(None) {
-            Ok(reply) => {
-                if remembered && learn {
-                    s.state.repo_mut(&repo.id).needs_token = false;
-                    s.must_save = true;
-                }
-                Ok((reply, None))
-            }
+            Ok(reply) => Ok((reply, None, false)),
             Err(e) if matches!(e.kind, FailureKind::NotFound | FailureKind::RateLimited) => match s.token(self.tokens.as_ref()) {
                 Ok(token) => {
                     let reply = tree(Some(&token))?;
-                    if e.kind == FailureKind::NotFound && !remembered && learn {
-                        s.state.repo_mut(&repo.id).needs_token = true;
-                        s.must_save = true;
-                    }
-                    Ok((reply, Some(token)))
+                    Ok((reply, Some(token), e.kind == FailureKind::NotFound))
                 }
-                Err(_) if e.kind == FailureKind::NotFound => Err(Failure { message: format!("{}. {SIGN_IN}", e.message), ..e.into() }),
-                Err(_) => Err(e.into()),
+                Err(_) if e.kind == FailureKind::NotFound => Err(RemoteError { message: format!("{}. {SIGN_IN}", e.message), ..e }),
+                Err(_) => Err(e),
             },
-            Err(e) => Err(e.into()),
+            Err(e) => Err(e),
         }
     }
 
@@ -1187,10 +1315,37 @@ impl Engine {
             return report.fail(RemoteError::new(FailureKind::TooLarge, "GitHub cut the listing short because the folder is too big; nothing was changed"));
         }
 
-        let single = tree::is_single_skill(&snapshot.entries);
-        let discovery = tree::discover(&snapshot.entries, &repo.single_skill_name(), root_len(&s.applier));
         let before_state = s.state.repo(&repo.id).cloned().unwrap_or_default();
-        let mut cx = Ctx { repo, repo_ref, token, single, opts, cancel, theirs: HashMap::new(), historical: HashMap::new(), tree: snapshot.sha };
+        let found = match tree::discover_source(repo, snapshot, root_len(&s.applier)) {
+            Ok(found) => found,
+            Err(e) => return report.fail(RemoteError::new(FailureKind::Protocol, e)),
+        };
+        let tree::SourceItems::Skills { single, skills } = found.items() else { unreachable!("skills dispatcher") };
+        let discovery = Discovery { skills: skills.clone(), rejected: found.rejected().to_vec() };
+        let mut cx =
+            Ctx { repo, repo_ref, token, single: *single, opts, cancel, theirs: HashMap::new(), historical: HashMap::new(), tree: found.tree_id().into() };
+        // Confirm absence of either a skill or an installed member of a skill before interpreting it.
+        let removes = before_state.skills.iter().any(|old| {
+            let key = fold(&old.name);
+            if found.rejected().iter().any(|r| fold(&r.name) == key) {
+                return false;
+            }
+            skills.iter().find(|k| fold(&k.name) == key).is_none_or(|k| old.files.iter().any(|f| !k.files.iter().any(|n| fold(&n.path) == fold(&f.path))))
+        });
+        if removes {
+            if !same_source || !found.complete_for(repo) || before_state.source.is_empty() {
+                return report.fail(RemoteError::new(FailureKind::Protocol, "the listing cannot confirm removals for the recorded source"));
+            }
+            let confirmed = (|| {
+                if commit.is_none() {
+                    commit = Some(self.remote.commit(&cx.repo_ref, cx.token.as_deref(), cancel)?);
+                }
+                crate::github::confirm_source_at(self.remote.as_ref(), repo, &found, commit.as_deref().unwrap_or_default(), cx.token.as_deref(), cancel)
+            })();
+            if let Err(e) = confirmed {
+                return report.fail(e);
+            }
+        }
         let unmanaged = match self.compare_unmanaged(s, &mut cx, &discovery, &mut commit) {
             Ok(u) => u,
             Err(e) if e.kind == FailureKind::Cancelled => return RepoReport { outcome: Outcome::Cancelled, ..report },
@@ -1202,7 +1357,16 @@ impl Engine {
             Err(e) if e.kind == FailureKind::Cancelled => return RepoReport { outcome: Outcome::Cancelled, ..report },
             Err(e) => return report.fail(e),
         };
-        let decisions = plan_repo(s, repo, &discovery, unmanaged, &local, &matching, opts.confirm_mass_delete);
+        let mut decisions = plan_repo(s, repo, &discovery, unmanaged, &local, &matching, opts.confirm_mass_delete);
+        // Downloads for positive changes precede removals. A failed transfer must never authorize a deletion later in the plan.
+        if removes {
+            decisions.sort_by_key(|d| matches!(d.verdict, Verdict::Delete | Verdict::Forget));
+        }
+        if !opts.dry_run && decisions.iter().any(|d| d.verdict.is_action()) {
+            if let Err(e) = s.authorize() {
+                return report.fail(e);
+            }
+        }
         let head = commit.clone();
         let run = self.apply_all(s, &cx, &discovery, &decisions, commit);
 
@@ -1538,7 +1702,7 @@ impl Engine {
             if cx.cancel.load(Ordering::Relaxed) {
                 run.cancelled = true;
             }
-            if run.cancelled || run.stopped.is_some() {
+            if run.cancelled || run.stopped.is_some() || (!run.local_failures.is_empty() && matches!(d.verdict, Verdict::Delete | Verdict::Forget)) {
                 run.results[i] = ApplyResult::NotTried;
                 continue;
             }
@@ -1663,8 +1827,21 @@ impl Engine {
     /// Settles one skill that needs the user's decision.
     pub fn resolve(&mut self, cfg: &Config, repo_id: &str, skill: &str, how: Resolution, cancel: &AtomicBool) -> Result<ResolveReport, EngineError> {
         let repo = cfg.find(repo_id).ok_or_else(|| failed(format!("no repository '{repo_id}' is set up")))?;
-        let mut s = self.begin_settled()?.ok_or_else(folder_changed)?;
-        let result = self.resolve_in(&mut s, repo, skill, how, cancel);
+        pathsafe::check_component(skill).map_err(|why| failed(why.to_string()))?;
+        let mut s = self.begin_settled(cfg)?.ok_or_else(folder_changed)?;
+        let result = if repo.kind.is_skills() {
+            s.authorize().map_err(|e| failed(e.message)).and_then(|()| {
+                if s.state.repo(repo_id).and_then(|r| r.skill(skill)).is_some_and(|k| k.pending.is_some()) {
+                    return Err(failed("finish the interrupted change before resolving this skill"));
+                }
+                self.resolve_in(&mut s, repo, skill, how, cancel)
+            })
+        } else {
+            self.resolve_file(&mut s, repo, skill, how, cancel).map_err(|e| failed(e.message))
+        };
+        if result.is_ok() && !repo.kind.is_skills() && how == Resolution::Overwrite {
+            self.file_review = None;
+        }
         self.conclude(s, result)
     }
 
@@ -1703,9 +1880,12 @@ impl Engine {
                 Ok(ResolveReport { message: format!("'{skill}' will be handled like any other skill at the next check"), backups: Vec::new() })
             }
             Resolution::Overwrite => {
-                if let Some(search) = s.state.repo_mut(&repo.id).searches.get_mut(&key) {
-                    search.paused = true;
-                    s.must_save = true;
+                let review = self.skill_review.as_ref().filter(|r| r.source.id == repo.id && fold(&r.name) == key);
+                if review.is_none() {
+                    if let Some(search) = s.state.repo_mut(&repo.id).searches.get_mut(&key) {
+                        search.paused = true;
+                        s.must_save = true;
+                    }
                 }
                 if s.state.repo(&repo.id).is_some_and(|r| r.is_ignored(skill)) {
                     return Err(failed(format!("'{skill}' is marked as yours; choose 'manage again' first")));
@@ -1728,7 +1908,23 @@ impl Engine {
                 }
                 let single = tree::is_single_skill(&snapshot.entries);
                 let discovery = tree::discover(&snapshot.entries, &repo.single_skill_name(), root_len(&s.applier));
-                let Some(upstream) = discovery.skills.iter().find(|k| fold(&k.name) == key) else {
+                let upstream = discovery.skills.iter().find(|k| fold(&k.name) == key);
+                if let Some(r) = review {
+                    let recorded = s.state.repo(&repo.id).and_then(|state| state.skill(skill));
+                    let paths = wanted_here(upstream.map_or(&[][..], |k| k.files.as_slice()), recorded);
+                    if r.source != *repo
+                        || r.dir != s.applier.skills_dir.join(skill)
+                        || r.single != single
+                        || r.desired.as_ref() != upstream
+                        || !r.local.files.iter().map(|(p, _)| p).eq(&paths)
+                    {
+                        return Err(failed(apply::STALE_REVIEW));
+                    }
+                    if r.local.files.iter().any(|(_, file)| matches!(file, verify::ReviewFile::Unreadable)) {
+                        return Err(failed("The comparison could not verify every local file. No files were replaced."));
+                    }
+                }
+                let Some(upstream) = upstream else {
                     let why = discovery.rejected.iter().find(|r| fold(&r.name) == key).map(|r| format!(" ({})", r.reason)).unwrap_or_default();
                     return Err(failed(format!("'{skill}' cannot be installed from the repository{why}")));
                 };
@@ -1745,7 +1941,8 @@ impl Engine {
                         })
                         .map_err(|e| missing_means_changed(e, &file.path))
                 };
-                let applied = s.applier.install(&mut s.state, &repo.id, upstream, &commit, Mode::Overwrite, &mut fetch, cancel);
+                let applied =
+                    s.applier.install_with_review(&mut s.state, &repo.id, upstream, &commit, Mode::Overwrite, &mut fetch, cancel, review.map(|r| &r.local));
                 s.downloaded += bytes.get();
                 let applied = applied.inspect_err(|_| s.suspect = true).map_err(|e| failed(e.message))?;
                 let backups: Vec<PathBuf> = backups_in(&s.applier.work_dir).into_iter().filter(|b| !backups_before.contains(b)).collect();
@@ -1764,18 +1961,30 @@ impl Engine {
         }
     }
 
-    /// What is different between a skill on GitHub and the copy on this PC. Changes nothing and remembers nothing (only
-    /// a check learns that a repository is private), and downloads only the files whose hash is not the same.
+    /// What is different between GitHub and the copy on this PC. Writes nothing, but retains
+    /// enough evidence in memory to check a later overwrite choice.
     pub fn diff(&mut self, cfg: &Config, repo_id: &str, skill: &str, cancel: &AtomicBool) -> Result<DiffReport, EngineError> {
         let repo = cfg.find(repo_id).ok_or_else(|| failed(format!("no repository '{repo_id}' is set up")))?;
         pathsafe::check_component(skill).map_err(|e| failed(format!("'{skill}' is not a skill name ({e})")))?;
-        let mut s = self.begin(Access::ReadOnly)?;
-        let result = self.diff_in(&mut s, repo, skill, cancel);
+        let mut s = self.begin(cfg, Access::ReadOnly)?;
+        let result = if repo.kind.is_skills() {
+            self.diff_in(&mut s, repo, skill, cancel).map(|(report, review)| {
+                self.skill_review = Some(review);
+                report
+            })
+        } else {
+            self.view_file(&mut s, repo, skill, false, cancel)
+                .map(|(report, review)| {
+                    self.file_review = review;
+                    report
+                })
+                .map_err(|e| failed(e.message))
+        };
         self.finish(s);
         result
     }
 
-    fn diff_in(&self, s: &mut Session, repo: &RepoConfig, skill: &str, cancel: &AtomicBool) -> Result<DiffReport, EngineError> {
+    fn diff_in(&self, s: &mut Session, repo: &RepoConfig, skill: &str, cancel: &AtomicBool) -> Result<(DiffReport, SkillComparison), EngineError> {
         let problems = repo.problems();
         if !problems.is_empty() {
             return Err(failed(problems.join("; ")));
@@ -1798,11 +2007,12 @@ impl Engine {
         let files = upstream.map_or(&[][..], |k| k.files.as_slice());
         let by_name: HashMap<String, &SkillFile> = files.iter().map(|f| (fold(&f.path), f)).collect();
 
-        let (ours, same) = if here {
-            let recorded = s.state.repo(&repo.id).and_then(|r| r.skill(skill));
-            read_here(&dir, wanted_here(files, recorded), &by_name, cancel)?
+        let recorded = s.state.repo(&repo.id).and_then(|r| r.skill(skill));
+        let paths = wanted_here(files, recorded);
+        let (ours, same, evidence) = if here {
+            read_here(&dir, paths, &by_name, cancel)?
         } else {
-            Default::default()
+            (Vec::new(), HashSet::new(), paths.into_iter().map(|p| (p, verify::ReviewFile::Missing)).collect())
         };
         let mut theirs = Vec::new();
         let mut commit: Option<String> = None;
@@ -1829,42 +2039,76 @@ impl Engine {
             };
             theirs.push((file.path.clone(), content));
         }
-        Ok(DiffReport { on_github: upstream.is_some(), here, files: diff::compare(theirs, ours) })
+        let review = SkillComparison {
+            source: repo.clone(),
+            dir,
+            name: skill.into(),
+            single,
+            desired: upstream.cloned(),
+            local: verify::SkillReview { here, files: evidence },
+        };
+        Ok((DiffReport { on_github: upstream.is_some(), here, files: diff::compare(theirs, ours) }, review))
     }
 
     /// Preview: the files GitHub put in a skill, as they are on this PC. Only the files the record lists are read, so a
     /// file the user added is never opened. Asks GitHub nothing and changes nothing.
     pub fn preview(&mut self, cfg: &Config, repo_id: &str, skill: &str, cancel: &AtomicBool) -> Result<DiffReport, EngineError> {
-        cfg.find(repo_id).ok_or_else(|| failed(format!("no repository '{repo_id}' is set up")))?;
+        let repo = cfg.find(repo_id).ok_or_else(|| failed(format!("no repository '{repo_id}' is set up")))?;
         pathsafe::check_component(skill).map_err(|e| failed(format!("'{skill}' is not a skill name ({e})")))?;
-        let s = self.begin(Access::ReadOnly)?;
-        let result = preview_in(&s, repo_id, skill, cancel);
+        let mut s = self.begin(cfg, Access::ReadOnly)?;
+        let result = if repo.kind.is_skills() {
+            preview_in(&s, repo_id, skill, cancel)
+        } else {
+            self.view_file(&mut s, repo, skill, true, cancel).map(|(report, _)| report).map_err(|e| failed(e.message))
+        };
         self.finish(s);
         result
     }
 
     /// Stops managing a repository's skills. The caller removes the repository from the settings afterwards.
     pub fn remove_repo(&mut self, repo_id: &str, delete_skills: bool) -> Result<RemoveReport, EngineError> {
-        let mut s = self.begin_settled()?.ok_or_else(folder_changed)?;
+        self.remove_source(&Config::default(), repo_id, delete_skills)
+    }
+
+    pub fn remove_source(&mut self, cfg: &Config, repo_id: &str, delete_skills: bool) -> Result<RemoveReport, EngineError> {
+        let mut s = self.begin_settled(cfg)?.ok_or_else(folder_changed)?;
+        let active = cfg.find(repo_id);
+        s.authorize().map_err(|e| failed(e.message))?;
         let mut report = RemoveReport::default();
-        let names: Vec<String> = s.state.repo(repo_id).map(|r| r.skills.iter().map(|k| k.name.clone()).collect()).unwrap_or_default();
-        for name in names {
-            if !delete_skills {
-                report.kept.push((name, "kept as you asked".to_string()));
-                continue;
+        if let Some(record) = s.state.loose_sources().get(repo_id) {
+            if delete_skills {
+                return Err(failed("--delete-skills is only for a Skills source"));
             }
-            let outcome = s.ensure_preflight().and_then(|()| s.applier.delete(&mut s.state, repo_id, &name));
-            match outcome {
-                Ok(Applied::Done | Applied::Displaced { .. }) => report.deleted.push(name),
-                Ok(Applied::Held(why)) => report.kept.push((name, why)),
-                Err(e) => {
-                    s.suspect = true;
-                    report.kept.push((name, e.message));
+            let recorded = record.recorded_source(repo_id);
+            let source = active.or(recorded.as_ref()).ok_or_else(|| failed("cannot verify the detached source identity"))?;
+            report.kept.extend(record.leaves().iter().map(|l| (l.name.clone(), "kept as you asked".into())));
+            s.state.forget_loose_source(source).map_err(failed)?;
+            s.must_save = true;
+        } else if active.is_some_and(|r| !r.kind.is_skills()) {
+            if delete_skills {
+                return Err(failed("--delete-skills is only for a Skills source"));
+            }
+            // A saved source can legitimately have no binding before its first check.
+        } else {
+            let names: Vec<String> = s.state.repo(repo_id).map(|r| r.skills.iter().map(|k| k.name.clone()).collect()).unwrap_or_default();
+            for name in names {
+                if !delete_skills {
+                    report.kept.push((name, "kept as you asked".to_string()));
+                    continue;
+                }
+                let outcome = s.ensure_preflight().and_then(|()| s.applier.delete(&mut s.state, repo_id, &name));
+                match outcome {
+                    Ok(Applied::Done | Applied::Displaced { .. }) => report.deleted.push(name),
+                    Ok(Applied::Held(why)) => report.kept.push((name, why)),
+                    Err(e) => {
+                        s.suspect = true;
+                        report.kept.push((name, e.message));
+                    }
                 }
             }
-        }
-        if s.state.drop_repo(repo_id) {
-            s.must_save = true;
+            if s.state.drop_repo(repo_id) {
+                s.must_save = true;
+            }
         }
         self.schedule.forget(repo_id);
         self.lazy.remove(repo_id);
@@ -1909,7 +2153,7 @@ fn local_states(s: &mut Session, repo_id: &str) -> HashMap<String, LocalState> {
         .into_iter()
         .filter_map(|(name, status)| match status {
             LocalStatus::Checked(local) => Some((fold(&name), local)),
-            LocalStatus::Interrupted | LocalStatus::History { .. } => None,
+            LocalStatus::Interrupted | LocalStatus::History { .. } | LocalStatus::Unavailable(_) => None,
         })
         .collect()
 }

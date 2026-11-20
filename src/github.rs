@@ -4,12 +4,12 @@
 //! any `RemoteError` as "the answer is unknown": a missing network, a bad token, a rate limit, a 404 or a redirect
 //! is never read as "the skill was removed upstream".
 
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::config::RepoConfig;
 use crate::secret::Secret;
-use crate::tree::{EntryKind, Snapshot, parse_snapshot};
+use crate::tree::{self, EntryKind, Snapshot, SourceDiscovery, parse_snapshot};
 use crate::win::cred;
 use crate::win::http::{Client, HttpError, Request, Response, Url, percent_encode, percent_encode_path};
 use crate::win::proc;
@@ -57,8 +57,12 @@ pub fn web_url(cfg: &RepoConfig, skill: Option<&str>) -> Option<String> {
     let repo = RepoRef::of(cfg).ok().filter(|r| plain(r.owner) && plain(r.name))?;
     let mut url = format!("https://github.com/{}/{}", repo.owner, repo.name);
     if let Some(skill) = skill {
-        let folders = [repo.path, if skill == cfg.single_skill_name() { "" } else { skill }];
-        url.push_str("/tree/");
+        let is_skill = cfg.kind.is_skills();
+        if !is_skill && crate::pathsafe::check_component(skill).is_err() {
+            return None;
+        }
+        let folders = [repo.path, if is_skill && skill == cfg.single_skill_name() { "" } else { skill }];
+        url.push_str(if is_skill { "/tree/" } else { "/blob/" });
         url.push_str(&percent_encode_path(repo.reference()));
         for folder in folders.into_iter().filter(|f| !f.is_empty()) {
             url.push('/');
@@ -151,6 +155,67 @@ pub trait Remote: Send + Sync {
         cancel: &AtomicBool,
         sink: &mut dyn FnMut(&[u8]) -> bool,
     ) -> Result<(), RemoteError>;
+}
+
+/// Fresh, unconditional discovery. Request the selected folder itself, so another folder, kind or branch cannot
+/// accidentally supply names for this one. File paths in `SourceItems::Files` can go straight to `Remote::file`.
+pub fn discover_source<'a>(
+    remote: &dyn Remote,
+    source: &'a RepoConfig,
+    install_root_len: usize,
+    token: Option<&Secret>,
+    cancel: &AtomicBool,
+) -> Result<SourceDiscovery<'a>, RemoteError> {
+    let problems = source.problems();
+    if !problems.is_empty() {
+        return Err(RemoteError::new(FailureKind::Local, problems.join("; ")));
+    }
+    let reference = RepoRef::of(source).map_err(|why| RemoteError::new(FailureKind::Local, why))?;
+    let cancelled = || cancel.load(Ordering::Relaxed).then(|| RemoteError::new(FailureKind::Cancelled, "listing the source was stopped"));
+    if let Some(error) = cancelled() {
+        return Err(error);
+    }
+    let TreeReply::Snapshot { snapshot, .. } = remote.tree(&reference, None, token, cancel)? else {
+        return Err(RemoteError::new(FailureKind::Protocol, "GitHub answered 'not modified' without a fresh listing"));
+    };
+    if let Some(error) = cancelled() {
+        return Err(error);
+    }
+    if snapshot.truncated {
+        return Err(RemoteError::new(FailureKind::TooLarge, "GitHub cut the folder listing short; nothing was changed"));
+    }
+    tree::discover_source(source, snapshot, install_root_len).map_err(|why| RemoteError::new(FailureKind::Protocol, why))
+}
+
+/// Before interpreting any missing name as a removal, corroborate the entire listing once at the
+/// recorded source's exact folder and pinned commit. A 404, missing subtree, or different tree is not absence.
+pub fn confirm_source_at(
+    remote: &dyn Remote,
+    recorded: &RepoConfig,
+    listing: &SourceDiscovery<'_>,
+    pin: &str,
+    token: Option<&Secret>,
+    cancel: &AtomicBool,
+) -> Result<(), RemoteError> {
+    if !listing.complete_for(recorded) || !is_commit_sha(pin) {
+        return Err(RemoteError::new(FailureKind::Protocol, "removals require a complete, safe listing for the recorded source and a pinned commit"));
+    }
+    let stopped = || RemoteError::new(FailureKind::Cancelled, "checking the source was stopped");
+    if cancel.load(Ordering::Relaxed) {
+        return Err(stopped());
+    }
+    let reference = RepoRef::of(recorded).map_err(|why| RemoteError::new(FailureKind::Local, why))?;
+    let changed = || RemoteError::new(FailureKind::Changed, "the folder at the pinned commit does not confirm the source listing");
+    let snapshot = remote.historical_tree(&reference, pin, "", token, cancel)?.ok_or_else(changed)?;
+    if snapshot.sha != listing.tree_id() {
+        return Err(changed());
+    }
+    // Lengths were checked at discovery. Here we compare the pinned Git entries, not a local destination.
+    let pinned = tree::discover_source(recorded, snapshot, 0).map_err(|why| RemoteError::new(FailureKind::Protocol, why))?;
+    if cancel.load(Ordering::Relaxed) {
+        return Err(stopped());
+    }
+    if pinned.complete_for(recorded) && pinned.items() == listing.items() { Ok(()) } else { Err(changed()) }
 }
 
 /// Where the token comes from. Resolved once per sync, never stored anywhere.

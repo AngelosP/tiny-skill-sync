@@ -35,10 +35,29 @@ Verified by reading code (2026-11, self-update relaunch review):
 - `bench::mark` appends, so one `TSS_BENCH_REPORT` file collects marks from successive processes.
 - `app.started_by_windows` sets sign-in grace holds and defers the first look; it is the wrong semantics for a restart.
 
+Verified by reading code (2026-11-20, custom-agents design review):
+
+- Folder-per-item assumptions: `tree::discover` groups by top folder with `SKILL.md` (tree.rs:123-129);
+  `Applier::live` = `skills_dir.join(name)` (apply.rs:298); whole-folder renames at apply.rs:588/597/702; `carry`
+  apply.rs:393. `verify::verify_files(dir, files)` (verify.rs:172) only needs the root to be a Dir, then checks listed
+  files: it is already file-granular inside one root.
+- `reconcile::plan` is item-generic (keyed by `fold(name)`), but the mass-deletion guard infers "listing empty" from
+  `desired`/`rejected` being empty (reconcile.rs:235); a second item kind derived from skills would trip it wrongly.
+- `State` ties records to one `skills_dir` and one `volume` (state.rs:183-184, `follow_folder` state.rs:306);
+  `Session::volume` probes only the skills folder (engine.rs:425); `apply::preflight` checks only skills+work volumes
+  (apply.rs:191). `Paths::work_dir` is the skills folder's sibling (config.rs:494). Scripts set
+  `TSS_SKILLS_DIR=$Root\skills` (scripts/common.ps1:87,124), so any folder derived as a sibling stays sandboxed.
+- One `RepoConfig` = one `BRANCH:FOLDER?recursive=1` listing and ETag (engine.rs:1068 `list`); sibling folders are not in it.
+- The tray watches only the skills folder (shell.rs:536, 610); AGENTS.md caps idle wake-ups at two folder notifications.
+- Portable `Sources` has `deny_unknown_fields` (portable.rs:69) but `RepoConfig` (config.rs:180-182) and `RepoState`
+  (state.rs:93-95) do not: older versions silently ignore new nested fields and drop them on save.
+
 ## Baselines
 
 No review baseline recorded.
 
 ## Open proposals
 
-None.
+- 2026-11-20: custom agents. Recommended "A-prime" (agents shipped at `<skill>/agents/<name>.agent.md`, installed as
+  independent file-level items into the skills folder's sibling `agents`, reusing `reconcile::plan` and a new
+  file-level transaction in `apply.rs`). Awaiting owner decision; Copilot CLI's agents-folder path is unverified.

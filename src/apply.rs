@@ -39,11 +39,15 @@ use crate::tree::{Skill, SkillFile};
 use crate::verify::{self, Check, Likeness, Spot, Spots, Stats};
 use crate::win::fs::{FileHasher, Kind, kind_at, list_entries, volume_id};
 
+pub mod leaf;
+
 const EMPTY_BLOB: &str = "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391";
 const ERROR_DIR_NOT_EMPTY: i32 = 145;
 
 /// Supplies one file's bytes to the sink, in order. The sink returns false to stop the transfer.
 pub type Fetch<'a> = &'a mut dyn FnMut(&SkillFile, &mut dyn FnMut(&[u8]) -> bool) -> Result<(), RemoteError>;
+
+pub(crate) const STALE_REVIEW: &str = "The comparison changed. Choose Show changes again before replacing it.";
 
 /// The moments at which a change can be interrupted. Used by tests to stop dead, or to make something happen,
 /// at exactly that point.
@@ -495,12 +499,30 @@ impl Applier {
         fetch: Fetch,
         cancel: &AtomicBool,
     ) -> Result<Applied, RemoteError> {
+        self.install_with_review(state, repo_id, skill, commit, mode, fetch, cancel, None)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn install_with_review(
+        &mut self,
+        state: &mut State,
+        repo_id: &str,
+        skill: &Skill,
+        commit: &str,
+        mode: Mode,
+        fetch: Fetch,
+        cancel: &AtomicBool,
+        review: Option<&verify::SkillReview>,
+    ) -> Result<Applied, RemoteError> {
         check_names(skill)?;
         let before = state.repo(repo_id).and_then(|r| r.skill(&skill.name)).cloned();
         if before.as_ref().is_some_and(|o| o.pending.is_some()) {
             return Ok(Applied::Held("an earlier change to this skill was interrupted and is not sorted out yet".into()));
         }
         let live = self.live(&skill.name);
+        if review.is_some_and(|r| !r.matches(&live, &mut self.hasher)) {
+            return Ok(Applied::Held(STALE_REVIEW.into()));
+        }
         if before.is_none() && mode == Mode::Normal && exists_no_follow(&live) {
             return Ok(Applied::Held("a folder with this name appeared; it was left alone".into()));
         }
@@ -550,7 +572,7 @@ impl Applier {
             return Err(RemoteError::new(FailureKind::Cancelled, "cancelled"));
         }
         let new_files: Vec<ManagedFile> = skill.files.iter().map(ManagedFile::from).collect();
-        self.swap_in(state, repo_id, &skill.name, &before, mode, &txn, commit, &new_files)
+        self.swap_in(state, repo_id, &skill.name, &before, mode, &txn, commit, &new_files, review)
     }
 
     /// Puts the staged folder in place of the skill's folder (steps 3 to 6 of the module's pattern). The files the user
@@ -567,6 +589,7 @@ impl Applier {
         txn: &str,
         commit: &str,
         new_files: &[ManagedFile],
+        review: Option<&verify::SkillReview>,
     ) -> Result<Applied, RemoteError> {
         let removing = new_files.is_empty();
         let live = self.live(name);
@@ -593,6 +616,14 @@ impl Applier {
             moved_old = true;
         }
         self.at(Step::OldMoved)?;
+
+        if review.is_some_and(|r| !r.matches(if moved_old { &old } else { &live }, &mut self.hasher)) {
+            if moved_old {
+                move_no_replace_retry(&old, &live).map_err(|e| io_err("could not restore the changed skill; the original is in the work folder", &e))?;
+            }
+            self.abandon(state, repo_id, name, before, Some(&stage));
+            return Ok(Applied::Held(STALE_REVIEW.into()));
+        }
 
         if let Err(e) = rename_retry(&stage, &live) {
             if moved_old {
@@ -688,7 +719,7 @@ impl Applier {
             let stage = self.stage_dir(&txn);
             fs::create_dir_all(&stage).map_err(|e| io_err("cannot create the stage folder", &e))?;
             self.at(Step::Staged)?;
-            return self.swap_in(state, repo_id, &owned.name, &before, Mode::Normal, &txn, &owned.commit, &[]);
+            return self.swap_in(state, repo_id, &owned.name, &before, Mode::Normal, &txn, &owned.commit, &[], None);
         }
 
         let trash = self.trash_dir(&txn);
@@ -940,7 +971,9 @@ impl Applier {
     /// removable. Does nothing while any change is unsettled, including one in a skills folder used before, which may
     /// share this work folder.
     pub fn sweep(&self, state: &State) {
-        if state.has_pending() || state.has_pending_set_aside() {
+        // This optional prefix-based directory sweep knows only the skills namespace. It cannot
+        // prove a mixed/aliased work layout safe; each loose journal retires its own exact files.
+        if state.has_pending() || state.has_pending_set_aside() || !state.loose_sources().is_empty() {
             return;
         }
         let Ok(entries) = fs::read_dir(&self.work_dir) else { return };
@@ -973,6 +1006,14 @@ fn settle(state: &mut State, repo: &str, owned: &OwnedSkill) {
 }
 
 #[cfg(test)]
+fn fixture_root(name: &str) -> PathBuf {
+    let base = std::env::var_os("TSS_TEST_ROOT").filter(|p| !p.is_empty()).map(PathBuf::from).unwrap_or_else(std::env::temp_dir);
+    let root = base.join(format!("tss-apply-{name}-{}", unique_suffix()));
+    fs::create_dir_all(&root).unwrap();
+    root
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::hash::blob_hex;
@@ -1002,8 +1043,7 @@ mod tests {
 
     impl Env {
         fn new(name: &str) -> Env {
-            let root = std::env::temp_dir().join(format!("tss-apply-{name}-{}", unique_suffix()));
-            fs::create_dir_all(&root).unwrap();
+            let root = fixture_root(name);
             Env { skills: root.join("skills"), work: root.join(".tss-work"), state: root.join("home").join("state.json"), root }
         }
 

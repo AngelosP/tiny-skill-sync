@@ -13,9 +13,10 @@ use windows_sys::Win32::Storage::FileSystem::{DELETE, FILE_FLAG_DELETE_ON_CLOSE,
 use crate::fsx;
 use crate::interval::{Interval, Unit};
 use crate::pathsafe;
+use crate::source::SourceKind;
 
 pub const CONFIG_FILE: &str = "config.json";
-pub const CONFIG_VERSION: u32 = 1;
+pub const CONFIG_VERSION: u32 = 2;
 pub const DEFAULT_INTERVAL: Interval = Interval::new(1, Unit::Day);
 
 /// Hold through re-read, decision, and replacement. The directory must exist. Cooperating writers must see the
@@ -81,7 +82,23 @@ pub(crate) fn parse_json_object<'de, T: Deserialize<'de>>(bytes: &'de [u8]) -> R
     if !bytes.trim_ascii_start().starts_with(b"{") {
         return Err("expected a JSON object".into());
     }
+
     serde_json::from_slice(bytes).map_err(|e| e.to_string())
+}
+
+pub(crate) const fn legacy_version() -> u32 {
+    1
+}
+
+/// Read no payload fields until we know which format they use.
+#[derive(Deserialize)]
+pub(crate) struct Format {
+    #[serde(default = "legacy_version")]
+    pub version: u32,
+}
+
+pub(crate) fn source_version(repos: &[RepoConfig]) -> u32 {
+    if repos.iter().all(|r| r.kind.is_skills()) { 1 } else { 2 }
 }
 
 /// `app_update` in both local and portable settings. Omitted members mean enabled, daily and immediate.
@@ -159,9 +176,8 @@ pub enum UpdateTiming {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, remote = "Self")]
 pub struct Config {
-    pub version: u32,
     /// Where skills are installed. Empty means `%USERPROFILE%\.copilot\skills`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub skills_dir: Option<String>,
@@ -171,9 +187,28 @@ pub struct Config {
     pub repos: Vec<RepoConfig>,
 }
 
+impl Serialize for Config {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        // The format is a property of the payload, not a mutable setting that can get out of sync.
+        #[derive(Serialize)]
+        struct Wire<'a> {
+            version: u32,
+            #[serde(flatten, serialize_with = "Config::serialize")]
+            settings: &'a Config,
+        }
+        Wire { version: self.wire_version(), settings: self }.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for Config {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Config::deserialize(deserializer)
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
-        Config { version: CONFIG_VERSION, skills_dir: None, default_interval: DEFAULT_INTERVAL, app_update: UpdatePrefs::default(), repos: Vec::new() }
+        Config { skills_dir: None, default_interval: DEFAULT_INTERVAL, app_update: UpdatePrefs::default(), repos: Vec::new() }
     }
 }
 
@@ -186,7 +221,7 @@ pub struct RepoConfig {
     pub repo: String,
     /// Empty means the default branch.
     pub branch: String,
-    /// The folder that holds the skills. Empty means the repository root.
+    /// The source folder for this kind. Empty means the repository root.
     pub path: String,
     /// Empty means the default interval.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -194,11 +229,22 @@ pub struct RepoConfig {
     /// Send the user's GitHub token. Needed for private repositories; also raises the rate limit.
     pub use_token: bool,
     pub enabled: bool,
+    #[serde(skip_serializing_if = "SourceKind::is_skills")]
+    pub kind: SourceKind,
 }
 
 impl Default for RepoConfig {
     fn default() -> Self {
-        RepoConfig { id: String::new(), repo: String::new(), branch: String::new(), path: String::new(), interval: None, use_token: false, enabled: true }
+        RepoConfig {
+            id: String::new(),
+            repo: String::new(),
+            branch: String::new(),
+            path: String::new(),
+            interval: None,
+            use_token: false,
+            enabled: true,
+            kind: SourceKind::Skills,
+        }
     }
 }
 
@@ -260,17 +306,26 @@ impl RepoConfig {
 }
 
 impl Config {
+    pub fn wire_version(&self) -> u32 {
+        source_version(&self.repos)
+    }
+
     pub fn parse(bytes: &[u8]) -> Result<Config, String> {
-        let mut cfg: Config = parse_json_object(bytes).map_err(|e| format!("config.json is not valid: {e}"))?;
-        if cfg.version > CONFIG_VERSION {
-            return Err(format!("config.json was written by a newer version (format {}, this app understands {CONFIG_VERSION})", cfg.version));
+        let invalid = |e| format!("config.json is not valid: {e}");
+        let Format { version } = parse_json_object(bytes).map_err(invalid)?;
+        if version > CONFIG_VERSION {
+            return Err(format!("config.json was written by a newer version (format {version}, this app understands {CONFIG_VERSION})"));
+        }
+        let mut cfg: Config = parse_json_object(bytes).map_err(invalid)?;
+        if version < 2 && cfg.wire_version() == 2 {
+            return Err("typed sources require config.json format 2".into());
         }
         // A relative folder would depend on the folder the app is started in, which at sign-in is Windows' own.
         if let Some(dir) = cfg.skills_dir.as_deref().map(str::trim).filter(|d| !d.is_empty() && !Path::new(d).is_absolute()) {
             return Err(format!("the skills folder in {CONFIG_FILE} must be a full path, such as D:\\skills; '{dir}' is not one"));
         }
-        cfg.version = CONFIG_VERSION;
         cfg.assign_missing_ids();
+        cfg.check_typed_ids()?;
         Ok(cfg)
     }
 
@@ -281,16 +336,33 @@ impl Config {
     /// A missing file is an empty configuration; a file that cannot be read or understood is an error, so it is never
     /// overwritten by mistake.
     pub fn load(path: &Path) -> Result<Config, String> {
+        Self::load_sources(path)?.skills_only()
+    }
+
+    /// Settings model for typed callers. The existing app/CLI must not dispatch these IDs as skills.
+    pub fn load_sources(path: &Path) -> Result<Config, String> {
         match read_optional(path)? {
             Some(bytes) => Config::parse(&bytes).map_err(|e| format!("{e} ({})", path.display())),
             None => Ok(Config::default()),
         }
     }
 
+    pub(crate) fn skills_only(self) -> Result<Self, String> {
+        self.require_skills()?;
+        Ok(self)
+    }
+
+    pub(crate) fn require_skills(&self) -> Result<(), String> {
+        match self.repos.iter().find(|r| !r.kind.is_skills()) {
+            Some(r) => Err(format!("source '{}' is not a skills source; this version cannot sync its kind", r.id)),
+            None => Ok(()),
+        }
+    }
+
     /// Explicit replacement of a readable config. Use `save_if_unchanged` for an edit based on a snapshot.
     pub fn save(&self, path: &Path) -> Result<(), String> {
         let _lock = local_settings_lock(path)?;
-        Config::load(path)?;
+        Config::load_sources(path)?;
         self.write(path)
     }
 
@@ -298,14 +370,29 @@ impl Config {
     /// when the settings window opens.
     pub fn save_if_unchanged(&self, path: &Path, before: &Config) -> Result<(), String> {
         let _lock = (self != before).then(|| local_settings_lock(path)).transpose()?;
-        if Config::load(path)? != *before {
+        if Config::load_sources(path)? != *before {
             return Err(format!("{CONFIG_FILE} changed since it was loaded ({})", path.display()));
         }
         if self == before { Ok(()) } else { self.write(path) }
     }
 
     fn write(&self, path: &Path) -> Result<(), String> {
+        self.check_typed_ids()?;
         write_json_atomic(path, self.to_json().as_bytes()).map_err(|e| format!("cannot save {}: {e}", path.display()))
+    }
+
+    pub(crate) fn check_typed_ids(&self) -> Result<(), String> {
+        // Legacy settings still report duplicates through `problems`. Typed ownership cannot be
+        // keyed by an ambiguous ID. Missing IDs are assigned by the unchanged legacy algorithm.
+        if self.wire_version() > 1 {
+            let mut ids = std::collections::HashSet::new();
+            for r in &self.repos {
+                if !r.id.trim().is_empty() && !ids.insert(&r.id) {
+                    return Err(format!("two sources share the id '{}'", r.id));
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Entries written by hand may lack an id. The id is derived from the repository name, so it is the same on every load.
@@ -331,8 +418,21 @@ impl Config {
     }
 
     pub fn add_repo(&mut self, spec: &RepoSpec, interval: Option<Interval>, use_token: bool) -> &RepoConfig {
+        self.add_source(SourceKind::Skills, spec, interval, use_token)
+    }
+
+    pub fn add_source(&mut self, kind: SourceKind, spec: &RepoSpec, interval: Option<Interval>, use_token: bool) -> &RepoConfig {
         let id = self.unique_id(&spec.full_name());
-        self.repos.push(RepoConfig { id, repo: spec.full_name(), branch: spec.branch.clone(), path: spec.path.clone(), interval, use_token, enabled: true });
+        self.repos.push(RepoConfig {
+            id,
+            kind,
+            repo: spec.full_name(),
+            branch: spec.branch.clone(),
+            path: spec.path.clone(),
+            interval,
+            use_token,
+            enabled: true,
+        });
         self.repos.last().expect("just pushed")
     }
 
@@ -450,6 +550,7 @@ pub fn check_branch(branch: &str) -> Result<(), String> {
 pub struct Paths {
     pub home: PathBuf,
     pub skills: PathBuf,
+    file_roots: Option<[PathBuf; 2]>,
 }
 
 impl Paths {
@@ -478,7 +579,25 @@ impl Paths {
     }
 
     pub fn new(home: PathBuf, skills: PathBuf) -> Paths {
-        Paths { home, skills }
+        Paths { home, skills, file_roots: None }
+    }
+
+    /// Explicit, per-engine roots (also used by in-process fixtures, without changing process-wide environment).
+    pub fn with_file_roots(mut self, agents: PathBuf, instructions: PathBuf) -> Self {
+        self.file_roots = Some([agents, instructions]);
+        self
+    }
+
+    pub(crate) fn root(&self, kind: SourceKind) -> Result<PathBuf, String> {
+        kind.root_with(&self.skills, |key| match (&self.file_roots, key) {
+            (Some(roots), "TSS_AGENTS_DIR") => Some(roots[0].as_os_str().into()),
+            (Some(roots), "TSS_INSTRUCTIONS_DIR") => Some(roots[1].as_os_str().into()),
+            _ => std::env::var_os(key),
+        })
+    }
+
+    pub(crate) fn has_file_root(&self, kind: SourceKind) -> bool {
+        self.file_roots.is_some() || std::env::var_os(if kind == SourceKind::Agents { "TSS_AGENTS_DIR" } else { "TSS_INSTRUCTIONS_DIR" }).is_some()
     }
 
     pub fn config_file(&self) -> PathBuf {
@@ -507,6 +626,65 @@ pub fn instance_tag(home: &Path) -> String {
         hash = (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3);
     }
     format!("{hash:016x}")
+}
+
+// Frozen shapes of the shipped readers. Do not reuse the evolving source model for a downgrade test.
+#[cfg(test)]
+#[allow(dead_code)]
+pub(crate) mod v1_reader {
+    use super::*;
+
+    #[derive(Deserialize, Default)]
+    #[serde(default)]
+    struct Repo {
+        id: String,
+        repo: String,
+        branch: String,
+        path: String,
+        interval: Option<Interval>,
+        use_token: bool,
+        #[serde(default = "enabled")]
+        enabled: bool,
+    }
+
+    fn enabled() -> bool {
+        true
+    }
+    fn version() -> u32 {
+        1
+    }
+    fn daily() -> Interval {
+        Interval::new(1, Unit::Day)
+    }
+
+    #[derive(Deserialize)]
+    struct Local {
+        #[serde(default = "version")]
+        version: u32,
+        skills_dir: Option<String>,
+        #[serde(default = "daily")]
+        default_interval: Interval,
+        #[serde(default, deserialize_with = "UpdatePrefs::read_object")]
+        app_update: UpdatePrefs,
+        #[serde(default)]
+        repos: Vec<Repo>,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Sources {
+        version: u32,
+        #[serde(default)]
+        repos: Vec<Repo>,
+    }
+
+    pub fn accepts_local(bytes: &[u8]) -> bool {
+        parse_json_object::<Local>(bytes).unwrap().version <= 1
+    }
+
+    pub fn accepts_sources(bytes: &[u8]) -> bool {
+        parse_json_object::<Sources>(bytes).unwrap().version == 1
+    }
 }
 
 #[cfg(test)]
@@ -643,6 +821,64 @@ mod tests {
     fn config_from_a_newer_version_is_refused() {
         assert!(Config::parse(br#"{ "version": 99 }"#).is_err());
         assert!(Config::parse(b"not json").is_err());
+    }
+
+    #[test]
+    fn an_explicit_invalid_kind_is_not_a_legacy_skill() {
+        for kind in ["null", r#""plugins""#, r#"["skills","agents"]"#, r#"{"skills":null}"#] {
+            let json = format!(r#"{{"repos":[{{"repo":"o/r","kind":{kind}}}]}}"#);
+            assert!(Config::parse(json.as_bytes()).is_err(), "{json}");
+        }
+    }
+
+    #[test]
+    fn only_a_loose_source_gates_the_local_writer_and_skills_dispatch() {
+        let dir = temp_dir("typed");
+        let path = dir.join(CONFIG_FILE);
+        let mut cfg = Config::parse(br#"{"repos":[{"repo":"o/r"},{"repo":"o/r","kind":"skills","id":"o-r-2","path":"skills"}]}"#).unwrap();
+        let legacy = cfg.to_json();
+        assert!(v1_reader::accepts_local(legacy.as_bytes()));
+        assert!(!legacy.contains("\"kind\""));
+        let spec = RepoSpec::parse("https://github.com/o/r/tree/main/more").unwrap();
+        for kind in [SourceKind::Agents, SourceKind::Instructions] {
+            cfg.add_source(kind, &spec, None, false);
+        }
+        assert_eq!(cfg.repos.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(), ["o-r", "o-r-2", "o-r-3", "o-r-4"]);
+        cfg.save(&path).unwrap();
+        let bytes = fs::read(&path).unwrap();
+        assert!(!v1_reader::accepts_local(&bytes), "the old payload decoded, but its version gate refused");
+        assert_eq!(Config::load_sources(&path).unwrap(), cfg);
+        assert!(Config::load(&path).is_err(), "never give mixed settings to the skills worker");
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+        let before = cfg.clone();
+        cfg.repos.truncate(2);
+        cfg.save_if_unchanged(&path, &before).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), legacy.as_bytes());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn invalid_or_ungated_typed_local_settings_cannot_be_overwritten() {
+        let dir = temp_dir("kind-gate");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(CONFIG_FILE);
+        for bad in [
+            r#"{"version":1,"repos":[{"kind":"agents"}]}"#,
+            r#"{"version":2,"repos":[{"kind":null}]}"#,
+            r#"{"version":2,"repos":[{"kind":"plugins"}]}"#,
+            r#"{"version":2,"repos":[{"kind":"skills","kind":"instructions"}]}"#,
+            r#"{"version":2,"repos":[{"id":"r","kind":"agents"},{"id":"r"}]}"#,
+            r#"{"repos":[{"kind":null}],"version":99}"#,
+        ] {
+            fs::write(&path, bad).unwrap();
+            let err = Config::load_sources(&path).unwrap_err();
+            if bad.contains("99") {
+                assert!(err.contains("newer version"), "{err}");
+            }
+            assert!(Config::default().save(&path).is_err());
+            assert_eq!(fs::read(&path).unwrap(), bad.as_bytes());
+        }
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
