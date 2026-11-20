@@ -10,7 +10,7 @@
 //! A control has no background of its own: it asks its parent to draw what is under it into the same bitmap first
 //! ([`WM_PAINTBG`]), so rounded corners and tints blend with the card or page beneath.
 
-use std::cell::RefCell;
+use std::cell::{OnceCell, RefCell};
 use std::collections::HashMap;
 use std::mem::{size_of, zeroed};
 use std::ptr::{null, null_mut};
@@ -21,11 +21,13 @@ use windows_sys::Win32::Graphics::Gdi::{
 };
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::Controls::{
-    SetScrollInfo, SetWindowTheme, TTF_IDISHWND, TTF_SUBCLASS, TTM_ADDTOOLW, TTM_SETMAXTIPWIDTH, TTS_ALWAYSTIP, TTS_NOPREFIX, TTTOOLINFOW, WM_MOUSELEAVE,
+    SetScrollInfo, SetWindowTheme, TTF_IDISHWND, TTF_SUBCLASS, TTM_ADDTOOLW, TTM_DELTOOLW, TTM_RELAYEVENT, TTM_SETMAXTIPWIDTH, TTS_ALWAYSTIP, TTS_NOPREFIX,
+    TTTOOLINFOW, WM_MOUSELEAVE,
 };
 use windows_sys::Win32::UI::HiDpi::GetDpiForWindow;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    EnableWindow, GetFocus, IsWindowEnabled, ReleaseCapture, SetCapture, SetFocus, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent, VK_RETURN, VK_SPACE,
+    EnableWindow, GetCapture, GetFocus, GetKeyState, IsWindowEnabled, ReleaseCapture, SetCapture, SetFocus, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent,
+    VK_APPS, VK_F10, VK_RETURN, VK_SHIFT, VK_SPACE,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, BM_CLICK, CREATESTRUCTW, CreatePopupMenu, CreateWindowExW, DLGC_WANTMESSAGE, DefWindowProcW, DestroyMenu, DestroyWindow, GA_ROOT,
@@ -36,10 +38,11 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     SetWindowTextW, SystemParametersInfoW, TPM_RETURNCMD, TPM_RIGHTALIGN, TrackPopupMenuEx, UIS_INITIALIZE, UISF_HIDEACCEL, UISF_HIDEFOCUS, WM_APP,
     WM_CAPTURECHANGED, WM_CHANGEUISTATE, WM_COMMAND, WM_CTLCOLOREDIT, WM_CTLCOLORSTATIC, WM_ENABLE, WM_ERASEBKGND, WM_GETDLGCODE, WM_KEYDOWN, WM_KILLFOCUS,
     WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCREATE, WM_NCDESTROY, WM_NCHITTEST, WM_PAINT, WM_QUERYUISTATE,
-    WM_SETFOCUS, WM_SETTEXT, WM_SIZE, WM_UPDATEUISTATE, WM_VSCROLL, WS_CHILD, WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_DISABLED, WS_EX_CONTROLPARENT,
-    WS_EX_NOPARENTNOTIFY, WS_POPUP, WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
+    WM_SETFOCUS, WM_SETTEXT, WM_SIZE, WM_SYSKEYDOWN, WM_UPDATEUISTATE, WM_VSCROLL, WS_CHILD, WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_DISABLED,
+    WS_EX_CONTROLPARENT, WS_EX_NOPARENTNOTIFY, WS_POPUP, WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
 };
 
+use super::page::{self, Hit};
 use super::paint::{self, Font, Rect, Tone, glyph};
 use super::theme::{self, Role};
 use super::{register_class, scale, text_of};
@@ -57,8 +60,55 @@ pub const WM_HOVER: u32 = WM_APP + 7;
 pub const BN_CLICKED: u32 = 0;
 /// The code a combo sends when an entry was chosen; the combo's text is then the entry.
 pub const CBN_SELENDOK: u32 = 9;
-/// The code a skill's row sends when the Open folder button it shows under the mouse was clicked.
-pub const ROW_FOLDER: u32 = 0x100;
+/// Ask the owner to show *all* currently available commands, including those shown inline.
+pub const ROW_MENU: u32 = 0x110;
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[repr(u32)]
+pub enum RowCmd {
+    Open = 0x100,
+    Preview,
+    CopyPath,
+    CopyLink,
+    OnGitHub,
+    Compare,
+    ManageAgain,
+}
+
+impl RowCmd {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Open => "Open folder",
+            Self::Preview => "Preview",
+            Self::CopyPath => "Copy path",
+            Self::CopyLink => "Copy GitHub link",
+            Self::OnGitHub => "Open on GitHub",
+            Self::Compare => "Show changes",
+            Self::ManageAgain => "Manage again",
+        }
+    }
+
+    pub fn code(self) -> u32 {
+        self as u32
+    }
+
+    pub fn from_code(code: u32) -> Option<Self> {
+        [Self::Open, Self::Preview, Self::CopyPath, Self::CopyLink, Self::OnGitHub, Self::Compare, Self::ManageAgain].into_iter().find(|c| c.code() == code)
+    }
+
+    fn draw_icon(self, zone: Rect) {
+        let ch = match self {
+            Self::Open => glyph::FOLDER,
+            Self::Preview => glyph::VIEW,
+            Self::CopyPath => glyph::COPY,
+            Self::CopyLink => glyph::LINK,
+            Self::OnGitHub => return paint::github_mark(zone, Role::Text),
+            Self::Compare => glyph::FILE,
+            Self::ManageAgain => glyph::UNDO,
+        };
+        paint::glyph(zone, ch, 16, Role::Text);
+    }
+}
 const BM_GETCHECK: u32 = 0xF0;
 const BM_SETCHECK: u32 = 0xF1;
 /// How far above and below the part of a page shown its controls are made, in DIPs: about two screens, so the next
@@ -100,12 +150,12 @@ pub enum Look {
         ink: Role,
         selected: bool,
     },
-    /// A skill: its name, and its status in a pill (see [`lines`]). With `folder`, an Open folder button shows at its
-    /// right while the mouse is on it; the row draws it itself, so no control is over another (see [`folder_zone`]).
+    /// A skill header. `disclosure` is its expanded state, or None for a flat row.
     Row {
         tone: Tone,
         glyph: Option<char>,
-        folder: bool,
+        commands: Vec<RowCmd>,
+        disclosure: Option<bool>,
     },
     Pill {
         tone: Tone,
@@ -161,10 +211,11 @@ struct Ctl {
     at: Rect,
     hover: bool,
     down: bool,
-    /// The mouse is on the Open folder button a skill's row shows (see [`row_parts`]).
-    on_folder: bool,
-    /// The press started there.
-    folder_down: bool,
+    layout: OnceCell<RowParts>,
+    hot: Option<RowTarget>,
+    pressed: Option<RowTarget>,
+    /// The panel's shared tooltip, while this row has registered tools with it.
+    tools: Option<(HWND, Vec<Vec<u16>>)>,
 }
 
 struct Panel {
@@ -176,6 +227,7 @@ struct Panel {
     dpi: u32,
     /// The mouse is on the panel itself, not on one of its controls.
     hover: bool,
+    row_tip: HWND,
 }
 
 fn ctl_of(hwnd: HWND) -> Option<&'static RefCell<Ctl>> {
@@ -302,6 +354,11 @@ fn activate(hwnd: HWND) {
         Err(_) => return,
     };
     match look {
+        Look::Row { disclosure: None, commands, .. } => {
+            if !commands.is_empty() {
+                notify(hwnd, ROW_MENU);
+            }
+        }
         Look::Combo { items } => {
             let current = text_of(hwnd);
             let refs: Vec<&str> = items.iter().map(String::as_str).collect();
@@ -319,37 +376,136 @@ fn activate(hwnd: HWND) {
     }
 }
 
-/// The two lines of a list entry or a skill: its window text is both, so a screen reader reads the status with the name.
+/// The two lines of a list entry: its window text is both, so a screen reader reads the status with the name.
 /// A name never holds a line break: names pass `printable` first.
 pub fn lines(text: &str) -> (&str, &str) {
     text.split_once('\n').unwrap_or((text, ""))
 }
 
-/// Where a skill's row, at `at`, draws its parts: the name, the Open folder button it shows while the mouse is on it
-/// (with `folder`), and the pill, `pill_w` wide, at the right. None is over another.
-pub fn row_parts([x, y, w, h]: Rect, pill_w: i32, folder: bool) -> (Rect, Option<Rect>, Rect) {
-    let pill = [x + w - 16 - pill_w, y + (h - paint::PILL_H) / 2, pill_w, paint::PILL_H];
-    let zone = folder.then(|| [pill[0] - 8 - 32, y + (h - 32) / 2, 32, 32]);
-    let right = zone.map_or(pill[0] - 12, |z| z[0] - 8);
-    ([x + 44, y, (right - x - 44).max(0), h], zone, pill)
+struct RowText<'a> {
+    name: &'a str,
+    tag: &'a str,
+    facts: &'a str,
+    explanation: &'a str,
 }
 
-fn contains([x, y, w, h]: Rect, px: i32, py: i32) -> bool {
-    px >= x && px < x + w && py >= y && py < y + h
+impl<'a> RowText<'a> {
+    fn parse(text: &'a str) -> Self {
+        let mut fields = text.splitn(4, '\n');
+        Self {
+            name: fields.next().unwrap_or_default(),
+            tag: fields.next().unwrap_or_default(),
+            facts: fields.next().unwrap_or_default(),
+            explanation: fields.next().unwrap_or_default(),
+        }
+    }
+
+    fn tip(&self) -> String {
+        match (self.explanation.trim(), self.facts.trim()) {
+            ("", "") => self.tag.into(),
+            ("", facts) => facts.into(),
+            (explanation, "") => explanation.into(),
+            (explanation, facts) => format!("{explanation}\n{facts}"),
+        }
+    }
 }
 
-/// Is the mouse, at `lp` (in the control's pixels), on the Open folder button of a skill's row?
-fn on_folder(hwnd: HWND, lp: LPARAM) -> bool {
-    let Some(Ok(c)) = ctl_of(hwnd).map(RefCell::try_borrow) else { return false };
-    let Look::Row { glyph, folder: true, .. } = c.look else { return false };
-    let dpi = dpi_of(hwnd);
-    let text = text_of(hwnd);
-    let tag = lines(&text).1;
-    let pw = if tag.is_empty() { 0 } else { paint::pill_width(tag, glyph, dpi) };
-    let (_, Some(zone), _) = row_parts(c.at, pw, true) else { return false };
-    // Signed: while the button is held the mouse can be left of or above the control.
-    let dips = |px: isize| i32::from(px as u16 as i16) * 96 / dpi as i32;
-    contains(zone, c.at[0] + dips(lp & 0xFFFF), c.at[1] + dips((lp >> 16) & 0xFFFF))
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum RowTarget {
+    Cmd(RowCmd),
+    More,
+    Disclosure,
+}
+
+impl RowTarget {
+    fn code(self) -> u32 {
+        match self {
+            Self::Cmd(cmd) => cmd.code(),
+            Self::More => ROW_MENU,
+            Self::Disclosure => BN_CLICKED,
+        }
+    }
+
+    fn tip(self) -> &'static str {
+        match self {
+            Self::Cmd(RowCmd::Open) => "Open this skill’s folder in File Explorer.",
+            Self::Cmd(cmd) => cmd.label(),
+            Self::More => "More actions",
+            Self::Disclosure => "Show or hide repair choices",
+        }
+    }
+}
+
+struct RowParts {
+    mark: Rect,
+    name: Rect,
+    icons: Vec<(RowTarget, Rect)>,
+    pill: Rect,
+    clipped_pill: bool,
+}
+
+fn row_parts([x, y, w, h]: Rect, name_w: i32, pill_w: i32, commands: &[RowCmd]) -> RowParts {
+    const SLOT: i32 = 32;
+    const GAP: i32 = 4;
+    let left = x + 44;
+    let right = x + w - 16;
+    let reserve = if commands.is_empty() { 0 } else { SLOT + GAP };
+    let pw = pill_w.min((right - left - 8 - reserve - 24).max(0));
+    let pill = [right - pw, y + (h - paint::PILL_H) / 2, pw, paint::PILL_H];
+    let room = (pill[0] - if pw > 0 { 8 } else { 0 } - left).max(0);
+    // Keep a recognizable name before fitting commands. If necessary, trade the last slot for More.
+    let min_slots = if commands.contains(&RowCmd::Open) && commands.len() > 1 && room >= name_w.min(24) + GAP + 2 * SLOT {
+        2 // Shorten the name before hiding Open folder behind More.
+    } else {
+        i32::from(!commands.is_empty())
+    };
+    let slots = ((room - name_w.min(80) - GAP) / SLOT).max(min_slots) as usize;
+    let count = slots.min(commands.len());
+    let icon_w = SLOT.min((room - GAP).max(0));
+    let name = [left, y, name_w.min((room - if count == 0 { 0 } else { GAP + icon_w * count as i32 }).max(0)), h];
+    let ordered = commands.iter().filter(|&&c| c == RowCmd::Open).chain(commands.iter().filter(|&&c| c != RowCmd::Open));
+    let icons = ordered
+        .take(count)
+        .enumerate()
+        .map(|(i, &cmd)| {
+            let target = if i + 1 == count && count < commands.len() { RowTarget::More } else { RowTarget::Cmd(cmd) };
+            (target, [left + name[2] + GAP + icon_w * i as i32, y + (h - SLOT.min(h)) / 2, icon_w, SLOT.min(h)])
+        })
+        .collect();
+    RowParts { mark: [x + 16, y, 16, h], name, icons, pill, clipped_pill: pw != pill_w }
+}
+
+impl Ctl {
+    fn row(&self, hwnd: HWND, dpi: u32) -> Option<&RowParts> {
+        let Look::Row { glyph, commands, .. } = &self.look else { return None };
+        Some(self.layout.get_or_init(|| {
+            let text = text_of(hwnd);
+            let RowText { name, tag, .. } = RowText::parse(&text);
+            row_parts(self.at, paint::measure(name, Font::Body, 0, dpi).0, if tag.is_empty() { 0 } else { paint::pill_width(tag, *glyph, dpi) }, commands)
+        }))
+    }
+
+    fn target(&self, hwnd: HWND, lp: LPARAM) -> Option<RowTarget> {
+        let Look::Row { disclosure, .. } = self.look else { return None };
+        let dpi = dpi_of(hwnd);
+        let hit = |rect| {
+            let r = client_rect(self.at, rect, dpi);
+            let (x, y) = (i32::from(lp as i16), i32::from((lp >> 16) as i16));
+            x >= r.left && x < r.right && y >= r.top && y < r.bottom
+        };
+        self.row(hwnd, dpi)?
+            .icons
+            .iter()
+            .find(|(_, r)| hit(*r))
+            .map(|(t, _)| *t)
+            .or_else(|| (disclosure.is_some() && hit(self.at)).then_some(RowTarget::Disclosure))
+    }
+}
+
+/// Scale both edges exactly as paint and child placement do, including at fractional DPI.
+fn client_rect(at: Rect, [x, y, w, h]: Rect, dpi: u32) -> RECT {
+    let (ox, oy) = (scale(at[0], dpi), scale(at[1], dpi));
+    RECT { left: scale(x, dpi) - ox, top: scale(y, dpi) - oy, right: scale(x + w, dpi) - ox, bottom: scale(y + h, dpi) - oy }
 }
 
 /// The window text of an entry with a second line.
@@ -367,7 +523,7 @@ fn draw_ctl(hwnd: HWND) {
     let text = text_of(hwnd);
     let enabled = unsafe { IsWindowEnabled(hwnd) } != 0;
     let [x, y, w, h] = c.at;
-    let tint = if c.down && c.hover && !c.folder_down {
+    let tint = if c.down && c.hover && !matches!(c.pressed, Some(RowTarget::Cmd(_) | RowTarget::More)) {
         Role::Sel
     } else if c.hover {
         Role::Hover
@@ -431,22 +587,43 @@ fn draw_ctl(hwnd: HWND) {
                 paint::line([left, top + 20, w - left + x - 8, 16], sub, Font::Caption, Role::Text2);
             }
         }
-        Look::Row { tone, glyph, folder } => {
-            let (text, tag) = lines(&text);
+        Look::Row { tone, glyph, disclosure, commands } => {
+            let RowText { name: text, tag, .. } = RowText::parse(&text);
             paint::fill([x + 4, y + 3, w - 8, h - 6], 4, tint, Role::None);
-            paint::glyph([x + 16, y, 16, h], glyph::FILE, 14, Role::Text3);
-            let pw = if tag.is_empty() { 0 } else { paint::pill_width(tag, *glyph, dpi) };
-            let (name, zone, pill) = row_parts(c.at, pw, *folder && c.hover);
-            if pw > 0 {
+            let mark = match disclosure {
+                Some(true) => glyph::CHEVRON_DOWN,
+                Some(false) => glyph::CHEVRON_RIGHT,
+                None => glyph::FILE,
+            };
+            let parts = c.row(hwnd, dpi).expect("row");
+            paint::glyph(parts.mark, mark, 14, Role::Text2);
+            let pill = parts.pill;
+            if parts.clipped_pill && pill[2] > 4 {
+                paint::line(pill, tag, Font::Caption, Role::Text2);
+            } else if !parts.clipped_pill && pill[2] > 0 {
                 paint::pill(pill[0], pill[1], tag, *tone, *glyph, dpi);
             }
-            if let Some(zone) = zone {
-                if c.on_folder {
-                    paint::fill(zone, 4, if c.folder_down { Role::Sel } else { Role::Hover }, Role::None);
+            let focus = unsafe { GetFocus() } == hwnd;
+            if c.hover || focus {
+                for &(target, zone) in &parts.icons {
+                    if c.hot == Some(target) {
+                        paint::fill(zone, 4, if c.pressed == Some(target) { Role::Sel } else { Role::Hover }, Role::None);
+                    }
+                    match target {
+                        RowTarget::Cmd(cmd) => cmd.draw_icon(zone),
+                        _ => paint::glyph(zone, glyph::MORE, 16, Role::Text),
+                    }
                 }
-                paint::glyph(zone, glyph::FOLDER, 16, if c.on_folder { Role::Text } else { Role::Text2 });
+                if focus && !commands.is_empty() {
+                    let left = parts.icons.last().map_or(parts.name[0] + parts.name[2], |(_, r)| r[0] + r[2]) + 6;
+                    let room = pill[0] - 6 - left;
+                    let hint = "Shift+F10: actions";
+                    if room >= paint::measure(hint, Font::Caption, 0, dpi).0 {
+                        paint::line([left, y, room, h], hint, Font::Caption, Role::Text2);
+                    }
+                }
             }
-            paint::line(name, text, Font::Body, Role::Text);
+            paint::line(parts.name, text, Font::Body, Role::Text);
         }
         Look::Pill { tone, glyph } => paint::pill(x, y + (h - paint::PILL_H) / 2, &text, *tone, *glyph, dpi),
         Look::Toggle { on } => {
@@ -505,7 +682,8 @@ unsafe extern "system" fn ctl_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
         WM_NCDESTROY => {
             let ptr = unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0) } as *mut RefCell<Ctl>;
             if !ptr.is_null() {
-                drop(unsafe { Box::from_raw(ptr) });
+                let mut c = unsafe { Box::from_raw(ptr) }.into_inner();
+                remove_tools(hwnd, &mut c);
             }
         }
         WM_NCHITTEST => {
@@ -519,14 +697,17 @@ unsafe extern "system" fn ctl_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
             return 0;
         }
         WM_MOUSEMOVE => {
-            let folder = on_folder(hwnd, lp);
             if let Some(Ok(mut c)) = ctl_of(hwnd).map(RefCell::try_borrow_mut) {
-                let mut changed = c.on_folder != folder;
-                c.on_folder = folder;
+                let target = c.target(hwnd, lp);
+                let mut changed = c.hot != target;
+                c.hot = target;
                 if !c.hover {
                     c.hover = true;
                     changed = true;
                     track_hover(hwnd);
+                }
+                if matches!(c.look, Look::Row { .. }) && !c.down {
+                    row_tool_move(hwnd, &mut c, wp, lp);
                 }
                 if changed {
                     invalidate(hwnd);
@@ -537,7 +718,8 @@ unsafe extern "system" fn ctl_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
         WM_MOUSELEAVE => {
             if let Some(Ok(mut c)) = ctl_of(hwnd).map(RefCell::try_borrow_mut) {
                 c.hover = false;
-                c.on_folder = false;
+                c.hot = None;
+                remove_tools(hwnd, &mut c);
                 invalidate(hwnd);
             }
             hovered(hwnd);
@@ -545,27 +727,33 @@ unsafe extern "system" fn ctl_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
         }
         WM_LBUTTONDOWN | WM_LBUTTONDBLCLK => {
             unsafe { SetFocus(hwnd) };
-            let folder = on_folder(hwnd, lp);
             if let Some(Ok(mut c)) = ctl_of(hwnd).map(RefCell::try_borrow_mut) {
                 c.down = true;
                 c.hover = true;
-                c.on_folder = folder;
-                c.folder_down = folder;
+                c.hot = c.target(hwnd, lp);
+                c.pressed = c.hot;
+                remove_tools(hwnd, &mut c);
             }
             unsafe { SetCapture(hwnd) };
             invalidate(hwnd);
             return 0;
         }
         WM_LBUTTONUP => {
-            let folder = on_folder(hwnd, lp);
-            let (was_down, from_folder) = ctl_of(hwnd).and_then(|c| c.try_borrow().ok().map(|c| (c.down && c.hover, c.folder_down))).unwrap_or_default();
+            let Some(cell) = ctl_of(hwnd) else { return 0 };
+            let Ok(c) = cell.try_borrow() else { return 0 };
+            let row = matches!(c.look, Look::Row { .. });
+            let clicked = c.down && c.hover;
+            let target = c.pressed.filter(|&t| c.down && c.target(hwnd, lp) == Some(t));
+            drop(c);
+            if row && unsafe { GetCapture() } != hwnd {
+                return 0;
+            }
             unsafe { ReleaseCapture() };
-            // A press on the Open folder button counts only if it ends there too, as on any button.
-            if from_folder {
-                if was_down && folder {
-                    notify(hwnd, ROW_FOLDER);
+            if row {
+                if let Some(t) = target {
+                    notify(hwnd, t.code());
                 }
-            } else if was_down {
+            } else if clicked {
                 activate(hwnd);
             }
             return 0;
@@ -573,7 +761,7 @@ unsafe extern "system" fn ctl_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
         WM_CAPTURECHANGED => {
             if let Some(Ok(mut c)) = ctl_of(hwnd).map(RefCell::try_borrow_mut) {
                 c.down = false;
-                c.folder_down = false;
+                c.pressed = None;
                 // Still under the mouse? Hover is checked again on the next move.
                 let mut pt = POINT { x: 0, y: 0 };
                 let mut rc: RECT = unsafe { zeroed() };
@@ -588,8 +776,19 @@ unsafe extern "system" fn ctl_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
         }
         WM_GETDLGCODE => {
             let msg = lp as *const MSG;
-            if !msg.is_null() && unsafe { (*msg).message == WM_KEYDOWN && (*msg).wParam == usize::from(VK_RETURN) } {
+            if !msg.is_null()
+                && unsafe {
+                    ((*msg).message == WM_KEYDOWN && (*msg).wParam == usize::from(VK_RETURN))
+                        || (matches!((*msg).message, WM_KEYDOWN | WM_SYSKEYDOWN) && row_menu_key(hwnd, (*msg).wParam))
+                }
+            {
                 return DLGC_WANTMESSAGE as LRESULT;
+            }
+            return 0;
+        }
+        WM_KEYDOWN | WM_SYSKEYDOWN if row_menu_key(hwnd, wp) => {
+            if lp & (1 << 30) == 0 && unsafe { IsWindowEnabled(hwnd) != 0 && GetFocus() == hwnd } {
+                notify(hwnd, ROW_MENU);
             }
             return 0;
         }
@@ -619,8 +818,16 @@ unsafe extern "system" fn ctl_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
             unsafe { SendMessageW(GetParent(hwnd), WM_REVEAL, hwnd as usize, 0) };
             invalidate(hwnd);
         }
-        WM_KILLFOCUS | WM_ENABLE => invalidate(hwnd),
+        WM_KILLFOCUS | WM_ENABLE => {
+            if msg == WM_ENABLE && wp == 0 {
+                reset_row(hwnd);
+            }
+            invalidate(hwnd);
+        }
         WM_UPDATEUISTATE | WM_SETTEXT => {
+            if msg == WM_SETTEXT {
+                reset_row(hwnd);
+            }
             let r = unsafe { DefWindowProcW(hwnd, msg, wp, lp) };
             invalidate(hwnd);
             return r;
@@ -631,10 +838,38 @@ unsafe extern "system" fn ctl_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
     unsafe { DefWindowProcW(hwnd, msg, wp, lp) }
 }
 
+fn row_menu_key(hwnd: HWND, key: usize) -> bool {
+    (key == usize::from(VK_APPS) || (key == usize::from(VK_F10) && unsafe { GetKeyState(i32::from(VK_SHIFT)) } < 0))
+        && ctl_of(hwnd).is_some_and(|cell| cell.try_borrow().is_ok_and(|c| matches!(&c.look, Look::Row { commands, .. } if !commands.is_empty())))
+}
+
+fn reset_row(hwnd: HWND) {
+    let Some(Ok(mut c)) = ctl_of(hwnd).map(RefCell::try_borrow_mut) else { return };
+    if !matches!(c.look, Look::Row { .. }) {
+        return;
+    }
+    remove_tools(hwnd, &mut c);
+    c.layout.take();
+    c.hot = None;
+    c.pressed = None;
+    c.down = false;
+    drop(c);
+    if unsafe { GetCapture() } == hwnd {
+        unsafe { ReleaseCapture() };
+    }
+}
+
 /// Makes an empty panel. `bg` is its colour; `Role::None` lets its parent draw behind it.
 pub fn panel(parent: HWND, id: i32, bg: Role) -> HWND {
-    let state =
-        Box::into_raw(Box::new(RefCell::new(Panel { surface: Surface::default(), children: Vec::new(), bg, scroll: 0, dpi: dpi_of(parent), hover: false })));
+    let state = Box::into_raw(Box::new(RefCell::new(Panel {
+        surface: Surface::default(),
+        children: Vec::new(),
+        bg,
+        scroll: 0,
+        dpi: dpi_of(parent),
+        hover: false,
+        row_tip: null_mut(),
+    })));
     let hwnd = unsafe {
         CreateWindowExW(
             WS_EX_CONTROLPARENT | WS_EX_NOPARENTNOTIFY,
@@ -696,6 +931,7 @@ pub fn set(panel: HWND, surface: Surface) {
     let mut changed = moved_dpi || p.surface.decos != surface.decos || p.surface.height != surface.height;
     let old_items = std::mem::take(&mut p.surface.items);
     let index: HashMap<i32, usize> = old_items.iter().enumerate().map(|(i, item)| (item.id, i)).collect();
+    let captured = unsafe { GetCapture() };
     let mut old: Vec<Option<(HWND, Item)>> = std::mem::take(&mut p.children).into_iter().zip(old_items).map(Some).collect();
     let mut children = Vec::with_capacity(surface.items.len());
     let (mut reorder, mut last, mut after) = (false, 0, HWND_TOP);
@@ -705,6 +941,16 @@ pub fn set(panel: HWND, surface: Surface) {
             Some((pos, (hwnd, before))) if !hwnd.is_null() => {
                 reorder |= pos < last;
                 last = pos;
+                // Row ids are positional. Even identical-looking items may be from different
+                // repositories, so don't carry a captured press across a new surface.
+                if matches!(before.look, Look::Row { .. }) && (hwnd == captured || moved_dpi || before != *item) {
+                    reset_row(hwnd);
+                } else if hwnd == captured && matches!(before.look, Look::Button { .. }) && matches!(page::hit(before.id), Hit::Skill(..) | Hit::DiffAction(_))
+                {
+                    // Repair and comparison buttons also use positional ids. Even an unchanged label
+                    // cannot prove the target survived a refresh. WM_CAPTURECHANGED cancels the press.
+                    unsafe { ReleaseCapture() };
+                }
                 if before.at != item.at || moved_dpi {
                     place_child(hwnd, item.at, p.scroll, dpi, SWP_NOREDRAW);
                     changed = true;
@@ -774,8 +1020,16 @@ fn first_tab_stop(panel: HWND) -> Option<HWND> {
 
 /// Makes the control for `item`, in the tab order just after `after` (first, given `HWND_TOP`).
 fn make_ctl(panel: HWND, item: &Item, scroll: i32, dpi: u32, after: HWND) -> HWND {
-    let state =
-        Box::into_raw(Box::new(RefCell::new(Ctl { look: item.look.clone(), at: item.at, hover: false, down: false, on_folder: false, folder_down: false })));
+    let state = Box::into_raw(Box::new(RefCell::new(Ctl {
+        look: item.look.clone(),
+        at: item.at,
+        hover: false,
+        down: false,
+        layout: OnceCell::new(),
+        hot: None,
+        pressed: None,
+        tools: None,
+    })));
     let mut style = WS_CHILD | WS_VISIBLE;
     if item.look.interactive() {
         style |= WS_TABSTOP;
@@ -987,7 +1241,10 @@ unsafe extern "system" fn panel_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARA
         WM_NCDESTROY => {
             let ptr = unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0) } as *mut RefCell<Panel>;
             if !ptr.is_null() {
-                drop(unsafe { Box::from_raw(ptr) });
+                let p = unsafe { Box::from_raw(ptr) }.into_inner();
+                if !p.row_tip.is_null() && unsafe { IsWindow(p.row_tip) } != 0 {
+                    unsafe { DestroyWindow(p.row_tip) };
+                }
             }
         }
         WM_ERASEBKGND => return 1,
@@ -1044,8 +1301,7 @@ unsafe extern "system" fn panel_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARA
     unsafe { DefWindowProcW(hwnd, msg, wp, lp) }
 }
 
-/// A tooltip for a control.
-pub fn tip(ctl: HWND, text: &str) {
+fn make_tip(ctl: HWND) -> HWND {
     let tip = unsafe {
         CreateWindowExW(
             0,
@@ -1062,21 +1318,109 @@ pub fn tip(ctl: HWND, text: &str) {
             null(),
         )
     };
+    if !tip.is_null() {
+        unsafe { SendMessageW(tip, TTM_SETMAXTIPWIDTH, 0, scale(320, dpi_of(ctl)) as isize) };
+        scrollbar_theme(tip);
+    }
+    tip
+}
+
+fn tool_info(hwnd: HWND, id: usize) -> TTTOOLINFOW {
+    let mut info: TTTOOLINFOW = unsafe { zeroed() };
+    // Nothing here uses the v6-only lpReserved tail. v5 (e.g. an unmanifested host)
+    // rejects the entire tool if given a v6 size.
+    info.cbSize = std::mem::offset_of!(TTTOOLINFOW, lpReserved) as u32;
+    info.hwnd = hwnd;
+    info.uId = id;
+    info
+}
+
+/// Only a hovered row registers tools. Explicit relay includes the first mouse move, even
+/// when the pointer entered directly over an icon and then stayed still.
+fn row_tool_move(hwnd: HWND, c: &mut Ctl, wp: WPARAM, lp: LPARAM) {
+    if c.tools.is_none() {
+        let dpi = dpi_of(hwnd);
+        let Some(parts) = c.row(hwnd, dpi) else { return };
+        let disclosure = matches!(c.look, Look::Row { disclosure: Some(_), .. }).then_some((RowTarget::Disclosure, parts.mark));
+        let parent = unsafe { GetParent(hwnd) };
+        let Some(Ok(mut p)) = panel_of(parent).map(RefCell::try_borrow_mut) else { return };
+        if p.row_tip.is_null() {
+            p.row_tip = make_tip(parent);
+        }
+        let tip = p.row_tip;
+        drop(p);
+        if tip.is_null() {
+            return;
+        }
+        let mut strings = Vec::new();
+        let mut add = |rect: Rect, text: &str| {
+            if rect[2] <= 0 || rect[3] <= 0 {
+                return;
+            }
+            let mut s = wide(text);
+            let mut info = tool_info(hwnd, strings.len() + 1);
+            info.rect = client_rect(c.at, rect, dpi);
+            info.lpszText = s.as_mut_ptr();
+            unsafe { SendMessageW(tip, TTM_ADDTOOLW, 0, (&raw const info) as isize) };
+            strings.push(s);
+        };
+        for (target, rect) in parts.icons.iter().copied().chain(disclosure) {
+            add(rect, target.tip());
+        }
+        // Native tools must not overlap. The disclosure spans the row height; command
+        // slots form one contiguous band, with body space above and below it.
+        let body = RowText::parse(&text_of(hwnd)).tip();
+        let [mut left, y, w, h] = c.at;
+        let right = left + w;
+        if let Some((_, [x, _, width, _])) = disclosure {
+            add([left, y, x - left, h], &body);
+            left = x + width;
+        }
+        if let (Some((_, [x, top, ..])), Some((_, [last, _, width, height]))) = (parts.icons.first().copied(), parts.icons.last().copied()) {
+            add([left, y, x - left, h], &body);
+            left = last + width;
+            add([x, y, left - x, top - y], &body);
+            add([x, top + height, left - x, y + h - top - height], &body);
+        }
+        add([left, y, right - left, h], &body);
+        c.tools = Some((tip, strings));
+    }
+    if let Some((tip, _)) = &c.tools {
+        let mut msg: MSG = unsafe { zeroed() };
+        msg.hwnd = hwnd;
+        msg.message = WM_MOUSEMOVE;
+        msg.wParam = wp;
+        msg.lParam = lp;
+        msg.pt = POINT { x: i32::from(lp as i16), y: i32::from((lp >> 16) as i16) };
+        unsafe {
+            MapWindowPoints(hwnd, null_mut(), &mut msg.pt, 1);
+            SendMessageW(*tip, TTM_RELAYEVENT, 0, (&raw const msg) as isize);
+        }
+    }
+}
+
+fn remove_tools(hwnd: HWND, c: &mut Ctl) {
+    if let Some((tip, strings)) = c.tools.take() {
+        for i in 0..strings.len() {
+            let info = tool_info(hwnd, i + 1);
+            unsafe { SendMessageW(tip, TTM_DELTOOLW, 0, (&raw const info) as isize) };
+        }
+    }
+}
+
+/// A tooltip for a control.
+pub fn tip(ctl: HWND, text: &str) {
+    let tip = make_tip(ctl);
     if tip.is_null() {
         return;
     }
     let mut text = wide(text);
-    let mut info: TTTOOLINFOW = unsafe { zeroed() };
-    info.cbSize = size_of::<TTTOOLINFOW>() as u32;
+    let mut info = tool_info(ctl, ctl as usize);
     info.uFlags = TTF_IDISHWND | TTF_SUBCLASS;
-    info.hwnd = ctl;
-    info.uId = ctl as usize;
     info.lpszText = text.as_mut_ptr();
     unsafe {
-        SendMessageW(tip, TTM_SETMAXTIPWIDTH, 0, scale(320, dpi_of(ctl)) as isize);
         SendMessageW(tip, TTM_ADDTOOLW, 0, (&raw const info) as isize);
     }
-    scrollbar_theme(tip);
 }
 
 #[cfg(test)]
@@ -1093,7 +1437,7 @@ mod tests {
             id: FIRST + i,
             at: [0, i * 48, 560, 44],
             text: format!("skill {i}"),
-            look: Look::Row { tone: Tone::Ok, glyph: None, folder: false },
+            look: Look::Row { tone: Tone::Ok, glyph: None, commands: vec![], disclosure: None },
             enabled: true,
         };
         Surface { items: (0..ROWS).map(row).collect(), decos: Vec::new(), height: ROWS * 48 }
@@ -1146,20 +1490,37 @@ mod tests {
     }
 
     #[test]
-    fn a_rows_open_folder_button_is_between_the_name_and_the_pill_and_over_neither() {
-        for (w, pill_w) in [(294, 104), (850, 120), (560, 0)] {
-            let at = [1, 200, w, 42];
-            let (name, zone, pill) = row_parts(at, pill_w, true);
-            let zone = zone.expect("a row with a folder shows the button");
-            let inside = |[x, y, rw, rh]: Rect| x >= at[0] && y >= at[1] && x + rw <= at[0] + at[2] && y + rh <= at[1] + at[3];
-            assert!(inside(name) && inside(zone) && inside(pill), "{name:?} {zone:?} {pill:?} in {at:?}");
-            assert_eq!((zone[2], zone[3]), (32, 32));
-            assert!(name[0] + name[2] <= zone[0] && zone[0] + zone[2] <= pill[0], "in order, apart: {name:?} {zone:?} {pill:?}");
-            assert_eq!(pill[2], pill_w);
-            assert!(contains(zone, zone[0], zone[1]) && !contains(zone, zone[0] + 32, zone[1]) && !contains(zone, zone[0], zone[1] - 1));
-
-            let (whole, none, same) = row_parts(at, pill_w, false);
-            assert!(none.is_none() && same == pill && whole[0] == name[0] && whole[2] > name[2] && whole[0] + whole[2] <= pill[0]);
+    fn row_icons_follow_the_measured_name_and_overflow_before_the_badge() {
+        let commands = [RowCmd::Preview, RowCmd::Open, RowCmd::CopyPath, RowCmd::CopyLink, RowCmd::OnGitHub];
+        for dpi in [96, 120, 144, 192] {
+            for name in ["a", "a long skill name".repeat(12).as_str()] {
+                let nw = paint::measure(name, Font::Body, 0, dpi).0;
+                for w in [214, 294, 850] {
+                    let at = [3, 5, w, 42];
+                    let parts = row_parts(at, nw, 102, &commands);
+                    let (first, zone) = parts.icons[0];
+                    assert_eq!(zone[0], parts.name[0] + parts.name[2] + 4);
+                    assert!(parts.name[2] <= nw);
+                    if name == "a" {
+                        assert_eq!(parts.name[2], nw);
+                    }
+                    let last = parts.icons.last().unwrap();
+                    assert!(client_rect(at, last.1, dpi).right <= client_rect(at, parts.pill, dpi).left);
+                    assert_eq!(last.0 == RowTarget::More, parts.icons.len() < commands.len());
+                    if parts.icons.len() > 1 {
+                        assert_eq!(first, RowTarget::Cmd(RowCmd::Open));
+                    }
+                    if w == 850 {
+                        assert_eq!(parts.icons.len(), commands.len());
+                    } else if w == 294 && name != "a" {
+                        assert_eq!(parts.icons.iter().map(|(target, _)| *target).collect::<Vec<_>>(), [RowTarget::Cmd(RowCmd::Open), RowTarget::More]);
+                        assert!(parts.name[2] >= 24 && parts.name[2] < nw);
+                        assert_eq!(parts.pill[2], 102);
+                    } else if w == 214 {
+                        assert_eq!(last.0, RowTarget::More);
+                    }
+                }
+            }
         }
     }
 
@@ -1175,8 +1536,7 @@ mod tests {
         unsafe { DefWindowProcW(hwnd, msg, wp, lp) }
     }
 
-    #[test]
-    fn a_click_on_a_rows_open_folder_button_says_so_and_anywhere_else_on_it_is_a_click_on_the_row() {
+    fn test_panel() -> (HWND, HWND) {
         register();
         assert!(register_class("TinySkillSyncTestTop", Some(record), null_mut()));
         let top = unsafe {
@@ -1198,25 +1558,136 @@ mod tests {
         assert!(!top.is_null());
         let panel = panel(top, 1, Role::Bg);
         unsafe { SetWindowPos(panel, null_mut(), 0, 0, 600, 500, SWP_NOZORDER | SWP_NOACTIVATE) };
+        (top, panel)
+    }
+
+    #[test]
+    fn a_skill_card_button_press_does_not_transfer_to_an_identically_labelled_replacement() {
+        let (top, panel) = test_panel();
+        let card = |skill: &str, part, label: &str| Surface {
+            items: vec![
+                Item {
+                    id: page::skill_id(0, 0),
+                    at: [0, 0, 500, 40],
+                    text: skill.into(),
+                    look: Look::Row { tone: Tone::Ok, glyph: None, commands: vec![], disclosure: Some(true) },
+                    enabled: true,
+                },
+                Item {
+                    id: page::skill_id(0, part),
+                    at: [0, 40, 120, 40],
+                    text: label.into(),
+                    look: Look::Button { kind: Kind::Standard, glyph: None },
+                    enabled: true,
+                },
+            ],
+            height: 80,
+            decos: vec![],
+        };
+        for (part, label) in [(2, "Show changes"), (4, "Keep my version")] {
+            set(panel, card("alpha", part, label));
+            let id = page::skill_id(0, part);
+            let button = child(panel, id);
+            unsafe { SendMessageW(button, WM_LBUTTONDOWN, 1, 0) };
+            set(panel, card("bravo", part, label));
+            assert_eq!(child(panel, id), button);
+            unsafe { SendMessageW(button, WM_LBUTTONUP, 0, 0) };
+            assert!(COMMANDS.with(|c| c.take()).is_empty(), "{label} dispatched to replacement skill");
+            unsafe {
+                SendMessageW(button, WM_LBUTTONDOWN, 1, 0);
+                SendMessageW(button, WM_LBUTTONUP, 0, 0);
+            }
+            assert_eq!(COMMANDS.with(|c| c.take()).len(), 1, "fresh {label} press should work");
+        }
+        unsafe { DestroyWindow(top) };
+    }
+
+    #[test]
+    fn row_details_cover_body_and_badge_without_shadowing_icon_tips() {
+        use windows_sys::Win32::UI::Controls::{TTHITTESTINFOW, TTM_GETTEXTW, TTM_GETTOOLCOUNT, TTM_HITTESTW};
+
+        let (top, panel) = test_panel();
+        let at = [8, 5, 510, 48];
+        let page = |text: &str, commands| Surface {
+            items: vec![Item { id: FIRST, at, text: text.into(), look: Look::Row { tone: Tone::Ok, glyph: None, commands, disclosure: None }, enabled: true }],
+            decos: vec![],
+            height: 60,
+        };
+        let details = "alpha\nReady\nYesterday\nFirst line\nSecond line";
+        set(panel, page(details, vec![]));
+        let row = child(panel, FIRST);
+        let tip_at = |x, y| {
+            let pt = POINT { x, y };
+            unsafe { SendMessageW(row, WM_MOUSEMOVE, 0, ((y << 16) | x) as LPARAM) };
+            let tip = panel_of(panel).unwrap().borrow().row_tip;
+            assert!(!tip.is_null());
+            let mut hit = TTHITTESTINFOW { hwnd: row, pt, ti: tool_info(row, 0) };
+            assert_ne!(unsafe { SendMessageW(tip, TTM_HITTESTW, 0, (&raw mut hit) as isize) }, 0, "missing tooltip at {x},{y}");
+            let mut buf = [0u16; 128];
+            hit.ti.lpszText = buf.as_mut_ptr();
+            unsafe { SendMessageW(tip, TTM_GETTEXTW, buf.len(), (&raw mut hit.ti) as isize) };
+            String::from_utf16_lossy(&buf[..buf.iter().position(|&n| n == 0).unwrap()])
+        };
+        let body = "First line\nSecond line\nYesterday";
+        let dpi = dpi_of(row);
+        let bounds = client_rect(at, at, dpi);
+        assert_eq!(tip_at(bounds.right - 1, bounds.bottom - 1), body);
+
+        set(panel, page(details, vec![RowCmd::Preview]));
+        let tip = panel_of(panel).unwrap().borrow().row_tip;
+        assert_eq!(unsafe { SendMessageW(tip, TTM_GETTOOLCOUNT, 0, 0) }, 0);
+        let parts = row_parts(at, paint::measure("alpha", Font::Body, 0, dpi).0, paint::pill_width("Ready", None, dpi), &[RowCmd::Preview]);
+        let icon = client_rect(at, parts.icons[0].1, dpi);
+        let badge = client_rect(at, parts.pill, dpi);
+        assert_eq!(ctl_of(row).unwrap().borrow().row(row, dpi).unwrap().pill, parts.pill);
+        for (x, y) in [(0, 0), (icon.left, icon.top - 1), (icon.right - 1, icon.bottom), (badge.left, badge.top)] {
+            assert_eq!(tip_at(x, y), body);
+        }
+        assert_eq!(tip_at(icon.left, icon.top), "Preview");
+        for (text, expected) in [("alpha\nReady\n\nDetails", "Details"), ("alpha\nReady\nYesterday\n", "Yesterday"), ("alpha\nReady", "Ready")] {
+            set(panel, page(text, vec![]));
+            assert_eq!(tip_at(1, 1), expected);
+        }
+        unsafe { DestroyWindow(top) };
+    }
+
+    #[test]
+    fn row_input_distinguishes_icons_disclosure_and_keyboard_and_cancels_on_rebind() {
+        let (top, panel) = test_panel();
         let at = [0, 0, 560, 42];
-        let page = |folder| Surface {
+        let page = |disclosure| Surface {
             items: vec![Item {
                 id: FIRST,
                 at,
                 text: "alpha\nUp to date".to_string(),
-                look: Look::Row { tone: Tone::Ok, glyph: Some(glyph::OK), folder },
+                look: Look::Row { tone: Tone::Ok, glyph: Some(glyph::OK), commands: vec![RowCmd::Open, RowCmd::Preview], disclosure },
                 enabled: true,
             }],
             decos: Vec::new(),
             height: 42,
         };
-        set(panel, page(true));
+        set(panel, page(None));
         let row = child(panel, FIRST);
         let dpi = dpi_of(row);
-        let (_, zone, _) = row_parts(at, paint::pill_width("Up to date", Some(glyph::OK), dpi), true);
-        let [zx, zy, zw, zh] = zone.unwrap_or_default();
+        let parts = row_parts(
+            at,
+            paint::measure("alpha", Font::Body, 0, dpi).0,
+            paint::pill_width("Up to date", Some(glyph::OK), dpi),
+            &[RowCmd::Open, RowCmd::Preview],
+        );
+        let [zx, zy, zw, zh] = parts.icons[0].1;
         let point = |x: i32, y: i32| ((scale(y, dpi) << 16) | (scale(x, dpi) & 0xFFFF)) as LPARAM;
         let (on_zone, on_name) = (point(zx + zw / 2, zy + zh / 2), point(60, 21));
+        unsafe { SendMessageW(row, WM_MOUSEMOVE, 0, on_zone) };
+        let tip = panel_of(panel).unwrap().borrow().row_tip;
+        assert!(!tip.is_null());
+        for (i, expected) in [(1, "Open this skill’s folder in File Explorer."), (2, "Preview")] {
+            let mut info = tool_info(row, i);
+            let mut buf = [0u16; 128];
+            info.lpszText = buf.as_mut_ptr();
+            unsafe { SendMessageW(tip, windows_sys::Win32::UI::Controls::TTM_GETTEXTW, buf.len(), (&raw mut info) as isize) };
+            assert_eq!(String::from_utf16_lossy(&buf[..buf.iter().position(|&n| n == 0).unwrap()]), expected);
+        }
         let click = |down: LPARAM, up: LPARAM| {
             COMMANDS.with(|c| c.borrow_mut().clear());
             unsafe {
@@ -1228,12 +1699,36 @@ mod tests {
             COMMANDS.with(|c| c.borrow().clone())
         };
 
-        assert_eq!(click(on_zone, on_zone), [(FIRST, ROW_FOLDER)]);
-        assert_eq!(click(on_name, on_name), [(FIRST, BN_CLICKED)]);
+        let on_preview = point(zx + zw + zw / 2, zy + zh / 2);
+        assert_eq!(click(on_zone, on_zone), [(FIRST, RowCmd::Open.code())]);
+        assert_eq!(click(on_preview, on_preview), [(FIRST, RowCmd::Preview.code())]);
+        assert_eq!(click(on_zone, on_preview), []);
+        assert_eq!(click(on_name, on_name), []);
         assert_eq!(click(on_zone, on_name), [], "a press that leaves the button is no click");
-        assert_eq!(click(on_name, on_zone), [(FIRST, BN_CLICKED)], "a press on the row is the row's");
-        set(panel, page(false));
-        assert_eq!(click(on_zone, on_zone), [(FIRST, BN_CLICKED)], "a row with no folder has no button");
+        assert_eq!(click(on_name, on_zone), []);
+        unsafe { SendMessageW(row, WM_KEYDOWN, VK_RETURN.into(), 0) };
+        assert_eq!(COMMANDS.with(|c| c.take()), [(FIRST, ROW_MENU)]);
+        set(panel, page(Some(false)));
+        assert_eq!(click(on_name, on_name), [(FIRST, BN_CLICKED)]);
+        assert_eq!(click(on_name, on_zone), []);
+        unsafe { SendMessageW(row, WM_KEYDOWN, VK_APPS.into(), 0) };
+        assert_eq!(COMMANDS.with(|c| c.take()), [(FIRST, ROW_MENU)]);
+        unsafe { SendMessageW(row, WM_LBUTTONDOWN, 1, on_zone) };
+        let mut rebound = page(Some(false));
+        rebound.items[0].text = "bravo\nUp to date".into();
+        set(panel, rebound);
+        unsafe { SendMessageW(row, WM_LBUTTONUP, 0, on_zone) };
+        assert!(COMMANDS.with(|c| c.take()).is_empty());
+        let mut narrow = page(None);
+        narrow.items[0].at[2] = 170;
+        set(panel, narrow);
+        let more = {
+            let c = ctl_of(row).unwrap().borrow();
+            let &(target, [x, y, w, h]) = c.row(row, dpi).unwrap().icons.last().unwrap();
+            assert_eq!(target, RowTarget::More);
+            point(x + w / 2, y + h / 2)
+        };
+        assert_eq!(click(more, more), [(FIRST, ROW_MENU)]);
         unsafe { DestroyWindow(top) };
     }
 }

@@ -7,7 +7,7 @@
 
 use std::fs;
 use std::io::{self, IsTerminal, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 
 use crate::autostart::{Exe, Keys, Startup, Via};
@@ -17,6 +17,7 @@ use crate::engine::{Access, ApplyResult, Engine, EngineError, Outcome, Resolutio
 use crate::github::{GitHubRemote, Remote, SystemTokens, TokenProvider};
 use crate::interval::{Interval, now_secs};
 use crate::pathsafe::{fold, printable_lines};
+use crate::portable;
 use crate::reconcile::Verdict;
 use crate::state::State;
 use crate::verify::Check;
@@ -67,6 +68,8 @@ Usage:
       folder) when you sign in. It starts without its window and waits a
       little before it looks at your skills or checks GitHub, so it does not
       slow sign-in down.
+  tss portable
+      Export local settings and repositories to companion files beside tss.exe.
   tss help
   tss --version
 
@@ -86,7 +89,12 @@ Environment:
 pub trait Host {
     /// Where the settings and the state are kept.
     fn home(&self) -> PathBuf;
+    /// The folder containing this copy's executable and portable companions.
+    fn executable_dir(&self) -> Result<PathBuf, String>;
     fn skills_dir(&self, cfg: &Config) -> PathBuf;
+    fn portable_skills_dir(&self, cfg: &Config) -> Result<PathBuf, String> {
+        Ok(self.skills_dir(cfg))
+    }
     fn remote(&self) -> Result<Box<dyn Remote>, String>;
     fn tokens(&self) -> Box<dyn TokenProvider>;
     fn token_saved(&self) -> bool;
@@ -112,8 +120,23 @@ impl Host for SystemHost {
         Paths::home_dir()
     }
 
+    fn executable_dir(&self) -> Result<PathBuf, String> {
+        std::env::current_exe()
+            .map_err(|error| format!("the folder this executable is in cannot be found: {error}"))?
+            .parent()
+            .map(PathBuf::from)
+            .ok_or_else(|| "the folder this executable is in cannot be found".to_string())
+    }
+
     fn skills_dir(&self, cfg: &Config) -> PathBuf {
         Paths::skills_dir(cfg)
+    }
+
+    fn portable_skills_dir(&self, cfg: &Config) -> Result<PathBuf, String> {
+        let profile = std::env::var_os("USERPROFILE").map(PathBuf::from);
+        portable::resolve_skills_dir(cfg, std::env::var_os("TSS_SKILLS_DIR").as_deref(), profile.as_deref(), |name| {
+            std::env::var_os(name).map(|value| value.to_string_lossy().into_owned())
+        })
     }
 
     fn remote(&self) -> Result<Box<dyn Remote>, String> {
@@ -184,6 +207,7 @@ pub enum Command {
     Remove { repo: String, delete_skills: bool },
     Token(TokenAction),
     Startup(StartupAction),
+    Portable,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -239,6 +263,7 @@ fn usage_of(command: &str) -> &'static str {
         "remove" => "tss remove REPO [--delete-skills]",
         "token" => "tss token [status|set|clear]",
         "startup" => "tss startup [status|on|off]",
+        "portable" => "tss portable",
         _ => "tss status",
     }
 }
@@ -364,6 +389,10 @@ pub fn parse(args: &[String]) -> Result<Command, String> {
             };
             Command::Startup(action)
         }
+        "portable" => {
+            expect_words(&name, words, 0, 0)?;
+            Command::Portable
+        }
         _ => return Err(format!("unknown command '{first}'")),
     };
     flags.finish(&name)?;
@@ -458,6 +487,7 @@ fn execute(command: Command, host: &dyn Host, out: &mut String) -> Result<i32, F
         Command::Remove { repo, delete_skills } => remove(host, out, &repo, delete_skills),
         Command::Token(action) => token(host, out, action),
         Command::Startup(action) => startup(host, out, action),
+        Command::Portable => export_portable(host, out),
     }
 }
 
@@ -465,23 +495,44 @@ fn config_path(host: &dyn Host) -> PathBuf {
     host.home().join(CONFIG_FILE)
 }
 
-fn load_config(host: &dyn Host) -> Result<Config, Fail> {
-    Config::load(&config_path(host)).map_err(Fail::Failed)
+fn load_config(host: &dyn Host) -> Result<(Config, Option<PathBuf>), Fail> {
+    let directory = host.executable_dir().map_err(Fail::Failed)?;
+    match portable::load(&directory).map_err(Fail::Failed)? {
+        Some(config) => Ok((config, Some(directory))),
+        None => Config::load(&config_path(host)).map(|config| (config, None)).map_err(Fail::Failed),
+    }
 }
 
-fn paths(host: &dyn Host, cfg: &Config) -> Paths {
-    Paths::new(host.home(), host.skills_dir(cfg))
+fn save_config(host: &dyn Host, directory: Option<&Path>, before: &Config, after: &Config) -> Result<(), String> {
+    match directory {
+        Some(directory) => portable::save_changes(directory, before, after).map(|_| ()),
+        None => after.save(&config_path(host)),
+    }
 }
 
-fn open_engine(host: &dyn Host, cfg: &Config) -> Result<Engine, Fail> {
+fn export_portable(host: &dyn Host, out: &mut String) -> Result<i32, Fail> {
+    let directory = host.executable_dir().map_err(Fail::Failed)?;
+    portable::check_export_target(&directory).map_err(Fail::Failed)?;
+    let local = Config::load(&config_path(host)).map_err(Fail::Failed)?;
+    portable::export(&directory, &local).map_err(Fail::Failed)?;
+    say!(out, "Exported shared settings and repositories beside tss.exe. The local config.json was not changed.");
+    Ok(EXIT_OK)
+}
+
+fn paths(host: &dyn Host, cfg: &Config, portable: bool) -> Result<Paths, Fail> {
+    let skills = if portable { host.portable_skills_dir(cfg) } else { Ok(host.skills_dir(cfg)) }.map_err(Fail::Failed)?;
+    Ok(Paths::new(host.home(), skills))
+}
+
+fn open_engine(host: &dyn Host, cfg: &Config, portable: bool) -> Result<Engine, Fail> {
     let remote = host.remote().map_err(Fail::Failed)?;
-    Ok(Engine::new(paths(host, cfg), remote, host.tokens()))
+    Ok(Engine::new(paths(host, cfg, portable)?, remote, host.tokens()))
 }
 
 /// What is recorded, read without the engine's lock and without changing anything. Only used to check names
 /// typed on the command line; the engine reads it again under its lock before acting.
-fn load_state(host: &dyn Host, cfg: &Config) -> Result<State, Fail> {
-    let file = paths(host, cfg).state_file();
+fn load_state(host: &dyn Host, cfg: &Config, portable: bool) -> Result<State, Fail> {
+    let file = paths(host, cfg, portable)?.state_file();
     State::load_with(&file, false).map(|loaded| loaded.state).map_err(|e| Fail::Failed(format!("cannot read {}: {e}", file.display())))
 }
 
@@ -613,16 +664,22 @@ fn tracking_text(tracking: Tracking) -> &'static str {
 }
 
 fn status(host: &dyn Host, out: &mut String) -> Result<i32, Fail> {
-    let cfg = load_config(host)?;
-    say!(out, "Skills folder: {}", host.skills_dir(&cfg).display());
-    say!(out, "Settings: {}", config_path(host).display());
+    let (cfg, portable_directory) = load_config(host)?;
+    let portable_mode = portable_directory.is_some();
+    let skills_dir = if portable_mode { host.portable_skills_dir(&cfg) } else { Ok(host.skills_dir(&cfg)) }.map_err(Fail::Failed)?;
+    say!(out, "Skills folder: {}", skills_dir.display());
+    if let Some(directory) = &portable_directory {
+        say!(out, "Settings: portable companions beside tss.exe ({})", directory.display());
+    } else {
+        say!(out, "Settings: {}", config_path(host).display());
+    }
     let mut level = Level::Ok;
     for problem in cfg.problems() {
         say!(out, "Settings problem: {problem}");
         level = Level::Attention;
     }
 
-    let mut engine = open_engine(host, &cfg)?;
+    let mut engine = open_engine(host, &cfg, portable_mode)?;
     let report = engine.verify(&cfg, Access::ReadOnly)?;
     let now = now_secs();
     let mut board = Board::new();
@@ -683,6 +740,8 @@ fn change(skill: &SkillReport) -> Option<String> {
         (Verdict::Update, false) => format!("Would update {name}"),
         (Verdict::Adopt, true) => format!("Now managing {name} (the installed copy matched upstream)"),
         (Verdict::Adopt, false) => format!("Would start managing {name} (the installed copy matches upstream)"),
+        (Verdict::CatchUp, true) => format!("Marked {name} as in sync (your edit is on GitHub too)"),
+        (Verdict::CatchUp, false) => format!("Would mark {name} as in sync (your edit is on GitHub too)"),
         (Verdict::AdoptHistorical, true) => format!("Verified and adopted an older GitHub copy of {name}, then updated it"),
         (Verdict::AdoptHistorical, false) => format!("Would adopt and update {name} (a complete older GitHub version matches)"),
         (Verdict::Delete, true) => format!("Removed {name} (gone upstream)"),
@@ -704,7 +763,8 @@ fn size(bytes: u64) -> String {
 }
 
 fn check(host: &dyn Host, out: &mut String, query: Option<&str>, dry_run: bool, full_listing: bool, delete_all: bool) -> Result<i32, Fail> {
-    let cfg = load_config(host)?;
+    let (cfg, portable_directory) = load_config(host)?;
+    let portable_mode = portable_directory.is_some();
     let which = match query {
         Some(query) => Which::One(find_repo(&cfg, query).map_err(Fail::Usage)?.id.clone()),
         None if cfg.repos.iter().any(|r| r.enabled) => Which::All,
@@ -718,7 +778,7 @@ fn check(host: &dyn Host, out: &mut String, query: Option<&str>, dry_run: bool, 
         }
     };
 
-    let mut engine = open_engine(host, &cfg)?;
+    let mut engine = open_engine(host, &cfg, portable_mode)?;
     let now = now_secs();
     let mut board = Board::new();
     // The look at the disk comes first, so local edits are reported even when GitHub says nothing changed.
@@ -769,16 +829,17 @@ fn check(host: &dyn Host, out: &mut String, query: Option<&str>, dry_run: bool, 
 }
 
 fn resolve(host: &dyn Host, out: &mut String, query: &str, skill: &str, how: Resolution) -> Result<i32, Fail> {
-    let cfg = load_config(host)?;
+    let (cfg, portable_directory) = load_config(host)?;
+    let portable_mode = portable_directory.is_some();
     let repo = find_repo(&cfg, query).map_err(Fail::Usage)?;
     // The engine checks `replace` against upstream itself. The other two only change a list, so a typo would be
     // recorded as it is: the name is checked here.
     let name = match how {
         Resolution::Overwrite | Resolution::PauseHistory | Resolution::ResumeHistory => skill.to_string(),
-        Resolution::KeepMine => installed_name(host, &cfg, repo, skill)?,
-        Resolution::ManageAgain => kept_name(host, &cfg, repo, skill)?,
+        Resolution::KeepMine => installed_name(host, &cfg, portable_mode, repo, skill)?,
+        Resolution::ManageAgain => kept_name(host, &cfg, portable_mode, repo, skill)?,
     };
-    let mut engine = open_engine(host, &cfg)?;
+    let mut engine = open_engine(host, &cfg, portable_mode)?;
     let report = engine.resolve(&cfg, &repo.id, &name, how, &AtomicBool::new(false))?;
     say!(out, "{}.", report.message);
     for backup in &report.backups {
@@ -788,8 +849,8 @@ fn resolve(host: &dyn Host, out: &mut String, query: &str, skill: &str, how: Res
 }
 
 /// The skill as it is recorded for the repository, or a folder of that name in the skills folder.
-fn installed_name(host: &dyn Host, cfg: &Config, repo: &RepoConfig, skill: &str) -> Result<String, Fail> {
-    let state = load_state(host, cfg)?;
+fn installed_name(host: &dyn Host, cfg: &Config, portable: bool, repo: &RepoConfig, skill: &str) -> Result<String, Fail> {
+    let state = load_state(host, cfg, portable)?;
     let key = fold(skill);
     if let Some(owner) = state.names_owned_elsewhere(&repo.id).get(&key) {
         let instead =
@@ -799,7 +860,7 @@ fn installed_name(host: &dyn Host, cfg: &Config, repo: &RepoConfig, skill: &str)
     if let Some(owned) = state.repo(&repo.id).and_then(|r| r.skill(skill)) {
         return Ok(owned.name.clone());
     }
-    let dir = host.skills_dir(cfg);
+    let dir = if portable { host.portable_skills_dir(cfg) } else { Ok(host.skills_dir(cfg)) }.map_err(Fail::Failed)?;
     let folder = fs::read_dir(&dir).ok().and_then(|entries| {
         entries
             .flatten()
@@ -810,8 +871,8 @@ fn installed_name(host: &dyn Host, cfg: &Config, repo: &RepoConfig, skill: &str)
     folder.ok_or_else(|| Fail::Usage(format!("'{skill}' is neither installed from {} nor a folder in {}", repo.id, dir.display())))
 }
 
-fn kept_name(host: &dyn Host, cfg: &Config, repo: &RepoConfig, skill: &str) -> Result<String, Fail> {
-    let state = load_state(host, cfg)?;
+fn kept_name(host: &dyn Host, cfg: &Config, portable: bool, repo: &RepoConfig, skill: &str) -> Result<String, Fail> {
+    let state = load_state(host, cfg, portable)?;
     let kept = state.repo(&repo.id).map(|r| r.ignored.clone()).unwrap_or_default();
     let key = fold(skill);
     kept.iter().find(|name| fold(name) == key).cloned().ok_or_else(|| {
@@ -822,38 +883,39 @@ fn kept_name(host: &dyn Host, cfg: &Config, repo: &RepoConfig, skill: &str) -> R
 
 fn add(host: &dyn Host, out: &mut String, spec: &str, every: Option<Interval>, use_token: bool) -> Result<i32, Fail> {
     let spec = RepoSpec::parse(spec).map_err(Fail::Usage)?;
-    let file = config_path(host);
-    let mut cfg = Config::load(&file).map_err(Fail::Failed)?;
+    let (mut cfg, portable_directory) = load_config(host)?;
+    let before = cfg.clone();
     let full_name = spec.full_name();
     if let Some(existing) = cfg.repos.iter().find(|r| r.repo.eq_ignore_ascii_case(&full_name) && r.branch == spec.branch && r.path == spec.path) {
         return Err(Fail::Usage(format!("{} is already set up, as '{}'", existing.label(), existing.id)));
     }
     let added = cfg.add_repo(&spec, every, use_token).clone();
-    cfg.save(&file).map_err(Fail::Failed)?;
+    save_config(host, portable_directory.as_deref(), &before, &cfg).map_err(Fail::Failed)?;
     say!(out, "Added {} as '{}'. {}", added.label(), added.id, schedule_text(&cfg, &added, added.use_token));
     say!(out, "Install its skills now with: {}", command_line("check", &[&added.id], &[]).unwrap_or_else(|| "tss check".to_string()));
     Ok(EXIT_OK)
 }
 
 fn remove(host: &dyn Host, out: &mut String, query: &str, delete_skills: bool) -> Result<i32, Fail> {
-    let file = config_path(host);
-    let mut cfg = Config::load(&file).map_err(Fail::Failed)?;
+    let (mut cfg, portable_directory) = load_config(host)?;
+    let portable_mode = portable_directory.is_some();
+    let before = cfg.clone();
     // A repository that left the settings while its skills stayed on record can be let go of too.
     let (id, in_settings) = match find_repo(&cfg, query) {
         Ok(repo) => (repo.id.clone(), true),
-        Err(e) => match load_state(host, &cfg)?.repo(query) {
+        Err(e) => match load_state(host, &cfg, portable_mode)?.repo(query) {
             Some(r) if !r.skills.is_empty() => (query.to_string(), false),
             _ => return Err(Fail::Usage(e)),
         },
     };
-    let mut engine = open_engine(host, &cfg)?;
+    let mut engine = open_engine(host, &cfg, portable_mode)?;
     let report = engine.remove_repo(&id, delete_skills)?;
 
     let mut saved = Ok(());
     if in_settings {
         let label = cfg.find(&id).map(RepoConfig::label).unwrap_or_default();
         cfg.repos.retain(|r| r.id != id);
-        saved = cfg.save(&file);
+        saved = save_config(host, portable_directory.as_deref(), &before, &cfg);
         if saved.is_ok() {
             say!(out, "Removed {label} [{id}] from the settings.");
         }
@@ -872,10 +934,12 @@ fn remove(host: &dyn Host, out: &mut String, query: &str, delete_skills: bool) -
         say!(out, "These skills stay installed and are now yours: {}", names.join(", "));
     }
     if let Err(e) = saved {
-        return Err(Fail::Failed(format!(
-            "{e}. The skills of '{id}' are no longer managed, but it is still in the settings: remove it from {} by hand",
-            file.display()
-        )));
+        let next_step = if let Some(directory) = &portable_directory {
+            format!("update the portable settings beside tss.exe in {} by hand", directory.display())
+        } else {
+            format!("remove it from {} by hand", config_path(host).display())
+        };
+        return Err(Fail::Failed(format!("{e}. The skills of '{id}' are no longer managed, but it is still in the settings: {next_step}")));
     }
     Ok(if delete_skills && !report.kept.is_empty() { EXIT_ATTENTION } else { EXIT_OK })
 }
@@ -897,7 +961,8 @@ fn token(host: &dyn Host, out: &mut String, action: TokenAction) -> Result<i32, 
             Ok(EXIT_OK)
         }
         TokenAction::Status => {
-            let cfg = load_config(host)?;
+            let (cfg, portable_directory) = load_config(host)?;
+            let portable_mode = portable_directory.is_some();
             let available = if host.token_saved() {
                 say!(out, "Saved token: yes, in Windows Credential Manager ({}).", cred::TOKEN_TARGET);
                 say!(out, "GitHub CLI: not asked; the saved token comes first.");
@@ -917,7 +982,7 @@ fn token(host: &dyn Host, out: &mut String, action: TokenAction) -> Result<i32, 
             };
             // The repositories the user marked, and those found to be private. A state that cannot be read only hides
             // the second kind, so it is not a failure here.
-            let state = load_state(host, &cfg).unwrap_or_default();
+            let state = load_state(host, &cfg, portable_mode).unwrap_or_default();
             let sends = |r: &RepoConfig| r.use_token || state.repo(&r.id).is_some_and(|s| s.needs_token);
             let users: Vec<&str> = cfg.repos.iter().filter(|r| sends(r)).map(|r| r.id.as_str()).collect();
             if users.is_empty() {
@@ -995,6 +1060,7 @@ mod tests {
         assert_eq!(parsed("startup status"), Command::Startup(StartupAction::Status));
         assert_eq!(parsed("Startup ON"), Command::Startup(StartupAction::On));
         assert_eq!(parsed("startup off"), Command::Startup(StartupAction::Off));
+        assert_eq!(parsed("portable"), Command::Portable);
         for help in ["help", "-h", "--help", "check --help", "help me"] {
             assert_eq!(parsed(help), Command::Help, "{help}");
         }
@@ -1032,6 +1098,7 @@ mod tests {
         assert!(refused("startup maybe").contains("'maybe' is not a startup action; use: tss startup [status|on|off]"));
         assert!(refused("startup on off").contains("'off' was not expected"));
         assert!(refused("startup on --now").contains("'startup' has no option --now"));
+        assert!(refused("portable now").contains("'now' was not expected"));
     }
 
     fn cfg_with(repos: &[(&str, &str, &str)]) -> Config {
@@ -1129,6 +1196,7 @@ mod tests {
             actions: actions.to_vec(),
             facts: None,
             listed: true,
+            folder_missing: false,
         };
 
         let mut out = String::new();

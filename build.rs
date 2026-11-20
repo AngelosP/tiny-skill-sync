@@ -40,6 +40,7 @@ fn main() {
         data.extend(&icon);
         std::fs::write(&res, data).expect("the resources can be written");
         println!("cargo:rustc-link-arg-bin={name}={}", res.display());
+        println!("cargo:rustc-link-arg-bin={name}=/SWAPRUN:NET");
     }
 }
 

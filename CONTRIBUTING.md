@@ -49,7 +49,7 @@ scripts\dev.ps1 test
 ```
 
 This runs `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings` and `cargo test --no-fail-fast`. All three
-must pass. There are 554 tests (351 in the library, 203 integration tests); the whole gate takes about 40 seconds when
+must pass. There are 580 tests (365 in the library, 215 integration tests); the whole gate takes about 40 seconds when
 the code is already built.
 
 If the change can affect speed, memory or disk use (startup, verification, the poll, the tray, the window),
@@ -109,8 +109,10 @@ ends up on disk, what the app says and what it leaves alone.
 | --- | --- |
 | `install` | First start: what is installed, how the idle app behaves, how fast it quits. |
 | `places` | With `TSS_HOME` and `TSS_SKILLS_DIR` unset and the profile folders pointed at `%TEMP%`: skills go to `%USERPROFILE%\.copilot\skills` beside a skill written by hand, the settings to `%LOCALAPPDATA%\tiny-skill-sync`, nothing anywhere else. Then `skills_dir` set in `config.json`: the new folder gets its own copies and the old one is left as it is; taken out again while the tray runs, the first folder is managed as before, with an edit made there meanwhile kept and shown. |
+| `portable` | `tss portable` exports two companion files without changing `config.json`; two tray copies read those shared sources but keep separate local state and skills folders. Uses the public fixture's existing branch without pushing. |
 | `changes` | Six kinds of upstream change reach the disk through the tray's **Sync now**. |
 | `local-edit` | An edit made while the app runs, then an upstream change to the same skill. |
+| `converged` | Three skills edited here, then the edits pushed to GitHub: one with Windows line endings against GitHub's Unix ones, one byte for byte, one differently. The first two are marked as in sync with nothing written and take the next update; the third stays edited. |
 | `edit-stopped` | Edits made while the app was not running, including ones that keep a file's size and time; a file added meanwhile is not reported and stays. |
 | `holds` | A skill deleted locally; a skill deleted upstream after being edited; every skill deleted upstream, where only the files GitHub put there go and a file the user added stays. |
 | `unmanaged` | Current and whole historical copies, an edited old copy, a longer saved search, persistent pause (including a window screenshot) and overwrite with a backup. The user's extra file survives adoption, update and removal. Makes ten small history commits only on its own fixture branch. |
@@ -120,7 +122,7 @@ ends up on disk, what the app says and what it leaves alone.
 | `failures` | A bad network, bad answers, a bad token: the skills folder must not change. |
 | `stale` | GitHub answering with a listing that is newer than its commit. |
 | `empty` | A repository added as a whole when its skills are in a subfolder. |
-| `ui` | The window, its questions and the tray menu, driven and read from outside: layout, tab order, painting, the text at the top for each kind of failure, a skill row opening, an open skill's facts, **Copy path**, **Copy GitHub link** (read back from the clipboard) and **Preview** (with a file the user added that must not be listed), the folder button a row shows under the mouse (it opens File Explorer), **Show changes** (after a push to its own branch, with a file the user added that must not be listed) and back, the repository and diff file lists widening under the mouse (with scroll positions kept), and a new size remembered. It runs in the light or dark mode Windows is in. |
+| `ui` | The window, its questions and the tray menu, driven and read from outside: layout, tab order, painting, failure text, skill details in row tooltips, inline folder and clipboard actions, **Preview**, and repair choices for an edited skill. **Show changes** compares a fixture update; neither comparison nor preview should list a file the user added. Also checks the repository and diff lists widening under the mouse, scroll positions, and remembering a new window size. Runs in the current Windows light or dark mode. |
 | `signin` | Start with Windows: `tss startup` on, off, and switched off in Task Manager; the app started from its entry the way Windows starts it at sign-in: only the tray, nothing looked at or checked for 30 seconds, then the look and the check; started by hand during that wait, it looks at once; a second start; settings that cannot be read; copies in folders too deep for the entry (named by the short path, or not possible). |
 
 Run it when you change the engine's visible behaviour, the tray, the window or anything GitHub-facing, at least
@@ -230,7 +232,10 @@ The budgets, agreed before the app was written:
 | Unchanged poll | 50 ms CPU, 0 file reads or writes, 1 request |
 | After a poll | 20 MiB working set, 5 MiB private, 10 threads, 350 handles |
 | Quit | 2 s at most |
-| `tiny-skill-sync.exe` | 1 MiB |
+| `tiny-skill-sync.exe` | 1.1 MiB |
+
+The exe's budget was 1 MiB until the shared-folder settings, the new skill rows and the check that marks an edit
+GitHub also has as in sync took it to 1.01 MiB; the owner raised it to 1.1 MiB. The other rows are as first agreed.
 
 The recorded results and their test conditions are in [the user guide](docs/GUIDE.md#measured-cost).
 
@@ -251,8 +256,8 @@ The recorded results and their test conditions are in [the user guide](docs/GUID
 
 `Cargo.toml` and `.cargo\config.toml` set the release profile: `opt-level = "z"`, fat LTO, one codegen unit,
 `panic = "abort"`, stripped symbols and a static C runtime (no Visual C++ redistributable needed). `opt-level = "z"`
-keeps the tray exe at 1,045,504 bytes, under its 1 MiB budget (in the earlier comparison, `opt-level = "s"` made it
-1.01 MiB, `opt-level = 3` larger still). It costs about 12% of SHA-1 speed (339 MB/s instead of 384) and nothing the
+keeps the tray exe at 1,057,280 bytes, within its 1.1 MiB budget (in the earlier comparison, `opt-level = "s"` made the
+0.89 MiB exe 1.01 MiB, `opt-level = 3` larger still). It costs about 12% of SHA-1 speed (339 MB/s instead of 384) and nothing the
 bench can see. `build.rs` embeds
 `app.manifest` (common controls 6, per-monitor DPI, long paths, UTF-8), a version resource: the name and version
 Windows shows for each exe, as in Task Manager's startup apps (about 1 KiB), and the icon, `assets\tiny-skill-sync.ico`

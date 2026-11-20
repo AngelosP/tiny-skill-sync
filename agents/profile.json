@@ -1,0 +1,39 @@
+{
+  "schema_version": 2,
+  "repository": {
+    "name": "AngelosP/tiny-skill-sync",
+    "default_branch": "main"
+  },
+  "documentation": {
+    "architecture": ["ARCHITECTURE.md"],
+    "conventions": ["AGENTS.md", "CONTRIBUTING.md"],
+    "testing": ["CONTRIBUTING.md"],
+    "operations": ["CONTRIBUTING.md", "docs\\GUIDE.md"],
+    "security": ["AGENTS.md", "ARCHITECTURE.md", "docs\\GUIDE.md"]
+  },
+  "toolchain": {
+    "required": ["node", "git", "gh"],
+    "optional": []
+  },
+  "specialists": {
+    "architect": { "required_tools": ["git"] },
+    "quality": { "required_tools": ["git"] },
+    "test": { "required_tools": ["git"] },
+    "security": { "required_tools": ["git"] },
+    "ux": { "required_tools": ["git"] },
+    "performance": { "required_tools": ["git"] },
+    "data": { "required_tools": ["git"] }
+  },
+  "forbidden_commands": [
+    "tss token set",
+    "tss token clear",
+    "Any command that prints, logs, or saves a token",
+    "tss startup on or off without TSS_HOME",
+    "Direct app execution without both TSS_HOME and TSS_SKILLS_DIR pointing at disposable folders",
+    "Any command that accesses the real skills, settings, or work folders",
+    "Any command that writes Windows' Run or StartupApproved\\Run keys",
+    "Pushing to fixture main branches or running live scripts against repositories not owned by the user",
+    "scripts\\dev.ps1 clean while another worktree or live run is active"
+  ],
+  "install_policy": "Cargo is the package manager; preserve Cargo.toml and Cargo.lock. Do not install tools during feature runs. Restore missing dependencies with cargo fetch --locked only after a check fails because dependencies are missing; this may use the network but must not change the manifests or lockfile. New or upgraded dependencies and tool installs need separate approval; a new runtime dependency also needs a measured reason. No npm setup."
+}

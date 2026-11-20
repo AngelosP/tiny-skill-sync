@@ -72,13 +72,23 @@ fn under_test_root(key: &str) -> bool {
 pub struct Exe {
     pub long: String,
     pub short: Option<String>,
+    aliases: Vec<String>,
 }
 
 impl Exe {
     pub fn new(long: &str, short: Option<&str>) -> Exe {
         let long = plain(long).into_owned();
         let short = short.map(|s| plain(s).into_owned()).filter(|s| !s.is_empty() && !same_path(s, &long));
-        Exe { long, short }
+        Exe { long, short, aliases: Vec::new() }
+    }
+
+    /// Also recognize a previous path spelling, without using it for a new startup entry.
+    pub(crate) fn with_alias(mut self, path: &str) -> Exe {
+        let alias = plain(path).into_owned();
+        if !self.is(&alias) {
+            self.aliases.push(alias);
+        }
+        self
     }
 
     /// What the entry says: the long path when the command fits in [`MAX_COMMAND`], else the short one. `None` when
@@ -90,7 +100,9 @@ impl Exe {
     /// Whether a path names this program, in either form.
     pub fn is(&self, path: &str) -> bool {
         let path = plain(path);
-        same_path(&path, &self.long) || self.short.as_deref().is_some_and(|short| same_path(&path, short))
+        same_path(&path, &self.long)
+            || self.short.as_deref().is_some_and(|short| same_path(&path, short))
+            || self.aliases.iter().any(|alias| same_path(&path, alias))
     }
 }
 
@@ -106,6 +118,15 @@ pub fn plain(path: &str) -> Cow<'_, str> {
         return Cow::Owned(format!(r"\\{}", &path[UNC.len()..]));
     }
     Cow::Borrowed(path.strip_prefix(r"\\?\").unwrap_or(path))
+}
+
+/// Prefer a resolved UNC path, but keep the current path for every other result.
+pub fn prefer_unc(current: &str, final_path: Option<&str>) -> String {
+    const UNC: &str = r"\\?\UNC\";
+    match final_path.filter(|path| path.get(..UNC.len()).is_some_and(|head| head.eq_ignore_ascii_case(UNC))) {
+        Some(path) => plain(path).into_owned(),
+        None => current.to_string(),
+    }
 }
 
 /// The program a command line starts, found the way Windows finds it: the text in quotes, or else the text up to the
@@ -250,6 +271,32 @@ mod tests {
         let share = Exe::new(r"\\?\UNC\server\share\tss\tiny-skill-sync.exe", None);
         assert_eq!(share.long, r"\\server\share\tss\tiny-skill-sync.exe");
         assert_eq!(Exe::new(LONG, Some(&LONG.to_uppercase())).short, None, "a short form that is the long one is no short form");
+    }
+
+    #[test]
+    fn a_rewritten_unc_path_still_recognizes_the_old_entry() {
+        let unc = r"\\server\share\tss\tiny-skill-sync.exe";
+        let old = r"Z:\tss\tiny-skill-sync.exe";
+        let short = r"Z:\TSS\TINY-S~1.EXE";
+        let exe = Exe::new(unc, Some(short)).with_alias(old);
+        assert!(exe.is(unc) && exe.is(old) && exe.is(short));
+        assert_eq!(Startup::decide(Some(&format!("\"{old}\" {BACKGROUND}")), None, &exe), Startup::On);
+        assert_eq!(exe.command().as_deref(), Some(r#""\\server\share\tss\tiny-skill-sync.exe" --background"#));
+    }
+
+    #[test]
+    fn only_a_resolved_unc_final_path_replaces_the_current_path() {
+        let current = r"Z:\apps\tiny-skill-sync.exe";
+        assert_eq!(prefer_unc(current, Some(r"\\?\UNC\server\share\apps\tiny-skill-sync.exe")), r"\\server\share\apps\tiny-skill-sync.exe");
+        assert_eq!(
+            prefer_unc(current, Some(r"\\?\unc\server\share\apps\tiny-skill-sync.exe")),
+            r"\\server\share\apps\tiny-skill-sync.exe",
+            "the prefix is case-insensitive"
+        );
+        assert_eq!(prefer_unc(current, None), current, "a resolution failure keeps the current path");
+        assert_eq!(prefer_unc(current, Some(r"\\?\C:\apps\tiny-skill-sync.exe")), current, "a local path is unchanged");
+        assert_eq!(prefer_unc(current, Some(r"\\?\Volume{abc}\apps\tiny-skill-sync.exe")), current, "a volume path is unchanged");
+        assert_eq!(prefer_unc(current, Some(r"\\server\share\apps\tiny-skill-sync.exe")), current, "only a final path is accepted");
     }
 
     #[test]

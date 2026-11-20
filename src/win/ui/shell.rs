@@ -6,6 +6,8 @@
 //! change; safety never depends on it, because every check compares the disk with the record first.
 
 use std::cell::{Cell, RefCell};
+use std::fs::{self, OpenOptions};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::ptr::{null, null_mut};
 use std::sync::Arc;
@@ -37,7 +39,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 
 use super::page::{self, Note};
 use super::{bench, dialogs, register_class, sentence, tray, trim_memory, window};
-use crate::app::{App, Done, Job, Order, Shown, perform};
+use crate::app::{App, Done, Job, Order, SettingsSource, Shown, perform};
 use crate::autostart::BACKGROUND;
 use crate::board::{APP_NAME, Level, RepoView, span};
 use crate::cli::{Host, SystemHost};
@@ -57,6 +59,7 @@ const WM_KICK: u32 = WM_APP + 3;
 const TIMER_LOOK: usize = 1;
 /// A look at the skills folder waits until it has been quiet this long.
 const LOOK_DELAY_MS: u32 = 2000;
+const STARTUP_OFFER_FILE: &str = "startup-offer-seen";
 /// How long quitting waits for the job that is running and for saving what is waiting to be saved.
 const QUIT_WAIT: Duration = Duration::from_secs(2);
 const CLASS: &str = "TinySkillSyncTray";
@@ -103,6 +106,13 @@ struct Shell {
     /// `config.json` cannot be read. Until it can, the settings in use stay as they were, and if the app has not
     /// started yet it does not start: it would not know which skills folder to look at.
     cfg_error: bool,
+    /// Settings files beside the executable are read and written only by the worker.
+    portable_mode: bool,
+    saving_settings: bool,
+    /// The first worker load decides whether this machine should open the window.
+    initial_load: bool,
+    background: bool,
+    open_after_initial: bool,
     /// How the last thing the user asked for went, for the status line.
     feedback: Option<String>,
     /// When the worker was handed the job it runs.
@@ -161,12 +171,14 @@ pub fn run() -> i32 {
     }
 
     let cfg_file = home.join(CONFIG_FILE);
-    let first_run = !cfg_file.exists();
-    let (cfg, cfg_error) = match Config::load(&cfg_file) {
-        Ok(cfg) => (cfg, None),
-        Err(e) => (Config::default(), Some(e)),
-    };
     let host = SystemHost;
+    let executable_dir = match host.executable_dir() {
+        Ok(directory) => directory,
+        Err(error) => {
+            message_box(&sentence(&error));
+            return 2;
+        }
+    };
     let remote = match host.remote() {
         Ok(remote) => remote,
         Err(e) => {
@@ -174,6 +186,7 @@ pub fn run() -> i32 {
             return 2;
         }
     };
+    let cfg = Config::default();
     let skills = host.skills_dir(&cfg);
     let engine = Engine::new(Paths::new(home.clone(), skills.clone()), remote, host.tokens());
 
@@ -214,14 +227,13 @@ pub fn run() -> i32 {
 
     let now = now_secs();
     let mut app = App::new(cfg, skills.clone());
+    app.set_settings_source(SettingsSource::new(cfg_file.clone(), executable_dir));
+    app.queue_initial_settings_load();
     if background {
         app.started_by_windows(now);
     }
     for problem in app.cfg().problems() {
         app.board.say(now, Level::Attention, format!("Settings problem: {problem}"));
-    }
-    if let Some(e) = &cfg_error {
-        app.board.say(now, Level::Error, format!("{}. Nothing is checked until it is fixed.", sentence(e)));
     }
     let paths = Paths::new(home.clone(), skills.clone());
     let shell = Shell {
@@ -234,7 +246,12 @@ pub fn run() -> i32 {
         skills_watch: Watch::open(&skills, true, SKILL_CHANGES),
         cfg_stamp: stamp_of(&cfg_file),
         seen_state: stamp_of(&paths.state_file()),
-        cfg_error: cfg_error.is_some(),
+        cfg_error: false,
+        portable_mode: false,
+        saving_settings: false,
+        initial_load: true,
+        background,
+        open_after_initial: false,
         feedback: None,
         sent_at: None,
         diff: None,
@@ -244,11 +261,6 @@ pub fn run() -> i32 {
     tray::init(hwnd);
     bench::mark("tray", None);
     on_kick();
-    // A settings error is shown whatever started the app: nothing is checked until it is fixed.
-    if cfg_error.is_some() || (first_run && !background) {
-        open_window();
-    }
-
     let code = pump(None);
     shutdown();
     SHELL.with(|s| s.borrow_mut().take());
@@ -323,31 +335,31 @@ impl Shell {
 
     /// Hands the worker the next job, and sets the timer for the one after.
     fn dispatch(&mut self) {
-        let paused = self.cfg_error && !self.app.started();
-        if !paused {
-            if let Some(order) = self.app.next_order() {
-                self.sent_at = Some(Instant::now());
-                // A flag belongs to exactly one order. A late cancellation can never poison its successor.
-                self.cancel = Arc::new(AtomicBool::new(false));
-                if let Err(mpsc::SendError((order, _))) = self.orders.send((order, self.cancel.clone())) {
-                    // Only if the worker died; the job fails like any other, so nothing waits for it forever.
-                    let why = "the worker thread stopped; quit and start Tiny Skill Sync again".to_string();
-                    let failed = Done {
-                        job: order.job,
-                        result: Err(EngineError::Failed(why)),
-                        next_wake: None,
-                        last_checks: Vec::new(),
-                        kept: Vec::new(),
-                        facts: Vec::new(),
-                        lists_nothing: Vec::new(),
-                        private: Vec::new(),
-                        stamp: None,
-                    };
-                    self.on_done(failed);
-                }
+        if let Some(order) = self.app.next_order() {
+            self.sent_at = Some(Instant::now());
+            // A flag belongs to exactly one order. A late cancellation can never poison its successor.
+            self.cancel = Arc::new(AtomicBool::new(false));
+            if let Err(mpsc::SendError((order, _))) = self.orders.send((order, self.cancel.clone())) {
+                // Only if the worker died; the job fails like any other, so nothing waits for it forever.
+                let why = "the worker thread stopped; quit and start Tiny Skill Sync again".to_string();
+                let failed = Done {
+                    job: order.job,
+                    result: Err(EngineError::Failed(why)),
+                    next_wake: None,
+                    last_checks: Vec::new(),
+                    kept: Vec::new(),
+                    facts: Vec::new(),
+                    lists_nothing: Vec::new(),
+                    private: Vec::new(),
+                    stamp: None,
+                    settings: None,
+                    config_saves: Vec::new(),
+                    settings_checked: false,
+                };
+                self.on_done(failed);
             }
         }
-        let at = if paused { None } else { self.app.arm(now_secs()) };
+        let at = self.app.arm(now_secs());
         unsafe {
             match at {
                 Some(at) => {
@@ -362,10 +374,52 @@ impl Shell {
         }
     }
 
-    fn on_done(&mut self, done: Done) {
+    fn on_done(&mut self, mut done: Done) {
         let job = done.job.clone();
+        if let Some(settings) = done.settings.take() {
+            let initial = self.initial_load;
+            let first_run = settings.first_run;
+            self.initial_load = false;
+            match settings.result {
+                Ok(loaded) => {
+                    self.cfg_error = false;
+                    self.portable_mode = loaded.portable;
+                    self.cfg_stamp = stamp_of(&self.cfg_file());
+                    if self.app.cfg() != &loaded.config {
+                        for problem in loaded.config.problems() {
+                            self.app.board.say(now_secs(), Level::Attention, format!("Settings problem: {problem}"));
+                        }
+                    }
+                    let moved = loaded.skills_dir != *self.app.skills_dir();
+                    self.app.settings_reloaded(loaded, &job);
+                    if moved {
+                        self.skills_watch = None;
+                    }
+                }
+                Err(error) => {
+                    self.cfg_error = true;
+                    self.app.board.say(now_secs(), Level::Error, format!("{}. Nothing is checked until it is fixed.", sentence(&error)));
+                }
+            }
+            if initial && (self.cfg_error || (first_run && !self.background)) {
+                self.open_after_initial = true;
+            }
+        }
+
         bench::mark(bench::job_label(&job), self.sent_at.take().map(|t| t.elapsed()));
+        let config_saves = done.config_saves.clone();
         let settled = self.app.finish(done, now_secs());
+        if !config_saves.is_empty() {
+            self.saving_settings = false;
+        }
+        for saved in &config_saves {
+            if saved.result.is_ok() && self.app.cfg() == &saved.before {
+                self.app.set_cfg(saved.after.clone(), self.app.skills_dir().clone());
+            }
+        }
+        if !config_saves.is_empty() && config_saves.iter().all(|saved| saved.result.is_ok()) && self.feedback.as_deref() == Some("Saving shared settings…") {
+            self.feedback = None;
+        }
         if let Some(id) = settled.removed {
             self.drop_from_config(&id);
         }
@@ -394,6 +448,15 @@ impl Shell {
 
     /// The engine let go of a repository; it leaves the settings too.
     fn drop_from_config(&mut self, id: &str) {
+        if self.portable_mode {
+            let before = self.app.cfg().clone();
+            let mut cfg = before.clone();
+            cfg.repos.retain(|r| r.id != id);
+            if cfg != before {
+                self.save_portable_config(before, cfg, false);
+            }
+            return;
+        }
         let file = self.cfg_file();
         let saved = Config::load(&file).and_then(|mut cfg| {
             cfg.repos.retain(|r| r.id != id);
@@ -419,6 +482,14 @@ impl Shell {
         }
     }
 
+    fn save_portable_config(&mut self, before: Config, after: Config, revert_on_failure: bool) {
+        let skills = self.app.skills_dir().clone();
+        self.app.set_cfg(after.clone(), skills);
+        self.app.queue_config_save(before, after, true, revert_on_failure);
+        self.saving_settings = true;
+        self.feedback = Some("Saving shared settings…".to_string());
+    }
+
     /// Uses new settings. `tell` says what is wrong with them, for settings changed outside the app.
     fn apply_cfg(&mut self, cfg: Config, tell: bool) {
         self.cancel.store(true, Ordering::Relaxed);
@@ -442,15 +513,17 @@ impl Shell {
         let stamp = stamp_of(&file);
         if stamp.is_some() && stamp != self.cfg_stamp {
             self.cfg_stamp = stamp;
-            match Config::load(&file) {
-                Ok(cfg) => {
-                    self.cfg_error = false;
-                    self.apply_cfg(cfg, true);
-                }
-                Err(e) => {
-                    self.cfg_error = true;
-                    let text = format!("{}. The settings in use are unchanged, and nothing is saved to the file until it is fixed.", sentence(&e));
-                    self.app.board.say(now_secs(), Level::Error, text);
+            if !self.portable_mode {
+                match Config::load(&file) {
+                    Ok(cfg) => {
+                        self.cfg_error = false;
+                        self.apply_cfg(cfg, true);
+                    }
+                    Err(e) => {
+                        self.cfg_error = true;
+                        let text = format!("{}. The settings in use are unchanged, and nothing is saved to the file until it is fixed.", sentence(&e));
+                        self.app.board.say(now_secs(), Level::Error, text);
+                    }
                 }
             }
         }
@@ -479,6 +552,9 @@ impl Shell {
         if self.cfg_error {
             return CFG_UNREADABLE.to_string();
         }
+        if !self.app.settings_initialized() {
+            return "Loading settings…".to_string();
+        }
         if !self.app.cfg().repos.iter().any(|r| r.enabled) {
             return "Add a repository to start".to_string();
         }
@@ -503,7 +579,7 @@ impl Shell {
     }
 }
 
-const CFG_UNREADABLE: &str = "config.json can’t be read; see Activity";
+const CFG_UNREADABLE: &str = "Settings cannot be read; see Activity";
 
 /// What the main window shows.
 pub struct Snapshot {
@@ -559,10 +635,74 @@ pub fn tell(text: String) {
     kick();
 }
 
-/// Changes the settings in `config.json` as it is now on disk, and uses them. `change` returns whether it changed
-/// anything; nothing is saved when it did not, or when it fails. A failure is also shown on the status line.
+pub fn startup_offer_seen() -> Result<bool, String> {
+    startup_offer_seen_at(&Paths::home_dir().join(STARTUP_OFFER_FILE))
+}
+
+fn startup_offer_seen_at(path: &Path) -> Result<bool, String> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(format!("the Start with Windows offer could not be checked: {error}")),
+    }
+}
+
+pub fn mark_startup_offer_seen() -> Result<(), String> {
+    mark_startup_offer_seen_at(&Paths::home_dir().join(STARTUP_OFFER_FILE))
+}
+
+fn mark_startup_offer_seen_at(path: &Path) -> Result<(), String> {
+    let result = OpenOptions::new().write(true).create_new(true).open(path);
+    match result {
+        Ok(mut file) => {
+            if let Err(error) = file.write_all(b"seen\n").and_then(|()| file.sync_all()) {
+                drop(file);
+                let _ = fs::remove_file(path);
+                Err(format!("the Start with Windows offer could not be remembered: {error}"))
+            } else {
+                Ok(())
+            }
+        }
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Ok(()),
+        Err(error) => Err(format!("the Start with Windows offer could not be remembered: {error}")),
+    }
+}
+
+/// Reloads shared companions when a new window opens. The read runs through the worker queue.
+pub fn reload_settings() {
+    with_shell(|s| {
+        s.feedback = None;
+        s.app.request_settings_reload();
+    });
+    kick();
+}
+
+/// Changes settings and uses them. Local config keeps its immediate save behavior; portable companions are saved on
+/// the worker so a slow shared folder never blocks the UI.
 pub fn edit_config(change: impl FnOnce(&mut Config) -> Result<bool, String>) -> Result<bool, String> {
     let result = with_shell(|s| {
+        if !s.app.settings_initialized() {
+            return Err("Settings are still loading; try again in a moment".to_string());
+        }
+        if s.cfg_error {
+            return Err("Settings could not be loaded; fix them before editing".to_string());
+        }
+        if s.saving_settings {
+            return Err("Shared settings are still being saved; try again in a moment".to_string());
+        }
+        if !s.app.portable_mode() && s.app.portable_probe_pending() {
+            return Err("Settings are being checked; try again in a moment".to_string());
+        }
+        if s.portable_mode {
+            let before = s.app.cfg().clone();
+            let mut cfg = before.clone();
+            if !change(&mut cfg)? {
+                return Ok(false);
+            }
+            s.save_portable_config(before, cfg, true);
+            return Ok(true);
+        }
+
         let file = s.cfg_file();
         let mut cfg = Config::load(&file)?;
         if !change(&mut cfg)? {
@@ -585,6 +725,30 @@ pub fn edit_config(change: impl FnOnce(&mut Config) -> Result<bool, String>) -> 
 
 pub fn is_idle() -> bool {
     with_shell(|s| s.app.is_idle()).unwrap_or(false)
+}
+
+#[cfg(test)]
+mod startup_offer_tests {
+    use super::*;
+
+    fn temp_dir(label: &str) -> PathBuf {
+        let directory = std::env::temp_dir().join(format!("tss-shell-{label}-{}", crate::fsx::unique_suffix()));
+        fs::create_dir_all(&directory).unwrap();
+        directory
+    }
+
+    #[test]
+    fn startup_offer_marker_is_local_idempotent_state() {
+        let directory = temp_dir("startup-offer");
+        let marker = directory.join(STARTUP_OFFER_FILE);
+
+        assert!(!startup_offer_seen_at(&marker).unwrap());
+        mark_startup_offer_seen_at(&marker).unwrap();
+        mark_startup_offer_seen_at(&marker).unwrap();
+        assert!(startup_offer_seen_at(&marker).unwrap());
+
+        fs::remove_dir_all(directory).unwrap();
+    }
 }
 
 /// Asks for [`on_kick`] once, however often it is asked for before it runs.
@@ -763,9 +927,12 @@ fn on_tray(hwnd: HWND, wp: WPARAM, lp: LPARAM) {
 
 /// Opens the window, or brings it to the front. Someone is looking, so nothing waits for sign-in to settle.
 fn open_window() {
-    with_shell(|s| s.app.user_here());
+    with_shell(|s| {
+        s.app.user_here();
+    });
     kick();
     window::open();
+    window::offer_startup_once();
 }
 
 fn on_command(hwnd: HWND, id: usize) {
@@ -795,14 +962,18 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
     match msg {
         WM_KICK => on_kick(),
         WM_WORKER => {
-            let drained = with_shell(|s| {
+            let open_window_after_initial = with_shell(|s| {
                 while let Ok(done) = s.done.try_recv() {
                     s.on_done(done);
                 }
+                std::mem::take(&mut s.open_after_initial)
             });
-            if drained.is_none() {
+            if open_window_after_initial == Some(true) {
+                open_window();
+            } else if open_window_after_initial.is_none() {
                 unsafe { PostMessageW(hwnd, WM_WORKER, 0, 0) };
             }
+            window::offer_startup_once();
             kick();
         }
         tray::WM_TRAY => on_tray(hwnd, wp, lp),

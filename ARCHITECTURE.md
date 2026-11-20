@@ -34,14 +34,15 @@ case by case. Code that talks to Windows is kept in `src\win\`.
 
 | Module | Job | Pure? |
 | --- | --- | --- |
-| `config` | `config.json`: the repositories, their intervals, the skills folder. | yes |
+| `config` | Configuration model and local `config.json` parsing and writing. | file I/O |
+| `portable` | Versioned settings and repository companion files beside the executables; portable skills-path expansion. | file I/O |
 | `tree` | Reads a GitHub tree listing and decides which folders are skills. | yes |
 | `pathsafe` | Rules for names and paths that come from GitHub (no `..`, no `CON`, no case clashes, length). | yes |
 | `reconcile` | The decision table: given upstream, the record and the disk, what may be done to each skill? | yes |
 | `scheduler` | When is each repository due; how long to wait after a failure. | yes |
 | `interval` | `30m`, `6h`, `1d`, `2w`, `1mo` and calendar-month arithmetic. | yes |
 | `board` | What the tray and the window say: one line per repository and per skill, and the buttons. | yes |
-| `app` | The tray app without its windows: which job runs next and when to wake up. | yes |
+| `app` | The tray app without its windows: which job runs next, when to wake up, and worker settings lifecycle. | state machine and worker I/O |
 | `autostart` | Start with Windows: what the startup entry says, what it means, and which registry keys may be written. | yes |
 | `diff` | What is different between the GitHub copy of a skill and the copy on disk, line by line ("Show changes"), and a skill's files whole ("Preview"). | yes |
 | `text` | When two copies of a file are the same: line endings, the line break at the end and blank lines don't count. | yes |
@@ -67,9 +68,11 @@ The tray app has two threads.
 
 - The **UI thread** owns the hidden main window, the tray icon, the window you open and the message loop. It sleeps in
   `MsgWaitForMultipleObjectsEx` on window messages and three handles: a waitable timer set to the next check, a change
-  notification on the app's folder (`config.json`, `state.json`), and one on the skills folder. Nothing polls.
-- The **worker thread** owns the engine and runs one job at a time: the start-up look, a check, a resolution. Network
-  calls, hashing and file changes never run on the UI thread.
+  notification on the local app's folder (`config.json`, `state.json`), and one on the skills folder. Nothing polls.
+- The **worker thread** owns the engine and runs one job at a time: loading settings, the start-up look, a check, a
+  resolution. Network calls, hashing, portable companion-file I/O and file changes never run on the UI thread.
+  Settings load at startup and are reloaded before a poll or explicit check, and when the window opens; no
+  shared-folder watcher is added.
 
 ```mermaid
 sequenceDiagram
@@ -78,7 +81,9 @@ sequenceDiagram
     participant E as Engine
     Note over UI: start: one copy per app folder (named mutex)
     UI->>UI: hidden window and tray icon (about 8 ms)
-    Note over UI: started at sign-in: 30 s pass first, unless you come
+    UI->>W: Load settings
+    W-->>UI: Settings
+    Note over UI: started at sign-in: first look waits 30 s, unless you come
     UI->>W: Startup job
     W->>E: startup: finish interrupted changes, load the record, quick check
     E-->>W: report
@@ -100,10 +105,11 @@ check and when the window closes, the app trims its working set so it holds abou
 least 30 seconds apart; and after the computer wakes from sleep, the app waits 30 seconds for the network.
 
 Started by Windows at sign-in (`--background`, see [Start with Windows](#start-with-windows)), the app shows its icon
-and then does nothing for 30 seconds (`SIGN_IN_GRACE`), so that Windows can finish starting and the network can come
-up: the start-up job is taken off the queue (`App::started_by_windows`) and the timer queues it when the time is up.
-It then runs in background mode, followed by the check of any repository that is due. Meanwhile the icon is a blue
-ring with the tooltip "waiting for Windows to finish starting" (`Health::Waiting`). Someone coming ends the wait:
+and reads settings on the worker, but does not look at skills or GitHub for 30 seconds (`SIGN_IN_GRACE`), so that
+Windows can finish starting and the network can come up: the start-up job is taken off the queue
+(`App::started_by_windows`) and the timer queues it when the time is up. It then runs in background mode, followed by
+the check of any repository that is due. Meanwhile the icon is a blue ring with the tooltip "waiting for Windows to
+finish starting" (`Health::Waiting`). Someone coming ends the wait:
 opening the window, or any job they ask for, queues the start-up job at once at normal priority (`App::user_here`);
 timed checks still wait for the 30 seconds. A look the skills folder's notification asks for during the wait is
 dropped, because the start-up job looks anyway.
@@ -169,7 +175,8 @@ owns, and what is on disk. It is a pure function; every row below is a test.
 | has it, same | owned | clean | In sync |
 | has it, changed | owned | clean | **Update** |
 | has it, same | owned | edited or deleted | Report only |
-| has it, changed | owned | edited or deleted | **Hold** |
+| has it, changed | owned | edited, and the folder is now what upstream has | **Catch up** (record it, change nothing) |
+| has it, changed | owned | edited (not what upstream has) or deleted | **Hold** |
 | gone | owned | clean | **Delete** |
 | gone | owned | edited | **Hold** |
 | gone | owned | no folder | Forget it |
@@ -194,6 +201,31 @@ byte against the Git blob hash.
 **A failure never reaches this table.** `github::FailureKind` separates authentication, not found, rate limited, server
 error, redirect, protocol, network, too large, cancelled, changed during download and local errors. Any of them ends
 the check of that repository before anything is decided.
+
+### An edit that GitHub has too
+
+"Edited" in the table means the folder differs from what the app *recorded* when it installed the skill. **Show
+changes** compares the folder with what GitHub has *now*. When an edit made here is later put on GitHub too, the two
+disagree: the folder is not what was recorded, and yet it is exactly what GitHub has. Held for ever, the skill would
+look edited while **Show changes** says there is nothing to show.
+
+So before reconciling, for each owned skill that is edited **and** whose upstream changed (`reconcile::needs_comparison`:
+a clean skill or an unchanged upstream costs nothing), the engine compares the folder with upstream
+(`Engine::compare_owned`, `verify::compare_owned`). The folder counts as what upstream has only when every upstream
+file is here and the same as `text.rs` says, **and** every file the record owns that upstream dropped is gone. Then the
+verdict is **Catch up**: `Applier::catch_up` looks at the folder once more, records the current commit and files, and
+writes not one byte to it. Any other difference keeps the hold, as before.
+
+- **Reads are only for what the record cannot answer.** For every file GitHub did not change, the record's `canon`
+  already says what GitHub has (`verify::known_canons`), so the common hold, "edited one file here while GitHub
+  changed another", reads nothing from GitHub. Otherwise a text file whose bytes differ from GitHub's is read from
+  GitHub, one file at a time, until a difference is proven or everything agrees. Cost: a held skill is listed again at
+  every check (it already was), and this comparison runs again with it: at most one small download per file GitHub
+  changed, usually one, and none once the skill settles.
+- **A failed read ends the check** of the repository before anything is decided, like any failure. So a read that
+  keeps failing for one edited skill also holds back the repository's other skills until it stops failing or that
+  skill is resolved. That is the price of one simple rule: a failure decides nothing. Going past the download limit
+  only leaves that skill held; it is never read as a match.
 
 ### Recognising older copies
 
@@ -317,6 +349,9 @@ flowchart TD
   listing. Subfolders are opened by their path, again without following a link at the end of the path, so a folder
   replaced by a link is reported, never followed. A listing only reads names; if a folder higher up is swapped for a
   link while it runs, the names may come from the link's target (a known limit of opening by path).
+- "Edited" always means *different from what was recorded*. The other question, *is the folder what GitHub has now*,
+  is `verify::compare_owned`, asked only of an edited skill whose upstream changed (see
+  [An edit that GitHub has too](#an-edit-that-github-has-too)).
 
 The evidence for this design, including the spikes that measured it, is in [spikes/README.md](spikes/README.md) and the
 tests in `tests\downtime.rs`.
@@ -346,11 +381,27 @@ flowchart TD
     Home["%LOCALAPPDATA%\tiny-skill-sync"] --> Config[config.json: what you set]
     Home --> StateFile[state.json: what the app owns]
     Home --> LockFile[engine.lock: one worker at a time]
+    Exe["Executable folder (shared, optional)"] --> Settings[tiny-skill-sync.settings.json]
+    Exe --> Sources[tiny-skill-sync.sources.json]
     Parent["%USERPROFILE%\.copilot"] --> Skills[skills: only skill folders]
     Parent --> Work[.tss-work: stage, old, trash, backups]
 ```
 
-- `config.json` is meant to be read and edited by hand. The tray reloads it when it changes.
+- In local mode, `config.json` is meant to be read and edited by hand. The tray reloads it when it changes.
+- Portable mode is selected when either companion file exists beside the executable. `portable.rs` merges the two
+  versioned portions into the existing `Config` model; a missing portion uses defaults, while a malformed or
+  unsupported present file is an error. `tss portable` exports local settings into both files and refuses to replace
+  either existing file.
+- Companion files are read and written on the worker, without a new notification handle. The app reloads them before a
+  portable poll or explicit check and when the window opens. Saves compare the changed portion with the version last
+  loaded and write only that portion; separate files are not a cross-file transaction, so simultaneous writers are
+  unsupported.
+- `state.json`, `engine.lock`, window size, the startup-offer marker, mutex and saved token stay per machine. Shared
+  repository records include their enabled state and interval. A missing shared repository becomes an orphan in the
+  local ownership record; it is not a request to delete its skills.
+- The default skills folder is resolved from each machine's `%USERPROFILE%`. Portable `skills_dir` values may contain
+  environment variables; a folder shared by machines is unsupported because each machine keeps its own ownership
+  record and can otherwise race while changing the same skills.
 - `state.json` holds, per repository: the ETag of the last fully applied listing, the last check time, whether the last
   listing had no skills in it at all, the "keep mine" list, and per owned skill its commit, its files (path, Git blob
   hash, size, fingerprint, and `canon`, the hash of the lines that count), when the app last installed, updated or took
@@ -386,13 +437,15 @@ everything they show.
   dividers, icons, plain text). A page is a `Surface`: its items, each a real child window with an id and the text it
   shows (so the tests find them), and its decorations. `set` matches a new surface with the controls already there by
   id, so the focus, the hover and the scroll position survive a refresh. A window costs about 0.15 ms to make, so only
-  the controls within about two screens of what is shown are made (`NEAR`); the others are made as the page scrolls to
+  the controls within about two screens of what is shown are made initially (`NEAR`); the others are made as the page scrolls to
   them, or when the window asks for one by id (`child`). 463 skills open in about 43 ms; with a control made for every
   row it took 125 ms. The controls of a page never overlap: they are sibling windows that do not clip each other, so a
   control that paints again by itself (under the mouse, on a click) would draw over the part of a neighbour it covers.
-  The `page.rs` tests and the e2e layout check enforce this. So the folder button a skill row shows under the mouse is
-  not a control: the row draws it (`Look::Row { folder }`), knows where it is (`control::row_parts`), and tells the
-  window `ROW_FOLDER` instead of a click when a press starts and ends on it.
+  The `page.rs` tests and the e2e layout check enforce this. A skill row draws its action icons after the measured
+  name, sharing their rectangles with hit testing. The focused row also offers a native menu with the command names.
+  After the popup returns, the window looks up the repository and skill again before acting: a refresh can reorder
+  the rows or remove a command while the menu is open. Keyboard focus returns by skill identity rather than by the
+  old row index.
 - **`paint.rs`** draws each paint into one off-screen bitmap and copies it to the screen at once, so nothing flickers.
   Rounded boxes are anti-aliased by hand (GDI cannot); text is drawn by GDI with ClearType. Positions are in DIPs and
   become pixels at the window's DPI. A control has no background of its own: it asks its parent to draw what is under
@@ -448,9 +501,11 @@ can't be read, skills that need you, repositories that need you, the first check
 line under it says where, when the last check was, and when the next one is (`page::hero_of`). While the app works, or
 just after it told you something, that line says so instead. After a check you asked for, it is `summary` in `app.rs`:
 a failed check puts the reason first, and a check that found nothing new says "Checked: nothing new on GitHub" unless
-all is well. A skill row opens to show a card (`page::skill_card`): what is the matter (`Row.text`, `board.rs`) and the
-choices first, then one line of facts, then **Preview**, **Copy path**, **Copy GitHub link**, **Open on GitHub** and
-**Open folder**, each only when it can work. The facts (`Row.facts`) come from the record after every job
+all is well. Each skill header paints only its name, actions and status badge. Its window text also carries the
+explanation (`Row.text`, `board.rs`) and known facts for the row tooltip, whether open or closed; hovering an
+action shows that action's tooltip instead.
+Only attention/error rows with resolution choices expand. Routine commands remain beside the name even while
+those choices are open. The facts (`Row.facts`) come from the record after every job
 (`engine::facts`, which reads nothing from disk) and are worded by `board::facts_text`; a plain row ("Up to date",
 "Installed") that has them leaves out its sentence, which says no more than its tag. A skill that needs you starts
 open. Each skill has 16 ids (`page::id::STRIDE`): its row, its parts and its buttons, so `page::hit` tells the skill and
@@ -471,8 +526,8 @@ switched off in Windows (the app's own entry with an odd mark), another copy (th
 path) and too long. The entry is matched by the program it starts, found the way Windows finds it (`program`), with
 no case and in either form of this exe's path. `win\autorun.rs` reads and writes the registry:
 
-- It reads only when the Settings page is shown, before the offer to turn it on after the first repository is added,
-  and in `tss startup`. Never at start or on a timer.
+- It reads only when the Settings page is shown, before the one-time per-machine offer after the first repository is
+  added or first shared repositories are opened, and in `tss startup`. Never at start or on a timer.
 - It writes only when the user turns the switch, accepts the offer or runs `tss startup on|off`, and never puts back
   an entry the user deleted or switched off. Turning it on writes the entry and deletes Windows' mark; turning it off
   deletes both, but only when the entry starts this copy.
@@ -480,12 +535,15 @@ no case and in either form of this exe's path. `win\autorun.rs` reads and writes
   long path when the command fits (a path of at most 245 characters), else by its short (8.3) path from
   `GetShortPathNameW`. When neither fits, the state is too long and the switch is greyed out. The `\\?\` prefix is
   never written.
+- When a running copy resolves to a UNC network path, `win\autorun.rs` prefers that path for the startup entry and
+  `build.rs` links both executables with `/SWAPRUN:NET`. This permits Windows to load the image from a network share;
+  it does not make an unavailable share or an unsynced OneDrive file available at sign-in.
 - A copy with an app folder of its own (`TSS_HOME`: the scripts and tests) keeps its entry and mark under
   `HKCU\Software\tiny-skill-sync-test\<instance>\`, which Windows never reads. `Keys::allowed` and `autorun::guard`
   refuse to write any other key, and refuse Windows' own keys from the tests and from such a copy whatever keys it is
   handed. `scripts\dev.ps1 clean` deletes `HKCU\Software\tiny-skill-sync-test`.
 
-`--background` is all a start at sign-in changes: no window (unless `config.json` can't be read, which the window
+`--background` is all a start at sign-in changes: no window (unless settings can't be read, which the window
 says), the 30-second wait described in [Threads and waking up](#threads-and-waking-up), and a second start while a copy
 runs ends at once with 0 instead of opening that copy's window. `build.rs` writes a version resource into both exes
 (about 1 KiB), so Task Manager names the entry "Tiny Skill Sync" rather than the exe's file name, and the logo as their

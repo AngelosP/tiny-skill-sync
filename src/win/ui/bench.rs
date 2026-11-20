@@ -58,6 +58,7 @@ fn ms(ticks: u64) -> String {
 /// A one-word name for a job in a mark.
 pub fn job_label(job: &Job) -> &'static str {
     match job {
+        Job::LoadSettings => "job-settings",
         Job::Startup => "job-startup",
         Job::Look => "job-look",
         Job::Poll => "job-poll",

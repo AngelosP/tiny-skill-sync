@@ -156,7 +156,7 @@ try {
     $edited = @(Read-Skills $win | Where-Object Name -eq 'review-notes')[0]
     Assert-Demo ($edited.Detail -match 'Update held') 'the window explicitly reports the held update'
     Save-DemoScene $win '04-held' 'Your edits stop an update' 'This skill waits for you. Your words are still on disk.' `
-        (Get-Ui $win $UiPanel.Page ($edited.Id + 1)) 'Sync now used here to show the conflict without another wait.'
+        (Get-Ui $win $UiPanel.Page $edited.Id) 'Sync now used here to show the conflict without another wait.'
     Click-Ui $win $UiPanel.Page ($edited.Id + 2)
     [void](Wait-Live { Read-Ui $win $UiPanel.Files $UiId.File } 'Show changes')
     Assert-Demo ((Read-Ui $win $UiPanel.Files $UiId.File) -match '^SKILL.md') 'Show changes compares the edited file'

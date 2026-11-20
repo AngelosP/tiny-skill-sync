@@ -25,6 +25,22 @@ public static class TssLive {
     [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
     [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr hwnd, IntPtr after, int x, int y, int cx, int cy, uint flags);
     [DllImport("user32.dll")] public static extern uint GetDpiForWindow(IntPtr hwnd);
+    [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hwnd);
+    [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+    [DllImport("user32.dll")] static extern bool GetGUIThreadInfo(uint thread, ref GUITHREADINFO info);
+    [StructLayout(LayoutKind.Sequential)] struct GUITHREADINFO {
+        public uint Size, Flags;
+        public IntPtr Active, Focus, Capture, MenuOwner, MoveSize, Caret;
+        public RECT CaretRect;
+    }
+
+    public static IntPtr Focused(IntPtr window) {
+        uint pid;
+        uint thread = GetWindowThreadProcessId(window, out pid);
+        GUITHREADINFO info = new GUITHREADINFO();
+        info.Size = (uint)Marshal.SizeOf(typeof(GUITHREADINFO));
+        return thread != 0 && GetGUIThreadInfo(thread, ref info) ? info.Focus : IntPtr.Zero;
+    }
     [DllImport("user32.dll")] public static extern int GetScrollPos(IntPtr hwnd, int bar);
     [DllImport("kernel32.dll")] public static extern bool QueryProcessCycleTime(IntPtr process, out ulong cycles);
 
@@ -163,19 +179,36 @@ public static class TssLive {
         }
     }
 
-    // Where something drawn on a plain background starts, going left along line y of a picture from x (a point of the
-    // background right of it): the leftmost x of the first run of pixels that are not the background's colour, or -1
-    // when there is none. Finds the left edge of a skill's status pill, which is as wide as its text.
-    public static int LeftEdge(string path, int x, int y) {
-        using (Bitmap bmp = new Bitmap(path)) {
-            Color bg = bmp.GetPixel(x, y);
-            Func<int, bool> same = i => { Color c = bmp.GetPixel(i, y); return Math.Abs(c.R - bg.R) <= 8 && Math.Abs(c.G - bg.G) <= 8 && Math.Abs(c.B - bg.B) <= 8; };
-            int at = x;
-            while (at > 0 && same(at)) at--;
-            if (at == 0) return -1;
-            while (at > 0 && !same(at - 1)) at--;
-            return at;
+    // Find the glyphs that appeared on a row, not its hover background, unchanged name or status. Use the
+    // middle band to exclude the focus outline. Return x centres relative to the row for pointer hit tests.
+    public static int[] NewGlyphs(string before, string after, int x, int y, int w, int h, int gap) {
+        var centres = new System.Collections.Generic.List<int>();
+        using (Bitmap a = new Bitmap(before))
+        using (Bitmap b = new Bitmap(after)) {
+            if (a.Size != b.Size || x < 0 || y < 0 || x+w > a.Width || y+h > a.Height)
+                return centres.ToArray();
+            int first = -1, last = -1;
+            for (int i = gap; i < w - gap; i++) {
+                if (ColumnInk(b, x+i, y+h/4, y+3*h/4) && !ColumnInk(a, x+i, y+h/4, y+3*h/4)) {
+                    if (first < 0 || i-last > gap) {
+                        if (first >= 0) centres.Add((first+last)/2);
+                        first = i;
+                    }
+                    last = i;
+                }
+            }
+            if (first >= 0) centres.Add((first+last)/2);
         }
+        return centres.ToArray();
+    }
+
+    static bool ColumnInk(Bitmap image, int x, int top, int bottom) {
+        Color bg = image.GetPixel(x, top);
+        for (int y = top+1; y <= bottom; y++) {
+            Color p = image.GetPixel(x, y);
+            if (Math.Max(Math.Abs(p.R-bg.R), Math.Max(Math.Abs(p.G-bg.G), Math.Abs(p.B-bg.B))) > 48) return true;
+        }
+        return false;
     }
 
     [DllImport("user32.dll")] static extern bool OpenClipboard(IntPtr owner);
@@ -308,8 +341,10 @@ public static class TssLive {
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern IntPtr SendMessageW(IntPtr hwnd, uint msg, IntPtr wp, StringBuilder lp);
 
     // The text of a window or control of any kind.
-    public static string Text(IntPtr hwnd) {
-        int n = (int)SendMessageW(hwnd, 0x000E, IntPtr.Zero, IntPtr.Zero);
+    public static string Text(IntPtr hwnd) { return Text(hwnd, 256); }
+    public static string Text(IntPtr hwnd, int minimum) {
+        // A visible native tooltip can supply WM_GETTEXT even when WM_GETTEXTLENGTH has no stored caption.
+        int n = Math.Max(minimum, (int)SendMessageW(hwnd, 0x000E, IntPtr.Zero, IntPtr.Zero));
         StringBuilder sb = new StringBuilder(n + 2);
         SendMessageW(hwnd, 0x000D, (IntPtr)(n + 1), sb);
         return sb.ToString();
@@ -400,6 +435,7 @@ $MN_SELECTITEM = 0x1E5
 $CBN_SELENDOK = 9
 $VK_ESCAPE = 0x1B
 $VK_RETURN = 0x0D
+$VK_APPS = 0x5D
 $CMD_SETTINGS = 1001
 $CMD_CHECK = 1002
 $CMD_QUIT = 1003
@@ -422,8 +458,8 @@ $UiId = @{
     DefaultEvery = 320; OpenSkills = 321; OpenBackups = 322; Startup = 325; StartupText = 413
     Title = 400; Private = 401; Sub = 402; InfoLead = 403; InfoText = 404; SkillsDir = 410; TokenText = 411; Empty = 412
     Back = 330; DiffAction = 333; Note = 100000; File = 200000; Gap = 300000
-    # Plus 16 per skill, plus the part: 0 the row ("name`ntag"), 1 its details, 2 Show changes, 3 Open folder, 4 to 7
-    # its actions, 8 its facts, 9 Preview, 10 Copy path, 11 Copy GitHub link, 12 Open on GitHub.
+    # Plus 16 per skill: 0 row ("name`ntag"), 1 explanation, 8 facts; 2 Show changes, 4 to 7 repair choices.
+    # Everyday actions are drawn inside the row, not separate child windows.
     Skill = 1000000; SkillStride = 16
 }
 # A question (src\win\ui\page.rs, mod ask_id): its controls are on one panel.
@@ -868,21 +904,22 @@ function Read-Nav([IntPtr]$Window) {
     }
 }
 
-# The skills on a repository's page, top to bottom: the name and the tag on the row and, when the row is open, the
-# details, the facts and the buttons under it ($null and none when it is closed). Wrap the call in @( ).
+# The skills on a repository's page, top to bottom. Only repair buttons depend on disclosure; collect all
+# child buttons (including obsolete everyday ids) so an unexpected extra button is observable.
 function Read-Skills([IntPtr]$Window) {
     for ($j = 0; ; $j++) {
         $base = $UiId.Skill + $UiId.SkillStride * $j
         $row = Read-Ui $Window $UiPanel.Page $base
         if ($null -eq $row) { break }
-        $two = $row -split "`n", 2
+        $parts = $row -split '\r?\n', 4 # Keep empty fields and all remaining lines of explanation.
+        if ($parts.Count -ne 4) { throw "Skill row $base is missing native text fields." }
         $buttons = @(foreach ($k in @(2..7) + @(9..12)) {
                 $t = Read-Ui $Window $UiPanel.Page ($base + $k)
                 if ($null -ne $t) { [pscustomobject]@{ Id = $base + $k; Text = $t } }
             })
         [pscustomobject]@{
-            Index = $j; Id = $base; Name = $two[0]; Tag = $(if ($two.Count -gt 1) { $two[1] } else { '' })
-            Detail = (Read-Ui $Window $UiPanel.Page ($base + 1)); Facts = (Read-Ui $Window $UiPanel.Page ($base + 8)); Buttons = $buttons
+            Index = $j; Id = $base; Name = $parts[0]; Tag = $parts[1]
+            Facts = $parts[2]; Detail = $parts[3]; Buttons = $buttons
         }
     }
 }

@@ -111,6 +111,8 @@ pub struct Row {
     pub facts: Option<SkillFacts>,
     /// GitHub lists it, so there is something to link to.
     pub listed: bool,
+    /// A local check found no folder, even if the status describes an upstream change or a failed check.
+    pub folder_missing: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -160,6 +162,8 @@ enum Fact {
     Removed,
     /// An identical folder exists and will be taken over.
     Adopting,
+    /// The folder was edited here and is now what upstream has; the record will catch up.
+    Matching,
     Historical(bool),
     Searching,
     HistoryWaiting,
@@ -182,7 +186,7 @@ enum Fact {
 impl Fact {
     /// These only make sense for a skill we own. Once a look at the disk finds no such skill, they are out of date.
     fn needs_ownership(&self) -> bool {
-        matches!(self, Fact::InSync | Fact::Newer | Fact::Removed | Fact::EmptyListing)
+        matches!(self, Fact::InSync | Fact::Newer | Fact::Removed | Fact::EmptyListing | Fact::Matching)
     }
 }
 
@@ -212,7 +216,8 @@ impl SkillBoard {
     fn row(&self) -> Row {
         let shown = present(self.local.as_ref(), self.fact.as_ref());
         let listed = !matches!(self.fact, Some(Fact::Removed | Fact::EmptyListing | Fact::NotSafe(_)));
-        Row { name: self.name.clone(), text: shown.text, tag: shown.tag, level: shown.level, actions: shown.actions, facts: None, listed }
+        let folder_missing = matches!(self.local, Some(LocalStatus::Checked(LocalState::FolderMissing)));
+        Row { name: self.name.clone(), text: shown.text, tag: shown.tag, level: shown.level, actions: shown.actions, facts: None, listed, folder_missing }
     }
 }
 
@@ -226,6 +231,8 @@ fn fact_of(verdict: &Verdict, done: bool) -> Option<Fact> {
         Verdict::Update => Fact::Newer,
         Verdict::Adopt if done => Fact::InSync,
         Verdict::Adopt => Fact::Adopting,
+        Verdict::CatchUp if done => Fact::InSync,
+        Verdict::CatchUp => Fact::Matching,
         Verdict::AdoptHistorical => Fact::Historical(done),
         Verdict::Delete | Verdict::Forget => Fact::Removed,
         Verdict::Held(Hold::UpdateBlocked(_) | Hold::UpdateBlockedMissing) => Fact::Newer,
@@ -273,6 +280,7 @@ pub const DELETED_TAG: &str = "Deleted on this PC";
 const UPDATE_TAG: &str = "Update available";
 const REMOVED_TAG: &str = "Removed on GitHub";
 const NEW_TAG: &str = "New";
+const MATCHING_TAG: &str = "Matches GitHub";
 const DIFFERENT_TAG: &str = "Different copy here";
 const LISTS_NOTHING_TAG: &str = "GitHub lists nothing";
 const KEPT_TAG: &str = "Kept as yours";
@@ -286,15 +294,16 @@ impl Row {
     /// "Show changes" has something to show: a copy here that may differ from GitHub's, under a name that is safe to
     /// look up and in a folder this repository owns.
     pub fn can_compare(&self) -> bool {
-        matches!(
-            self.tag,
-            EDITED_TAG | UPDATE_TAG | REMOVED_TAG | DIFFERENT_TAG | LISTS_NOTHING_TAG | KEPT_TAG | NOT_CHANGED_TAG | FAILED_TAG | INTERRUPTED_TAG
-        )
+        self.has_folder()
+            && matches!(
+                self.tag,
+                EDITED_TAG | UPDATE_TAG | REMOVED_TAG | DIFFERENT_TAG | LISTS_NOTHING_TAG | KEPT_TAG | NOT_CHANGED_TAG | FAILED_TAG | INTERRUPTED_TAG
+            )
     }
 
     /// There may be a folder to open.
     pub fn has_folder(&self) -> bool {
-        !matches!(self.tag, DELETED_TAG | NEW_TAG | NOT_SAFE_TAG)
+        !self.folder_missing && !matches!(self.tag, DELETED_TAG | NEW_TAG | NOT_SAFE_TAG)
     }
 
     /// Nothing is the matter: the sentence behind the tag says no more than the tag.
@@ -363,6 +372,10 @@ fn present(local: Option<&LocalStatus>, fact: Option<&Fact>) -> Shown {
         },
         Some(Fact::New) => shown(Verdict::Install.message(), NEW_TAG, Ok, &[]),
         Some(Fact::Adopting) => shown("Already installed and identical: will be managed at the next check", "Will be managed", Ok, &[]),
+        Some(Fact::Matching) => match state {
+            Some(LocalState::FolderMissing) => shown(Verdict::MissingLocally.message(), DELETED_TAG, Attention, &DELETED),
+            _ => shown("Edited here, and GitHub has the same: will be marked as in sync at the next check", MATCHING_TAG, Ok, &[]),
+        },
         Some(Fact::Historical(true)) => shown("An older copy from GitHub was verified, adopted and updated", "Older copy updated", Ok, &[]),
         Some(Fact::Historical(false)) => shown(Verdict::AdoptHistorical.message(), "Older GitHub copy", Ok, &[]),
         Some(Fact::Searching) => {
@@ -508,7 +521,7 @@ impl Board {
     /// One message for each kind of change a check made on this PC. Up to three skills are named, more are counted.
     fn tell_changes(&mut self, now: UnixSecs, report: &RepoReport) {
         let from = repo_name(&report.label);
-        for verdict in [Verdict::Install, Verdict::Update, Verdict::Delete, Verdict::Adopt, Verdict::AdoptHistorical] {
+        for verdict in [Verdict::Install, Verdict::Update, Verdict::Delete, Verdict::Adopt, Verdict::AdoptHistorical, Verdict::CatchUp] {
             let names: Vec<&str> = report.skills.iter().filter(|s| s.result == ApplyResult::Done && s.verdict == verdict).map(|s| s.name.as_str()).collect();
             let what = match names.as_slice() {
                 [] => continue,
@@ -523,6 +536,7 @@ impl Board {
                 Verdict::Update => format!("Updated {what} from {from}"),
                 Verdict::Delete => format!("Deleted {what}: {from} no longer has {them}"),
                 Verdict::AdoptHistorical => format!("Verified and adopted an older GitHub copy of {what}, then updated {them} from {from}"),
+                Verdict::CatchUp => format!("The edits to {what} on this PC are now on {from} too, so {they} marked as in sync"),
                 _ => format!("{what} on this PC matched {from}, so {they} now kept in sync"),
             };
             self.say(now, Level::Ok, text);
@@ -988,6 +1002,11 @@ mod tests {
             (Verdict::Adopt, ApplyResult::Done, Level::Ok, vec![], "In sync", "Up to date"),
             (Verdict::Adopt, ApplyResult::DryRun, Level::Ok, vec![], "will be managed", "Will be managed"),
             (Verdict::Adopt, held(), Level::Attention, vec![], "Not changed", "Not changed"),
+            (Verdict::CatchUp, ApplyResult::Done, Level::Ok, vec![], "In sync", "Up to date"),
+            (Verdict::CatchUp, ApplyResult::DryRun, Level::Ok, vec![], "GitHub has the same", "Matches GitHub"),
+            (Verdict::CatchUp, ApplyResult::NotTried, Level::Ok, vec![], "GitHub has the same", "Matches GitHub"),
+            (Verdict::CatchUp, held(), Level::Attention, vec![], "Not changed", "Not changed"),
+            (Verdict::CatchUp, broke(), Level::Error, vec![], "Failed: disk full", "Failed"),
             (Verdict::Delete, ApplyResult::DryRun, Level::Ok, vec![], "will be deleted", "Removed on GitHub"),
             (Verdict::Delete, ApplyResult::NotTried, Level::Ok, vec![], "will be deleted", "Removed on GitHub"),
             (Verdict::Delete, held(), Level::Attention, vec![], "Not changed", "Not changed"),
@@ -1024,13 +1043,29 @@ mod tests {
     }
 
     #[test]
+    fn an_edit_that_github_has_too_is_not_called_an_edit_but_a_deleted_folder_still_is() {
+        let mut board = after(Outcome::Synced, vec![skill("s", Verdict::CatchUp, ApplyResult::NotTried)]);
+        for local in [edited("a.md"), clean()] {
+            board.note_verify(&verified(vec![("a", "s", local)]), NOW);
+            let got = row(&board, "s");
+            assert_eq!((got.tag, got.level, got.actions.is_empty()), ("Matches GitHub", Level::Ok, true));
+        }
+        board.note_verify(&verified(vec![("a", "s", missing())]), NOW);
+        let got = row(&board, "s");
+        assert_eq!((got.tag, got.level), ("Deleted on this PC", Level::Attention));
+    }
+
+    #[test]
     fn show_changes_is_offered_for_a_copy_here_that_may_differ_and_open_folder_where_one_may_be() {
         let na = || ApplyResult::NotApplicable;
         let cases = [
             (Verdict::InSync, na(), false, true),
             (Verdict::Install, ApplyResult::DryRun, false, false),
             (Verdict::Update, ApplyResult::DryRun, true, true),
+            (Verdict::CatchUp, ApplyResult::DryRun, false, true),
             (Verdict::Delete, ApplyResult::DryRun, true, true),
+            (Verdict::Forget, ApplyResult::DryRun, false, false),
+            (Verdict::Forget, ApplyResult::Failed("disk full".to_string()), false, false),
             (Verdict::Install, ApplyResult::Failed("disk full".to_string()), true, true),
             (Verdict::ModifiedLocally(info("a.md")), na(), true, true),
             (Verdict::MissingLocally, na(), false, false),
@@ -1044,6 +1079,18 @@ mod tests {
             let board = after(Outcome::Unchanged, vec![skill("s", verdict.clone(), result.clone())]);
             let got = row(&board, "s");
             assert_eq!((got.can_compare(), got.has_folder()), (compare, folder), "{verdict:?} / {result:?} ({})", got.tag);
+        }
+    }
+
+    #[test]
+    fn a_local_check_changes_folder_commands_without_changing_the_failure() {
+        let mut board = after(Outcome::NeedsAttention, vec![skill("s", Verdict::Update, ApplyResult::Failed("disk full".to_string()))]);
+        let before = row(&board, "s");
+        for (local, available) in [(missing(), false), (clean(), true)] {
+            board.note_verify(&verified(vec![("a", "s", local)]), NOW);
+            let got = row(&board, "s");
+            assert_eq!((&got.tag, &got.text, got.level, &got.actions), (&before.tag, &before.text, before.level, &before.actions));
+            assert_eq!((got.has_folder(), got.can_compare()), (available, available));
         }
     }
 
@@ -1638,6 +1685,9 @@ mod tests {
             skill("historical", Verdict::AdoptHistorical, ApplyResult::Done),
             skill("history-held", Verdict::AdoptHistorical, ApplyResult::Held("edited".to_string())),
             skill("history-trial", Verdict::AdoptHistorical, ApplyResult::DryRun),
+            skill("mine", Verdict::CatchUp, ApplyResult::Done),
+            skill("catch-held", Verdict::CatchUp, ApplyResult::Held("busy".to_string())),
+            skill("catch-trial", Verdict::CatchUp, ApplyResult::DryRun),
             skill("record", Verdict::Forget, ApplyResult::Done),
             skill("held", Verdict::Update, ApplyResult::Held("edited".to_string())),
             skill("trial", Verdict::Install, ApplyResult::DryRun),
@@ -1655,9 +1705,13 @@ mod tests {
                 (Level::Ok, "Deleted gone: owner/a no longer has it"),
                 (Level::Ok, "same on this PC matched owner/a, so it is now kept in sync"),
                 (Level::Ok, "Verified and adopted an older GitHub copy of historical, then updated it from owner/a"),
+                (Level::Ok, "The edits to mine on this PC are now on owner/a too, so it is marked as in sync"),
             ]
         );
         assert_eq!(row(&board, "historical").tag, "Older copy updated");
+        assert_eq!(row(&board, "mine").tag, "Up to date");
+        assert_ne!(row(&board, "catch-held").tag, "Up to date");
+        assert_ne!(row(&board, "catch-trial").tag, "Up to date");
         assert_ne!(row(&board, "history-held").tag, "Older copy updated");
         assert_ne!(row(&board, "history-trial").tag, "Older copy updated");
 
@@ -1666,6 +1720,7 @@ mod tests {
         let mut many = done(&["a", "b", "c", "d"], Verdict::Install);
         many.extend(done(&["e", "f"], Verdict::Delete));
         many.extend(done(&["g", "h", "i"], Verdict::Adopt));
+        many.extend(done(&["j", "k"], Verdict::CatchUp));
         let mut board = Board::new();
         board.note_sync(&sync_of(vec![report("b", Outcome::Synced, many)]), NOW);
         let got: Vec<&str> = board.messages().map(|m| m.text.as_str()).collect();
@@ -1674,7 +1729,8 @@ mod tests {
             [
                 "Installed 4 skills from owner/b",
                 "Deleted e and f: owner/b no longer has them",
-                "g, h and i on this PC matched owner/b, so they are now kept in sync"
+                "g, h and i on this PC matched owner/b, so they are now kept in sync",
+                "The edits to j and k on this PC are now on owner/b too, so they are marked as in sync"
             ]
         );
     }

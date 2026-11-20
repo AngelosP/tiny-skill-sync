@@ -7,7 +7,7 @@ use std::fs;
 use common::*;
 use tiny_skill_sync::apply::Step;
 use tiny_skill_sync::diff::{Body, FileChange, Presence};
-use tiny_skill_sync::engine::{ApplyResult, DIFF_FILE_BYTES, DiffReport, Outcome, Resolution, SkillFacts, SyncOptions, SyncReport};
+use tiny_skill_sync::engine::{Access, ApplyResult, DIFF_FILE_BYTES, DiffReport, Outcome, Resolution, SkillFacts, SyncOptions, SyncReport};
 use tiny_skill_sync::github::{FailureKind, RemoteError};
 use tiny_skill_sync::reconcile::{Hold, Skip, Verdict};
 
@@ -94,7 +94,9 @@ fn a_skill_edited_locally_is_never_overwritten_and_is_updated_once_the_edit_is_u
     assert!(matches!(skill(repo, "alpha").verdict, Verdict::Held(Hold::UpdateBlocked(_))), "{:?}", skill(repo, "alpha").verdict);
     assert_eq!(s.w.read("alpha/SKILL.md"), "my own words\n", "the user's edit is untouched");
     assert!(s.w.backups().is_empty());
-    assert!(s.remote.calls().file == 0, "nothing was downloaded for a skill that cannot be updated");
+    // The one read is the edited file, to see whether GitHub has the very same words now. Nothing is read to update it.
+    let fetched: Vec<String> = s.remote.log().into_iter().filter(|l| l.starts_with("file ")).collect();
+    assert!(matches!(fetched.as_slice(), [one] if one.ends_with("skills/alpha/SKILL.md")), "only the edited file was read, to compare it: {fetched:?}");
 
     // Still held at the next check: the ETag was not stored, so the listing is looked at again.
     s.advance(60);
@@ -130,6 +132,311 @@ fn an_edit_with_no_upstream_change_is_reported_and_left_alone() {
     assert_eq!(s.w.read("beta/SKILL.md"), "beta, my way\n");
     assert_eq!(s.w.read("beta/notes.txt"), "extra file\n");
     assert!(s.w.backups().is_empty());
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// An edit that GitHub has now too: the disk and GitHub agree, only the record is older
+// ---------------------------------------------------------------------------------------------------------------------
+
+/// What a Windows editor makes of a text: other line breaks and a blank line more at the end.
+fn windows_text(body: &str) -> String {
+    format!("{}\r\n", body.replace('\n', "\r\n"))
+}
+
+/// The user edited a file of alpha, and the same text was pushed to GitHub afterwards.
+fn same_on_both_sides(s: &Setup, rel: &str, body: &str) {
+    s.w.write(&format!("alpha/{rel}"), body);
+    s.remote.put(REPO, &format!("skills/alpha/{rel}"), body);
+}
+
+/// Alpha as the user and GitHub both have it in the tests that settle: three files changed or new, one left as installed.
+fn edited_like_github(s: &Setup) {
+    for (rel, body) in [("SKILL.md", ALPHA_V2), ("references/guide.md", "guide v2\n"), ("references/extra.md", "extra\n")] {
+        same_on_both_sides(s, rel, body);
+    }
+}
+
+/// What the record says was installed: the commit, and every file with its blob. Fingerprints may be refreshed by any check.
+fn recorded(s: &Setup, name: &str) -> (String, Vec<(String, String)>) {
+    let record = s.w.state().repo("fx").unwrap().skill(name).unwrap().clone();
+    (record.commit, record.files.into_iter().map(|file| (file.path, file.blob)).collect())
+}
+
+/// The skill is neither held nor reported as edited, and the check did what it set out to do.
+#[track_caller]
+fn assert_settled(report: &SyncReport, name: &str) {
+    let repo = only(report);
+    let found = skill(repo, name);
+    assert!(!matches!(found.verdict, Verdict::Held(_) | Verdict::ModifiedLocally(_)), "{name} is held or reported as edited: {:?}", found.verdict);
+    assert!(!matches!(repo.outcome, Outcome::NeedsAttention), "{:?}", repo.outcome);
+    assert_eq!(found.result, ApplyResult::Done, "{name}: {:?}", found.verdict);
+}
+
+/// The settled skill is remembered at GitHub's version: the next checks, the look at the disk and "Show changes" agree.
+#[track_caller]
+fn assert_remembered(s: &mut Setup, name: &str) {
+    s.advance(3600);
+    s.remote.reset();
+    let before = s.w.snapshot();
+    let report = s.sync();
+    assert!(matches!(only(&report).outcome, Outcome::Unchanged), "{:?}", only(&report).outcome);
+    assert_eq!(s.remote.calls(), Calls { tree: 1, conditional: 1, commit: 0, file: 0, ..Calls::default() });
+    assert_eq!(s.w.snapshot(), before, "a check that finds nothing new writes nothing");
+
+    let looked = s.engine.verify(&s.cfg, Access::ReadOnly).unwrap();
+    assert_eq!(status_of(&looked, name), clean());
+    let report = sync_with(&mut s.engine, &s.cfg, SyncOptions { ignore_etag: true, ..SyncOptions::default() });
+    assert_eq!(skill(only(&report), name).verdict, Verdict::InSync);
+    assert!(diff(s, name).files.is_empty(), "Show changes sees no difference");
+}
+
+#[test]
+fn an_edit_that_github_now_has_too_settles_without_touching_a_file() {
+    let mut s = Setup::installed("converged");
+    edited_like_github(&s);
+    let before = s.w.skills_snapshot();
+    assert!(diff(&mut s, "alpha").files.is_empty(), "Show changes already says the two are the same");
+    s.remote.reset();
+
+    let report = s.sync();
+
+    assert_settled(&report, "alpha");
+    assert_eq!(s.w.skills_snapshot(), before, "not one file was created, changed or removed");
+    assert!(s.w.backups().is_empty(), "{:?}", s.w.backups());
+    assert!(s.w.work_leftovers().is_empty(), "{:?}", s.w.work_leftovers());
+    assert_eq!(s.remote.calls().file, 0, "every file is the same byte for byte, so none is read");
+    assert_eq!(recorded(&s, "alpha").0, s.remote.head(REPO), "the record is at GitHub's version now");
+    assert_remembered(&mut s, "alpha");
+}
+
+#[test]
+fn a_settled_edit_follows_the_next_github_change() {
+    let mut s = Setup::installed("converged-then-update");
+    edited_like_github(&s);
+    assert_settled(&s.sync(), "alpha");
+
+    let third = ALPHA_V2.replace("v2", "v3");
+    s.remote.put(REPO, "skills/alpha/SKILL.md", &third);
+    s.remote.remove(REPO, "skills/alpha/references/extra.md");
+    s.advance(60);
+    let report = s.sync();
+
+    let repo = only(&report);
+    assert!(matches!(repo.outcome, Outcome::Synced), "{:?}", repo.outcome);
+    assert_eq!((&skill(repo, "alpha").verdict, &skill(repo, "alpha").result), (&Verdict::Update, &ApplyResult::Done));
+    assert_eq!(s.w.read("alpha/SKILL.md"), third);
+    assert_eq!(s.w.read("alpha/references/guide.md"), "guide v2\n");
+    assert_eq!(names(&s.w.files_of("alpha")), ["SKILL.md", "references/guide.md", "scripts/hello.ps1"]);
+    assert!(s.w.backups().is_empty(), "{:?}", s.w.backups());
+    assert!(s.w.work_leftovers().is_empty(), "{:?}", s.w.work_leftovers());
+    assert_remembered(&mut s, "alpha");
+}
+
+#[test]
+fn a_failed_read_while_comparing_decides_nothing() {
+    let mut s = Setup::installed("converged-fails");
+    s.w.write("alpha/SKILL.md", &windows_text(ALPHA_V2));
+    // GitHub has the same lines with blank lines between them: only its own copy can say the two are the same.
+    s.remote.put(REPO, "skills/alpha/SKILL.md", &ALPHA_V2.replace('\n', "\n\n"));
+    s.remote.fail_file(REPO, "skills/alpha/SKILL.md", Some(RemoteError::new(FailureKind::Network, "the network is down")));
+    let before = s.w.skills_snapshot();
+    let record = recorded(&s, "alpha");
+
+    let report = s.sync();
+    let repo = only(&report);
+    // Either the whole check fails or this skill stays held: neither decides anything.
+    match &repo.outcome {
+        Outcome::Failed(failure) => assert_eq!(failure.kind, FailureKind::Network),
+        other => {
+            assert!(matches!(other, Outcome::NeedsAttention), "{other:?}");
+            assert!(matches!(skill(repo, "alpha").verdict, Verdict::Held(_)), "{:?}", skill(repo, "alpha").verdict);
+            assert_ne!(skill(repo, "alpha").result, ApplyResult::Done);
+        }
+    }
+    assert_eq!(s.w.skills_snapshot(), before, "nothing was changed or deleted");
+    assert!(s.w.backups().is_empty(), "{:?}", s.w.backups());
+    assert_eq!(recorded(&s, "alpha"), record, "nothing was remembered");
+
+    s.remote.fail_file(REPO, "skills/alpha/SKILL.md", None);
+    s.remote.reset();
+    let report = s.sync();
+    assert_settled(&report, "alpha");
+    assert_eq!(s.remote.calls().file, 1, "only the file whose bytes differ was read");
+    assert_eq!(s.w.skills_snapshot(), before);
+    assert_remembered(&mut s, "alpha");
+}
+
+#[test]
+fn a_failed_read_while_comparing_ends_the_check_before_anything_else_is_decided() {
+    let mut s = Setup::installed("converged-fails-first");
+    s.w.write("alpha/SKILL.md", &windows_text(ALPHA_V2));
+    s.remote.put(REPO, "skills/alpha/SKILL.md", &ALPHA_V2.replace('\n', "\n\n"));
+    // GitHub dropped gamma as well: with the check cut short, that must not reach the disk.
+    s.remote.remove(REPO, "skills/gamma");
+    s.remote.fail_file(REPO, "skills/alpha/SKILL.md", Some(RemoteError::new(FailureKind::Network, "the network is down")));
+    let before = s.w.skills_snapshot();
+
+    let report = s.sync();
+    let repo = only(&report);
+    assert!(matches!(&repo.outcome, Outcome::Failed(failure) if failure.kind == FailureKind::Network), "{:?}", repo.outcome);
+    assert!(repo.skills.is_empty(), "no decision was made: {:?}", repo.skills);
+    assert_eq!(s.w.skills_snapshot(), before, "a failure is never a deletion");
+    assert!(s.w.backups().is_empty(), "{:?}", s.w.backups());
+}
+
+#[test]
+fn going_past_the_download_limit_while_comparing_only_leaves_that_skill_held() {
+    let mut s = Setup::installed("converged-limit");
+    s.w.write("alpha/SKILL.md", &windows_text(ALPHA_V2));
+    s.remote.put(REPO, "skills/alpha/SKILL.md", ALPHA_V2);
+    let before = s.w.skills_snapshot();
+    let record = recorded(&s, "alpha");
+
+    let report = sync_with(&mut s.engine, &s.cfg, SyncOptions { max_download_bytes: 1, ..SyncOptions::default() });
+    let repo = only(&report);
+    assert!(matches!(skill(repo, "alpha").verdict, Verdict::Held(Hold::UpdateBlocked(_))), "{:?}", skill(repo, "alpha").verdict);
+    assert!(matches!(repo.outcome, Outcome::NeedsAttention), "{:?}", repo.outcome);
+    assert_eq!(s.w.skills_snapshot(), before, "the limit is not a reason to change anything");
+    assert_eq!(recorded(&s, "alpha"), record, "nothing was remembered");
+
+    s.advance(60);
+    assert_settled(&s.sync(), "alpha");
+}
+
+#[test]
+fn a_dry_run_of_a_settling_edit_changes_nothing() {
+    let mut s = Setup::installed("converged-dry");
+    s.w.write("alpha/SKILL.md", &windows_text(ALPHA_V2));
+    s.remote.put(REPO, "skills/alpha/SKILL.md", ALPHA_V2);
+    let before = s.w.snapshot();
+
+    let report = sync_with(&mut s.engine, &s.cfg, SyncOptions { dry_run: true, ..SyncOptions::default() });
+    let repo = only(&report);
+    let dry = skill(repo, "alpha");
+    assert!(!matches!(dry.verdict, Verdict::Held(_) | Verdict::ModifiedLocally(_)), "a dry run still holds the skill: {:?}", dry.verdict);
+    assert_eq!(dry.result, ApplyResult::DryRun);
+    assert!(!matches!(repo.outcome, Outcome::NeedsAttention), "{:?}", repo.outcome);
+    assert_eq!(s.w.snapshot(), before, "a dry run changes not one file, not even state.json");
+
+    let verdict = dry.verdict.clone();
+    let report = s.sync();
+    assert_settled(&report, "alpha");
+    assert_eq!(skill(only(&report), "alpha").verdict, verdict, "the check does what the dry run said it would");
+    assert_remembered(&mut s, "alpha");
+}
+
+/// Alpha as the user edited it to what GitHub says now, but with one more difference between the folder and GitHub.
+fn stays_held(name: &str, one_more_difference: impl FnOnce(&Setup)) {
+    let mut s = Setup::installed(name);
+    same_on_both_sides(&s, "SKILL.md", ALPHA_V2);
+    one_more_difference(&s);
+    let before = s.w.skills_snapshot();
+    let record = recorded(&s, "alpha");
+    assert!(!diff(&mut s, "alpha").files.is_empty(), "{name}: Show changes sees the difference");
+
+    for round in 1..=2 {
+        s.advance(60);
+        s.remote.reset();
+        let report = s.sync();
+        let repo = only(&report);
+        let verdict = &skill(repo, "alpha").verdict;
+        assert!(matches!(verdict, Verdict::Held(Hold::UpdateBlocked(_))), "{name}, check {round}: {verdict:?}");
+        assert!(matches!(repo.outcome, Outcome::NeedsAttention), "{name}, check {round}: {:?}", repo.outcome);
+        assert_eq!(s.w.skills_snapshot(), before, "{name}, check {round}: the user's files are untouched");
+        assert!(s.w.backups().is_empty(), "{name}, check {round}: {:?}", s.w.backups());
+        assert_eq!(recorded(&s, "alpha"), record, "{name}, check {round}: nothing was remembered");
+    }
+}
+
+#[test]
+fn a_skill_that_does_not_match_github_stays_held_in_every_way() {
+    // Another file changed on GitHub too, and here it is still the old one.
+    stays_held("held-other-file", |s| s.remote.put(REPO, "skills/alpha/references/guide.md", "guide v2\n"));
+    // GitHub added a file that is not here.
+    stays_held("held-new-file", |s| s.remote.put(REPO, "skills/alpha/references/extra.md", "extra\n"));
+    // GitHub removed a file the app installed, and it is still here.
+    stays_held("held-removed-file", |s| s.remote.remove(REPO, "skills/alpha/scripts/hello.ps1"));
+    // A file GitHub still has is gone here.
+    stays_held("held-deleted-file", |s| s.w.remove("alpha/references/guide.md"));
+    // A file of the user's has the name of a new file on GitHub, with other words in it.
+    stays_held("held-same-name", |s| {
+        s.w.write("alpha/notes.md", "my notes\n");
+        s.remote.put(REPO, "skills/alpha/notes.md", "github's notes\n");
+    });
+}
+
+#[test]
+fn an_edit_to_a_file_github_did_not_change_is_told_apart_without_reading_anything() {
+    let mut s = Setup::installed("held-reads-nothing");
+    // The user edited one file and GitHub changed another, so the folder cannot be what GitHub has now.
+    s.w.write("alpha/references/guide.md", "guide, my way\n");
+    s.remote.put(REPO, "skills/alpha/SKILL.md", ALPHA_V2);
+    s.remote.reset();
+
+    for round in 1..=2 {
+        let report = s.sync();
+        assert!(
+            matches!(skill(only(&report), "alpha").verdict, Verdict::Held(Hold::UpdateBlocked(_))),
+            "check {round}: {:?}",
+            skill(only(&report), "alpha").verdict
+        );
+        assert_eq!(s.remote.calls().file, 0, "check {round}: what the record says of the guide is enough, so nothing is read from GitHub");
+        s.advance(60);
+    }
+}
+
+#[test]
+fn an_edit_with_other_line_breaks_that_github_now_has_settles() {
+    let mut s = Setup::installed("converged-text");
+    s.w.write("alpha/SKILL.md", &windows_text(ALPHA_V2));
+    s.remote.put(REPO, "skills/alpha/SKILL.md", ALPHA_V2);
+    let before = s.w.skills_snapshot();
+    assert!(diff(&mut s, "alpha").files.is_empty(), "Show changes does not count line breaks");
+    s.remote.reset();
+
+    let report = s.sync();
+
+    assert_settled(&report, "alpha");
+    assert_eq!(s.w.skills_snapshot(), before, "the copy stays as the user saved it");
+    let read: Vec<String> = s.remote.log().into_iter().filter(|l| l.starts_with("file ")).collect();
+    assert!(read.len() <= 1 && read.iter().all(|l| l.ends_with(" skills/alpha/SKILL.md")), "only the file whose bytes differ may be read: {read:?}");
+    assert_remembered(&mut s, "alpha");
+}
+
+#[test]
+fn a_file_removed_on_both_sides_still_settles() {
+    let mut s = Setup::installed("converged-removed");
+    same_on_both_sides(&s, "SKILL.md", ALPHA_V2);
+    s.w.remove("alpha/scripts");
+    s.remote.remove(REPO, "skills/alpha/scripts");
+    let before = s.w.skills_snapshot();
+    assert!(diff(&mut s, "alpha").files.is_empty(), "Show changes already says the two are the same");
+    s.remote.reset();
+
+    let report = s.sync();
+
+    assert_settled(&report, "alpha");
+    assert_eq!(s.w.skills_snapshot(), before, "nothing was put back");
+    assert!(!s.w.exists("alpha/scripts"));
+    assert_remembered(&mut s, "alpha");
+}
+
+#[test]
+fn a_file_the_user_added_does_not_stop_it_settling_and_is_left_alone() {
+    let mut s = Setup::installed("converged-extra");
+    s.w.write("alpha/mine.md", "only mine\n");
+    s.w.write("alpha/notes/more.txt", "more notes\n");
+    same_on_both_sides(&s, "SKILL.md", ALPHA_V2);
+    let before = s.w.skills_snapshot();
+    s.remote.reset();
+
+    let report = s.sync();
+
+    assert_settled(&report, "alpha");
+    assert_eq!(s.w.skills_snapshot(), before, "what the user added is exactly as it was");
+    assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+    assert_remembered(&mut s, "alpha");
+    assert_eq!(s.w.read("alpha/mine.md"), "only mine\n");
 }
 
 #[test]

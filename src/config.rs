@@ -415,6 +415,20 @@ mod tests {
     }
 
     #[test]
+    fn new_configs_and_repositories_default_to_one_day() {
+        let daily = Interval::new(1, Unit::Day);
+        assert_eq!(DEFAULT_INTERVAL, daily);
+
+        let mut cfg = Config::default();
+        let default_interval = cfg.default_interval;
+        let spec = RepoSpec::parse("o/r").unwrap();
+        let added = cfg.add_repo(&spec, None, false);
+        assert_eq!(default_interval, daily);
+        assert_eq!(added.interval, None);
+        assert_eq!(added.effective_interval(default_interval), daily);
+    }
+
+    #[test]
     fn minimal_hand_written_config_works() {
         let cfg = Config::parse(br#"{ "default_interval": "12h", "repos": [ { "repo": "a/b" }, { "repo": "a/b", "path": "skills" } ] }"#).unwrap();
         assert_eq!(cfg.default_interval, Interval::new(12, Unit::Hour));

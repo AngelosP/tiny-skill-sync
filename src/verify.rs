@@ -14,7 +14,7 @@
 //! Only the files that came from GitHub are looked at. Whatever the user added to a skill's folder is theirs: it is
 //! never read, never counts as an edit and never holds a change.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io;
 use std::path::Path;
 
@@ -354,6 +354,37 @@ pub fn compare_unmanaged(dir: &Path, skill: &Skill, theirs: &HashMap<String, Str
         }
     }
     if needs.is_empty() { Likeness::Same } else { Likeness::NeedsText(needs) }
+}
+
+/// What upstream's files are compared by, as far as the record of a skill we own already says. A file whose blob is
+/// the recorded one is the very same bytes, so what was kept for the recorded copy holds for upstream's copy too, and
+/// nothing has to be downloaded for it.
+pub fn known_canons(skill: &Skill, recorded: &[ManagedFile]) -> HashMap<String, String> {
+    let by_path: HashMap<&str, &ManagedFile> = recorded.iter().map(|file| (file.path.as_str(), file)).collect();
+    skill
+        .files
+        .iter()
+        .filter_map(|file| {
+            let same = by_path.get(file.path.as_str()).filter(|mine| mine.blob == file.blob)?;
+            Some((file.path.clone(), same.canon.clone()?))
+        })
+        .collect()
+}
+
+/// Is the folder of a skill we own what upstream has now, although it differs from the record? As for a folder nobody
+/// owns, every file upstream has must be here and match. And a file the record has that upstream no longer has must
+/// be gone from here too: it came from GitHub, so a copy that is still here is not what upstream has. Anything that is
+/// not plainly absent (a file, a folder, a link, something that cannot be looked at) counts as present.
+pub fn compare_owned(dir: &Path, skill: &Skill, recorded: &[ManagedFile], theirs: &HashMap<String, String>, hasher: &mut FileHasher) -> Likeness {
+    let upstream: HashSet<String> = skill.files.iter().map(|file| fold(&file.path)).collect();
+    let mut spots = Spots::new(dir);
+    let mut stats = Stats::default();
+    for file in recorded.iter().filter(|file| !upstream.contains(&fold(&file.path))) {
+        if !matches!(spots.find(&file.path, &mut stats), Spot::Missing) {
+            return Likeness::Different;
+        }
+    }
+    compare_unmanaged(dir, skill, theirs, hasher)
 }
 
 #[cfg(test)]
@@ -758,5 +789,103 @@ mod tests {
         assert_eq!(compare_unmanaged(&link, &upstream(&FILES), &HashMap::new(), &mut FileHasher::default()), Likeness::Different);
         fs::remove_dir(&link).unwrap();
         fs::remove_dir_all(base).unwrap();
+    }
+
+    fn owned_likeness(dir: &Path, up: &Skill, recorded: &[ManagedFile]) -> Likeness {
+        compare_owned(dir, up, recorded, &known_canons(up, recorded), &mut FileHasher::default())
+    }
+
+    #[test]
+    fn an_edited_folder_is_what_upstream_has_now_only_when_every_file_matches_and_no_dropped_file_is_left() {
+        let dir = temp("owned-same");
+        let skill = install(&dir, &FILES);
+        // The edit, pushed to GitHub as it is, and a file GitHub dropped in the same change.
+        let up = upstream(&[("SKILL.md", "# alpha 2\n"), ("scripts/run.ps1", "echo hi\n")]);
+        write(&dir, "SKILL.md", "# alpha 2\n");
+        assert_eq!(owned_likeness(&dir, &up, &skill.files), Likeness::Different, "refs/a.md came from GitHub and is still here");
+
+        fs::remove_file(dir.join("refs").join("a.md")).unwrap();
+        assert_eq!(owned_likeness(&dir, &up, &skill.files), Likeness::Same);
+        write(&dir, "notes.md", "mine");
+        write(&dir, "refs/mine.md", "mine");
+        assert_eq!(owned_likeness(&dir, &up, &skill.files), Likeness::Same, "what the user added is theirs and does not count");
+
+        write(&dir, "SKILL.md", "# alpha 3\n");
+        let mut known = known_canons(&up, &skill.files);
+        assert_eq!(compare_owned(&dir, &up, &skill.files, &known, &mut FileHasher::default()), Likeness::NeedsText(vec!["SKILL.md".into()]));
+        known.insert("SKILL.md".into(), text::canon(b"# alpha 2\n"));
+        assert_eq!(compare_owned(&dir, &up, &skill.files, &known, &mut FileHasher::default()), Likeness::Different, "a different edit");
+        write(&dir, "SKILL.md", "# alpha 2\n");
+        fs::remove_file(dir.join("scripts").join("run.ps1")).unwrap();
+        assert_eq!(owned_likeness(&dir, &up, &skill.files), Likeness::Different, "a file upstream still has is missing here");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_dropped_file_that_is_edited_replaced_or_behind_a_link_is_still_here() {
+        let dir = temp("owned-leftover");
+        let skill = install(&dir, &FILES);
+        let up = upstream(&[("SKILL.md", "# alpha 2\n"), ("scripts/run.ps1", "echo hi\n")]);
+        write(&dir, "SKILL.md", "# alpha 2\n");
+        write(&dir, "refs/a.md", "my notes\n");
+        assert_eq!(owned_likeness(&dir, &up, &skill.files), Likeness::Different, "edited");
+
+        fs::remove_file(dir.join("refs").join("a.md")).unwrap();
+        fs::create_dir_all(dir.join("refs").join("a.md")).unwrap();
+        assert_eq!(owned_likeness(&dir, &up, &skill.files), Likeness::Different, "replaced by a folder");
+        fs::remove_dir(dir.join("refs").join("a.md")).unwrap();
+        assert_eq!(owned_likeness(&dir, &up, &skill.files), Likeness::Same, "gone");
+
+        let outside = temp("owned-leftover-outside");
+        write(&outside, "a.md", "reference\n");
+        fs::remove_dir(dir.join("refs")).unwrap();
+        let made = std::process::Command::new("cmd").args(["/C", "mklink", "/J"]).arg(dir.join("refs")).arg(&outside).output().unwrap().status.success();
+        assert!(made);
+        assert_eq!(owned_likeness(&dir, &up, &skill.files), Likeness::Different, "a folder on the way is a link, so it is not looked into");
+        fs::remove_dir(dir.join("refs")).unwrap();
+        fs::remove_dir_all(outside).unwrap();
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_file_that_only_changed_case_upstream_is_not_a_dropped_file() {
+        let dir = temp("owned-case");
+        let skill = install(&dir, &[("SKILL.md", "# alpha\n"), ("Refs/A.md", "reference\n")]);
+        let up = upstream(&[("SKILL.md", "# alpha 2\n"), ("refs/a.md", "reference\n")]);
+        write(&dir, "SKILL.md", "# alpha 2\n");
+        assert_eq!(owned_likeness(&dir, &up, &skill.files), Likeness::Same);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn an_edit_with_other_line_breaks_needs_the_text_from_upstream_only_for_the_file_that_changed() {
+        let dir = temp("owned-text");
+        let skill = install(&dir, &FILES);
+        let up = upstream(&[("SKILL.md", "# alpha\n\nbody\n"), ("scripts/run.ps1", "echo hi\n"), ("refs/a.md", "reference\n")]);
+        write(&dir, "SKILL.md", "# alpha\r\nbody\r\n");
+        let mut known = known_canons(&up, &skill.files);
+        let mut names: Vec<&str> = known.keys().map(String::as_str).collect();
+        names.sort_unstable();
+        assert_eq!(names, ["refs/a.md", "scripts/run.ps1"], "the file that changed upstream is not known");
+        let mut h = FileHasher::default();
+        assert_eq!(compare_owned(&dir, &up, &skill.files, &known, &mut h), Likeness::NeedsText(vec!["SKILL.md".into()]));
+        known.insert("SKILL.md".into(), text::canon(b"# alpha\n\nbody\n"));
+        assert_eq!(compare_owned(&dir, &up, &skill.files, &known, &mut h), Likeness::Same);
+        known.insert("SKILL.md".into(), text::canon(b"# alpha\n\nother body\n"));
+        assert_eq!(compare_owned(&dir, &up, &skill.files, &known, &mut h), Likeness::Different);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn the_record_speaks_for_upstream_only_where_the_blob_is_the_recorded_one() {
+        let dir = temp("owned-known");
+        let skill = install(&dir, &FILES);
+        let up = upstream(&[("SKILL.md", "# alpha 2\n"), ("scripts/run.ps1", "echo hi\n"), ("new.md", "new\n")]);
+        let known = known_canons(&up, &skill.files);
+        assert_eq!(known, HashMap::from([("scripts/run.ps1".to_string(), text::canon(b"echo hi\n"))]));
+        let mut unread = skill.files.clone();
+        unread.iter_mut().for_each(|file| file.canon = None);
+        assert!(known_canons(&up, &unread).is_empty(), "a record that never read a file has nothing to say about it");
+        fs::remove_dir_all(dir).unwrap();
     }
 }

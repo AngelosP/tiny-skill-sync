@@ -1,7 +1,6 @@
 //! The main window: a band across the top that says how everything is, the repositories down the left, and on the
 //! right the page chosen there (a repository and its skills, Activity or Settings). "Show changes" turns the whole
-//! window into the differences of one skill until Back. Every change is saved to `config.json` at once; there is no OK
-//! button.
+//! window into the differences of one skill until Back. Every change is saved at once; there is no OK button.
 //!
 //! What it shows comes from [`shell::snapshot`], on a posted `WM_REFRESH`; [`page`] lays it out and [`control`] draws
 //! it. Handlers read what they need from the state, let go of it, and then act, so a question (which runs a message
@@ -29,7 +28,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     WS_EX_CONTROLPARENT, WS_OVERLAPPEDWINDOW, WindowFromPoint,
 };
 
-use super::control::{self, BN_CLICKED, CBN_SELENDOK, Surface};
+use super::control::{self, BN_CLICKED, CBN_SELENDOK, RowCmd, Surface};
 use super::dialogs::{self, Ask, Check, Field};
 use super::page::{self, CUSTOM, DIFF_FILES_W, DiffView, Fit, HERO_H, Hit, NAV_W, Page, Part, RepoPage, Report, SYNC_TIP, SettingsPage, id};
 use super::paint::{self, Font, Rect, glyph};
@@ -100,8 +99,8 @@ struct Win {
     /// The skills of the repository shown that the user opened or closed, by name.
     toggled: HashSet<String>,
     diff: Option<DiffView>,
-    /// The control that opened the diff view; it gets the focus back.
-    diff_from: i32,
+    /// Return to the comparison button rather than the header if it is still visible.
+    from_card: bool,
     token_saved: bool,
     /// Whether Windows starts this copy at sign-in, or why that can't be told. Read when Settings is shown, and only
     /// then: the registry is not read for any other page.
@@ -132,6 +131,14 @@ pub fn window() -> HWND {
 
 pub fn is_open() -> bool {
     !window().is_null()
+}
+
+pub fn offer_startup_once() {
+    let hwnd = window();
+    if hwnd.is_null() || !shell::snapshot().is_some_and(|snapshot| !snapshot.cfg.repos.is_empty()) {
+        return;
+    }
+    offer_startup(hwnd);
 }
 
 /// Runs `f` on the state, unless the window is closed or the state is in use further up the stack.
@@ -260,7 +267,7 @@ pub fn open() {
         page: None,
         toggled: HashSet::new(),
         diff: None,
-        diff_from: 0,
+        from_card: false,
         token_saved: cred::has_token(),
         startup: None,
         focus: null_mut(),
@@ -270,6 +277,7 @@ pub fn open() {
     WINDOW.with(|w| w.set(hwnd));
     REFRESH_POSTED.with(|p| p.set(false));
     DIFF_MODE.with(|d| d.set(false));
+    shell::reload_settings();
     // Now that the window knows its monitor's DPI.
     let [x, y, w, h] = place(STYLE, EX_STYLE, within_work_area(wanted, dpi), dpi, null_mut());
     unsafe { SetWindowPos(hwnd, null_mut(), x, y, w, h, SWP_NOZORDER | SWP_NOACTIVATE) };
@@ -336,6 +344,13 @@ fn update(hwnd: HWND) {
         if moved {
             st.page = page;
             st.toggled.clear();
+        } else if let Some(Page::Repo(id)) = &page {
+            if !st.toggled.is_empty() {
+                let mut previous = std::mem::take(&mut st.toggled);
+                if let Some(view) = snap.views.iter().find(|view| view.id == *id) {
+                    st.toggled.extend(view.skills.iter().filter(|r| page::expandable(r)).filter_map(|r| previous.take(&r.name)));
+                }
+            }
         }
         st.snap = Some(snap);
         moved.then_some(st.p.page)
@@ -642,10 +657,20 @@ fn add(hwnd: HWND) {
     }
 }
 
-/// Offers to start with Windows, when the first repository was just added and it does not yet. "Not now" is not
-/// remembered: the offer comes again only when a first repository is added again.
+/// Offers once per machine to start with Windows, when the first repository was just added.
 fn offer_startup(hwnd: HWND) {
+    match shell::startup_offer_seen() {
+        Ok(true) => return,
+        Ok(false) => {}
+        Err(error) => {
+            shell::tell(sentence(&error));
+            return;
+        }
+    }
     if startup_now() != Ok(Startup::Off) {
+        if let Err(error) = shell::mark_startup_offer_seen() {
+            shell::tell(sentence(&error));
+        }
         return;
     }
     let question = Ask {
@@ -658,7 +683,12 @@ fn offer_startup(hwnd: HWND) {
         cancel: "Not now".to_string(),
         ..Ask::default()
     };
-    if dialogs::ask(hwnd, question).is_some() {
+    let accepted = dialogs::ask(hwnd, question).is_some();
+    if let Err(error) = shell::mark_startup_offer_seen() {
+        shell::tell(sentence(&error));
+        return;
+    }
+    if accepted {
         let now = switch_startup(true);
         with_state(|st| st.startup = Some(now));
         refresh();
@@ -810,11 +840,60 @@ fn remove(hwnd: HWND, repo: &RepoConfig) {
     }
 }
 
+fn row_command(hwnd: HWND, button: HWND, index: usize, code: u32) {
+    let Some((repo, name, commands)) = shown_repo(|r, v| {
+        let row = v.skills.get(index)?;
+        Some((r.id.clone(), row.name.clone(), page::row_commands(row, web_url(r, None).is_some())))
+    })
+    .flatten() else {
+        return;
+    };
+    let cmd = if code == control::ROW_MENU && !commands.is_empty() {
+        let labels: Vec<_> = commands.iter().map(|cmd| cmd.label()).collect();
+        let picked = control::menu(button, &labels, None, false).map(|i| commands[i]);
+        if unsafe { GetFocus() } == button && shown_repo(|r, _| r.id == repo) == Some(true) {
+            focus_skill(hwnd, &repo, &name, false);
+        }
+        picked
+    } else {
+        RowCmd::from_code(code)
+    };
+    let Some(cmd) = cmd else { return };
+    // The popup runs a message loop: a refresh can remove, reorder, or resolve this skill.
+    let target = shown_repo(|r, v| command_target(&r.id, &v.skills, web_url(r, None).is_some(), &repo, &name, cmd)).flatten();
+    if let Some((index, part)) = target {
+        skill(hwnd, index, part);
+    }
+}
+
+fn command_target(shown: &str, rows: &[Row], linkable: bool, repo: &str, name: &str, cmd: RowCmd) -> Option<(usize, Part)> {
+    if shown != repo {
+        return None;
+    }
+    let (index, row) = rows.iter().enumerate().find(|(_, row)| row.name == name)?;
+    if !page::row_commands(row, linkable).contains(&cmd) {
+        return None;
+    }
+    let part = match cmd {
+        RowCmd::Open => Part::Open,
+        RowCmd::Preview => Part::Preview,
+        RowCmd::CopyPath => Part::CopyPath,
+        RowCmd::CopyLink => Part::CopyLink,
+        RowCmd::OnGitHub => Part::OnGitHub,
+        RowCmd::Compare => Part::Compare,
+        RowCmd::ManageAgain => Part::Action(row.actions.iter().position(|a| *a == Action::ManageAgain)?),
+    };
+    Some((index, part))
+}
+
 /// A part of a skill's row was clicked.
 fn skill(hwnd: HWND, index: usize, part: Part) {
     let Some((repo, label, row)) = shown_repo(|r, v| Some((r.clone(), v.label.clone(), v.skills.get(index)?.clone()))).flatten() else { return };
     match part {
         Part::Row => {
+            if !page::expandable(&row) {
+                return;
+            }
             with_state(|st| {
                 if !st.toggled.remove(&row.name) {
                     st.toggled.insert(row.name.clone());
@@ -822,14 +901,14 @@ fn skill(hwnd: HWND, index: usize, part: Part) {
             });
             render(hwnd);
         }
-        Part::Compare => compare(hwnd, repo.id, label, row, page::skill_id(index, 2), false),
+        Part::Compare => compare(hwnd, repo.id, label, row, false),
         Part::Open => open_skill(&row.name),
         Part::Action(k) => {
             if let Some(&action) = row.actions.get(k) {
                 act(hwnd, repo.id, &label, row.name, action);
             }
         }
-        Part::Preview => compare(hwnd, repo.id, label, row, page::skill_id(index, 9), true),
+        Part::Preview => compare(hwnd, repo.id, label, row, true),
         Part::CopyPath => {
             if let Some(dir) = skill_dir(&row.name) {
                 copy(hwnd, dir.as_os_str());
@@ -866,12 +945,13 @@ fn act(hwnd: HWND, repo: String, label: &str, skill: String, action: Action) {
 }
 
 /// Show changes, or a Preview: the window shows the differences, or the files, of one skill, read by the worker.
-fn compare(hwnd: HWND, repo: String, repo_label: String, row: Row, from: i32, preview: bool) {
+fn compare(hwnd: HWND, repo: String, repo_label: String, row: Row, preview: bool) {
+    let from_card = !preview && page::expandable(&row);
     let actions = if preview { Vec::new() } else { row.actions };
     let view = DiffView { repo_id: repo.clone(), repo_label, skill: row.name.clone(), preview, actions, report: Report::Loading, file: 0, gaps: Vec::new() };
     let Some(p) = with_state(|st| {
         st.diff = Some(view);
-        st.diff_from = from;
+        st.from_card = from_card;
         st.p
     }) else {
         return;
@@ -887,11 +967,18 @@ fn compare(hwnd: HWND, repo: String, repo_label: String, row: Row, from: i32, pr
 }
 
 fn leave_diff(hwnd: HWND) {
-    let Some((from, p)) = with_state(|st| st.diff.take().map(|_| (st.diff_from, st.p))).flatten() else { return };
+    let Some((d, from_card)) = with_state(|st| st.diff.take().map(|d| (d, st.from_card))).flatten() else { return };
     render(hwnd);
-    // Show changes, or the skill's row if it is closed now.
-    let back = [from, page::row_id(from)].into_iter().map(|n| control::child(p.page, n)).find(|h| !h.is_null()).unwrap_or(hwnd);
-    unsafe { SetFocus(back) };
+    focus_skill(hwnd, &d.repo_id, &d.skill, from_card);
+}
+
+fn focus_skill(hwnd: HWND, repo: &str, name: &str, from_card: bool) {
+    let Some(p) = with_state(|st| st.diff.is_none().then_some(st.p)).flatten() else { return };
+    let index = shown_repo(|r, v| (r.id == repo).then(|| v.skills.iter().position(|row| row.name == name)).flatten()).flatten();
+    let back = index
+        .and_then(|i| [if from_card { 2 } else { 0 }, 0].into_iter().map(|k| control::child(p.page, page::skill_id(i, k))).find(|h| !h.is_null()))
+        .unwrap_or_else(|| control::child(p.hero, id::SYNC));
+    unsafe { SetFocus(if back.is_null() { hwnd } else { back }) };
 }
 
 fn show_file(hwnd: HWND, index: usize) {
@@ -1051,7 +1138,7 @@ fn on_command(hwnd: HWND, wp: WPARAM, lp: LPARAM) {
     match (page::hit(n), code) {
         (Hit::Other(id::EVERY), CBN_SELENDOK) => every(hwnd, ctl, false),
         (Hit::Other(id::DEFAULT_EVERY), CBN_SELENDOK) => every(hwnd, ctl, true),
-        (Hit::Skill(j, Part::Row), control::ROW_FOLDER) => skill(hwnd, j, Part::Open),
+        (Hit::Skill(j, Part::Row), code) if code == control::ROW_MENU || RowCmd::from_code(code).is_some() => row_command(hwnd, ctl, j, code),
         (_, code) if code != BN_CLICKED => {}
         (Hit::Repo(i), _) => {
             if let Some(page) = with_state(|st| st.snap.as_ref()?.views.get(i).map(|v| Page::Repo(v.id.clone()))).flatten() {
@@ -1216,6 +1303,21 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn row_menu_dispatch_follows_identity_and_rechecks_availability() {
+        let cfg = Config { repos: vec![RepoConfig { id: "one".into(), repo: "owner/repo".into(), ..Default::default() }], ..Default::default() };
+        let mut board = crate::board::Board::new();
+        board.note_kept("one", &["alpha".into(), "beta".into()]);
+        let mut rows = board.views(&cfg, 0).remove(0).skills;
+        rows.swap(0, 1);
+        let resolve = |shown, rows: &[Row]| command_target(shown, rows, true, "one", "alpha", RowCmd::ManageAgain);
+        assert_eq!(resolve("one", &rows), Some((1, Part::Action(0))));
+        assert_eq!(resolve("other", &rows), None);
+        assert_eq!(resolve("one", &rows[..1]), None);
+        rows[1].actions.clear();
+        assert_eq!(resolve("one", &rows), None);
+    }
 
     #[test]
     fn the_saved_size_is_two_numbers_and_never_smaller_than_the_smallest() {

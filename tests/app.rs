@@ -6,10 +6,11 @@ mod common;
 use std::path::PathBuf;
 
 use common::*;
-use tiny_skill_sync::app::{self, Answer, App, BUSY_RETRY, Done, FAILURE_BACKOFF, Job, MIN_POLL_GAP, RESUME_GRACE, SIGN_IN_GRACE, Settled};
+use tiny_skill_sync::app::{self, Answer, App, BUSY_RETRY, Done, FAILURE_BACKOFF, Job, MIN_POLL_GAP, RESUME_GRACE, SIGN_IN_GRACE, SettingsSource, Settled};
 use tiny_skill_sync::board::{Action, Health, Level, Row};
 use tiny_skill_sync::config::Config;
 use tiny_skill_sync::engine::{self, Engine, EngineError, Resolution, SyncReport};
+use tiny_skill_sync::interval::{Interval, Unit};
 use tiny_skill_sync::reconcile::Verdict;
 
 const DAY: i64 = 24 * 60 * 60;
@@ -46,7 +47,12 @@ fn historical_search_rows_and_timer_survive_restart_and_pause() {
 fn run(app: &mut App, engine: &mut Engine, now: i64) -> Vec<(Job, Settled)> {
     let mut out = Vec::new();
     while let Some(order) = app.next_order() {
-        let done = app::perform(engine, &order, &cancel_flag());
+        let mut done = app::perform(engine, &order, &cancel_flag());
+        if let Some(settings) = done.settings.take() {
+            if let Ok(loaded) = settings.result {
+                app.settings_reloaded(loaded, &done.job);
+            }
+        }
         out.push((order.job, app.finish(done, now)));
     }
     out
@@ -55,7 +61,12 @@ fn run(app: &mut App, engine: &mut Engine, now: i64) -> Vec<(Job, Settled)> {
 /// Runs the next job. Returns it, and whether it ran as background work.
 fn run_next(app: &mut App, engine: &mut Engine, now: i64) -> (Job, bool) {
     let order = app.next_order().expect("a job is waiting");
-    let done = app::perform(engine, &order, &cancel_flag());
+    let mut done = app::perform(engine, &order, &cancel_flag());
+    if let Some(settings) = done.settings.take() {
+        if let Ok(loaded) = settings.result {
+            app.settings_reloaded(loaded, &done.job);
+        }
+    }
     app.finish(done, now);
     (order.job, order.background)
 }
@@ -79,6 +90,9 @@ fn answer(app: &mut App, result: Result<Answer, EngineError>, next_wake: Option<
             lists_nothing: Vec::new(),
             private: Vec::new(),
             stamp: None,
+            settings: None,
+            config_saves: Vec::new(),
+            settings_checked: false,
         },
         now,
     )
@@ -116,6 +130,163 @@ fn row(app: &App, name: &str) -> Row {
 
 fn fx() -> String {
     "fx".to_string()
+}
+
+fn portable_source(s: &Setup, cfg: &Config) -> SettingsSource {
+    let exe_dir = s.w.root.join("portable-bin");
+    std::fs::create_dir_all(&exe_dir).unwrap();
+    write_portable(&exe_dir, cfg);
+    SettingsSource::new(s.w.home.join(tiny_skill_sync::config::CONFIG_FILE), exe_dir)
+}
+
+fn write_portable(exe_dir: &std::path::Path, cfg: &Config) {
+    let settings = serde_json::json!({
+        "version": 1,
+        "default_interval": serde_json::to_value(cfg.default_interval).unwrap(),
+        "skills_dir": cfg.skills_dir
+    });
+    let sources = serde_json::json!({
+        "version": 1,
+        "repos": serde_json::to_value(&cfg.repos).unwrap()
+    });
+    std::fs::write(exe_dir.join(tiny_skill_sync::portable::SETTINGS_FILE), serde_json::to_vec_pretty(&settings).unwrap()).unwrap();
+    std::fs::write(exe_dir.join(tiny_skill_sync::portable::SOURCES_FILE), serde_json::to_vec_pretty(&sources).unwrap()).unwrap();
+}
+
+#[test]
+fn startup_loads_portable_settings_on_the_worker_before_the_first_engine_job() {
+    let mut s = Setup::fresh("app-portable-start");
+    let mut shared = s.cfg.clone();
+    shared.skills_dir = Some(s.w.skills.to_string_lossy().into_owned());
+    let source = portable_source(&s, &shared);
+    let mut app = App::new(Config::default(), s.w.skills.clone());
+    app.set_settings_source(source);
+
+    run(&mut app, &mut s.engine, T0);
+    app.want(Job::Check(None));
+    run(&mut app, &mut s.engine, T0 + 1);
+
+    assert!(app.started());
+    assert!(app.portable_mode());
+    assert_eq!(app.cfg().repos, shared.repos);
+    assert_eq!(s.w.skill_names(), ["alpha", "beta", "gamma"]);
+}
+
+#[test]
+fn a_malformed_present_portable_file_does_not_fall_back_to_local_config() {
+    let mut s = Setup::fresh("app-portable-malformed");
+    s.cfg.save(&s.w.home.join(tiny_skill_sync::config::CONFIG_FILE)).unwrap();
+    let source = portable_source(&s, &s.cfg);
+    std::fs::write(source.executable_dir.join(tiny_skill_sync::portable::SETTINGS_FILE), "{ broken").unwrap();
+    let mut app = App::new(Config::default(), s.w.skills.clone());
+    app.set_settings_source(source);
+
+    let order = app.next_order().unwrap();
+    let done = app::perform(&mut s.engine, &order, &cancel_flag());
+
+    assert!(matches!(done.result, Err(EngineError::Failed(_))));
+    assert!(done.settings.unwrap().result.is_err());
+    assert!(!app.started());
+    assert!(s.w.skill_names().is_empty());
+    assert!(!s.w.state_file().exists());
+}
+
+#[test]
+fn opening_the_window_can_reload_shared_settings_without_a_folder_watch() {
+    let mut s = Setup::fresh("app-portable-window-reload");
+    let mut shared = s.cfg.clone();
+    shared.skills_dir = Some(s.w.skills.to_string_lossy().into_owned());
+    let source = portable_source(&s, &shared);
+    let exe_dir = source.executable_dir.clone();
+    let mut app = App::new(Config::default(), s.w.skills.clone());
+    app.set_settings_source(source);
+    run(&mut app, &mut s.engine, T0);
+    assert!(app.cfg().repos[0].enabled);
+
+    shared.repos[0].enabled = false;
+    write_portable(&exe_dir, &shared);
+    app.request_settings_reload();
+    run(&mut app, &mut s.engine, T0 + 1);
+
+    assert!(!app.cfg().repos[0].enabled);
+}
+
+#[test]
+fn a_timer_poll_reloads_portable_settings_before_syncing() {
+    let mut s = Setup::fresh("app-portable-poll");
+    let mut shared = s.cfg.clone();
+    shared.skills_dir = Some(s.w.skills.to_string_lossy().into_owned());
+    let source = portable_source(&s, &shared);
+    let exe_dir = source.executable_dir.clone();
+    let mut app = App::new(Config::default(), s.w.skills.clone());
+    app.set_settings_source(source);
+    run(&mut app, &mut s.engine, T0);
+    app.want(Job::Check(None));
+    run(&mut app, &mut s.engine, T0);
+    assert_eq!(app.arm(T0), Some(T0 + DAY));
+
+    shared.repos[0].enabled = false;
+    write_portable(&exe_dir, &shared);
+    app.on_timer(T0 + DAY);
+    assert_eq!(app.queued(), &[Job::Poll]);
+    run(&mut app, &mut s.engine, T0 + DAY);
+
+    assert!(!app.cfg().repos[0].enabled);
+}
+
+#[test]
+fn a_portable_source_disappearing_makes_skills_orphans_not_deletions() {
+    let mut s = Setup::fresh("app-portable-orphan");
+    let mut shared = s.cfg.clone();
+    shared.skills_dir = Some(s.w.skills.to_string_lossy().into_owned());
+    let source = portable_source(&s, &shared);
+    let exe_dir = source.executable_dir.clone();
+    let mut app = App::new(Config::default(), s.w.skills.clone());
+    app.set_settings_source(source);
+    run(&mut app, &mut s.engine, T0);
+    app.want(Job::Check(None));
+    run(&mut app, &mut s.engine, T0 + 1);
+    assert_eq!(s.w.skill_names(), ["alpha", "beta", "gamma"]);
+
+    write_portable(&exe_dir, &Config { skills_dir: shared.skills_dir.clone(), ..Config::default() });
+    app.want(Job::Check(None));
+    run(&mut app, &mut s.engine, T0 + 1);
+
+    assert!(app.cfg().repos.is_empty());
+    assert_eq!(s.w.skill_names(), ["alpha", "beta", "gamma"]);
+    assert!(s.w.state().repo("fx").is_some(), "unlisted sources remain recorded as orphans");
+}
+
+#[test]
+fn portable_saves_run_on_the_worker_and_report_shared_file_conflicts() {
+    let mut s = Setup::fresh("app-portable-save");
+    let mut shared = s.cfg.clone();
+    shared.skills_dir = Some(s.w.skills.to_string_lossy().into_owned());
+    let source = portable_source(&s, &shared);
+    let exe_dir = source.executable_dir.clone();
+    let mut app = App::new(Config::default(), s.w.skills.clone());
+    app.set_settings_source(source);
+    run(&mut app, &mut s.engine, T0);
+
+    let before = app.cfg().clone();
+    let after = Config { default_interval: Interval::new(12, Unit::Hour), ..before.clone() };
+    app.set_cfg(after.clone(), s.w.skills.clone());
+    app.queue_config_save(before.clone(), after.clone(), true, true);
+    let order = app.next_order().unwrap();
+    let done = app::perform(&mut s.engine, &order, &cancel_flag());
+    assert!(matches!(done.config_saves[0].result, Ok(())));
+    app.finish(done, T0);
+    assert_eq!(tiny_skill_sync::portable::load(&exe_dir).unwrap().unwrap().default_interval, Interval::new(12, Unit::Hour));
+
+    write_portable(&exe_dir, &Config { default_interval: Interval::new(6, Unit::Hour), ..before.clone() });
+    app.queue_config_save(before.clone(), after, true, true);
+    let order = app.next_order().unwrap();
+    let done = app::perform(&mut s.engine, &order, &cancel_flag());
+    let Err(error) = &done.config_saves[0].result else { panic!("expected a settings conflict") };
+    assert!(error.contains("changed since it was loaded"));
+    app.finish(done, T0);
+    assert_eq!(app.cfg(), &before, "a failed shared edit is not kept in use");
+    assert_eq!(tiny_skill_sync::portable::load(&exe_dir).unwrap().unwrap().default_interval, Interval::new(6, Unit::Hour));
 }
 
 #[test]
@@ -231,12 +402,43 @@ fn quitting_drops_what_is_waiting_and_saves_last() {
         lists_nothing: Vec::new(),
         private: Vec::new(),
         stamp: None,
+        settings: None,
+        config_saves: Vec::new(),
+        settings_checked: false,
     };
     app.finish(done, T0);
     assert!(app.is_idle());
     assert_eq!(app.arm(T0), None, "no timer once quitting");
     app.on_timer(T0);
     assert!(app.queued().is_empty());
+}
+
+#[test]
+fn checking_settings_blocks_local_edits_until_the_worker_finishes() {
+    let mut app = bare();
+    assert!(app.want(Job::Check(None)));
+    assert!(app.portable_probe_pending());
+    answer(&mut app, Err(EngineError::Failed("test startup".to_string())), None, T0);
+
+    let order = app.next_order().unwrap();
+    app.finish(
+        Done {
+            job: order.job,
+            result: checked_nothing(),
+            next_wake: None,
+            last_checks: Vec::new(),
+            kept: Vec::new(),
+            facts: Vec::new(),
+            lists_nothing: Vec::new(),
+            private: Vec::new(),
+            stamp: None,
+            settings: None,
+            config_saves: Vec::new(),
+            settings_checked: true,
+        },
+        T0,
+    );
+    assert!(!app.portable_probe_pending());
 }
 
 #[test]
@@ -378,6 +580,48 @@ fn a_start_at_sign_in_waits_before_it_looks_then_looks_and_checks_as_background_
 
     let mut app = app_for(&s);
     assert_eq!(run_next(&mut app, &mut s.engine, T0), (Job::Startup, false), "started by the user, it looks as usual");
+}
+
+#[test]
+fn initial_settings_load_does_not_duplicate_startup() {
+    let mut s = Setup::fresh("app-initial-settings");
+    let source = portable_source(&s, &s.cfg);
+    let mut app = app_for(&s);
+    app.set_settings_source(source);
+    app.queue_initial_settings_load();
+
+    let order = app.next_order().expect("settings load comes first");
+    assert_eq!(order.job, Job::LoadSettings);
+    let mut done = app::perform(&mut s.engine, &order, &cancel_flag());
+    let loaded = done.settings.take().expect("settings were read").result.unwrap();
+    app.settings_reloaded(loaded, &done.job);
+    app.finish(done, T0);
+
+    assert_eq!(app.queued(), &[Job::Startup]);
+}
+
+#[test]
+fn a_start_at_sign_in_loads_settings_on_the_worker_without_ending_the_wait() {
+    let mut s = Setup::fresh("app-signin-settings");
+    let source = portable_source(&s, &s.cfg);
+    let mut app = app_for(&s);
+    app.set_settings_source(source);
+    app.queue_initial_settings_load();
+    app.started_by_windows(T0);
+
+    let order = app.next_order().expect("settings can be read while the first look waits");
+    assert_eq!((order.job.clone(), order.background), (Job::LoadSettings, true));
+    let mut done = app::perform(&mut s.engine, &order, &cancel_flag());
+    let loaded = done.settings.take().expect("settings were read").result.unwrap();
+    app.settings_reloaded(loaded, &done.job);
+    app.finish(done, T0);
+
+    assert!(app.settings_initialized());
+    assert!(!app.started());
+    assert!(app.queued().is_empty(), "the first look still waits for the sign-in grace period");
+    assert_eq!(app.arm(T0), Some(T0 + SIGN_IN_GRACE));
+    app.on_timer(T0 + SIGN_IN_GRACE);
+    assert_eq!(app.queued(), &[Job::Startup]);
 }
 
 #[test]

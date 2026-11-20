@@ -9,7 +9,7 @@ use std::collections::HashSet;
 
 use windows_sys::Win32::Graphics::Gdi::{DT_CENTER, DT_EDITCONTROL, DT_END_ELLIPSIS, DT_PATH_ELLIPSIS, DT_RIGHT, DT_SINGLELINE, DT_VCENTER, DT_WORDBREAK};
 
-use super::control::{Deco, Item, Kind, Look, Mark, Surface, two_lines};
+use super::control::{Deco, Item, Kind, Look, Mark, RowCmd, Surface, two_lines};
 use super::paint::{Font, Rect, Tone, glyph};
 use super::sentence;
 use super::theme::Role;
@@ -82,8 +82,9 @@ pub mod id {
     pub const NOTE: i32 = 100_000;
     pub const FILE: i32 = 200_000;
     pub const GAP: i32 = 300_000;
-    /// Plus [`STRIDE`] per skill, plus the part: 0 the row, 1 its details, 2 Show changes, 3 Open folder, 4 to 7 its
-    /// actions, 8 its facts, 9 Preview, 10 Copy path, 11 Copy GitHub link, 12 Open on GitHub.
+    /// Plus [`STRIDE`] per skill. Child controls: 0 row; in an open repair card, 2 Show
+    /// changes and 4 to 7 choices. Open folder (3), Preview (9), Copy path (10), Copy GitHub link (11) and Open
+    /// on GitHub (12) retain their part numbers but are inline commands, not separate child windows.
     pub const SKILL: i32 = 1_000_000;
     pub const STRIDE: i32 = 16;
 }
@@ -141,11 +142,6 @@ pub fn hit(n: i32) -> Hit {
 /// The id of part `k` of the skill at `index` (see [`id::SKILL`]).
 pub fn skill_id(index: usize, k: i32) -> i32 {
     id::SKILL + id::STRIDE * index as i32 + k
-}
-
-/// The id of the row a part of a skill is on.
-pub fn row_id(n: i32) -> i32 {
-    n - (n - id::SKILL) % id::STRIDE
 }
 
 /// Which page the right side shows.
@@ -500,9 +496,37 @@ pub fn pill_of(row: &Row) -> (Tone, Option<char>) {
     }
 }
 
-/// A skill that needs the user shows its choices until they close it; another shows them once opened.
+/// Only a sync problem with a repair choice has a card. Inspection and undoing "keep mine" don't need one.
+pub fn expandable(row: &Row) -> bool {
+    row.level >= Level::Attention && row.actions.iter().any(|a| *a != Action::ManageAgain)
+}
+
 pub fn is_open(row: &Row, toggled: &HashSet<String>) -> bool {
-    (row.level >= Level::Attention) != toggled.contains(&row.name)
+    expandable(row) && !toggled.contains(&row.name)
+}
+
+/// Commands shared by the inline icons and the row's menu, in display order.
+pub fn row_commands(row: &Row, linkable: bool) -> Vec<RowCmd> {
+    let mut commands = Vec::new();
+    if row.has_folder() {
+        commands.push(RowCmd::Open);
+        if row.facts.is_some() {
+            commands.push(RowCmd::Preview);
+        }
+        commands.push(RowCmd::CopyPath);
+    }
+    if row.listed && linkable {
+        commands.extend([RowCmd::CopyLink, RowCmd::OnGitHub]);
+    }
+    if !expandable(row) {
+        if row.can_compare() {
+            commands.push(RowCmd::Compare);
+        }
+        if row.actions.contains(&Action::ManageAgain) {
+            commands.push(RowCmd::ManageAgain);
+        }
+    }
+    commands
 }
 
 fn action_glyph(action: Action) -> Option<char> {
@@ -630,25 +654,25 @@ fn skills(o: &mut Out, p: &RepoPage, x: i32, mut y: i32, cw: i32) -> i32 {
         }
         let base = skill_id(j, 0);
         let (tone, pill) = pill_of(row);
-        let look = Look::Row { tone, glyph: pill, folder: row.has_folder() };
-        o.item(base, [x + 1, y, cw - 2, ROW_H], two_lines(&printable(&row.name), row.tag), look, true);
+        let open = is_open(row, p.toggled);
+        let look = Look::Row { tone, glyph: pill, commands: row_commands(row, linkable), disclosure: expandable(row).then_some(open) };
+        let facts = row.facts.as_ref().map(|f| printable(&board::facts_text(f, p.now)).into_owned()).unwrap_or_default();
+        let explanation = if !row.plain() || row.facts.is_none() { printable_lines(&row.text) } else { "".into() };
+        let text = format!("{}\n{}\n{facts}\n{explanation}", printable(&row.name), row.tag);
+        o.item(base, [x + 1, y, cw - 2, ROW_H], text, look, true);
         y += ROW_H;
-        if !is_open(row, p.toggled) {
-            continue;
+        let (tx, tw) = (x + 44, cw - 44 - 16);
+        if open {
+            y = skill_card(o, row, base, [tx, y, tw]) + 6;
         }
-        y = skill_card(o, p, row, base, linkable, [x + 44, y, cw - 44 - 16]);
+        y += 4;
     }
     o.card(mark, [x, top, cw, y - top]);
     y
 }
 
-/// What an open skill shows, at x, y, w wide: what is the matter and the choices first, then what the record says and
-/// what can be done with the skill. Returns the bottom.
-fn skill_card(o: &mut Out, p: &RepoPage, row: &Row, base: i32, linkable: bool, [x, mut y, w]: [i32; 3]) -> i32 {
-    let facts = row.facts.as_ref();
-    if !(row.plain() && facts.is_some()) {
-        y += o.para(base + 1, [x, y, w], printable_lines(&row.text), Font::Caption, Role::Text2) + 10;
-    }
+/// An open card contains just the comparison and repair choices. Returns the bottom.
+fn skill_card(o: &mut Out, row: &Row, base: i32, [x, y, w]: [i32; 3]) -> i32 {
     let mut choices = Vec::new();
     if row.can_compare() {
         let kind = if row.actions.contains(&Action::Overwrite) { Kind::Accent } else { Kind::Standard };
@@ -657,30 +681,7 @@ fn skill_card(o: &mut Out, p: &RepoPage, row: &Row, base: i32, linkable: bool, [
     for (k, action) in row.actions.iter().enumerate() {
         choices.push(btn(base + 4 + k as i32, action.label(), Kind::Standard, action_glyph(*action)));
     }
-    if !choices.is_empty() {
-        y = o.flow(x, y, x + w, 28, choices) + 10;
-    }
-    if let Some(facts) = facts {
-        y += o.para(base + 8, [x, y, w], board::facts_text(facts, p.now), Font::Caption, Role::Text2) + 10;
-    }
-    let mut more = Vec::new();
-    if row.has_folder() {
-        if facts.is_some() {
-            more.push(btn(base + 9, "Preview", Kind::Standard, Some(glyph::VIEW)));
-        }
-        more.push(btn(base + 10, "Copy path", Kind::Standard, Some(glyph::COPY)));
-    }
-    if row.listed && linkable {
-        more.push(btn(base + 11, "Copy GitHub link", Kind::Standard, Some(glyph::LINK)));
-        more.push(btn(base + 12, "Open on GitHub", Kind::Standard, Some(glyph::GLOBE)));
-    }
-    if row.has_folder() {
-        more.push(btn(base + 3, "Open folder", Kind::Standard, Some(glyph::OPEN)));
-    }
-    if !more.is_empty() {
-        y = o.flow(x, y, x + w, 28, more) + 10;
-    }
-    y + 2
+    o.flow(x, y, x + w, 28, choices)
 }
 
 pub struct SettingsPage<'a> {
@@ -1311,7 +1312,7 @@ mod tests {
     }
 
     fn row(name: &str, level: Level, tag: &'static str, actions: Vec<Action>) -> Row {
-        Row { name: name.to_string(), text: format!("about {name}"), tag, level, actions, facts: None, listed: true }
+        Row { name: name.to_string(), text: format!("about {name}"), tag, level, actions, facts: None, listed: true, folder_missing: false }
     }
 
     fn ok(name: &str) -> Row {
@@ -1525,22 +1526,22 @@ mod tests {
 
         let s = page(&none);
         // The status is in the window text too, after a line break, so a screen reader reads it with the name.
-        assert_eq!(item(&s, id::SKILL).text, "rlo-\\u{202e}gpj\nEdited on this PC");
+        assert_eq!(item(&s, id::SKILL).text, "rlo-\\u{202e}gpj\nEdited on this PC\n\nabout rlo-\\u{202e}gpj");
         assert_eq!(hit(id::SKILL), Hit::Skill(0, Part::Row));
-        assert_eq!(item(&s, id::SKILL + id::STRIDE).text, "alpha\nUp to date");
+        assert_eq!(item(&s, id::SKILL + id::STRIDE).text, "alpha\nUp to date\n\nabout alpha");
         assert_eq!(hit(id::SKILL + id::STRIDE), Hit::Skill(1, Part::Row));
         // The skill that needs the user is open: its choices are there, Show changes first and accented.
         assert_eq!(item(&s, id::SKILL + 2).look, Look::Button { kind: Kind::Accent, glyph: Some(glyph::FILE) });
         assert_eq!(item(&s, id::SKILL + 4).text, "Use the GitHub version");
         assert_eq!(hit(id::SKILL + 5), Hit::Skill(0, Part::Action(1)));
         assert_eq!(hit(id::SKILL + 3), Hit::Skill(0, Part::Open));
-        assert!(!s.items.iter().any(|i| i.id == id::SKILL + id::STRIDE + 3), "a skill that is fine is closed");
         fits_in(&s, 600);
 
         let toggled: HashSet<String> = ["rlo-\u{202e}gpj".to_string(), "alpha".to_string()].into();
         let s = page(&toggled);
         assert!(!s.items.iter().any(|i| i.id == id::SKILL + 2), "closed by the user");
-        assert_eq!(item(&s, id::SKILL + id::STRIDE + 3).text, "Open folder", "opened by the user");
+        assert!(item(&s, id::SKILL).text.ends_with("about rlo-\\u{202e}gpj"));
+        assert!(!is_open(&v.skills[1], &toggled), "a stale toggle cannot open a healthy skill");
     }
 
     #[test]
@@ -1562,7 +1563,7 @@ mod tests {
                 assert_eq!(hit(at(j, k)), Hit::Other(at(j, k)), "part {k} is text or unused");
             }
             for k in 0..id::STRIDE {
-                assert_eq!((skill_id(j as usize, k), row_id(at(j, k))), (at(j, k), at(j, 0)));
+                assert_eq!(skill_id(j as usize, k), at(j, k));
             }
         }
     }
@@ -1572,65 +1573,69 @@ mod tests {
     }
 
     #[test]
-    fn an_open_skill_tells_what_the_record_says_and_offers_what_can_be_done_with_it() {
+    fn everyday_commands_and_disclosure_follow_the_current_row() {
+        use RowCmd::*;
+        let kept = row("mine", Level::Ok, "Kept as yours", vec![Action::ManageAgain]);
+        let failed = row("busy", Level::Error, "Failed", vec![]);
+        let deleted = Row { facts: Some(facts("gone")), ..row("gone", Level::Attention, board::DELETED_TAG, vec![Action::Restore, Action::LeaveRemoved]) };
+        assert!(!expandable(&kept));
+        assert!(!expandable(&failed));
+        assert!(expandable(&deleted));
+        assert_eq!(row_commands(&kept, false), [Open, CopyPath, Compare, ManageAgain]);
+        assert_eq!(row_commands(&failed, false), [Open, CopyPath, Compare]);
+        assert_eq!(row_commands(&deleted, true), [CopyLink, OnGitHub], "a record alone cannot be previewed");
+        assert!(row_commands(&deleted, false).is_empty());
+        let absent = Row { folder_missing: true, facts: Some(facts("busy")), ..failed };
+        assert_eq!(row_commands(&absent, true), [CopyLink, OnGitHub], "neither the failure tag nor an install record proves the folder exists");
+    }
+
+    #[test]
+    fn skill_rows_are_one_line_with_details_for_the_tooltip_and_only_repairs_expand() {
+        use RowCmd::*;
         let known = |row: Row| Row { facts: Some(facts(&row.name)), ..row };
+        let explanation = "This skill could not be updated. ".repeat(5);
         let v = view(
             "o/a",
             vec![
                 known(ok("alpha")),
-                known(edited("beta")),
+                Row { text: explanation.clone(), ..known(edited("beta")) },
                 row("gamma", Level::Ok, "New", Vec::new()),
                 Row { listed: false, ..known(row("delta", Level::Attention, "Removed on GitHub", vec![Action::KeepMine])) },
                 ok("epsilon"),
             ],
         );
-        // beta and delta need the user, so they are open; the others are opened by the user.
-        let toggled: HashSet<String> = ["alpha", "gamma", "epsilon"].map(String::from).into();
+        let toggled: HashSet<String> = ["beta", "alpha"].map(String::from).into();
         let at = |j: i32, k: i32| id::SKILL + id::STRIDE * j + k;
         let has = |s: &Surface, n: i32| s.items.iter().any(|i| i.id == n);
         for w in [344, 600, 900] {
             let s = repo_page(&RepoPage { view: &v, repo: &repo("o/a"), default: DEFAULT_INTERVAL, now: NOW, toggled: &toggled }, w, &fit);
             fits_in(&s, w);
-            // Top to bottom, then left to right.
-            let in_order = |j: i32, parts: &[i32]| {
-                parts.windows(2).all(|p| {
-                    let ([ax, ay, ..], [bx, by, ..]) = (item(&s, at(j, p[0])).at, item(&s, at(j, p[1])).at);
-                    (ay, ax) < (by, bx)
-                })
+            let look = |j, tone, glyph, commands, disclosure| {
+                assert_eq!(item(&s, at(j, 0)).look, Look::Row { tone, glyph, commands, disclosure });
             };
-
-            // In sync: the facts say more than the sentence behind "Up to date" would.
-            assert!(!has(&s, at(0, 1)), "the sentence behind the tag is left out");
-            assert_eq!(item(&s, at(0, 8)).text, "Version 1a2b3c4 · 3 files, 12 KB · Updated 2 days ago");
-            let texts: Vec<&str> = [9, 10, 11, 12, 3].iter().map(|&k| item(&s, at(0, k)).text.as_str()).collect();
-            assert_eq!(texts, ["Preview", "Copy path", "Copy GitHub link", "Open on GitHub", "Open folder"]);
-            assert!(in_order(0, &[0, 8, 9, 10, 11, 12, 3]), "at {w}");
-            assert_eq!(item(&s, at(0, 9)).look, Look::Button { kind: Kind::Standard, glyph: Some(glyph::VIEW) });
-            assert_eq!(item(&s, at(0, 0)).look, Look::Row { tone: Tone::Ok, glyph: Some(glyph::OK), folder: true });
-
-            // Needs the user: what is the matter and the choices come first, then the facts and the rest.
-            assert!(in_order(1, &[0, 1, 2, 4, 5, 8, 9, 10, 11, 12, 3]), "at {w}");
-
-            // New: nothing is on this PC yet to open, copy or show, but GitHub has it.
-            for k in [3, 8, 9, 10] {
-                assert!(!has(&s, at(2, k)), "a new skill has no part {k}");
+            let facts = "Version 1a2b3c4 · 3 files, 12 KB · Updated 2 days ago";
+            assert_eq!(item(&s, at(0, 0)).text, format!("alpha\nUp to date\n{facts}\n"));
+            let everyday = vec![Open, Preview, CopyPath, CopyLink, OnGitHub];
+            look(0, Tone::Ok, Some(glyph::OK), everyday.clone(), None);
+            look(1, Tone::Warn, Some(glyph::EDIT), everyday, Some(false));
+            assert!(!has(&s, at(1, 2)) && !has(&s, at(1, 4)));
+            assert_eq!(item(&s, at(1, 0)).text, format!("beta\nEdited on this PC\n{facts}\n{explanation}"));
+            assert_eq!(item(&s, at(2, 0)).at[1] - item(&s, at(1, 0)).at[1], ROW_H + 4);
+            look(2, Tone::Off, None, vec![CopyLink, OnGitHub], None);
+            look(3, Tone::Warn, Some(glyph::WARN), vec![Open, Preview, CopyPath], Some(true));
+            assert_eq!(item(&s, at(3, 4)).text, "Keep my version");
+            assert!(item(&s, at(3, 4)).at[1] >= item(&s, at(3, 0)).at[1] + ROW_H);
+            assert!(item(&s, at(4, 0)).text.ends_with("\n\nabout epsilon"));
+            for j in 0..5 {
+                assert!(!has(&s, at(j, 1)) && !has(&s, at(j, 8)), "no extra lines below the header");
+                assert!([3, 9, 10, 11, 12].iter().all(|&k| !has(&s, at(j, k))), "no duplicate everyday buttons");
             }
-            assert!(in_order(2, &[0, 1, 11, 12]), "at {w}");
-            assert_eq!(item(&s, at(2, 0)).look, Look::Row { tone: Tone::Off, glyph: None, folder: false });
-
-            // Gone from GitHub: there is nothing there to link to.
-            assert!(!has(&s, at(3, 11)) && !has(&s, at(3, 12)));
-            assert!(in_order(3, &[0, 1, 4, 8, 9, 10, 3]), "at {w}");
-
-            // In sync, but nothing is known about it yet: the sentence stays, and there is no record to preview.
-            assert!(!has(&s, at(4, 8)) && !has(&s, at(4, 9)));
-            assert!(in_order(4, &[0, 1, 10, 11, 12, 3]), "at {w}");
         }
 
         // No link is made to a repository whose name can't be put in one as it is.
         let odd = RepoConfig { repo: "o/\u{202e}a".to_string(), ..repo("o/a") };
         let s = repo_page(&RepoPage { view: &v, repo: &odd, default: DEFAULT_INTERVAL, now: NOW, toggled: &toggled }, 600, &fit);
-        assert!(!has(&s, at(0, 11)) && !has(&s, at(0, 12)) && has(&s, at(0, 10)));
+        assert!(matches!(&item(&s, at(0, 0)).look, Look::Row { commands, .. } if commands == &[Open, Preview, CopyPath]));
     }
 
     #[test]

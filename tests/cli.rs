@@ -17,6 +17,7 @@ use tiny_skill_sync::cli::{self, Host};
 use tiny_skill_sync::config::{CONFIG_FILE, Config};
 use tiny_skill_sync::github::{FailureKind, Remote, RemoteError, TokenProvider};
 use tiny_skill_sync::logo;
+use tiny_skill_sync::portable::{SETTINGS_FILE, SOURCES_FILE};
 use tiny_skill_sync::win::{autorun, wide};
 use windows_sys::Win32::Foundation::ERROR_SUCCESS;
 use windows_sys::Win32::Storage::FileSystem::{GetFileVersionInfoSizeW, GetFileVersionInfoW, VS_FFI_SIGNATURE, VS_FIXEDFILEINFO, VerQueryValueW};
@@ -36,6 +37,10 @@ struct TestHost {
 impl Host for TestHost {
     fn home(&self) -> PathBuf {
         self.world.home.clone()
+    }
+
+    fn executable_dir(&self) -> Result<PathBuf, String> {
+        Ok(self.world.root.join("exe"))
     }
 
     fn skills_dir(&self, _cfg: &Config) -> PathBuf {
@@ -99,8 +104,10 @@ impl TestHost {
 
     /// No settings at all.
     fn empty(name: &str) -> TestHost {
+        let world = World::new(name);
+        std::fs::create_dir_all(world.root.join("exe")).unwrap();
         TestHost {
-            world: World::new(name),
+            world,
             remote: FakeRemote::new(),
             tokens: FakeTokens::none(),
             saved: Mutex::new(None),
@@ -201,6 +208,42 @@ fn an_edit_holds_an_update_until_the_user_settles_it() {
     expect(&ran, 0, &["Backup: "]);
     assert_eq!(host.world.read("alpha/SKILL.md"), ALPHA_V2);
     assert_eq!(host.world.backups().len(), 1);
+    expect(&tss(&host, "check"), 0, &["Up to date"]);
+}
+
+#[test]
+fn a_converged_edit_is_not_reported_as_edited_or_held() {
+    let host = TestHost::new("cli-converged");
+    expect(&tss(&host, "check"), 0, &[]);
+    // The user edited alpha, and the same text was pushed to GitHub afterwards.
+    host.world.write("alpha/SKILL.md", ALPHA_V2);
+    host.remote.put(REPO, "skills/alpha/SKILL.md", ALPHA_V2);
+    let before = host.world.skills_snapshot();
+
+    let ran = tss(&host, "check");
+    expect(&ran, 0, &[]);
+    let said = format!("{}{}", ran.out, ran.err).to_lowercase();
+    assert!(!said.contains("edited") && !said.contains("held"), "the check reports it as edited or held:\n{ran:?}");
+    assert_eq!(host.world.skills_snapshot(), before, "not one file changed");
+    assert!(host.world.backups().is_empty(), "{:?}", host.world.backups());
+
+    let ran = tss(&host, "status");
+    expect(&ran, 0, &[]);
+    let said = format!("{}{}", ran.out, ran.err);
+    assert!(!said.contains("Needs attention") && !said.contains("Edited"), "status says it needs attention:\n{ran:?}");
+}
+
+#[test]
+fn a_converged_edit_is_told_as_a_catch_up_and_a_dry_run_only_says_so() {
+    let host = TestHost::new("cli-catch-up");
+    expect(&tss(&host, "check"), 0, &[]);
+    host.world.write("alpha/SKILL.md", ALPHA_V2);
+    host.remote.put(REPO, "skills/alpha/SKILL.md", ALPHA_V2);
+
+    let ran = tss(&host, "check fx --dry-run");
+    expect(&ran, 0, &["Would mark alpha as in sync (your edit is on GitHub too)", "Dry run: nothing was changed."]);
+    let ran = tss(&host, "check");
+    expect(&ran, 0, &["Marked alpha as in sync (your edit is on GitHub too)"]);
     expect(&tss(&host, "check"), 0, &["Up to date"]);
 }
 
@@ -506,6 +549,81 @@ fn broken_settings_are_reported_not_replaced() {
     expect(&tss(&host, "status"), 2, &["config.json"]);
     expect(&tss(&host, "add o/other"), 2, &["config.json"]);
     assert_eq!(std::fs::read_to_string(host.config_file()).unwrap(), "{ not json");
+}
+
+#[test]
+fn portable_companions_select_and_update_shared_settings_without_changing_local_config() {
+    let host = TestHost::empty("cli-portable-route");
+    host.save(&standard_config());
+    let local_before = std::fs::read(host.config_file()).unwrap();
+    let executable_dir = host.world.root.join("exe");
+
+    std::fs::write(executable_dir.join(SETTINGS_FILE), r#"{"version":1,"default_interval":"12h"}"#).unwrap();
+    let settings_only = tss(&host, "status");
+    expect(&settings_only, 0, &["No repositories are set up"]);
+    assert!(!settings_only.out.contains("[fx]"), "local config was used:\n{settings_only:?}");
+
+    std::fs::write(executable_dir.join(SETTINGS_FILE), "{ not json").unwrap();
+    expect(&tss(&host, "status"), 2, &["tiny-skill-sync.settings.json is not valid"]);
+    assert_eq!(std::fs::read(host.config_file()).unwrap(), local_before, "a portable settings error must not fall back to config.json");
+
+    std::fs::remove_file(executable_dir.join(SETTINGS_FILE)).unwrap();
+    std::fs::write(executable_dir.join(SOURCES_FILE), r#"{"version":1,"repos":[{"id":"shared","repo":"o/shared","enabled":false,"interval":"6h"}]}"#).unwrap();
+    let sources_only = tss(&host, "status");
+    expect(&sources_only, 0, &["[shared] (disabled)", "Disabled: checked only when asked"]);
+    assert!(!sources_only.out.contains("[fx]"), "local config was used:\n{sources_only:?}");
+
+    expect(&tss(&host, "add o/new --every 3h"), 0, &["Added o/new as 'o-new'."]);
+    let sources: serde_json::Value = serde_json::from_slice(&std::fs::read(executable_dir.join(SOURCES_FILE)).unwrap()).unwrap();
+    assert_eq!(sources["repos"].as_array().unwrap().len(), 2);
+    assert_eq!(sources["repos"][0]["id"], "shared");
+    assert_eq!(sources["repos"][0]["enabled"], false);
+    assert_eq!(sources["repos"][0]["interval"], "6h");
+    assert_eq!(sources["repos"][1]["id"], "o-new");
+    assert_eq!(std::fs::read(host.config_file()).unwrap(), local_before, "portable commands must not mutate config.json");
+}
+
+#[test]
+fn portable_export_omits_machine_local_skills_path_and_leaves_config_untouched() {
+    let host = TestHost::empty("cli-portable-export");
+    let mut local = standard_config();
+    local.default_interval = tiny_skill_sync::interval::Interval::new(12, tiny_skill_sync::interval::Unit::Hour);
+    local.skills_dir = Some(host.world.root.join("custom-skills").to_string_lossy().into_owned());
+    local.repos[0].enabled = false;
+    local.repos[0].interval = Some(tiny_skill_sync::interval::Interval::new(6, tiny_skill_sync::interval::Unit::Hour));
+    host.save(&local);
+    let local_before = std::fs::read(host.config_file()).unwrap();
+
+    expect(&tss(&host, "portable"), 0, &["Exported shared settings and repositories", "config.json was not changed"]);
+
+    let executable_dir = host.world.root.join("exe");
+    let settings: serde_json::Value = serde_json::from_slice(&std::fs::read(executable_dir.join(SETTINGS_FILE)).unwrap()).unwrap();
+    assert_eq!(settings["version"], 1);
+    assert_eq!(settings["default_interval"], "12h");
+    assert!(settings.get("skills_dir").is_none(), "{settings}");
+    let sources: serde_json::Value = serde_json::from_slice(&std::fs::read(executable_dir.join(SOURCES_FILE)).unwrap()).unwrap();
+    assert_eq!(sources["repos"][0]["enabled"], false);
+    assert_eq!(sources["repos"][0]["interval"], "6h");
+    assert_eq!(std::fs::read(host.config_file()).unwrap(), local_before, "export must not mutate config.json");
+}
+
+#[test]
+fn portable_export_refuses_to_overwrite_either_companion() {
+    for existing in [SETTINGS_FILE, SOURCES_FILE] {
+        let host = TestHost::empty("cli-portable-no-overwrite");
+        host.save(&standard_config());
+        let local_before = std::fs::read(host.config_file()).unwrap();
+        let executable_dir = host.world.root.join("exe");
+        let path = executable_dir.join(existing);
+        std::fs::write(&path, b"keep exactly").unwrap();
+
+        let ran = tss(&host, "portable");
+        expect(&ran, 2, &["already exists; refusing to overwrite"]);
+        assert_eq!(std::fs::read(path).unwrap(), b"keep exactly");
+        let other = if existing == SETTINGS_FILE { SOURCES_FILE } else { SETTINGS_FILE };
+        assert!(!executable_dir.join(other).exists(), "partial export was left behind");
+        assert_eq!(std::fs::read(host.config_file()).unwrap(), local_before);
+    }
 }
 
 // ---------------------------------------------------------------------------------------------------------------------

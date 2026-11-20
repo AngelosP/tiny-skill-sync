@@ -10,11 +10,11 @@ existing copy only after proving it matches upstream history, and never overwrit
 your choice. It removes from your PC only
 what came from GitHub and was later removed there; files you add are yours, and the app does not even show them.
 
-- **Small and quiet.** One exe under 1 MiB, no runtime to install. It starts in about 8 ms, uses about 1 MiB of
+- **Small and quiet.** One exe of about 1 MiB, no runtime to install. It starts in about 8 ms, uses about 1 MiB of
   memory while idle, and does no work at all between checks: no CPU, no disk, no network.
 - **Starts with Windows, without slowing it down.** Turn on **Start with Windows** (the app offers it when you add your
-  first repository). At sign-in it goes straight to the tray and waits 30 seconds before it looks at your skills or
-  checks GitHub, and then does both at low priority.
+  first repository). At sign-in it goes straight to the tray, reads settings on the worker, then waits 30 seconds
+  before it looks at your skills or checks GitHub, and then does both at low priority.
 - **Cheap checks.** An unchanged repository costs one small "has anything changed?" request to GitHub, which reads and
   writes no files.
 - **Public and private repositories.** Public ones need nothing. Private ones are read with the GitHub CLI's sign-in
@@ -43,7 +43,9 @@ These are the rules the app follows. Each one is covered by tests (see [CONTRIBU
 2. **Your edits win.** If you change or delete a file the app installed and upstream changes that skill too, the app
    changes nothing and asks you what to do. If you delete a whole skill, it does not put it back unless you ask. Other
    line endings and added or removed blank lines are not edits (see
-   [What counts as the same](#what-counts-as-the-same)).
+   [What counts as the same](#what-counts-as-the-same)). If you made your edit on GitHub too, so that your folder is
+   exactly what GitHub has now, there is nothing to decide: the app marks the skill as in sync and writes nothing
+   (see [An edit that GitHub has too](#an-edit-that-github-has-too)).
 3. **A failure is never a deletion.** No network, a wrong token, a missing repository, a rate limit or a strange answer
    from GitHub only means "could not check". Skills are removed only when GitHub returned a complete listing in which
    they are gone. If a repository suddenly lists no skills at all, nothing is deleted until you confirm.
@@ -97,27 +99,67 @@ allows the same current-or-historical adoption checks.
 4. The app installs the skills at once and then checks once a day. It also asks whether to start with Windows.
 
 To update it, quit the app (right-click the icon, **Quit**), replace both exes with the new ones and start it again.
-The settings and the record of what it installed stay in `%LOCALAPPDATA%\tiny-skill-sync`, and Start with Windows
-stays as it was, because it names the exe's path.
+In local mode, the settings and the record of what it installed stay in `%LOCALAPPDATA%\tiny-skill-sync`, and Start
+with Windows stays as it was, because it names the exe's path.
+
+### Run from a shared folder
+
+Both exes can live in a folder available to several Windows machines. On the machine whose local configuration you
+want to copy, run:
+
+```powershell
+tss portable
+```
+
+This creates two files beside `tss.exe` and refuses to replace either one if it already exists:
+
+- `tiny-skill-sync.settings.json` holds the default interval and optional skills-folder setting.
+- `tiny-skill-sync.sources.json` holds the repositories, including their branch, folder, enabled state, interval and
+  `use_token` choice.
+
+The files are deliberately separate, so you can copy or update one without replacing the other. The command does not
+change the local `config.json`. To change shared settings later, edit the companion JSON files or copy in reviewed
+versions; `tss portable` is an export, not a merge command. Each file has a format version, and an unreadable,
+unsupported or malformed companion is reported rather than silently ignored.
+
+The settings and sources are shared; `state.json`, `engine.lock`, window size, the one-time startup-offer marker,
+mutex, saved GitHub token and skills folder remain local to each machine. The default skills folder is resolved
+separately on each machine as `%USERPROFILE%\.copilot\skills`. A portable `skills_dir` may use Windows environment
+variables such as `%USERPROFILE%`; they are expanded locally and the stored value is not rewritten. `TSS_SKILLS_DIR`
+still overrides it on that machine. Do not set `skills_dir` to a folder shared by machines: concurrent installs and
+per-machine ownership records are not supported.
+
+The app reads and writes companion files on its worker, so a slow or unavailable share does not block the window.
+Changes made on another machine are picked up at the next poll, **Sync now** or check, or when the window opens. There
+is no cross-machine lock or transaction across the two files: avoid editing them from multiple machines at once, and
+check for OneDrive conflict copies before continuing. If the share is unavailable, the check fails and installed
+skills are left alone.
+
+You may turn on **Start with Windows** with `tss startup on`. When Windows can resolve the executable's final network
+path, the startup entry uses its UNC path; the executable also opts into Windows' network image-loading behavior.
+Windows still needs access to the NAS or a fully synced OneDrive folder at sign-in. Startup from a real NAS or OneDrive
+share has not been verified, so try it on your setup before relying on it.
 
 ### Start with Windows
 
 With **Start with Windows** on (in Settings, or `tss startup on`), Windows starts the app when you sign in. Windows
 starts such apps only once the desktop is up. The app then goes straight to the tray without opening its window and
-waits 30 seconds, so that Windows can finish starting and the network can come up (the tooltip says "waiting for
-Windows to finish starting"). Then it looks over the installed skills and checks GitHub, at low priority, so it does
-not slow your sign-in down. If you open the window before then, it looks over the skills at once; it checks GitHub
-before the 30 seconds are up only when you ask it to (**Sync now**).
+reads settings on the worker. It waits 30 seconds before looking over the installed skills and checking GitHub, so
+Windows can finish starting and the network can come up (the tooltip says "waiting for Windows to finish starting").
+Then it looks over the skills and checks GitHub, at low priority, so it does not slow your sign-in down. If you open
+the window before then, it looks over the skills at once; it checks GitHub before the 30 seconds are up only when you
+ask it to (**Sync now**).
 
-- The app offers this when you add your first repository (**Turn on** or **Not now**). It never turns it on by itself,
-  and never turns it back on after you turned it off.
+- The app offers this once per machine when you add your first repository, or open a machine with already-shared
+  repositories (**Turn on** or **Not now**). It never turns it on by itself, and never turns it back on after you
+  turned it off.
 - It is the entry that Task Manager (**Startup apps**) and Windows Settings (**Apps** > **Startup**) list as Tiny Skill
   Sync. Turned off there, it stays off, and Settings in the app says so; turning it on in the app turns it on there too.
 - The entry names the exe by its path. If you move the app to another folder, Settings says that Windows starts
   another copy, until you turn it on in the new folder. Before you delete the app, turn it off (or run
   `tss startup off`), so that no entry is left behind.
-- Only the settings file can make it open its window at sign-in: when `config.json` can't be read, nothing can be
-  checked until it is fixed, so the window says why.
+- Only readable settings can make it open its window at sign-in: when the local config or a portable companion cannot
+  be read, nothing is checked until it is fixed, and the window says why.
 
 ## Which folders are skills
 
@@ -177,8 +219,9 @@ room from the page beside it, and narrows again when the mouse leaves.
   - The **More** button holds **Sync this repository**, **Open on GitHub**, **Open skills folder** and **Remove
     repository…**. Removing asks whether to leave its skills installed (they become yours) or to delete them too
     (skills you edited are kept, and files you added stay where they are).
-- **Its skills,** each with its state. A skill that needs you is open already; click any other to open it. An open
-  skill says what is going on, and offers the choices that make sense (see below) and **Show changes**. Under them:
+- **Its skills,** each on one line with its state. Rest the mouse on the name or status badge to see the explanation
+  and any known version, file count, size and update time. Only a skill with a problem you can act on has an arrow: its choices start open.
+  Click the row or press Enter on it to hide or show those choices.
   - For a skill the app installed, one line from its record: the version (the start of the commit it came from), how
     many files GitHub put there and their size, and when the app installed or last updated it ("Version 1a2b3c4 ·
     3 files, 12 KB · Updated 2 days ago"). Skills installed by an older version of the app say when only after their
@@ -186,15 +229,17 @@ room from the page beside it, and narrows again when the mouse leaves.
   - **Preview** shows the files GitHub put in the skill, each whole, as they are on this PC, in the same view as
     **Show changes** but with nothing to choose. Files you added are not shown, and nothing is written.
   - **Copy path** copies the path of the skill's folder. **Copy GitHub link** copies the address of the skill on
-    GitHub, and **Open on GitHub** opens it in your browser; the address names the repository's branch, or its default
+    GitHub, and the GitHub logo (**Open on GitHub**) opens it in your browser; the address names the repository's branch, or its default
     branch when none is set. The line under the band says what was copied.
   - **Open folder** opens the skill's folder in File Explorer.
 
   Each button shows only when it can work: no **Preview** for a skill the app did not install, no **Preview**, **Copy
   path** or **Open folder** for a skill whose folder is not on this PC, and no GitHub link for a skill GitHub no longer
   lists.
-- **Rest the mouse on a skill** whose folder is on this PC, and a folder button appears beside its state: click it to
-  open the folder without opening the skill.
+- **Rest the mouse on a skill or focus it with Tab** to see actions beside its name, starting with the folder icon
+  when the folder is available. Rest on an icon to read what it does. In a narrow window, **More actions** gives
+  access to commands that don't fit. Press the Menu key or Shift+F10 on a focused skill for a named list of actions.
+  A skill **Kept as yours** stays closed; choose **Manage again** beside its name to resume syncing.
 - **Show changes** turns the window into the differences between the GitHub version of the skill and the copy on this
   PC, shown as what taking the GitHub version would do to the copy on this PC. Nothing changes until you choose.
   - The files are listed on the left, each marked "Only on GitHub" (`+`, it would be added), "Only on this PC" (`−`,
@@ -275,6 +320,7 @@ tss remove REPO [--delete-skills]
 tss resolve REPO SKILL replace|restore|keep|leave|manage|pause|resume
 tss token [status|set|clear]                 gh auth token | tss token set
 tss startup [status|on|off]                  start the tray app when you sign in
+tss portable                                 export local settings to companion files
 ```
 
 `REPO` is the id that `tss status` shows, or `owner/name`. Exit codes: 0 all fine, 1 something needs attention,
@@ -297,7 +343,8 @@ was interrupted.
 
 | What | Where |
 | --- | --- |
-| Settings | `%LOCALAPPDATA%\tiny-skill-sync\config.json` |
+| Local settings | `%LOCALAPPDATA%\tiny-skill-sync\config.json` |
+| Shared settings and repositories (portable mode) | `tiny-skill-sync.settings.json` and `tiny-skill-sync.sources.json` beside the exes |
 | What the app installed (the ownership record) | `%LOCALAPPDATA%\tiny-skill-sync\state.json` |
 | The window's size | `%LOCALAPPDATA%\tiny-skill-sync\window.txt` |
 | Skills | `%USERPROFILE%\.copilot\skills`, unless `skills_dir` is set in `config.json` |
@@ -315,7 +362,7 @@ and kept, and a change that was interrupted there is finished then, not before. 
 folder (the tray does at once; with `tss` alone, run `tss check`), a choice about a skill or the removal of a repository
 is refused with a request to check first.
 
-`config.json` can be edited by hand while the app runs; it is picked up at once. An example:
+In local mode, `config.json` can be edited by hand while the app runs; it is picked up at once. An example:
 
 ```json
 {
@@ -348,9 +395,9 @@ every request to that repository; without it, a private repository is still read
 [Private repositories](#private-repositories)). Never change an `id`: the installed skills are recorded under it. When
 the app or `tss` saves the settings, it writes only the fields above, so anything else you added by hand is dropped.
 
-`skills_dir`, when you set it, must be a full path such as `D:\skills`. A relative one would depend on the folder the
-app was started from (at sign-in, Windows chooses that), so a `config.json` with one can't be read, and the window
-and `tss` say why.
+In local `config.json`, `skills_dir`, when set, must be a full path such as `D:\skills`. In portable settings it may
+also contain `%VARIABLE%` references, which are expanded on each machine; unknown variables and relative results are
+errors. The default remains the per-machine `%USERPROFILE%\.copilot\skills`.
 
 Environment variables, mainly for tests and scripts:
 
@@ -380,6 +427,24 @@ are looked at: a file you add to a skill is never counted as an edit.
 Not tested: ReFS, Dev Drive, FAT and exFAT drives. A change made through a memory-mapped view that has not been
 written to disk yet is not visible until it is; the full read before an update or deletion still catches it.
 
+### An edit that GitHub has too
+
+An edit means "different from what the app installed". **Show changes** answers another question: "different from
+what GitHub has now". They can disagree. If you edit a skill here and later put the same edit on GitHub, your folder
+is exactly what GitHub has, yet it still differs from what the app installed, so it would look edited for ever while
+**Show changes** says the two are identical.
+
+The app handles this at the next check. For a skill you edited whose GitHub version changed, it compares your folder
+with GitHub's version. When every file is the same (see [What counts as the same](#what-counts-as-the-same)) and no
+file GitHub removed is still in your folder, it only updates its own record, and Activity says your edits are on
+GitHub too and the skill is marked as in sync. Not one file in your folder is touched. Any other difference keeps
+the skill held, as before.
+
+To compare, the app may read from GitHub a text file that you and GitHub both changed. It reads one file at a time,
+and not at all for a file GitHub did not change. A skill that really differs and stays held is compared again at
+each check; that is at most one small download for each file GitHub changed. If a read fails, the check of that
+repository ends and nothing is decided. If a check reaches its download limit, the skill is simply left held.
+
 ### What counts as the same
 
 Two copies of a text file are the same when they differ only in how lines end (`\r\n` or `\n`), in the line break at
@@ -403,24 +468,24 @@ historical adoption; the larger install is an earlier baseline.
 
 | Measure | 442 files, current | 1,555 files, earlier | Budget |
 | --- | --- | --- | --- |
-| Start to tray icon | 7.8 ms | 8.6 ms | 30 ms median |
-| Start-up check of every installed file | 21 ms | 105 ms | 75 µs per file |
-| Start at sign-in, its first 3 s: CPU, file I/O | 7.8 ms, 241 bytes | under 16 ms, 251 bytes | 300 ms, 300 KB |
+| Start to tray icon | 7.7 ms | 8.6 ms | 30 ms median |
+| Start-up check of every installed file | 20.1 ms | 105 ms | 75 µs per file |
+| Start at sign-in, its first 3 s: CPU, file I/O | 15.6 ms median, 46.9 ms max; 241 bytes read | under 16 ms, 251 bytes | 300 ms, 300 KB |
 | Idle for 10 s: CPU, disk, page faults | 0, 0, 0 | 0, 0, 0 | 0 |
 | Idle memory: trimmed working set / private | 1.0 / 1.9 MiB | 1.2 / 2.6 MiB | 2 / 4 MiB |
 | Window: open to painted (median) | 37.0 ms | 43 ms | 100 ms |
 | Window open: working set | 13.6 MiB | 14.4 MiB | 40 MiB |
 | Window closed: working set (trimmed) | 1.5 MiB | 1.5 MiB | 2 MiB |
 | Unchanged check: CPU, file reads and writes | 0 ms, 0, 0 | 16 ms, 0, 0 | 50 ms, 0 |
-| Exe size | 1,015,808 bytes | 0.93 MiB | 1 MiB |
+| Exe size | 1,057,280 bytes (1.01 MiB) | 0.93 MiB | 1.1 MiB |
 
 Every budget row passed. The current startup check took 48.2 microseconds per file; an unchanged poll took 438 ms
 wall time and changed no files. The eight-candidate historical quick slice took 11.4 seconds in the live fixture
 check, including an initial install and an older-copy update; its time depends on the network.
 
 Windows counts a process's CPU time in ticks of 15.6 ms, so an unchanged check shows as zero to three ticks (0 to
-47 ms) from run to run. The exe is built for size: in the earlier comparison, building for speed made it 1.01 MiB,
-over its budget, and hashed files about 13% faster (384 instead of 339 MB/s). A list of 463 skills opens almost as fast
+47 ms) from run to run. The exe is built for size: in the earlier comparison, building for speed made the 0.89 MiB exe 1.01 MiB,
+and hashed files about 13% faster (384 instead of 339 MB/s). A list of 463 skills opens almost as fast
 as one of 19, because only
 the rows within about two screens of what is shown are made at first; the rest are made as you scroll (with a row made
 for every skill, it took 120 ms). Widening the list of repositories under the mouse takes 18 ms with those 463 skills
@@ -428,12 +493,14 @@ on the page.
 
 The start at sign-in (`--background`) is measured against what Task Manager calls a "low" startup impact: under 300 ms
 of CPU and under 300 KB of disk I/O. It was measured later, when the second repository had 464 skills and 1,556 files.
-For its first 30 seconds the app only shows its icon: in the first 3 seconds it read its settings and nothing else,
-wrote nothing and ran no job. Then it looks at the skills at low priority, so it gives way to everything else Windows
-does then. That look costs what the start-up check costs, and nearly all of its reads are `state.json`, about 500 bytes
-for each installed file. A repository that is due is checked after it, at the cost of an unchanged check. These are
-warm runs: at a real sign-in the files are not in the cache yet. Task Manager rates startup apps from a trace Windows
-records at each start, and it is not known whether that trace still runs 30 seconds in (see
+For its first 30 seconds the app only shows its icon and reads settings on the worker; it does not look at skills or
+GitHub. In the first 3 seconds, that read used 241 bytes in 2 operations, with no writes or file changes, and the only
+job was loading settings. After the wait, the worker looks at the skills, then checks GitHub when a repository is due.
+That look costs what the start-up check costs, and nearly
+all of its reads are `state.json`, about 500 bytes for each installed file. A repository that is due is checked after
+it, at the cost of an unchanged check. These are warm runs: at a real sign-in the files are not in the cache yet.
+Task Manager rates startup apps from a trace Windows records at each start, and it is not known whether that trace
+still runs 30 seconds in (see
 [Limitations](#limitations)).
 
 Left running for 75 minutes against a test repository with a 5-minute interval and seven upstream changes
@@ -481,7 +548,8 @@ ended at 3.2 MiB of private memory. Each change reached the disk within one inte
 - The window opens at 980 by 680 at 100% scale (smaller if the screen has less room) and can be made as small as 640
   by 480. It has been tried only at 100% scale.
 - The window's controls are drawn by the app. Each is a real window with its text, and Tab, Enter, Space and Esc work,
-  but they do not tell a screen reader what kind of control they are.
+  but they do not tell a screen reader what kind of control they are. A skill's icons are drawn inside its row, not
+  separate Tab stops. Use Shift+F10 on the row to choose an action by name.
 - Changing the skills folder does not move installed skills (see [Files](#files)). Once more than four other folders
   have been used, the oldest record is forgotten; going back to that folder then works like a damaged `state.json`.
   Two names for one folder that only the disk could tell apart (a short 8.3 name, a mapped drive, a link) count as two

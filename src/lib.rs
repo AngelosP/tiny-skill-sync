@@ -17,6 +17,7 @@ pub mod hash;
 pub mod interval;
 pub mod logo;
 pub mod pathsafe;
+pub mod portable;
 pub mod reconcile;
 pub mod scheduler;
 pub mod secret;

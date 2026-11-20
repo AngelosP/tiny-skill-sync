@@ -17,7 +17,7 @@ You decide what happens next.
 - **Keep your edits.** Review differences in the window before choosing GitHub's version or keeping yours.
 - **Keep your own files.** Files you add to a skill stay yours; the app does not list them as changes.
 - **Stay out of the way.** It lives in the tray, can start with Windows, and does no work between checks.
-  The tray exe is under 1 MiB; [measured idle memory is about 1 MiB](docs/GUIDE.md#measured-cost).
+  The tray exe is about 1 MiB; [measured idle memory is about 1 MiB](docs/GUIDE.md#measured-cost).
 
 ## Get started
 
@@ -73,3 +73,11 @@ Downloads are copied, never run.
 
 The app does not update itself. To update, quit it from the tray, replace both exes, and start it again.
 Whether an already-running Copilot session reloads changed skills without restarting has not been verified.
+
+### Run from a shared folder
+
+You can keep both exes in a NAS or OneDrive folder and use `tss portable` to export the current repositories and
+settings into two companion JSON files beside them. The per-machine state, token and default Copilot skills folder stay
+local. Read [the shared-folder notes](docs/GUIDE.md#run-from-a-shared-folder) before using this mode: settings need a
+single writer, the shared folder must be available when Windows starts the app, and a skills folder must not be shared
+between machines.

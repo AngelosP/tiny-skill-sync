@@ -36,7 +36,7 @@ use crate::pathsafe::{self, fold};
 use crate::reconcile::{self, Decision, DirtyInfo, Input, LocalState, OwnedView, Skip, UnmanagedState, Verdict};
 use crate::scheduler::Schedule;
 use crate::secret::Secret;
-use crate::state::{Fingerprint, Folder, HistorySearch, LocalEvidence, OwnedSkill, Pending, State, VolumeId};
+use crate::state::{Fingerprint, Folder, HistorySearch, LocalEvidence, ManagedFile, OwnedSkill, Pending, State, VolumeId};
 use crate::text;
 use crate::tree::{self, Discovery, Rejected, SkillFile};
 use crate::verify::{self, Check, Likeness, Spot, Spots, Stats, check_for_volume};
@@ -651,8 +651,8 @@ struct Ctx<'a> {
     single: bool,
     opts: &'a SyncOptions,
     cancel: &'a AtomicBool,
-    /// What the copies on GitHub of files read to compare a folder nobody owns are compared by: folded skill name,
-    /// then path.
+    /// What the copies on GitHub of files read to compare a folder with them are compared by: folded skill name, then
+    /// path. For a folder nobody owns that is the same as upstream, and for one we own that was edited into it.
     theirs: HashMap<String, HashMap<String, String>>,
     historical: HashMap<String, HistoricalProof>,
     tree: String,
@@ -1196,7 +1196,13 @@ impl Engine {
             Err(e) if e.kind == FailureKind::Cancelled => return RepoReport { outcome: Outcome::Cancelled, ..report },
             Err(e) => return report.fail(e),
         };
-        let decisions = plan_repo(s, repo, &discovery, unmanaged, opts.confirm_mass_delete);
+        let local = local_states(s, &repo.id);
+        let matching = match self.compare_owned(s, &mut cx, &discovery, &local, &mut commit) {
+            Ok(m) => m,
+            Err(e) if e.kind == FailureKind::Cancelled => return RepoReport { outcome: Outcome::Cancelled, ..report },
+            Err(e) => return report.fail(e),
+        };
+        let decisions = plan_repo(s, repo, &discovery, unmanaged, &local, &matching, opts.confirm_mass_delete);
         let head = commit.clone();
         let run = self.apply_all(s, &cx, &discovery, &decisions, commit);
 
@@ -1369,27 +1375,97 @@ impl Engine {
                 if cx.cancel.load(Ordering::Relaxed) {
                     return Err(RemoteError::new(FailureKind::Cancelled, "earlier-version search stopped"));
                 }
-                if s.downloaded.saturating_add(file.size) > cx.opts.max_download_bytes {
-                    return Err(RemoteError::new(FailureKind::TooLarge, "the comparison reached this check's download limit; it is not a no-match result"));
-                }
-                if commit.is_none() {
-                    *commit = Some(self.remote.commit(&cx.repo_ref, cx.token.as_deref(), cx.cancel)?);
-                }
-                let bytes = download(
-                    self.remote.as_ref(),
-                    &cx.repo_ref,
-                    commit.as_deref().unwrap_or_default(),
-                    &cx.rel(&skill.name, &file.path),
-                    file,
-                    cx.token.as_deref(),
-                    cx.cancel,
-                )?;
-                s.downloaded += file.size;
-                theirs.insert(file.path.clone(), text::canon(&bytes));
+                theirs.insert(file.path.clone(), self.read_canon(s, cx, skill, file, commit)?);
             }
             likeness = verify::compare_unmanaged(&dir, skill, &theirs, &mut s.applier.hasher);
         }
         Ok((likeness == Likeness::Same, theirs))
+    }
+
+    /// Reads one file of a skill from GitHub, within this check's download limit, and returns what its lines count as
+    /// (see [`text::canon`]). The file is proved to be the one that was listed. `commit` is asked for when not known yet.
+    fn read_canon(&self, s: &mut Session, cx: &Ctx, skill: &tree::Skill, file: &SkillFile, commit: &mut Option<String>) -> Result<String, RemoteError> {
+        if s.downloaded.saturating_add(file.size) > cx.opts.max_download_bytes {
+            return Err(RemoteError::new(FailureKind::TooLarge, "the comparison reached this check's download limit; it is not a no-match result"));
+        }
+        if commit.is_none() {
+            *commit = Some(self.remote.commit(&cx.repo_ref, cx.token.as_deref(), cx.cancel)?);
+        }
+        let bytes = download(
+            self.remote.as_ref(),
+            &cx.repo_ref,
+            commit.as_deref().unwrap_or_default(),
+            &cx.rel(&skill.name, &file.path),
+            file,
+            cx.token.as_deref(),
+            cx.cancel,
+        )?;
+        s.downloaded += file.size;
+        Ok(text::canon(&bytes))
+    }
+
+    /// Finds the skills we own that were edited here, whose upstream moved on, and whose folder is now exactly what
+    /// upstream has: the edit reached GitHub too. Only a text file that differs from GitHub's copy in its line breaks
+    /// needs a read, one file at a time, so a folder that really differs costs one small read at most. Failing to read
+    /// ends the check, like any failure. Going past the download limit only leaves the skill held.
+    fn compare_owned(
+        &self,
+        s: &mut Session,
+        cx: &mut Ctx,
+        discovery: &Discovery,
+        local: &HashMap<String, LocalState>,
+        commit: &mut Option<String>,
+    ) -> Result<HashSet<String>, RemoteError> {
+        let repo_state = s.state.repo(&cx.repo.id);
+        let ignored: HashSet<String> = repo_state.map(|r| r.ignored.iter().map(|n| fold(n)).collect()).unwrap_or_default();
+        let other_owners = s.state.names_owned_elsewhere(&cx.repo.id);
+        let mut matching = HashSet::new();
+        for skill in &discovery.skills {
+            let key = fold(&skill.name);
+            let Some(here) = local.get(&key) else { continue };
+            let Some(owned) = s.state.repo(&cx.repo.id).and_then(|r| r.skill(&skill.name)).cloned() else { continue };
+            if ignored.contains(&key) || other_owners.contains_key(&key) || !reconcile::needs_comparison(skill, &owned, here) {
+                continue;
+            }
+            match self.compare_with_upstream(s, cx, skill, &owned.files, commit) {
+                Ok(Some(theirs)) => {
+                    cx.theirs.insert(key.clone(), theirs);
+                    matching.insert(key);
+                }
+                Ok(None) => {}
+                Err(e) if e.kind == FailureKind::TooLarge => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(matching)
+    }
+
+    /// Does the folder of a skill we own have every file upstream has now, and none that upstream dropped? The answer
+    /// is the text of the copies on GitHub that the comparison used, by path, and `None` for a folder that differs.
+    fn compare_with_upstream(
+        &self,
+        s: &mut Session,
+        cx: &Ctx,
+        skill: &tree::Skill,
+        recorded: &[ManagedFile],
+        commit: &mut Option<String>,
+    ) -> Result<Option<HashMap<String, String>>, RemoteError> {
+        let dir = s.applier.skills_dir.join(&skill.name);
+        let mut theirs = verify::known_canons(skill, recorded);
+        loop {
+            match verify::compare_owned(&dir, skill, recorded, &theirs, &mut s.applier.hasher) {
+                Likeness::Same => return Ok(Some(theirs)),
+                Likeness::Different => return Ok(None),
+                Likeness::NeedsText(paths) => {
+                    let Some(file) = skill.files.iter().find(|f| paths.contains(&f.path) && !theirs.contains_key(&f.path)) else { return Ok(None) };
+                    if cx.cancel.load(Ordering::Relaxed) {
+                        return Err(RemoteError::new(FailureKind::Cancelled, "the comparison was stopped"));
+                    }
+                    let canon = self.read_canon(s, cx, skill, file, commit)?;
+                    theirs.insert(file.path.clone(), canon);
+                }
+            }
+        }
     }
 
     fn search_history(&self, s: &mut Session, cx: &Ctx, h: &mut HistorySearch, left: &mut usize) -> Result<Option<HistoricalProof>, RemoteError> {
@@ -1505,6 +1581,19 @@ impl Engine {
             Verdict::Forget => {
                 s.applier.forget(&mut s.state, id, &d.name)?;
                 Ok(ApplyResult::Done)
+            }
+            Verdict::CatchUp => {
+                let skill = discovery
+                    .skills
+                    .iter()
+                    .find(|k| k.name == d.name)
+                    .ok_or_else(|| RemoteError::new(FailureKind::Protocol, format!("'{}' is missing from the listing", d.name)))?;
+                if commit.is_none() {
+                    *commit = Some(self.remote.commit(&cx.repo_ref, cx.token.as_deref(), cx.cancel)?);
+                }
+                let theirs = cx.theirs.get(&fold(&skill.name)).cloned().unwrap_or_default();
+                let applied = s.applier.catch_up(&mut s.state, id, skill, commit.as_deref().unwrap_or_default(), &theirs)?;
+                Ok(result(applied, &mut s.warnings))
             }
             Verdict::Delete => {
                 s.ensure_preflight()?;
@@ -1813,22 +1902,30 @@ fn verify_repo(s: &mut Session, repo_id: &str) -> Vec<(String, LocalStatus)> {
     out
 }
 
-/// Turns what is upstream, what is recorded and what is on disk into decisions. `unmanaged` says how each folder in
-/// the way of a skill nobody owns compares with it, by folded name.
-fn plan_repo(
-    s: &mut Session,
-    repo: &RepoConfig,
-    discovery: &Discovery,
-    unmanaged: HashMap<String, UnmanagedState>,
-    confirm_mass_delete: bool,
-) -> Vec<Decision> {
-    let local: HashMap<String, LocalState> = verify_repo(s, &repo.id)
+/// What the folder of each owned skill is like, by folded name. Interrupted skills, and those whose earlier-version
+/// search is paused, are left out.
+fn local_states(s: &mut Session, repo_id: &str) -> HashMap<String, LocalState> {
+    verify_repo(s, repo_id)
         .into_iter()
         .filter_map(|(name, status)| match status {
             LocalStatus::Checked(local) => Some((fold(&name), local)),
             LocalStatus::Interrupted | LocalStatus::History { .. } => None,
         })
-        .collect();
+        .collect()
+}
+
+/// Turns what is upstream, what is recorded and what is on disk into decisions. `unmanaged` says how each folder in
+/// the way of a skill nobody owns compares with it, by folded name. `local` says what the folder of each skill we own
+/// is like, and `matching` which of the edited ones are now what upstream has, also by folded name.
+fn plan_repo(
+    s: &Session,
+    repo: &RepoConfig,
+    discovery: &Discovery,
+    unmanaged: HashMap<String, UnmanagedState>,
+    local: &HashMap<String, LocalState>,
+    matching: &HashSet<String>,
+    confirm_mass_delete: bool,
+) -> Vec<Decision> {
     let repo_state = s.state.repo(&repo.id);
     let owned: Vec<OwnedSkill> = repo_state.map(|r| r.skills.clone()).unwrap_or_default();
     let ignored: HashSet<String> = repo_state.map(|r| r.ignored.iter().map(|n| fold(n)).collect()).unwrap_or_default();
@@ -1839,7 +1936,10 @@ fn plan_repo(
     let views: Vec<OwnedView> = owned
         .iter()
         .filter(|o| o.pending.is_none())
-        .map(|o| OwnedView { skill: o, local: local.get(&fold(&o.name)).cloned().unwrap_or_else(not_checked) })
+        .map(|o| {
+            let key = fold(&o.name);
+            OwnedView { skill: o, local: local.get(&key).cloned().unwrap_or_else(not_checked), matches_upstream: matching.contains(&key) }
+        })
         .collect();
     reconcile::plan(&Input {
         desired: &discovery.skills,
@@ -1859,7 +1959,9 @@ fn is_settled(verdict: &Verdict, result: &ApplyResult) -> bool {
         Verdict::InSync | Verdict::ModifiedLocally(_) | Verdict::MissingLocally | Verdict::Skipped(Skip::Ignored) | Verdict::Skipped(Skip::Rejected { .. }) => {
             true
         }
-        Verdict::Install | Verdict::Update | Verdict::Adopt | Verdict::AdoptHistorical | Verdict::Delete | Verdict::Forget => *result == ApplyResult::Done,
+        Verdict::Install | Verdict::Update | Verdict::Adopt | Verdict::AdoptHistorical | Verdict::CatchUp | Verdict::Delete | Verdict::Forget => {
+            *result == ApplyResult::Done
+        }
         Verdict::Held(reconcile::Hold::UnmanagedDiffers | reconcile::Hold::HistoryPaused) => true,
         Verdict::Held(_) | Verdict::Skipped(Skip::Collision { .. }) => false,
     }

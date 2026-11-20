@@ -111,7 +111,6 @@ pub mod glyph {
     pub const VIEW: char = '\u{E890}';
     pub const COPY: char = '\u{E8C8}';
     pub const LINK: char = '\u{E71B}';
-    pub const GLOBE: char = '\u{E774}';
 }
 
 struct Canvas {
@@ -418,6 +417,40 @@ pub fn glyph(at: Rect, ch: char, size: u8, ink: Role) {
     text(at, ch.encode_utf8(&mut buf), Font::Icon(size), ink, DT_SINGLELINE | DT_VCENTER | DT_CENTER);
 }
 
+/// The 16-DIP Octicons mark, drawn in the same foreground colour as the neighbouring actions.
+pub fn github_mark(at: Rect, ink: Role) {
+    const MASK: &[u8; 64 * 64] = include_bytes!("../../../assets/github-mark-64.alpha");
+    CANVAS.with(|cell| {
+        let cell = cell.borrow();
+        let Some(c) = cell.as_ref() else { return };
+        let (l, t, r, b) = edges(c, at);
+        let size = scale(16, c.dpi).min(r - l).min(b - t);
+        if size <= 0 {
+            return;
+        }
+        let left = l + (r - l - size) / 2;
+        let top = t + (b - t - size) / 2;
+        // Average the mask pixels covered by each device pixel, including at fractional display scales.
+        let span = |i| {
+            let edge = |v: i32| ((v * 64 + size / 2) / size) as usize;
+            let start = edge(i).min(63);
+            start..edge(i + 1).max(start + 1)
+        };
+        let fg = color(ink);
+        unsafe { GdiFlush() };
+        for y in top.max(0)..(top + size).min(c.h) {
+            let ys = span(y - top);
+            for x in left.max(0)..(left + size).min(c.w) {
+                let xs = span(x - left);
+                let n = (xs.len() * ys.len()) as u32;
+                let sum: u32 = ys.clone().flat_map(|j| &MASK[j * 64 + xs.start..j * 64 + xs.end]).map(|&a| u32::from(a)).sum();
+                let px = unsafe { &mut *c.bits.add((y as usize * c.cap.0 as usize) + x as usize) };
+                *px = blend(*px, fg, (sum * 256) / (n * 255));
+            }
+        }
+    });
+}
+
 /// The size of text in DIPs, rounded up: one line when `width` is 0, else wrapped at `width` DIPs.
 pub fn measure(s: &str, font_: Font, width: i32, dpi: u32) -> (i32, i32) {
     if s.is_empty() {
@@ -486,6 +519,31 @@ mod tests {
         assert_eq!(blend(0x000000, 0xFFFFFF, 256), 0xFFFFFF);
         assert_eq!(blend(0x204060, 0xFFFFFF, 0), 0x204060);
         assert_eq!(blend(0x000000, 0xFF8000, 128), 0x7F4000);
+    }
+
+    #[test]
+    fn github_mark_is_centred_with_the_cat_cut_out_of_the_foreground() {
+        for dpi in [96, 120, 192] {
+            let s = |v| scale(v, dpi);
+            // Paint against the opposite colour so the silhouette is visible in any theme.
+            let fg = color(Role::Text);
+            let bg = fg ^ 0xFFFFFF;
+            assert!(begin(dpi, s(24), s(24), 0, 0));
+            fill_argb([0, 0, 24, 24], 0, bg, 0);
+            github_mark([0, 0, 24, 24], Role::Text);
+            CANVAS.with(|cell| {
+                let c = cell.borrow();
+                let c = c.as_ref().unwrap();
+                let pixel = |x, y| unsafe { *c.bits.add((s(y) * c.cap.0 + s(x)) as usize) & 0xFFFFFF };
+                for (x, y) in [(12, 6), (5, 12), (18, 12)] {
+                    assert_eq!(pixel(x, y), fg & 0xFFFFFF, "inside the mark at {dpi} DPI");
+                }
+                for (x, y) in [(12, 3), (3, 12), (4, 4), (12, 12), (12, 18)] {
+                    assert_eq!(pixel(x, y), bg & 0xFFFFFF, "background or cutout at {dpi} DPI");
+                }
+            });
+        }
+        release();
     }
 
     // An empty line of a file in the diff view: DrawTextW read through the dangling pointer of an empty buffer and

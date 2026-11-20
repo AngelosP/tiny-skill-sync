@@ -885,7 +885,8 @@ fn going_back_to_a_folder_used_before_manages_its_skills_as_they_were() {
     assert_eq!(skill(repo, "gamma").verdict, Verdict::InSync);
     assert_eq!(s.w.read("alpha/SKILL.md"), "edited while the app looked elsewhere\n");
     assert_eq!(snapshot_of(&new), there, "the folder it left is as it was");
-    assert_eq!(s.remote.calls().file, 0);
+    let fetched: Vec<String> = s.remote.log().into_iter().filter(|l| l.starts_with("file ")).collect();
+    assert!(matches!(fetched.as_slice(), [one] if one.ends_with("skills/alpha/SKILL.md")), "only the edited file was read, to compare it: {fetched:?}");
     let state = s.w.state();
     assert_eq!(state.set_aside.len(), 1);
     assert_eq!(state.set_aside[0].skills_dir, new.display().to_string());

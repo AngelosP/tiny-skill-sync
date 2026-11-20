@@ -742,6 +742,48 @@ impl Applier {
         Ok(Applied::Done)
     }
 
+    /// Brings the record of a skill we own up to date with its folder, which was edited here and is now what upstream
+    /// has, file for file. The same as [`Applier::adopt`] for a folder nobody owns: not one byte of the folder is
+    /// written, and it is looked at again first. `theirs` holds what the copies on GitHub of the files whose bytes
+    /// differ are compared by, by path. The record already says it for the files upstream did not change.
+    pub fn catch_up(
+        &mut self,
+        state: &mut State,
+        repo_id: &str,
+        skill: &Skill,
+        commit: &str,
+        theirs: &HashMap<String, String>,
+    ) -> Result<Applied, RemoteError> {
+        check_names(skill)?;
+        let Some(before) = state.repo(repo_id).and_then(|r| r.skill(&skill.name)).cloned() else {
+            return Ok(Applied::Held("it is no longer recorded as installed; it was left alone".into()));
+        };
+        if before.pending.is_some() {
+            return Ok(Applied::Held("an earlier change to it is not sorted out yet; it was left alone".into()));
+        }
+        let mut known = verify::known_canons(skill, &before.files);
+        known.extend(theirs.iter().map(|(path, canon)| (path.clone(), canon.clone())));
+        let live = self.live(&skill.name);
+        let changed = || Applied::Held("the folder changed while it was being checked; it was left alone".to_string());
+        if verify::compare_owned(&live, skill, &before.files, &known, &mut self.hasher) != Likeness::Same {
+            return Ok(changed());
+        }
+        let mut files: Vec<ManagedFile> = skill.files.iter().map(|f| ManagedFile { canon: known.get(&f.path).cloned(), ..ManagedFile::from(f) }).collect();
+        verify::capture(&live, &mut files, &mut self.hasher);
+        if files.iter().any(|f| f.fp.is_none()) {
+            return Ok(changed());
+        }
+        state.repo_mut(repo_id).upsert_skill(OwnedSkill {
+            name: skill.name.clone(),
+            commit: commit.to_string(),
+            files,
+            updated: Some(self.now),
+            pending: None,
+        });
+        self.save(state)?;
+        Ok(Applied::Done)
+    }
+
     /// Drops the ownership record. No file is touched.
     pub fn forget(&mut self, state: &mut State, repo_id: &str, name: &str) -> Result<(), RemoteError> {
         state.repo_mut(repo_id).remove_skill(name);
@@ -1827,6 +1869,105 @@ mod tests {
         write_files(&env.live("alpha"), &[("SKILL.md".to_string(), EDITED.replace('\n', "\r\n"))]);
         assert!(held_reason(install(&mut a, &mut state, "alpha", V2, C2, Mode::Normal)).contains("edited locally"));
         assert_eq!(fs::read_to_string(env.live("alpha").join("SKILL.md")).unwrap(), EDITED.replace('\n', "\r\n"), "a real edit still holds");
+    }
+
+    /// The folder as the user left it after making the very changes that GitHub's next version has.
+    fn edited_into_v2(env: &Env) {
+        add(&env.live("alpha"), V2);
+        fs::remove_file(env.live("alpha").join("references").join("a.md")).unwrap();
+    }
+
+    #[test]
+    fn an_edit_that_upstream_now_has_too_is_caught_up_without_touching_a_byte() {
+        let env = Env::new("catch-up");
+        let (mut a, mut state) = installed_v1(&env);
+        edited_into_v2(&env);
+        add(&env.live("alpha"), MINE);
+        assert!(matches!(local_state(&mut a, &env, &state, "alpha"), LocalState::Dirty(_)), "the record still says the old version");
+        let stamp = |rel: &str| probe(&join_rel(&env.live("alpha"), rel)).unwrap().unwrap().fp;
+        let before: Vec<_> = V2.iter().map(|(rel, _)| stamp(rel)).collect();
+        a.now = T0 + 10;
+        assert_eq!(a.catch_up(&mut state, REPO, &skill("alpha", V2), C2, &HashMap::new()).unwrap(), Applied::Done);
+        let after: Vec<_> = V2.iter().map(|(rel, _)| stamp(rel)).collect();
+        assert_eq!(before, after, "no file was written, not even its timestamps");
+        assert_eq!(entries_of(&env.live("alpha")), with(V2, MINE), "what the user added is still there");
+        let rec = record(&state, "alpha");
+        assert_eq!((rec.commit.as_str(), rec.updated, rec.pending.is_none()), (C2, Some(T0 + 10), true));
+        assert_eq!(
+            rec.files.iter().map(|f| f.path.as_str()).collect::<Vec<_>>(),
+            V2.iter().map(|(p, _)| *p).collect::<Vec<_>>(),
+            "only GitHub's files are owned"
+        );
+        assert!(rec.files.iter().all(|f| f.fp.is_some()));
+        assert_eq!(local_state(&mut a, &env, &state, "alpha"), LocalState::Clean);
+        assert_eq!(State::load(&env.state).unwrap().state, state, "saved");
+        assert!(env.work_entries().is_empty(), "{:?}", env.work_entries());
+    }
+
+    #[test]
+    fn a_catch_up_is_held_when_the_folder_is_not_what_upstream_has() {
+        let env = Env::new("catch-up-differs");
+        let (mut a, mut state) = installed_v1(&env);
+        edited_into_v2(&env);
+        fs::write(env.live("alpha").join("SKILL.md"), EDITED).unwrap();
+        let before = state.clone();
+        assert!(held_reason(a.catch_up(&mut state, REPO, &skill("alpha", V2), C2, &HashMap::new())).contains("left alone"));
+        assert_eq!(state, before);
+        assert_eq!(fs::read_to_string(env.live("alpha").join("SKILL.md")).unwrap(), EDITED);
+        assert!(
+            held_reason(a.catch_up(&mut state, REPO, &skill("alpha", V2), C2, &HashMap::from([("SKILL.md".to_string(), crate::text::canon(b"# alpha v2\n"))])))
+                .contains("left alone")
+        );
+        assert_eq!(state, before);
+    }
+
+    #[test]
+    fn a_catch_up_is_held_while_a_file_that_upstream_dropped_is_still_here() {
+        let env = Env::new("catch-up-leftover");
+        let (mut a, mut state) = installed_v1(&env);
+        add(&env.live("alpha"), V2);
+        let before = state.clone();
+        assert!(held_reason(a.catch_up(&mut state, REPO, &skill("alpha", V2), C2, &HashMap::new())).contains("left alone"));
+        assert_eq!(state, before);
+        assert_eq!(fs::read_to_string(env.live("alpha").join("references").join("a.md")).unwrap(), "ref a\n");
+    }
+
+    #[test]
+    fn a_catch_up_for_a_copy_with_other_line_breaks_needs_the_copy_from_github() {
+        let env = Env::new("catch-up-text");
+        let (mut a, mut state) = installed_v1(&env);
+        fs::remove_file(env.live("alpha").join("references").join("a.md")).unwrap();
+        let copy = windows_copy(V2);
+        write_files(&env.live("alpha"), &copy);
+        let before = state.clone();
+        assert!(held_reason(a.catch_up(&mut state, REPO, &skill("alpha", V2), C2, &HashMap::new())).contains("left alone"), "the copy on GitHub is not known");
+        assert_eq!(state, before);
+
+        let theirs: HashMap<String, String> = V2.iter().map(|(p, c)| (p.to_string(), crate::text::canon(c.as_bytes()))).collect();
+        assert_eq!(a.catch_up(&mut state, REPO, &skill("alpha", V2), C2, &theirs).unwrap(), Applied::Done);
+        assert_eq!(tree_of(&env.live("alpha")), copy.iter().cloned().collect(), "not one byte was written");
+        assert_eq!(local_state(&mut a, &env, &state, "alpha"), LocalState::Clean);
+        assert_eq!(record(&state, "alpha").commit, C2);
+    }
+
+    #[test]
+    fn a_catch_up_changes_nothing_for_a_skill_that_is_not_recorded_or_is_not_sorted_out() {
+        let env = Env::new("catch-up-guard");
+        let (mut a, mut state) = installed_v1(&env);
+        edited_into_v2(&env);
+        let before = state.clone();
+        assert!(held_reason(a.catch_up(&mut state, REPO, &skill("beta", V2), C2, &HashMap::new())).contains("no longer recorded"));
+        assert_eq!(state, before);
+
+        let env = Env::new("catch-up-pending");
+        let (mut a, mut state) = installed_v1(&env);
+        crash_at(&mut a, Step::Marked);
+        assert!(install(&mut a, &mut state, "alpha", V2, C2, Mode::Normal).is_err());
+        a.hook = None;
+        edited_into_v2(&env);
+        let before = state.clone();
+        assert!(held_reason(a.catch_up(&mut state, REPO, &skill("alpha", V2), C2, &HashMap::new())).contains("not sorted out"));
+        assert_eq!(state, before);
     }
 
     #[test]

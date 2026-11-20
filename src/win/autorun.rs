@@ -8,15 +8,20 @@ use std::io;
 use std::path::Path;
 use std::ptr::{null, null_mut};
 
-use windows_sys::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_MORE_DATA, ERROR_SUCCESS, ERROR_UNSUPPORTED_TYPE, WIN32_ERROR};
-use windows_sys::Win32::Storage::FileSystem::{GetLongPathNameW, GetShortPathNameW};
+use windows_sys::Win32::Foundation::{
+    CloseHandle, ERROR_FILE_NOT_FOUND, ERROR_MORE_DATA, ERROR_SUCCESS, ERROR_UNSUPPORTED_TYPE, INVALID_HANDLE_VALUE, WIN32_ERROR,
+};
+use windows_sys::Win32::Storage::FileSystem::{
+    CreateFileW, FILE_NAME_NORMALIZED, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, GetFinalPathNameByHandleW, GetLongPathNameW,
+    GetShortPathNameW, OPEN_EXISTING, VOLUME_NAME_DOS,
+};
 use windows_sys::Win32::System::Registry::{
     HKEY, HKEY_CURRENT_USER, KEY_SET_VALUE, REG_OPTION_NON_VOLATILE, REG_ROUTINE_FLAGS, REG_SZ, RRF_RT_REG_BINARY, RRF_RT_REG_SZ, RegCloseKey, RegCreateKeyExW,
     RegDeleteKeyValueW, RegGetValueW, RegSetValueExW,
 };
 
 use super::wide;
-use crate::autostart::{Exe, Keys, Startup, VALUE_NAME};
+use crate::autostart::{Exe, Keys, Startup, VALUE_NAME, prefer_unc};
 use crate::config::Paths;
 
 /// Whether Windows starts this copy when the user signs in. Only reads.
@@ -58,7 +63,38 @@ pub fn exe_at(path: &Path) -> Exe {
     let given = path.to_string_lossy();
     let long = path_call(GetLongPathNameW, &verbatim(&given)).unwrap_or_else(|| given.to_string());
     let short = path_call(GetShortPathNameW, &verbatim(&long));
-    Exe::new(&long, short.as_deref())
+    let final_path = final_path(&long);
+    let preferred = prefer_unc(&long, final_path.as_deref());
+    let exe = Exe::new(&preferred, short.as_deref());
+    if preferred == long { exe } else { exe.with_alias(&long) }
+}
+
+/// The final path, which names mapped drives by their server and share when Windows can resolve them.
+fn final_path(path: &str) -> Option<String> {
+    let path = wide(&verbatim(path));
+    let handle = unsafe {
+        CreateFileW(path.as_ptr(), FILE_READ_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, null(), OPEN_EXISTING, 0, null_mut())
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        return None;
+    }
+
+    let result = (|| {
+        let mut buf = vec![0u16; 300];
+        for _ in 0..3 {
+            let len = unsafe { GetFinalPathNameByHandleW(handle, buf.as_mut_ptr(), buf.len() as u32, FILE_NAME_NORMALIZED | VOLUME_NAME_DOS) } as usize;
+            if len == 0 {
+                return None;
+            }
+            if len < buf.len() {
+                return String::from_utf16(&buf[..len]).ok();
+            }
+            buf = vec![0; len];
+        }
+        None
+    })();
+    unsafe { CloseHandle(handle) };
+    result
 }
 
 /// Writes go to Windows' own keys only from a real copy of the app: never from the tests, nor from a copy with an app

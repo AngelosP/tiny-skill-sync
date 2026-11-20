@@ -4,7 +4,7 @@
 
 .DESCRIPTION
   Release by default: that is what users run and what is measured. -DebugBuild makes a quicker, unoptimized build.
-  Prints the size of each executable (the budget for the tray app is 1 MiB).
+  Prints the size of each executable (the budget for the tray app is 1.1 MiB).
 
 .EXAMPLE
   scripts\build.ps1

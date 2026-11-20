@@ -6,7 +6,8 @@
 //! Rules in one place:
 //! * Delete or update only skills we own, and only when their folder is verified clean.
 //! * Any local deviation in the files that came from GitHub (edited, missing, replaced, or the whole folder missing)
-//!   HOLDs the change: nothing is touched. Files the user added are theirs and are not a deviation.
+//!   HOLDs the change: nothing is touched. Files the user added are theirs and are not a deviation. An edit that is
+//!   exactly what upstream has now is no longer a deviation: the record catches up and no file is written.
 //! * A skill that is absent upstream is deleted only from a complete, valid snapshot. Errors never reach this code.
 //! * A skill that exists upstream but fails validation is kept as it is.
 //! * A listing with no skills at all, while we own some, is held for confirmation before anything is deleted.
@@ -68,6 +69,9 @@ pub enum UnmanagedState {
 pub struct OwnedView<'a> {
     pub skill: &'a OwnedSkill,
     pub local: LocalState,
+    /// The folder is what upstream has now, file for file (every file, under the usual text rules), although it
+    /// differs from what was recorded. Only worked out where `needs_comparison` says so, and `false` otherwise.
+    pub matches_upstream: bool,
 }
 
 pub struct Input<'a> {
@@ -115,6 +119,9 @@ pub enum Verdict {
     Adopt,
     AdoptHistorical,
     Delete,
+    /// We own it, it was edited here, and upstream has now moved to the same content: bring the record up to date.
+    /// No file is written.
+    CatchUp,
     /// We own it, it is gone locally and gone upstream: just drop the record.
     Forget,
     /// Upstream is unchanged but the local copy differs. Informational.
@@ -133,7 +140,7 @@ pub struct Decision {
 impl Verdict {
     /// True when this verdict changes files or the ownership record.
     pub fn is_action(&self) -> bool {
-        matches!(self, Verdict::Install | Verdict::Update | Verdict::Adopt | Verdict::AdoptHistorical | Verdict::Delete | Verdict::Forget)
+        matches!(self, Verdict::Install | Verdict::Update | Verdict::Adopt | Verdict::AdoptHistorical | Verdict::CatchUp | Verdict::Delete | Verdict::Forget)
     }
 
     /// True when the skill needs the user's attention.
@@ -155,6 +162,7 @@ impl Verdict {
             Verdict::Update => "Update available".to_string(),
             Verdict::Adopt => "Already installed and identical: now managed".to_string(),
             Verdict::AdoptHistorical => "An older copy from GitHub: will be adopted and updated".to_string(),
+            Verdict::CatchUp => "Edited here, and GitHub has the same: marked as in sync".to_string(),
             Verdict::Delete => "Removed upstream: will be deleted".to_string(),
             Verdict::Forget => "Removed upstream and locally".to_string(),
             Verdict::ModifiedLocally(info) => format!("Edited locally ({info})"),
@@ -178,6 +186,12 @@ impl Verdict {
 
 fn same_files(desired: &Skill, owned: &[ManagedFile]) -> bool {
     desired.files.len() == owned.len() && desired.files.iter().zip(owned).all(|(d, o)| d.path == o.path && d.blob == o.blob)
+}
+
+/// Whether the folder of a skill we own has to be compared with what upstream has now: it was edited here, and
+/// upstream moved on as well. Without that, the answer is already known, and nothing is read or downloaded for it.
+pub fn needs_comparison(desired: &Skill, owned: &OwnedSkill, local: &LocalState) -> bool {
+    matches!(local, LocalState::Dirty(_)) && !same_files(desired, &owned.files)
 }
 
 pub fn plan(input: &Input) -> Vec<Decision> {
@@ -253,6 +267,7 @@ fn owned_verdict(desired: &Skill, owned: &OwnedView) -> Verdict {
         (LocalState::Clean, true) => Verdict::InSync,
         (LocalState::Clean, false) => Verdict::Update,
         (LocalState::Dirty(info), true) => Verdict::ModifiedLocally(info.clone()),
+        (LocalState::Dirty(_), false) if owned.matches_upstream => Verdict::CatchUp,
         (LocalState::Dirty(info), false) => Verdict::Held(Hold::UpdateBlocked(info.clone())),
         (LocalState::FolderMissing, true) => Verdict::MissingLocally,
         (LocalState::FolderMissing, false) => Verdict::Held(Hold::UpdateBlockedMissing),
@@ -295,6 +310,8 @@ mod tests {
         desired: Vec<Skill>,
         rejected: Vec<Rejected>,
         owned: Vec<(OwnedSkill, LocalState)>,
+        /// Case-folded names of owned skills whose folder was found to be what upstream has now.
+        matching: HashSet<String>,
         other: HashMap<String, String>,
         unmanaged: HashMap<String, UnmanagedState>,
         ignored: HashSet<String>,
@@ -308,6 +325,7 @@ mod tests {
                 desired: vec![],
                 rejected: vec![],
                 owned: vec![],
+                matching: HashSet::new(),
                 other: HashMap::new(),
                 unmanaged: HashMap::new(),
                 ignored: HashSet::new(),
@@ -317,7 +335,8 @@ mod tests {
         }
 
         fn run(&self) -> Vec<(String, Verdict)> {
-            let views: Vec<OwnedView> = self.owned.iter().map(|(s, l)| OwnedView { skill: s, local: l.clone() }).collect();
+            let views: Vec<OwnedView> =
+                self.owned.iter().map(|(s, l)| OwnedView { skill: s, local: l.clone(), matches_upstream: self.matching.contains(&fold(&s.name)) }).collect();
             let input = Input {
                 desired: &self.desired,
                 rejected: &self.rejected,
@@ -402,6 +421,49 @@ mod tests {
         assert!(matches!(c.only(), Verdict::ModifiedLocally(_)));
         c.desired = vec![up("alpha", "v2")];
         assert!(matches!(c.only(), Verdict::Held(Hold::UpdateBlocked(_))));
+    }
+
+    #[test]
+    fn an_edit_that_upstream_now_has_too_is_caught_up_instead_of_held() {
+        let mut c = Case::new();
+        c.desired = vec![up("alpha", "v2")];
+        c.owned = vec![(own("alpha", "v1"), dirty())];
+        assert!(matches!(c.only(), Verdict::Held(Hold::UpdateBlocked(_))), "held until the folder is known to match");
+        c.matching.insert("alpha".into());
+        let verdict = c.only();
+        assert_eq!(verdict, Verdict::CatchUp);
+        assert!(verdict.is_action() && !verdict.needs_attention());
+        assert!(verdict.message().contains("in sync"), "{}", verdict.message());
+    }
+
+    #[test]
+    fn matching_upstream_matters_only_to_an_edited_skill_whose_upstream_moved() {
+        let mut c = Case::new();
+        c.matching.insert("alpha".into());
+        c.desired = vec![up("alpha", "v1")];
+        c.owned = vec![(own("alpha", "v1"), dirty())];
+        assert!(matches!(c.only(), Verdict::ModifiedLocally(_)), "upstream did not move: still just an edit");
+        c.desired = vec![up("alpha", "v2")];
+        c.owned = vec![(own("alpha", "v1"), LocalState::Clean)];
+        assert_eq!(c.only(), Verdict::Update);
+        c.owned = vec![(own("alpha", "v1"), LocalState::FolderMissing)];
+        assert_eq!(c.only(), Verdict::Held(Hold::UpdateBlockedMissing));
+        c.desired = vec![];
+        c.owned = vec![(own("alpha", "v1"), dirty())];
+        assert!(matches!(c.only(), Verdict::Held(Hold::DeleteBlocked(_))), "gone upstream: never deleted over an edit");
+    }
+
+    #[test]
+    fn only_an_edited_skill_whose_upstream_moved_needs_comparing() {
+        let old = own("alpha", "v1");
+        let new = up("alpha", "v2");
+        assert!(needs_comparison(&new, &old, &dirty()));
+        assert!(!needs_comparison(&new, &old, &LocalState::Clean));
+        assert!(!needs_comparison(&new, &old, &LocalState::FolderMissing));
+        assert!(!needs_comparison(&up("alpha", "v1"), &old, &dirty()));
+        let mut more = up("alpha", "v1");
+        more.files.push(SkillFile { path: "z.md".into(), blob: "0".repeat(40), size: 1 });
+        assert!(needs_comparison(&more, &old, &dirty()), "a file added upstream is a move too");
     }
 
     #[test]

@@ -9,16 +9,16 @@
 //! * a job that found the engine busy (`tss` was working) is retried after a minute;
 //! * two timer-driven checks are at least 30 seconds apart;
 //! * a timer that fires much later than it was set for (the computer slept) waits 30 seconds for the network;
-//! * started by Windows at sign-in, the first look at the disk and the first check wait 30 seconds, so that Windows
-//!   can finish starting and the network can come up, and then run as background work. The user coming (the window,
-//!   or a job they ask for) starts the look at once.
+//! * started by Windows at sign-in, settings load on the worker, but the first look at the disk and the first check
+//!   wait 30 seconds, so that Windows can finish starting and the network can come up, and then run as background
+//!   work. The user coming (the window, or a job they ask for) starts the look at once.
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 
 use crate::board::{Board, Health, Level, capitalized};
-use crate::config::Config;
+use crate::config::{Config, Paths};
 use crate::engine::{
     Access, DiffReport, Engine, EngineError, Outcome, RemoveReport, Resolution, ResolveReport, SkillFacts, Stamp, StartupReport, SyncOptions, SyncReport,
     VerifyReport, Which,
@@ -39,8 +39,10 @@ pub const LATE_TIMER: UnixSecs = 60;
 pub const FAILURE_BACKOFF: UnixSecs = 5 * 60;
 pub const MAX_FAILURE_BACKOFF: UnixSecs = 60 * 60;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum Job {
+    /// Read settings on the worker before the first look at skills or GitHub.
+    LoadSettings,
     /// The first job, and the first for another skills folder: look at the disk and find out whether the skills folder
     /// can be used.
     Startup,
@@ -78,13 +80,81 @@ pub enum Job {
 impl Job {
     /// The tray shows "checking for updates…" while it runs. The window shows its own progress for "Show changes".
     pub fn shows_work(&self) -> bool {
-        !matches!(self, Job::Look | Job::Flush | Job::Plan | Job::Diff { .. })
+        !matches!(self, Job::LoadSettings | Job::Look | Job::Flush | Job::Plan | Job::Diff { .. })
     }
 
     /// The user asked for it, so they are told how it went.
     fn by_user(&self) -> bool {
         matches!(self, Job::Check(_) | Job::Resolve { .. } | Job::DeleteGone(_) | Job::Remove { .. })
     }
+}
+
+/// Where settings live. Portable companion files are probed on the worker; local config is loaded there at start
+/// and when falling back from portable mode, while its existing folder notification remains unchanged.
+#[derive(Clone, Debug)]
+pub struct SettingsSource {
+    pub local_file: PathBuf,
+    pub executable_dir: PathBuf,
+}
+
+impl SettingsSource {
+    pub fn new(local_file: PathBuf, executable_dir: PathBuf) -> SettingsSource {
+        SettingsSource { local_file, executable_dir }
+    }
+
+    fn load(&self, portable_mode: bool, force_local: bool, probe_portable: bool) -> Result<Option<LoadedSettings>, String> {
+        if probe_portable {
+            if let Some(config) = crate::portable::load(&self.executable_dir)? {
+                let profile = std::env::var_os("USERPROFILE").map(PathBuf::from);
+                let skills_dir = crate::portable::resolve_skills_dir(&config, std::env::var_os("TSS_SKILLS_DIR").as_deref(), profile.as_deref(), |name| {
+                    std::env::var_os(name).map(|value| value.to_string_lossy().into_owned())
+                })?;
+                return Ok(Some(LoadedSettings { config, skills_dir, portable: true, first_run: !self.local_file.exists() }));
+            }
+        }
+
+        if !force_local && !portable_mode {
+            return Ok(None);
+        }
+
+        let config = Config::load(&self.local_file)?;
+        let skills_dir = Paths::skills_dir(&config);
+        Ok(Some(LoadedSettings { config, skills_dir, portable: false, first_run: !self.local_file.exists() }))
+    }
+
+    fn save(&self, before: &Config, after: &Config, portable_mode: bool) -> Result<(), String> {
+        if portable_mode { crate::portable::save_changes(&self.executable_dir, before, after).map(|_| ()) } else { after.save(&self.local_file) }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct LoadedSettings {
+    pub config: Config,
+    pub skills_dir: PathBuf,
+    pub portable: bool,
+    pub first_run: bool,
+}
+
+#[derive(Debug)]
+pub struct SettingsOutcome {
+    pub first_run: bool,
+    pub result: Result<LoadedSettings, String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ConfigSave {
+    pub before: Config,
+    pub after: Config,
+    pub portable: bool,
+    pub revert_on_failure: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct ConfigSaveOutcome {
+    pub before: Config,
+    pub after: Config,
+    pub revert_on_failure: bool,
+    pub result: Result<(), String>,
 }
 
 /// One job for the worker, with the settings it runs against. Settings that change while it runs are only used by
@@ -94,6 +164,11 @@ pub struct Order {
     pub job: Job,
     pub cfg: Config,
     pub skills_dir: PathBuf,
+    pub settings_source: Option<SettingsSource>,
+    pub portable_mode: bool,
+    pub settings_initialized: bool,
+    pub reload_settings: bool,
+    pub config_saves: Vec<ConfigSave>,
     /// Run it as background work: lower CPU, I/O and memory priority, so it never gets in the way.
     pub background: bool,
 }
@@ -103,6 +178,7 @@ pub enum Answer {
     Started(StartupReport),
     Looked(VerifyReport),
     Checked { verified: Option<VerifyReport>, sync: SyncReport },
+    SettingsLoaded,
     Resolved(ResolveReport),
     Removed(RemoveReport),
     Diffed(DiffReport),
@@ -126,44 +202,100 @@ pub struct Done {
     pub private: Vec<(String, bool)>,
     /// The stamp of `state.json` as this job left it.
     pub stamp: Option<Stamp>,
+    /// Settings loaded before a startup, poll, check or window-open reload.
+    pub settings: Option<SettingsOutcome>,
+    /// Settings saves completed with this order.
+    pub config_saves: Vec<ConfigSaveOutcome>,
+    /// Whether this order checked for portable companions.
+    pub settings_checked: bool,
 }
 
 /// Runs one order. Called on the worker thread, which owns the engine.
 pub fn perform(engine: &mut Engine, order: &Order, cancel: &AtomicBool) -> Done {
-    if engine.paths().skills != order.skills_dir {
-        engine.set_skills_dir(order.skills_dir.clone());
+    let mut config_saves = Vec::with_capacity(order.config_saves.len());
+    for save in &order.config_saves {
+        let result = order
+            .settings_source
+            .as_ref()
+            .map_or_else(|| Err("the settings folder is unavailable".to_string()), |source| source.save(&save.before, &save.after, save.portable));
+        config_saves.push(ConfigSaveOutcome { before: save.before.clone(), after: save.after.clone(), revert_on_failure: save.revert_on_failure, result });
     }
-    let cfg = &order.cfg;
-    let result = match &order.job {
-        Job::Startup => engine.startup(cfg).map(Answer::Started),
-        Job::Look => engine.verify(cfg, Access::ReadOnly).map(Answer::Looked),
-        Job::Poll => engine.sync(cfg, &Which::Due, &SyncOptions::default(), cancel).map(|sync| Answer::Checked { verified: None, sync }),
-        Job::Check(which) => engine.verify(cfg, Access::Write).and_then(|verified| {
-            let which = which.as_ref().map_or(Which::All, |id| Which::One(id.clone()));
-            let sync = engine.sync(cfg, &which, &SyncOptions::default(), cancel)?;
-            Ok(Answer::Checked { verified: Some(verified), sync })
-        }),
-        Job::Resolve { repo, skill, how } => engine.resolve(cfg, repo, skill, *how, cancel).map(Answer::Resolved),
-        Job::DeleteGone(id) => {
-            let opts = SyncOptions { ignore_etag: true, confirm_mass_delete: true, ..SyncOptions::default() };
-            engine.sync(cfg, &Which::One(id.clone()), &opts, cancel).map(|sync| Answer::Checked { verified: None, sync })
+
+    let explicit_check = matches!(order.job, Job::Check(_));
+    let probe_portable = !order.settings_initialized || order.portable_mode || order.reload_settings || explicit_check;
+    let loads_settings = order.job == Job::LoadSettings
+        || (!order.settings_initialized && order.job == Job::Startup)
+        || (probe_portable && (matches!(order.job, Job::Poll | Job::Check(_)) || order.reload_settings));
+    let force_local = !order.settings_initialized && matches!(order.job, Job::LoadSettings | Job::Startup);
+    let mut cfg = order.cfg.clone();
+    let mut skills_dir = order.skills_dir.clone();
+    let portable_mode = order.portable_mode;
+    let mut settings = None;
+    let mut settings_error = None;
+    if loads_settings {
+        if let Some(source) = &order.settings_source {
+            let first_run = !source.local_file.exists();
+            match source.load(portable_mode, force_local, probe_portable) {
+                Ok(Some(loaded)) => {
+                    cfg = loaded.config.clone();
+                    skills_dir = loaded.skills_dir.clone();
+                    settings = Some(SettingsOutcome { first_run: loaded.first_run, result: Ok(loaded) });
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    settings_error = Some(error.clone());
+                    settings = Some(SettingsOutcome { first_run, result: Err(error) });
+                }
+            }
         }
-        Job::Remove { repo, delete_skills } => engine.remove_repo(repo, *delete_skills).map(Answer::Removed),
-        Job::Diff { repo, skill, preview: false } => engine.diff(cfg, repo, skill, cancel).map(Answer::Diffed),
-        Job::Diff { repo, skill, preview: true } => engine.preview(cfg, repo, skill, cancel).map(Answer::Diffed),
-        Job::Flush => engine.flush().map(|()| Answer::Flushed),
-        Job::Plan => Ok(Answer::Planned),
+    }
+    let moved = skills_dir != order.skills_dir;
+    let reload_only = order.job == Job::LoadSettings || (order.job == Job::Plan && order.reload_settings);
+    let skip_for_folder_change = moved && matches!(order.job, Job::Poll | Job::Check(_));
+    if settings_error.is_none() && !skip_for_folder_change && !reload_only && engine.paths().skills != skills_dir {
+        engine.set_skills_dir(skills_dir.clone());
+    }
+
+    let result = if let Some(error) = settings_error {
+        Err(EngineError::Failed(error))
+    } else if reload_only || skip_for_folder_change {
+        Ok(Answer::SettingsLoaded)
+    } else {
+        match &order.job {
+            Job::LoadSettings => Ok(Answer::SettingsLoaded),
+            Job::Startup => engine.startup(&cfg).map(Answer::Started),
+            Job::Look => engine.verify(&cfg, Access::ReadOnly).map(Answer::Looked),
+            Job::Poll => engine.sync(&cfg, &Which::Due, &SyncOptions::default(), cancel).map(|sync| Answer::Checked { verified: None, sync }),
+            Job::Check(which) => engine.verify(&cfg, Access::Write).and_then(|verified| {
+                let which = which.as_ref().map_or(Which::All, |id| Which::One(id.clone()));
+                let sync = engine.sync(&cfg, &which, &SyncOptions::default(), cancel)?;
+                Ok(Answer::Checked { verified: Some(verified), sync })
+            }),
+            Job::Resolve { repo, skill, how } => engine.resolve(&cfg, repo, skill, *how, cancel).map(Answer::Resolved),
+            Job::DeleteGone(id) => {
+                let opts = SyncOptions { ignore_etag: true, confirm_mass_delete: true, ..SyncOptions::default() };
+                engine.sync(&cfg, &Which::One(id.clone()), &opts, cancel).map(|sync| Answer::Checked { verified: None, sync })
+            }
+            Job::Remove { repo, delete_skills } => engine.remove_repo(repo, *delete_skills).map(Answer::Removed),
+            Job::Diff { repo, skill, preview: false } => engine.diff(&cfg, repo, skill, cancel).map(Answer::Diffed),
+            Job::Diff { repo, skill, preview: true } => engine.preview(&cfg, repo, skill, cancel).map(Answer::Diffed),
+            Job::Flush => engine.flush().map(|()| Answer::Flushed),
+            Job::Plan => Ok(Answer::Planned),
+        }
     };
     Done {
         job: order.job.clone(),
         result,
-        next_wake: engine.next_wake(cfg),
+        next_wake: engine.next_wake(&cfg),
         last_checks: cfg.repos.iter().filter_map(|r| engine.last_check(&r.id).map(|at| (r.id.clone(), at))).collect(),
         kept: cfg.repos.iter().map(|r| (r.id.clone(), engine.kept(&r.id))).collect(),
         facts: cfg.repos.iter().map(|r| (r.id.clone(), engine.facts(&r.id))).collect(),
         lists_nothing: cfg.repos.iter().map(|r| (r.id.clone(), engine.lists_nothing(&r.id))).collect(),
         private: cfg.repos.iter().map(|r| (r.id.clone(), engine.needs_token(&r.id))).collect(),
         stamp: engine.state_stamp(),
+        settings,
+        config_saves,
+        settings_checked: loads_settings && probe_portable,
     }
 }
 
@@ -195,6 +327,12 @@ pub struct App {
     pub board: Board,
     cfg: Config,
     skills_dir: PathBuf,
+    settings_source: Option<SettingsSource>,
+    portable_mode: bool,
+    settings_initialized: bool,
+    reload_settings_pending: bool,
+    portable_probe_pending: bool,
+    config_saves: Vec<ConfigSave>,
     queue: VecDeque<Job>,
     busy: Option<Job>,
     next_wake: Option<UnixSecs>,
@@ -220,6 +358,12 @@ impl App {
             board: Board::new(),
             cfg,
             skills_dir,
+            settings_source: None,
+            portable_mode: false,
+            settings_initialized: false,
+            reload_settings_pending: false,
+            portable_probe_pending: false,
+            config_saves: Vec::new(),
             queue: VecDeque::from([Job::Startup]),
             busy: None,
             next_wake: None,
@@ -242,10 +386,71 @@ impl App {
         &self.skills_dir
     }
 
+    pub fn set_settings_source(&mut self, source: SettingsSource) {
+        self.settings_source = Some(source);
+    }
+
+    pub fn queue_initial_settings_load(&mut self) {
+        self.queue.push_front(Job::LoadSettings);
+    }
+
+    pub fn portable_mode(&self) -> bool {
+        self.portable_mode
+    }
+
+    pub fn settings_initialized(&self) -> bool {
+        self.settings_initialized
+    }
+
+    pub fn portable_probe_pending(&self) -> bool {
+        self.portable_probe_pending
+    }
+
+    pub fn request_settings_reload(&mut self) {
+        self.reload_settings_pending = true;
+        self.portable_probe_pending = true;
+        self.want(Job::Plan);
+    }
+
+    pub fn queue_config_save(&mut self, before: Config, after: Config, portable: bool, revert_on_failure: bool) {
+        self.config_saves.push(ConfigSave { before, after, portable, revert_on_failure });
+        self.want(Job::Plan);
+    }
+
+    /// Takes in settings loaded on the worker. A changed skills folder is always started before it is checked.
+    pub fn settings_reloaded(&mut self, loaded: LoadedSettings, during: &Job) {
+        let moved = loaded.skills_dir != self.skills_dir;
+        self.retain_current_work(&loaded.config, moved);
+        self.cfg = loaded.config;
+        self.skills_dir = loaded.skills_dir;
+        self.portable_mode = loaded.portable;
+        self.settings_initialized = true;
+        if moved {
+            self.started = false;
+            if *during != Job::Startup && !self.sign_in_wait {
+                self.want(Job::Startup);
+            }
+        } else if !self.started && *during != Job::Startup && !self.sign_in_wait {
+            self.want(Job::Startup);
+        }
+    }
+
     /// New settings. The next job uses them; when to wake up is worked out again. Another skills folder is taken in
     /// the way the app starts, so the change is recorded, and the user told, at once rather than at the next check.
     pub fn set_cfg(&mut self, cfg: Config, skills_dir: PathBuf) {
         let moved = skills_dir != self.skills_dir;
+        self.retain_current_work(&cfg, moved);
+        self.cfg = cfg;
+        self.skills_dir = skills_dir;
+        if moved {
+            self.started = false;
+            self.want(Job::Startup);
+        } else {
+            self.want(Job::Plan);
+        }
+    }
+
+    fn retain_current_work(&mut self, cfg: &Config, moved: bool) {
         self.queue.retain(|job| match job {
             Job::Resolve { repo, .. } | Job::Diff { repo, .. } | Job::Remove { repo, .. } | Job::Check(Some(repo)) | Job::DeleteGone(repo) => {
                 !moved
@@ -257,14 +462,6 @@ impl App {
             }
             _ => true,
         });
-        self.cfg = cfg;
-        self.skills_dir = skills_dir;
-        if moved {
-            self.started = false;
-            self.want(Job::Startup);
-        } else {
-            self.want(Job::Plan);
-        }
     }
 
     pub fn health(&self) -> Health {
@@ -305,6 +502,9 @@ impl App {
     pub fn want(&mut self, job: Job) -> bool {
         if self.quitting || self.queue.contains(&job) {
             return false;
+        }
+        if matches!(job, Job::Check(_)) {
+            self.portable_probe_pending = true;
         }
         if job.by_user() {
             self.user_here();
@@ -347,8 +547,20 @@ impl App {
         }
         self.busy = Some(job.clone());
         self.armed = None;
-        let background = job == Job::Poll || (job == Job::Startup && self.at_sign_in);
-        Some(Order { job, cfg: self.cfg.clone(), skills_dir: self.skills_dir.clone(), background })
+        let background = job == Job::Poll || (matches!(job, Job::LoadSettings | Job::Startup) && self.at_sign_in);
+        let reload_settings = std::mem::take(&mut self.reload_settings_pending);
+        let config_saves = std::mem::take(&mut self.config_saves);
+        Some(Order {
+            job,
+            cfg: self.cfg.clone(),
+            skills_dir: self.skills_dir.clone(),
+            settings_source: self.settings_source.clone(),
+            portable_mode: self.portable_mode,
+            settings_initialized: self.settings_initialized,
+            reload_settings,
+            config_saves,
+            background,
+        })
     }
 
     /// Takes in what the worker sent back.
@@ -358,6 +570,10 @@ impl App {
         let before = self.health();
         let mut settled = Settled::default();
         let job = done.job;
+        let config_saves = done.config_saves;
+        if done.settings_checked && !self.reload_settings_pending && !self.queue.iter().any(|job| matches!(job, Job::Check(_))) {
+            self.portable_probe_pending = false;
+        }
         let by_user = job.by_user();
         let mut checked = None;
 
@@ -372,14 +588,17 @@ impl App {
                 if by_user {
                     self.board.say(now, Level::Error, why.clone());
                     settled.feedback = Some(why);
-                } else if matches!(job, Job::Startup | Job::Poll | Job::Look) {
+                } else if matches!(job, Job::LoadSettings | Job::Startup | Job::Poll | Job::Look) {
                     self.failures += 1;
                     self.board.note_failure(now, Some(&why));
                     self.hold(now + backoff(self.failures));
+                    if job == Job::LoadSettings {
+                        self.queue.retain(|queued| *queued != Job::Startup);
+                    }
                 }
             }
             Ok(answer) => {
-                if !matches!(answer, Answer::Flushed | Answer::Planned | Answer::Diffed(_)) {
+                if !matches!(answer, Answer::Flushed | Answer::Planned | Answer::SettingsLoaded | Answer::Diffed(_)) {
                     self.failures = 0;
                     self.board.note_failure(now, None);
                 }
@@ -420,11 +639,23 @@ impl App {
                         }
                     }
                     Answer::Diffed(report) => settled.diff = shown(&job, Ok(report)),
+                    Answer::SettingsLoaded => {}
                     Answer::Flushed | Answer::Planned => {}
                 }
             }
         }
 
+        for save in config_saves {
+            if let Err(error) = save.result {
+                if save.revert_on_failure && self.cfg == save.after {
+                    self.cfg = save.before;
+                    self.queue.retain(|queued| !matches!(queued, Job::Check(_)));
+                }
+                let text = format!("Shared settings could not be saved: {}", capitalized(&error));
+                self.board.say(now, Level::Error, text.clone());
+                settled.feedback = Some(text);
+            }
+        }
         self.next_wake = done.next_wake;
         for (id, at) in &done.last_checks {
             self.board.note_last_check(id, *at);
@@ -491,7 +722,7 @@ impl App {
         self.hold(now + RESUME_GRACE);
     }
 
-    /// Windows started the app as the user signed in. Nothing it does then is urgent: the first look at the disk waits
+    /// Windows started the app as the user signed in. Settings load on the worker, but the first look at the disk waits
     /// as long as the first check, which gives the network time to come up, and both are background work. When the
     /// wait is over, the timer queues the look as it does after a failed one.
     pub fn started_by_windows(&mut self, now: UnixSecs) {
