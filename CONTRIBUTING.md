@@ -76,7 +76,10 @@ refuses to write Windows' own keys from a test.
 there: another drive, a ReFS or Dev Drive volume, or a network share. Run it when you change file-system code. A run on
 an SMB share once found a bug the local NTFS runs could not. Without `-Root`, the runner sets `TSS_TEST_ROOT` to
 `%TEMP%`; this makes engine tests fail closed if they do not inject disposable Agents and Instructions roots. The
-`TSS_NO_SAVED_TOKEN` and `TSS_NO_APP_UPDATES` flags do not isolate file-system paths.
+`TSS_NO_SAVED_TOKEN` and `TSS_NO_APP_UPDATES` flags do not isolate file-system paths. The scripts use the long name of
+`%TEMP%` and of `-Root` (`Get-LongPath` in `scripts\common.ps1`): GitHub's runners spell `%TEMP%` with an 8.3 short name
+(`C:\Users\RUNNER~1\...`), and the app refuses such an alias for an Agents or Instructions folder. To try that case here,
+pass `-Root` a short name, for example the one `cmd /c for %I in ("FOLDER") do @echo %~sI` prints.
 
 **Live GitHub.** The tests never talk to GitHub. To try the real client, use `scripts\dev.ps1 dry-run -Repo ...` or the
 sandbox (`scripts\dev.ps1 tss add ...` then `tss check`), and for everything the tests cannot see, the live runs below.

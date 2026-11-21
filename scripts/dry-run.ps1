@@ -45,7 +45,7 @@ if (-not $Repo) {
     exit $code
 }
 
-$root = Join-Path $env:TEMP ('tss-dryrun-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
+$root = Join-Path $TempRoot ('tss-dryrun-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
 try {
     $code = Invoke-InSandbox -Root $root -Body {
         $add = @('add', $Repo)

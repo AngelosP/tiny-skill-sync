@@ -15,6 +15,25 @@ $ScriptTempFilePattern = '^tss-gh-body-[0-9a-f]+\.json$'
 # with an app folder of its own never writes Windows' Run key.
 $TestRegistryRoot = 'HKCU:\Software\tiny-skill-sync-test'
 
+# The long name of an existing folder. %TEMP% can be spelled with 8.3 short names (GitHub's runners use
+# C:\Users\RUNNER~1\...), and the app refuses such an alias for an Agents or Instructions folder.
+function Get-LongPath([string]$Path) {
+    if ($Path -notmatch '~') { return $Path }
+    if (-not ('TssScripts.LongPath' -as [type])) {
+        Add-Type -Namespace TssScripts -Name LongPath -MemberDefinition @'
+[DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+public static extern uint GetLongPathNameW(string shortPath, System.Text.StringBuilder longPath, uint size);
+'@
+    }
+    $long = New-Object System.Text.StringBuilder 1024
+    $n = [TssScripts.LongPath]::GetLongPathNameW($Path, $long, [uint32]$long.Capacity)
+    if ($n -eq 0 -or $n -ge $long.Capacity) { throw "cannot find the long name of $Path" }
+    $long.ToString()
+}
+
+# Where the scripts and tests make their throwaway folders.
+$TempRoot = Get-LongPath $env:TEMP
+
 function Use-Cargo {
     if (Get-Command cargo -ErrorAction SilentlyContinue) { return }
     $bin = Join-Path $env:USERPROFILE '.cargo\bin'
@@ -41,7 +60,7 @@ function Get-ExeDir([string]$Build) {
 # A fresh install, not just fresh settings: a portable export or an app update acts beside the executables.
 # $Build 'debug' copies the debug pair instead (relaunch-smoke.ps1 needs its test commands).
 function New-LiveRoot([string]$Prefix, [string]$Build = 'release') {
-    $root = Join-Path $env:TEMP ("tss-$Prefix-" + [guid]::NewGuid().ToString('N').Substring(0, 8))
+    $root = Join-Path $TempRoot ("tss-$Prefix-" + [guid]::NewGuid().ToString('N').Substring(0, 8))
     New-Item -ItemType Directory -Path $root -ErrorAction Stop | Out-Null
     try {
         foreach ($d in 'home', 'skills', 'bin', 'out') { New-Item -ItemType Directory -Path (Join-Path $root $d) | Out-Null }

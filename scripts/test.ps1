@@ -42,9 +42,9 @@ try {
         Write-Host '== cargo clippy' -ForegroundColor Cyan
         Invoke-Native cargo @('clippy', '--all-targets', '--', '-D', 'warnings')
     }
-    $testRoot = if ($Root) { $Root } elseif ($env:TSS_TEST_ROOT) { $env:TSS_TEST_ROOT } else { $env:TEMP }
+    $testRoot = if ($Root) { $Root } elseif ($env:TSS_TEST_ROOT) { $env:TSS_TEST_ROOT } else { $TempRoot }
     New-Item -ItemType Directory -Force $testRoot | Out-Null
-    $env:TSS_TEST_ROOT = $testRoot
+    $env:TSS_TEST_ROOT = Get-LongPath $testRoot
     Write-Host '== cargo test' -ForegroundColor Cyan
     $testArgs = @('test', '--no-fail-fast')
     if ($Filter) { $testArgs += @('--', $Filter) }

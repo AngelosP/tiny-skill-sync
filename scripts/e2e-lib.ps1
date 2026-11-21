@@ -1081,7 +1081,7 @@ function Start-Entry([string]$Command, [hashtable]$Env) {
     $vars['TSS_NO_APP_UPDATES'] = '1'
     $vars['TSS_NO_SAVED_TOKEN'] = '1'
     foreach ($k in 'TSS_HOME', 'TSS_SKILLS_DIR') {
-        if (-not $vars[$k] -or -not ([string]$vars[$k]).StartsWith("$env:TEMP\tss-", [StringComparison]::OrdinalIgnoreCase)) {
+        if (-not $vars[$k] -or -not ([string]$vars[$k]).StartsWith("$TempRoot\tss-", [StringComparison]::OrdinalIgnoreCase)) {
             throw "refusing to start $Command`: $k is not a throwaway folder"
         }
     }
