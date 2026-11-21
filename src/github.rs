@@ -49,7 +49,7 @@ impl<'a> RepoRef<'a> {
 }
 
 /// The page on github.com that shows a repository, or one of its skills on the configured branch (`HEAD`, the default
-/// branch, when none is set). A skill named like the configured folder is taken to be that folder, as when the folder
+/// branch, when none is set). For Plugins, the argument is a branch-root folder path. A skill named like the configured folder is taken to be that folder, as when the folder
 /// itself is one skill; a skill of the same name inside it is then one click away. `None` when the owner or name has
 /// anything but letters, digits, `-`, `_` and `.`.
 pub fn web_url(cfg: &RepoConfig, skill: Option<&str>) -> Option<String> {
@@ -57,12 +57,19 @@ pub fn web_url(cfg: &RepoConfig, skill: Option<&str>) -> Option<String> {
     let repo = RepoRef::of(cfg).ok().filter(|r| plain(r.owner) && plain(r.name))?;
     let mut url = format!("https://github.com/{}/{}", repo.owner, repo.name);
     if let Some(skill) = skill {
-        let is_skill = cfg.kind.is_skills();
-        if !is_skill && crate::pathsafe::check_component(skill).is_err() {
-            return None;
-        }
-        let folders = [repo.path, if is_skill && skill == cfg.single_skill_name() { "" } else { skill }];
-        url.push_str(if is_skill { "/tree/" } else { "/blob/" });
+        let kind = cfg.kind;
+        let folders = if kind == crate::source::SourceKind::Plugins {
+            if !skill.is_empty() {
+                crate::pathsafe::check_rel_path(skill).ok()?;
+            }
+            [skill, ""]
+        } else {
+            if !kind.is_skills() {
+                crate::pathsafe::check_component(skill).ok()?;
+            }
+            [repo.path, if kind.is_skills() && skill == cfg.single_skill_name() { "" } else { skill }]
+        };
+        url.push_str(if matches!(kind, crate::source::SourceKind::Agents | crate::source::SourceKind::Instructions) { "/blob/" } else { "/tree/" });
         url.push_str(&percent_encode_path(repo.reference()));
         for folder in folders.into_iter().filter(|f| !f.is_empty()) {
             url.push('/');

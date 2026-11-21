@@ -2,7 +2,8 @@
 
 [Back to the short introduction](../README.md)
 
-A tiny Windows tray app that keeps your user-level Copilot skills, agents and modular instructions in sync with GitHub.
+A tiny Windows tray app that keeps your user-level Copilot skills, agents, modular instructions and GitHub Copilot CLI
+plugins in sync with GitHub.
 
 You tell it which repositories (or which folder of a repository) hold skills. It installs them into your Copilot skills
 folder, checks GitHub on a schedule, and installs, updates and removes skills as they change upstream. It adopts an
@@ -10,7 +11,7 @@ existing copy only after proving it matches upstream history, and never overwrit
 your choice. It removes from your PC only
 what came from GitHub and was later removed there; files you add are yours, and the app does not even show them.
 
-- **Small and quiet.** One exe of about 1 MiB, no runtime to install. It starts in about 8 ms, uses about 1 MiB of
+- **Small and quiet.** One exe of about 1.4 MiB, no runtime to install. It starts in about 9 ms, uses about 1 MiB of
   memory while idle, and does no work at all between checks: no CPU, no disk, no network.
 - **Starts with Windows, without slowing it down.** Turn on **Start with Windows** (the app offers it when you add your
   first repository). At sign-in it goes straight to the tray, reads settings on the worker, then waits 30 seconds
@@ -89,7 +90,7 @@ allows the same current-or-historical adoption checks.
    are not signed, so if a browser downloaded them, Windows may ask before the first start (**More info**, **Run
    anyway**).
 3. Click the icon to open the window. Click **Add source**, paste the address of the GitHub folder, choose
-   **Skills** (the default), **Agents** or **Instructions**, and click **Preview**. For example:
+   **Skills** (the default), **Agents**, **Instructions** or **Plugins**, and click **Preview**. For example:
 
    ```text
    https://github.com/anthropics/skills/tree/main/skills
@@ -201,6 +202,46 @@ You may turn on **Start with Windows** with `tss startup on`. When Windows can r
 path, the startup entry uses its UNC path; the executable also opts into Windows' network image-loading behavior.
 Windows still needs access to the NAS or a fully synced OneDrive folder at sign-in. Startup from a real NAS or OneDrive
 share has not been verified, so try it on your setup before relying on it.
+
+### Plugins for GitHub Copilot CLI
+
+Install **GitHub Copilot CLI** before adding a Plugins source. Choose **Plugins** in **Add source** and use a named
+branch, for example `https://github.com/OWNER/NAME/tree/main` or a folder on that branch. Use letters, digits,
+`.`, `_`, `/`, `+` or `-` in the branch name. The marketplace manifest must be at the top of the branch. A folder
+limits the matches to plugins under that folder. Entries hosted elsewhere are shown but not handled.
+
+**Preview** reads GitHub and does not start Copilot CLI. It shows the marketplace, plugin names, versions,
+publishers and any declared hooks, MCP servers or LSP servers. Publishers are declared by the plugin or its
+marketplace, not verified by GitHub. **Add and check** approves exactly the names and publishers you reviewed on this
+PC. Plugins can run programs: approve only publishers and branches you trust. Updates for an approved plugin with
+the same publisher install automatically. A new plugin, a changed publisher, or a source copied in through shared
+settings needs local approval.
+
+**Needs your approval**, **Removed from GitHub**, rejected or blocked plugins, plugins waiting for the marketplace,
+unfinished planned changes and failures need attention. **Turned off in Copilot** and **Removed in Copilot** are
+informational: the app respects your choice. It does not turn a plugin back on or reinstall it on its own. After you
+turn a plugin back on in Copilot, its waiting update can install at the next full check (**Sync now**, `tss check`,
+or after a change on GitHub). Already installed, already tracked by another source and hosted elsewhere are also
+informational.
+
+| Choice | What it does |
+| --- | --- |
+| **Approve** | Approve the shown name and publisher, including future versions from this branch. |
+| **Reinstall** | Bring back a tracked plugin that was removed in Copilot. |
+| **Uninstall** | Confirm in the window to remove a tracked plugin from Copilot after it was removed from GitHub. |
+| **Forget** | Stop tracking a plugin removed from GitHub without uninstalling it. |
+
+A plugin removed from GitHub is never uninstalled automatically. Plain **Remove** forgets the source's records and
+leaves its plugins installed in Copilot, like **Forget** for each one. To **remove and uninstall**, use
+`tss remove ID --uninstall-plugins`. It removes the tracked plugins from Copilot and verifies each uninstall. If any
+uninstall fails, the command exits nonzero and keeps the source and remaining records. The marketplace stays registered.
+
+Copilot can change between the app's check and its command. If the result does not match what the app expected, it
+reports a failure and checks again. Copilot CLI also fetches the branch itself: if the branch moves and the publisher
+changes in the meantime, the newer plugin may be installed once before the next check sees the change and holds it for
+approval. Bump the plugin version when publishing a change: Copilot may skip an update without a new version. This works
+only with Copilot CLI; the app does not drive VS Code's plugin installer.
+The other source types do not need Copilot CLI.
 
 ### Start with Windows
 
@@ -385,18 +426,30 @@ also raises GitHub's rate limit: without one, every program on your network shar
 tss status                                   what is installed and what needs attention (no network)
 tss update status                            app versions and preferences (not a skill check)
 tss check [REPO] [--dry-run]                 check GitHub now and apply what is safe
-tss add OWNER/NAME|URL [--type skills|agents|instructions] [--preview] [--every 6h] [--use-token]
-tss remove REPO [--delete-skills]
+tss add OWNER/NAME|URL [--type skills|agents|instructions|plugins] [--preview] [--every 6h] [--use-token]
+tss remove REPO [--delete-skills|--uninstall-plugins]
 tss resolve REPO ITEM replace|restore|keep|leave|manage|pause|resume
+tss resolve REPO PLUGIN approve [PUBLISHER]
+tss resolve REPO PLUGIN reinstall|uninstall|forget
 tss token [status|set|clear]                 gh auth token | tss token set
 tss startup [status|on|off]                  start the tray app when you sign in
 tss portable                                 export local settings to companion files
 ```
 
-Use the source ID that `tss status` shows for `REPO` when one repository has several sources.
-`tss add ... --type agents --preview` checks the source without saving. Omit `--preview` for the
+Use the source ID that `tss status` shows for `REPO` when one repository has several sources. `tss check` (also
+`tss sync`) checks sources, not the app. Apply what is safe: install, update, remove.
+
+Private repositories use the saved token or the GitHub CLI sign-in when needed. `--use-token` sends the token for
+every request. `tss add ... --type agents --preview` checks the source without saving. Omit `--preview` for the
 confirmation prompt; confirming saves settings, then `tss check ID` installs. A bare `tss add` still saves a Skills
 source without a prompt or a download. `--delete-skills` and earlier-version searches are only for Skills sources.
+
+For Plugins, `tss add --type plugins URL --preview` previews without starting Copilot CLI. Omit `--preview` and
+answer `yes` to save the source and record local approval. Then run `tss check ID` (also `tss sync ID`) to install.
+`tss status` shows the last recorded versions without starting Copilot. `tss check` shows current plugin status
+and the choices that apply. For `approve`, give the publisher as one argument exactly as shown, for example
+`tss resolve ID example approve "Example Team"`. Omit it only when the publisher is not declared.
+
 Exit codes: 0 all fine, 1 something needs attention,
 2 failed, 3 bad command line. The tray notices changes made with `tss` and shows them. Only one of them checks at a
 time; the other one is told to try again in a moment.
@@ -482,7 +535,7 @@ In local mode, `config.json` can be edited by hand while the app runs; it is pic
 An empty `branch` means the default branch, and an empty `path` the repository root. `use_token` sends the token with
 every request to that repository; without it, a private repository is still read with the token (see
 [Private repositories](#private-repositories)). A missing `kind` means Skills; use `"agents"` or `"instructions"`
-for loose-file sources in format 2. An unknown or null kind is an error. Never change an `id`: the installed
+for loose-file sources, or `"plugins"` for a Plugins source, in format 2. An unknown or null kind is an error. Never change an `id`: the installed
 items are recorded under it. Unknown local settings fields are not preserved when the settings are saved.
 
 In local `config.json`, `skills_dir`, when set, must be a full path such as `D:\skills`. In portable settings it may
@@ -498,6 +551,7 @@ Environment variables, mainly for tests and scripts:
 | `TSS_AGENTS_DIR`, `TSS_INSTRUCTIONS_DIR` | Explicit disposable destinations for isolated copies syncing either loose-file type. Set them outside the active profile's `.copilot` folder. |
 | `TSS_BENCH_REPORT` | Write timing marks to this file (used by `scripts\bench.ps1`). |
 | `TSS_NO_SAVED_TOKEN` | Skip reading the saved app token (isolated live tests); GitHub CLI sign-in still works. |
+| `TSS_COPILOT_CLI` | Optional full path to `copilot.exe`. Otherwise the app checks `%LOCALAPPDATA%\GitHubCopilotCLI\copilot.exe` and then absolute folders on `PATH`. |
 | `TSS_API_BASE`, `TSS_RAW_BASE` | Other GitHub addresses (used by the HTTP tests). |
 
 ## How edits are found
@@ -552,10 +606,10 @@ updating and removing a skill, taking over a folder of yours, and **Show changes
 
 ## Measured cost
 
-With Agents and Instructions sources and the Universal C Runtime taken from Windows, the tray exe measured
-**1,287,680 bytes** (1.23 MiB), within its 1.25 MiB budget. On the three-skill, five-file public fixture, the tray
-appeared in 8.4 ms median, Settings painted in 47.0 ms median, an unchanged poll used 31.3 ms of CPU, and ordinary Quit
-took at most 0.9 ms. Ten idle seconds showed zero CPU, I/O and page faults. The
+With Plugins sources added, the tray exe measured **1,434,112 bytes** (1.37 MiB), within its 1.40 MiB budget. On the
+three-skill, five-file public fixture, the tray appeared in 8.5 ms median, Settings painted in 37.4 ms median, an
+unchanged poll used 15.6 ms of CPU (one tick) with no file read or written, and ordinary Quit took at most 1.1 ms. Ten
+idle seconds showed zero CPU, I/O and page faults, with a trimmed working set of 1.0 MiB. The
 benchmark suppressed release checks; it does not measure retaining an offered update or installing on a slow share.
 
 Measured with `scripts\bench.ps1` on a Ryzen 7 5800X3D with Windows 11, files in the cache, real installs of
@@ -574,7 +628,7 @@ historical adoption; the larger install is an earlier baseline.
 | Window open: working set | 13.6 MiB | 14.4 MiB | 40 MiB |
 | Window closed: working set (trimmed) | 1.5 MiB | 1.5 MiB | 2 MiB |
 | Unchanged check: CPU, file reads and writes | 0 ms, 0, 0 | 16 ms, 0, 0 | 50 ms, 0 |
-| Exe size | 1,057,280 bytes (1.01 MiB) | 0.93 MiB | 1.25 MiB |
+| Exe size | 1,057,280 bytes (1.01 MiB) | 0.93 MiB | 1.40 MiB |
 
 Every budget row passed in those earlier runs. The 442-file startup check took 48.2 microseconds per file; an unchanged poll took 438 ms
 wall time and changed no files. The eight-candidate historical quick slice took 11.4 seconds in the live fixture

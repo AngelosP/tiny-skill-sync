@@ -15,20 +15,21 @@ use windows_sys::Win32::Graphics::Gdi::{
 };
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::Controls::{EM_LIMITTEXT, EM_SETSEL};
-use windows_sys::Win32::UI::HiDpi::{AdjustWindowRectExForDpi, GetDpiForSystem, GetDpiForWindow};
+use windows_sys::Win32::UI::HiDpi::{AdjustWindowRectExForDpi, GetDpiForSystem, GetDpiForWindow, GetSystemMetricsForDpi};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{EnableWindow, GetFocus, SetFocus};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, ES_AUTOHSCROLL, ES_PASSWORD, GetClientRect, GetDlgItem, GetWindowRect, GetWindowTextLengthW,
-    GetWindowTextW, HMENU, HWND_TOP, IDCANCEL, IDOK, IsWindow, MB_ICONWARNING, SW_SHOWNORMAL, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOZORDER, SendMessageW,
-    SetForegroundWindow, SetWindowPos, SetWindowTextW, ShowWindow, WM_CLOSE, WM_COMMAND, WM_CTLCOLOREDIT, WM_DESTROY, WM_DPICHANGED, WM_ERASEBKGND, WM_SETFONT,
-    WM_SIZE, WS_CAPTION, WS_CHILD, WS_EX_CONTROLPARENT, WS_EX_DLGMODALFRAME, WS_POPUP, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE,
+    GetWindowTextW, HMENU, HWND_TOP, IDCANCEL, IDOK, IsWindow, MB_ICONWARNING, SM_CXVSCROLL, SW_SHOWNORMAL, SWP_NOACTIVATE, SWP_NOZORDER, SendMessageW,
+    SetForegroundWindow, SetWindowPos, SetWindowTextW, ShowWindow, WM_CLOSE, WM_COMMAND, WM_CTLCOLOREDIT, WM_DESTROY, WM_DISPLAYCHANGE, WM_DPICHANGED,
+    WM_ERASEBKGND, WM_SETFONT, WM_SETTINGCHANGE, WM_SIZE, WS_CAPTION, WS_CHILD, WS_EX_CONTROLPARENT, WS_EX_DLGMODALFRAME, WS_POPUP, WS_SYSMENU, WS_TABSTOP,
+    WS_VISIBLE,
 };
 
 use super::control::{self, BN_CLICKED, CBN_SELENDOK};
 use super::page::{self, ASK_W, Hint, Question, ask_id};
 use super::paint::{self, Font};
 use super::theme::{self, Role};
-use super::{place, register_class, scale, shell, text_of};
+use super::{centered, keep_on_screen, register_class, scale, shell, text_of, work_area};
 use crate::board::APP_NAME;
 use crate::secret::Secret;
 use crate::win::wide;
@@ -49,9 +50,8 @@ const EN_CHANGE: u32 = 0x300;
 const EM_SETMARGINS: u32 = 0xD3;
 const EC_BOTH: usize = 3;
 
-/// Reads a text box as it is typed: `Ok` is what the text means, `Err` what is wrong with it.
-/// Says what the typed text means, or what is wrong with it.
-pub type Verify = dyn Fn(&str) -> Result<String, String>;
+/// Says what the text means, or what is wrong with it, for the current choice (0 if there are none).
+pub type Verify = dyn Fn(&str, usize) -> Result<String, String>;
 pub type Check = Box<Verify>;
 
 pub enum Field {
@@ -118,14 +118,32 @@ fn dpi_of(hwnd: HWND) -> u32 {
     }
 }
 
-fn hint_of(text: &str, plain: &str, check: Option<&Verify>) -> Hint {
+fn hint_of(text: &str, plain: &str, check: Option<&Verify>, choice: usize) -> Hint {
     match check {
-        Some(check) if !text.trim().is_empty() => match check(text.trim()) {
+        Some(check) if !text.trim().is_empty() => match check(text.trim(), choice) {
             Ok(meaning) => Hint::Ok(meaning),
             Err(e) => Hint::Err(e),
         },
         _ => Hint::Plain(plain.to_string()),
     }
+}
+
+pub(super) fn fit_client_height(content: i32, work_height: i32, frame_height: i32) -> i32 {
+    content.min((work_height - frame_height).max(0))
+}
+
+fn fitted_size(height: i32, dpi: u32, work: RECT) -> [i32; 2] {
+    let mut frame = RECT { left: 0, top: 0, right: scale(ASK_W, dpi), bottom: 0 };
+    unsafe { AdjustWindowRectExForDpi(&mut frame, STYLE, 0, EX_STYLE, dpi) };
+    let frame_height = frame.bottom - frame.top;
+    let wanted = scale(height, dpi);
+    let client = fit_client_height(wanted, work.bottom - work.top, frame_height);
+    let mut width = frame.right - frame.left;
+    if client < wanted {
+        // Reserve room beside the page so the scroll bar does not cover its content.
+        width += unsafe { GetSystemMetricsForDpi(SM_CXVSCROLL, dpi) };
+    }
+    [width, client + frame_height]
 }
 
 /// Asks, and waits for the answer while the app keeps running. `None` when the user cancels, the window is closed,
@@ -141,7 +159,7 @@ pub fn ask(owner: HWND, a: Ask) -> Option<Reply> {
     }
     let (field, plain, initial, secret, check) = match a.field {
         Some(Field::Text { label, hint, initial, check }) => {
-            let shown = hint_of(&initial, &hint, check.as_deref());
+            let shown = hint_of(&initial, &hint, check.as_deref(), 0);
             (Some((label, shown)), hint, initial, false, check)
         }
         Some(Field::Secret { label, hint }) => (Some((label, Hint::Plain(hint.clone()))), hint, String::new(), true, None),
@@ -163,7 +181,8 @@ pub fn ask(owner: HWND, a: Ask) -> Option<Reply> {
     // Made where it will roughly end up, so it starts on the right monitor and DPI; sized again once it is there.
     let dpi = dpi_of(owner);
     let height = page::ask(&q, &|t: &str, f: Font, w: i32| paint::measure(t, f, w, dpi)).0.height;
-    let [x, y, w, h] = place(STYLE, EX_STYLE, (ASK_W, height), dpi, owner);
+    let work = work_area(owner);
+    let [x, y, w, h] = centered(work, owner, fitted_size(height, dpi, work));
     let hwnd = unsafe {
         CreateWindowExW(EX_STYLE, wide(CLASS).as_ptr(), wide(APP_NAME).as_ptr(), STYLE, x, y, w, h, owner, null_mut(), GetModuleHandleW(null()), null())
     };
@@ -260,22 +279,23 @@ fn update(hwnd: HWND) {
     let Some((q, edit)) = STATE.with(|s| s.try_borrow().ok()?.as_ref().filter(|s| !s.done).map(|s| (s.q.clone(), s.edit))) else { return };
     let dpi = dpi_of(hwnd);
     let (surface, edit_at) = page::ask(&q, &|t: &str, f: Font, w: i32| paint::measure(t, f, w, dpi));
-    let mut rc = RECT { left: 0, top: 0, right: scale(ASK_W, dpi), bottom: scale(surface.height, dpi) };
+    let work = work_area(hwnd);
+    let [w, h] = fitted_size(surface.height, dpi, work);
     let mut now: RECT = unsafe { zeroed() };
-    unsafe {
-        AdjustWindowRectExForDpi(&mut rc, STYLE, 0, EX_STYLE, dpi);
-        GetWindowRect(hwnd, &mut now);
+    unsafe { GetWindowRect(hwnd, &mut now) };
+    let [x, y, w, h] = keep_on_screen(work, [now.left, now.top, w, h]);
+    if [x, y, w, h] != [now.left, now.top, now.right - now.left, now.bottom - now.top] {
+        unsafe { SetWindowPos(hwnd, null_mut(), x, y, w, h, SWP_NOZORDER | SWP_NOACTIVATE) };
     }
-    let (w, h) = (rc.right - rc.left, rc.bottom - rc.top);
-    if now.right - now.left != w || now.bottom - now.top != h {
-        unsafe { SetWindowPos(hwnd, null_mut(), 0, 0, w, h, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE) };
-    }
-    control::set(unsafe { GetDlgItem(hwnd, PANEL) }, surface);
+    let panel = unsafe { GetDlgItem(hwnd, PANEL) };
+    control::set(panel, surface);
     if let (false, Some(at)) = (edit.is_null(), edit_at) {
         let [x, y, w, h] = at.map(|v| scale(v, dpi));
+        let y = y - control::scroll_offset(panel);
         // On top, so it comes first when Tab moves through the controls.
         unsafe { SetWindowPos(edit, HWND_TOP, x, y, w, h, SWP_NOACTIVATE) };
     }
+    control::reveal(panel, unsafe { GetFocus() });
 }
 
 fn with_state(f: impl FnOnce(&mut State)) {
@@ -330,7 +350,7 @@ fn accept() {
         reply.secret = Some(Secret::new(text.expose().trim()));
     } else if !edit.is_null() {
         let text = text_of(edit).trim().to_string();
-        let wrong = STATE.with(|s| s.try_borrow().ok()?.as_ref()?.check.as_ref().map(|check| check(&text).is_err())).unwrap_or(false);
+        let wrong = STATE.with(|s| s.try_borrow().ok()?.as_ref()?.check.as_ref().map(|check| check(&text, choice).is_err())).unwrap_or(false);
         if text.is_empty() || wrong {
             refuse(edit);
             return;
@@ -356,6 +376,17 @@ fn brush(argb: u32) -> HBRUSH {
     })
 }
 
+fn refresh_hint(s: &mut State) -> bool {
+    // Never read hidden text until OK.
+    let Some((_, shown)) = s.q.field.as_mut().filter(|_| !s.secret) else { return false };
+    let hint = hint_of(&text_of(s.edit), &s.plain, s.check.as_deref(), s.q.choice);
+    if *shown == hint {
+        return false;
+    }
+    *shown = hint;
+    true
+}
+
 fn on_command(hwnd: HWND, wp: WPARAM, lp: LPARAM) {
     let id = (wp & 0xFFFF) as i32;
     let code = ((wp >> 16) & 0xFFFF) as u32;
@@ -363,18 +394,8 @@ fn on_command(hwnd: HWND, wp: WPARAM, lp: LPARAM) {
         (IDOK, BN_CLICKED) => accept(),
         (IDCANCEL, BN_CLICKED) => finish(None),
         (ask_id::EDIT, EN_CHANGE) => {
-            let edit = lp as HWND;
             let mut changed = false;
-            with_state(|s| {
-                // A hidden text is never read until OK.
-                if !s.secret {
-                    let hint = hint_of(&text_of(edit), &s.plain, s.check.as_deref());
-                    if let Some((_, shown)) = s.q.field.as_mut().filter(|(_, shown)| *shown != hint) {
-                        *shown = hint;
-                        changed = true;
-                    }
-                }
-            });
+            with_state(|s| changed = refresh_hint(s));
             if changed {
                 update(hwnd);
             }
@@ -393,7 +414,10 @@ fn on_command(hwnd: HWND, wp: WPARAM, lp: LPARAM) {
             });
         }
         (n, BN_CLICKED) if n >= ask_id::CHOICE => {
-            with_state(|s| s.q.choice = (n - ask_id::CHOICE) as usize);
+            with_state(|s| {
+                s.q.choice = (n - ask_id::CHOICE) as usize;
+                refresh_hint(s);
+            });
             update(hwnd);
         }
         _ => {}
@@ -424,6 +448,10 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
             finish(None);
             0
         }
+        WM_DISPLAYCHANGE | WM_SETTINGCHANGE => {
+            update(hwnd);
+            0
+        }
         WM_DPICHANGED => {
             let rc = unsafe { &*(lp as *const RECT) };
             unsafe { SetWindowPos(hwnd, null_mut(), rc.left, rc.top, rc.right - rc.left, rc.bottom - rc.top, SWP_NOZORDER | SWP_NOACTIVATE) };
@@ -435,5 +463,17 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
             0
         }
         _ => unsafe { DefWindowProcW(hwnd, msg, wp, lp) },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fit_client_height;
+
+    #[test]
+    fn question_height_uses_only_available_client_space() {
+        assert_eq!(fit_client_height(200, 465, 34), 200);
+        assert_eq!(fit_client_height(598, 465, 34), 431);
+        assert_eq!(fit_client_height(598, 20, 34), 0);
     }
 }

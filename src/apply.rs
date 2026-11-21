@@ -40,6 +40,7 @@ use crate::verify::{self, Check, Likeness, Spot, Spots, Stats};
 use crate::win::fs::{FileHasher, Kind, kind_at, list_entries, volume_id};
 
 pub mod leaf;
+pub(crate) mod plugins;
 
 const EMPTY_BLOB: &str = "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391";
 const ERROR_DIR_NOT_EMPTY: i32 = 145;

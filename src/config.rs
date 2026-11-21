@@ -77,12 +77,13 @@ fn write_with_temp(path: &Path, bytes: &[u8], tmp: &Path) -> io::Result<()> {
 
 // Hand-edited JSON may have a UTF-8 BOM. Require an object: Serde also accepts arrays for structs, and e.g. `[]`
 // must not select enabled defaults as if a settings file were missing.
-pub(crate) fn parse_json_object<'de, T: Deserialize<'de>>(bytes: &'de [u8]) -> Result<T, String> {
+pub(crate) fn json_object_bytes(bytes: &[u8]) -> Option<&[u8]> {
     let bytes = bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(bytes);
-    if !bytes.trim_ascii_start().starts_with(b"{") {
-        return Err("expected a JSON object".into());
-    }
+    bytes.trim_ascii_start().starts_with(b"{").then_some(bytes)
+}
 
+pub(crate) fn parse_json_object<'de, T: Deserialize<'de>>(bytes: &'de [u8]) -> Result<T, String> {
+    let bytes = json_object_bytes(bytes).ok_or_else(|| "expected a JSON object".to_owned())?;
     serde_json::from_slice(bytes).map_err(|e| e.to_string())
 }
 
@@ -286,7 +287,16 @@ impl RepoConfig {
             Ok(spec) if spec.branch.is_empty() && spec.path.is_empty() && spec.full_name() == self.repo => {}
             Ok(_) | Err(_) => out.push(format!("'{}' is not a repository name like owner/name", self.repo)),
         }
-        if !self.branch.is_empty() {
+        let plugin_branch_problem = if self.kind != SourceKind::Plugins {
+            None
+        } else if self.branch.is_empty() || self.branch == "HEAD" {
+            Some("Plugins need a named branch, for example https://github.com/OWNER/NAME/tree/main.")
+        } else {
+            check_plugin_branch_chars(&self.branch).err()
+        };
+        if let Some(why) = plugin_branch_problem {
+            out.push(why.into());
+        } else if !self.branch.is_empty() {
             if let Err(e) = check_branch(&self.branch) {
                 out.push(format!("branch '{}': {e}", self.branch));
             }
@@ -470,6 +480,10 @@ impl RepoSpec {
     }
 
     pub fn parse(input: &str) -> Result<RepoSpec, String> {
+        Self::parse_for_kind(input, SourceKind::Skills)
+    }
+
+    pub(crate) fn parse_for_kind(input: &str, kind: SourceKind) -> Result<RepoSpec, String> {
         let text = input.trim();
         if text.is_empty() {
             return Err("enter a repository like owner/name".to_string());
@@ -509,6 +523,9 @@ impl RepoSpec {
                 return Err("only repository and folder addresses are supported (.../owner/name or .../tree/branch/folder)".to_string());
             }
             branch = parts[3].to_string();
+            if kind == SourceKind::Plugins {
+                check_plugin_branch_chars(&branch)?;
+            }
             check_branch(&branch)?;
             path = pathsafe::normalize_repo_dir(&parts[4..].join("/")).map_err(|e| format!("folder: {e}"))?;
         }
@@ -528,6 +545,15 @@ fn check_repo_name(name: &str) -> Result<(), String> {
         && name != ".."
         && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.');
     if ok { Ok(()) } else { Err(format!("'{name}' is not a valid repository name")) }
+}
+
+/// Copilot's marketplace shorthand uses a narrower alphabet than Git branch names.
+pub(crate) fn check_plugin_branch_chars(branch: &str) -> Result<(), &'static str> {
+    if branch.bytes().all(|b| b.is_ascii_alphanumeric() || b"._/+-".contains(&b)) {
+        Ok(())
+    } else {
+        Err("This branch name has characters the app will not pass to Copilot CLI: use letters, digits, '.', '_', '/', '+' or '-'.")
+    }
 }
 
 /// A conservative subset of `git check-ref-format`.
@@ -597,7 +623,12 @@ impl Paths {
     }
 
     pub(crate) fn has_file_root(&self, kind: SourceKind) -> bool {
-        self.file_roots.is_some() || std::env::var_os(if kind == SourceKind::Agents { "TSS_AGENTS_DIR" } else { "TSS_INSTRUCTIONS_DIR" }).is_some()
+        let key = match kind {
+            SourceKind::Agents => "TSS_AGENTS_DIR",
+            SourceKind::Instructions => "TSS_INSTRUCTIONS_DIR",
+            SourceKind::Skills | SourceKind::Plugins => return false,
+        };
+        self.file_roots.is_some() || std::env::var_os(key).is_some()
     }
 
     pub fn config_file(&self) -> PathBuf {
@@ -690,6 +721,39 @@ pub(crate) mod v1_reader {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn plugin_source_config_round_trips_as_typed_settings() {
+        let bytes = br#"{"version":2,"repos":[{"repo":"owner/tools","branch":"main","path":"tools","kind":"plugins"}]}"#;
+        let cfg = Config::parse(bytes).unwrap();
+        assert!(cfg.problems().is_empty());
+        assert_eq!(cfg.wire_version(), 2);
+        assert!(!v1_reader::accepts_local(cfg.to_json().as_bytes()));
+        assert_eq!(Config::parse(cfg.to_json().as_bytes()).unwrap(), cfg);
+        for branch in ["", "HEAD", "unusable#ref"] {
+            let source = RepoConfig { branch: branch.into(), ..cfg.repos[0].clone() };
+            assert!(!source.problems().is_empty(), "{branch}");
+        }
+        let mut no_version = serde_json::from_slice::<serde_json::Value>(bytes).unwrap();
+        no_version.as_object_mut().unwrap().remove("version");
+        assert!(Config::parse(&serde_json::to_vec(&no_version).unwrap()).is_err());
+    }
+
+    #[test]
+    fn plugin_sources_only_allow_branch_characters_copilot_accepts() {
+        let expected = "This branch name has characters the app will not pass to Copilot CLI: use letters, digits, '.', '_', '/', '+' or '-'.";
+        for branch in ["caf\u{e9}", "test!", "bad#ref", "a~b"] {
+            let source = RepoConfig { repo: "owner/repo".into(), branch: branch.into(), kind: SourceKind::Plugins, ..RepoConfig::default() };
+            assert_eq!(source.problems(), [expected], "{branch}");
+            if check_branch(branch).is_ok() {
+                for kind in [SourceKind::Skills, SourceKind::Agents, SourceKind::Instructions] {
+                    assert!(RepoConfig { kind, ..source.clone() }.problems().is_empty(), "{kind:?}: {branch}");
+                }
+            }
+        }
+        let allowed = RepoConfig { repo: "owner/repo".into(), branch: "Release/v1.2_rc+test-3".into(), kind: SourceKind::Plugins, ..RepoConfig::default() };
+        assert!(allowed.problems().is_empty());
+    }
 
     fn temp_dir(label: &str) -> PathBuf {
         let base = std::env::var_os("TSS_TEST_ROOT").filter(|s| !s.is_empty()).map(PathBuf::from).unwrap_or_else(std::env::temp_dir);
@@ -865,7 +929,7 @@ mod tests {
         for bad in [
             r#"{"version":1,"repos":[{"kind":"agents"}]}"#,
             r#"{"version":2,"repos":[{"kind":null}]}"#,
-            r#"{"version":2,"repos":[{"kind":"plugins"}]}"#,
+            r#"{"version":2,"repos":[{"kind":"packages"}]}"#,
             r#"{"version":2,"repos":[{"kind":"skills","kind":"instructions"}]}"#,
             r#"{"version":2,"repos":[{"id":"r","kind":"agents"},{"id":"r"}]}"#,
             r#"{"repos":[{"kind":null}],"version":99}"#,

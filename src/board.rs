@@ -15,12 +15,16 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 
 use crate::apply::Note;
 use crate::config::{Config, RepoConfig};
-use crate::engine::{ApplyResult, Failure, LocalStatus, Outcome, RepoReport, Resolution, SkillFacts, SkillReport, StartupReport, SyncReport, VerifyReport};
+use crate::engine::{
+    ApplyResult, Failure, LocalStatus, Outcome, PluginReport, RepoReport, Resolution, SkillFacts, SkillReport, StartupReport, SyncReport, VerifyReport,
+};
 use crate::github::FailureKind;
 use crate::interval::UnixSecs;
 use crate::pathsafe::{fold, printable};
+use crate::plugins::{Choice, Operation, Status};
 use crate::reconcile::{Hold, LocalState, Skip, Verdict};
 use crate::source::{PreviewDestination, SourceKind, SourcePreview};
+use crate::state::PluginSourceState;
 
 pub const APP_NAME: &str = "Tiny Skill Sync";
 /// A tray tooltip holds 127 UTF-16 units (128 with the closing zero).
@@ -38,6 +42,7 @@ impl SourceKind {
             Self::Skills => "Skills",
             Self::Agents => "Agents",
             Self::Instructions => "Instructions",
+            Self::Plugins => "Plugins",
         }
     }
 
@@ -46,6 +51,7 @@ impl SourceKind {
             Self::Skills => ("skill", "skills"),
             Self::Agents => ("agent", "agents"),
             Self::Instructions => ("instruction file", "instruction files"),
+            Self::Plugins => ("plugin", "plugins"),
         }
     }
 }
@@ -67,10 +73,16 @@ impl SourcePreview {
             Some("The listing contains rejected items. Choose a different source or fix the listing first.")
         } else if self.names.is_empty() {
             Some(match source.kind {
-                SourceKind::Skills => "No matching items were found. Check the source type and folder.",
+                SourceKind::Skills => "No folders with a SKILL.md file were found. Check the source type and folder.",
                 SourceKind::Agents => "No *.agent.md files were found directly in this folder. Check the source type and folder.",
                 SourceKind::Instructions => "No *.instructions.md files were found directly in this folder. Check the source type and folder.",
+                SourceKind::Plugins => "No matching plugins were found. Check the source folder.",
             })
+        } else if source.kind == SourceKind::Plugins {
+            match &self.plugins {
+                Some(catalog) if !catalog.plugins().is_empty() && catalog.rejected().is_empty() => None,
+                _ => Some("The plugin marketplace preview could not be confirmed."),
+            }
         } else if !matches!(self.destination, PreviewDestination::Resolved(_)) {
             Some("The destination could not be confirmed.")
         } else {
@@ -78,21 +90,70 @@ impl SourcePreview {
         }
     }
 
-    pub(crate) fn description(&self) -> String {
+    pub(crate) fn description(&self, source: &RepoConfig) -> String {
         use std::fmt::Write;
-        let destination = match &self.destination {
-            PreviewDestination::Resolved(dir) => printable(&dir.to_string_lossy()).into_owned(),
-            PreviewDestination::Held(why) => format!("not available: {}", printable(why)),
-            PreviewDestination::NotChecked => "not checked".into(),
-        };
+        let mut text = format!("Type: {}\n", self.kind.heading());
+        if self.kind == SourceKind::Plugins {
+            text.push_str("Installs with: GitHub Copilot CLI\n");
+            if let Some(catalog) = &self.plugins {
+                let _ = writeln!(text, "Marketplace: {}", printable(catalog.market()));
+            }
+        } else {
+            let destination = match &self.destination {
+                PreviewDestination::Resolved(dir) => printable(&dir.to_string_lossy()).into_owned(),
+                PreviewDestination::Held(why) => format!("not available: {}", printable(why)),
+                PreviewDestination::NotChecked => "not checked".into(),
+            };
+            let _ = writeln!(text, "Destination: {destination}");
+        }
         let (one, many) = self.kind.nouns();
         let n = self.count();
-        let mut text = format!("Type: {}\nDestination: {destination}\nMatched {n} {}:", self.kind.heading(), if n == 1 { one } else { many });
-        for name in &self.names {
-            let _ = write!(text, "\n  {}", printable(name));
+        if n == 0 {
+            let _ = write!(text, "Matched no {many}.");
+        } else {
+            let _ = write!(text, "Matched {n} {}:", if n == 1 { one } else { many });
+        }
+        if let Some(catalog) = &self.plugins {
+            for plugin in catalog.plugins().values() {
+                let _ = write!(text, "\n  {}", printable(&plugin.name));
+                if let Some(version) = &plugin.version {
+                    let _ = write!(text, " {}", printable(version));
+                }
+                if let Some(publisher) = &plugin.publisher {
+                    let _ = write!(text, ", by {}", printable(publisher));
+                } else {
+                    text.push_str(", publisher not declared");
+                }
+                let caps = &plugin.capabilities;
+                if caps.hooks || caps.mcp || caps.lsp {
+                    let mut sep = " (can start: ";
+                    for (has, name) in [(caps.hooks, "hooks"), (caps.mcp, "MCP servers"), (caps.lsp, "LSP servers")] {
+                        if has {
+                            text.push_str(sep);
+                            text.push_str(name);
+                            sep = ", ";
+                        }
+                    }
+                    text.push(')');
+                }
+            }
+            for name in catalog.hosted_elsewhere() {
+                let _ = write!(text, "\n  {}: Hosted elsewhere; not handled", printable(name));
+            }
+        } else {
+            for name in &self.names {
+                let _ = write!(text, "\n  {}", printable(name));
+            }
         }
         for why in &self.errors {
             let _ = write!(text, "\nRejected: {}", printable(why));
+        }
+        if self.kind == SourceKind::Plugins {
+            let _ = write!(
+                text,
+                "\n\nPlugins can run programs on this PC. Adding this source installs these plugins with GitHub Copilot CLI and installs new versions from {} automatically. New plugins, and plugins whose publisher changes, wait for your approval.",
+                printable(&source.branch)
+            );
         }
         text
     }
@@ -136,6 +197,10 @@ pub enum Action {
     /// Upstream lists no skills at all: delete the skills that are gone from it. This is a check with the
     /// mass-deletion confirmation, not a `Resolution`.
     RemoveThem,
+    ApprovePlugin,
+    ReinstallPlugin,
+    UninstallPlugin,
+    ForgetPlugin,
 }
 
 impl Action {
@@ -149,10 +214,14 @@ impl Action {
             Action::PauseHistory => "Cancel search",
             Action::ResumeHistory => "Resume search",
             Action::RemoveThem => "Delete them",
+            Action::ApprovePlugin => "Approve",
+            Action::ReinstallPlugin => "Reinstall",
+            Action::UninstallPlugin => "Uninstall",
+            Action::ForgetPlugin => "Forget",
         }
     }
 
-    /// What to ask the engine to do. `None` for `RemoveThem`, which is a check with `confirm_mass_delete`.
+    /// What to ask the engine to do for a skill or loose file.
     pub fn resolution(self) -> Option<Resolution> {
         match self {
             Action::Overwrite | Action::Restore => Some(Resolution::Overwrite),
@@ -160,7 +229,7 @@ impl Action {
             Action::ManageAgain => Some(Resolution::ManageAgain),
             Action::PauseHistory => Some(Resolution::PauseHistory),
             Action::ResumeHistory => Some(Resolution::ResumeHistory),
-            Action::RemoveThem => None,
+            _ => None,
         }
     }
 }
@@ -180,6 +249,20 @@ pub struct Row {
     pub listed: bool,
     /// A local check found no folder, even if the status describes an upstream change or a failed check.
     pub folder_missing: bool,
+    pub plugin: Option<PluginDetails>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PluginDetails {
+    pub version: Option<String>,
+    pub publisher: Option<String>,
+    pub path: Option<String>,
+}
+
+impl PluginDetails {
+    pub(crate) fn facts(&self) -> String {
+        format!("Version: {}. Publisher: {}.", self.version.as_deref().unwrap_or("not known"), self.publisher.as_deref().unwrap_or("not declared"))
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -293,7 +376,17 @@ impl SkillBoard {
         }
         let listed = !matches!(self.fact, Some(Fact::Removed | Fact::EmptyListing | Fact::NotSafe(_)));
         let folder_missing = matches!(self.local, Some(LocalStatus::Checked(LocalState::FolderMissing)));
-        Row { name: self.name.clone(), text: shown.text, tag: shown.tag, level: shown.level, actions: shown.actions, facts: None, listed, folder_missing }
+        Row {
+            name: self.name.clone(),
+            text: shown.text,
+            tag: shown.tag,
+            level: shown.level,
+            actions: shown.actions,
+            facts: None,
+            listed,
+            folder_missing,
+            plugin: None,
+        }
     }
 }
 
@@ -379,7 +472,22 @@ impl Row {
 
     /// There may be a folder to open.
     pub fn has_folder(&self) -> bool {
-        !self.folder_missing && !matches!(self.tag, DELETED_TAG | NEW_TAG | NOT_SAFE_TAG)
+        self.plugin.is_none() && !self.folder_missing && !matches!(self.tag, DELETED_TAG | NEW_TAG | NOT_SAFE_TAG)
+    }
+
+    pub(crate) fn plugin_choice(&self, action: Action) -> Option<Choice> {
+        let plugin = self.plugin.as_ref()?;
+        if !self.actions.contains(&action) {
+            return None;
+        }
+        let name = self.name.clone();
+        Some(match action {
+            Action::ApprovePlugin => Choice::Approve { name, publisher: plugin.publisher.clone() },
+            Action::ReinstallPlugin => Choice::Reinstall(name),
+            Action::UninstallPlugin => Choice::Uninstall(name),
+            Action::ForgetPlugin => Choice::Forget(name),
+            _ => return None,
+        })
     }
 
     /// Nothing is the matter: the sentence behind the tag says no more than the tag.
@@ -480,10 +588,98 @@ fn present(local: Option<&LocalStatus>, fact: Option<&Fact>) -> Shown {
     }
 }
 
+fn plugin_row(report: &PluginReport) -> Row {
+    use Level::{Attention, Error, Ok};
+    let level = if matches!(report.result, ApplyResult::Failed(_)) {
+        Error
+    } else if report.needs_attention() {
+        Attention
+    } else {
+        Ok
+    };
+    let (tag, detail) = match &report.result {
+        ApplyResult::Failed(why) => (FAILED_TAG, format!("Failed: {}", why.lines().next().unwrap_or("The Copilot command failed"))),
+        ApplyResult::Held(why) => (NOT_CHANGED_TAG, why.clone()),
+        _ => match &report.status {
+            Status::NeedsApproval => (
+                "Needs your approval",
+                "Needs your approval. Plugins can run programs on this PC. Approve installs it now and its new versions from this branch automatically.".into(),
+            ),
+            Status::TurnedOff => ("Turned off in Copilot", "Turned off in Copilot. Updates wait until you turn it on there.".into()),
+            Status::RemovedInCopilot => ("Removed in Copilot", "Removed in Copilot. Reinstall puts it back.".into()),
+            Status::RemovedFromGitHub => (
+                "Removed from GitHub",
+                "GitHub no longer lists this plugin. Uninstall removes it from Copilot; Forget stops tracking it and leaves it installed.".into(),
+            ),
+            Status::AlreadyInstalled => ("Already installed in Copilot", "Already installed in Copilot from somewhere else; left as it is.".into()),
+            Status::AlreadyTracked(id) => ("Already tracked", format!("Source {id} already tracks this plugin.")),
+            Status::HostedElsewhere => ("Hosted elsewhere", "Hosted in another repository; this source does not manage it.".into()),
+            Status::Rejected(why) => ("Rejected", format!("Rejected: {}.", why.trim_end_matches('.'))),
+            Status::Blocked if report.result == ApplyResult::DryRun => {
+                ("Not checked in Copilot", "A dry run does not check the plugins installed in Copilot.".into())
+            }
+            Status::Blocked => (NOT_CHANGED_TAG, "The app could not confirm that it was safe to change this plugin.".into()),
+            Status::WaitingForMarketplace => ("Waiting for the marketplace", "Copilot needs the marketplace before it can install this plugin.".into()),
+            Status::Planned(_) if report.result != ApplyResult::Done => {
+                ("Waiting for the next check", "The planned change did not finish. Check again to try it.".into())
+            }
+            Status::Planned(Operation::Install) => (INSTALLED_TAG, "Installed in Copilot from this source.".into()),
+            Status::Planned(Operation::Update) => ("Updated", "Copilot now has the new version from this source.".into()),
+            Status::Planned(Operation::Uninstall) => ("Uninstalled", "Removed from Copilot.".into()),
+            Status::Planned(Operation::Forget) => ("No longer tracked", "The app stopped tracking this plugin without uninstalling it.".into()),
+            Status::Planned(Operation::Approve) => (UP_TO_DATE_TAG, "Approved for automatic updates from this branch.".into()),
+            Status::Planned(Operation::Adopt) => (UP_TO_DATE_TAG, "This source now tracks the plugin already installed in Copilot.".into()),
+            Status::UpToDate | Status::Planned(Operation::Register) => (UP_TO_DATE_TAG, "This source has no update to install.".into()),
+        },
+    };
+    let actions = report
+        .choices
+        .iter()
+        .map(|choice| match choice {
+            Choice::Approve { .. } => Action::ApprovePlugin,
+            Choice::Reinstall(_) => Action::ReinstallPlugin,
+            Choice::Uninstall(_) => Action::UninstallPlugin,
+            Choice::Forget(_) => Action::ForgetPlugin,
+        })
+        .collect();
+    Row {
+        name: report.name.clone(),
+        text: detail,
+        tag,
+        level,
+        actions,
+        facts: None,
+        listed: report.path.is_some(),
+        folder_missing: false,
+        plugin: Some(PluginDetails { version: report.version.clone(), publisher: report.publisher.clone(), path: report.path.clone() }),
+    }
+}
+
+/// A read-only local look does not start Copilot. Do not present its saved versions as live status.
+pub(crate) fn recorded_plugin_rows(record: &PluginSourceState) -> Vec<Row> {
+    record
+        .plugins
+        .iter()
+        .map(|(name, installed)| Row {
+            name: name.clone(),
+            text: "Version last recorded by this app; sync to check Copilot now".into(),
+            tag: "Last recorded",
+            level: Level::Ok,
+            actions: Vec::new(),
+            facts: None,
+            listed: false,
+            folder_missing: false,
+            plugin: Some(PluginDetails { version: installed.version.clone(), publisher: record.approved.get(name).cloned().flatten(), path: None }),
+        })
+        .collect()
+}
+
 #[derive(Debug, Default)]
 struct RepoBoard {
     /// Keyed by the case-folded name, so the order is stable and `Foo` and `foo` are one skill.
     skills: BTreeMap<String, SkillBoard>,
+    plugins: Option<Vec<Row>>,
+    recorded_plugins: Vec<Row>,
     /// How the latest check ended.
     check: Option<Outcome>,
     last_check: Option<UnixSecs>,
@@ -497,7 +693,11 @@ struct RepoBoard {
 
 impl RepoBoard {
     fn rows(&self, kind: SourceKind) -> Vec<Row> {
-        let mut rows: Vec<Row> = self.skills.iter().map(|(key, skill)| Row { facts: self.facts.get(key).cloned(), ..skill.row(kind) }).collect();
+        let mut rows: Vec<Row> = if kind == SourceKind::Plugins {
+            self.plugins.as_ref().unwrap_or(&self.recorded_plugins).clone()
+        } else {
+            self.skills.iter().map(|(key, skill)| Row { facts: self.facts.get(key).cloned(), ..skill.row(kind) }).collect()
+        };
         rows.sort_by_key(|row| std::cmp::Reverse(row.level));
         rows
     }
@@ -583,22 +783,52 @@ impl Board {
 
     pub(crate) fn note_source_sync(&mut self, report: &SyncReport, now: UnixSecs, cfg: &Config) {
         for repo_report in &report.repos {
-            let repo = self.repos.entry(repo_report.repo_id.clone()).or_default();
-            // A listing replaces the rows, even one with nothing in it. No listing at all means the check did not get
-            // as far, or upstream was not modified: keep the rows.
-            if repo_report.lists_nothing || !repo_report.skills.is_empty() || !repo_report.rejected.is_empty() {
-                repo.replace_skills(repo_report);
-                repo.lists_nothing = repo_report.lists_nothing;
-            }
-            if matches!(repo_report.outcome, Outcome::Unchanged | Outcome::Synced | Outcome::NeedsAttention) {
-                repo.last_check = Some(repo_report.finished_at);
-            }
-            repo.check = Some(repo_report.outcome.clone());
-        }
-        for repo_report in &report.repos {
-            self.tell_changes(now, repo_report, cfg);
+            self.note_source_report(repo_report, now, cfg);
         }
         self.tell(now, &report.notes, &report.warnings);
+    }
+
+    pub(crate) fn note_source_report(&mut self, report: &RepoReport, now: UnixSecs, cfg: &Config) {
+        let repo = self.repos.entry(report.repo_id.clone()).or_default();
+        // With no new listing, keep the last rows. A fresh empty plugin listing still reads its marketplace manifest.
+        if cfg.find(&report.repo_id).is_some_and(|s| s.kind == SourceKind::Plugins) {
+            if !report.plugins.is_empty() || (report.lists_nothing && report.downloaded > 0 && !matches!(report.outcome, Outcome::Failed(_))) {
+                repo.plugins = Some(report.plugins.iter().map(plugin_row).collect());
+                repo.lists_nothing = report.lists_nothing;
+            }
+        } else if report.lists_nothing || !report.skills.is_empty() || !report.rejected.is_empty() {
+            repo.replace_skills(report);
+            repo.lists_nothing = report.lists_nothing;
+        }
+        if matches!(report.outcome, Outcome::Unchanged | Outcome::Synced | Outcome::NeedsAttention) {
+            repo.last_check = Some(report.finished_at);
+        }
+        repo.check = Some(report.outcome.clone());
+        self.tell_changes(now, report, cfg);
+    }
+
+    pub(crate) fn plugin_tag(&self, id: &str, name: &str) -> Option<&'static str> {
+        self.repos.get(id)?.plugins.as_ref()?.iter().find(|r| r.name == name).map(|r| r.tag)
+    }
+
+    pub(crate) fn note_plugin_failure(&mut self, id: &str, message: &str) {
+        self.repos.entry(id.to_owned()).or_default().check =
+            Some(Outcome::Failed(Failure { kind: FailureKind::Local, message: message.to_owned(), retry_at: None }));
+    }
+
+    pub(crate) fn has_plugin_rows(&self, id: &str) -> bool {
+        self.repos.get(id).is_some_and(|r| r.plugins.as_ref().is_some_and(|rows| !rows.is_empty()))
+    }
+
+    pub(crate) fn note_recorded_plugins(&mut self, id: &str, rows: Vec<Row>) {
+        if rows.is_empty() && !self.repos.contains_key(id) {
+            return;
+        }
+        let repo = self.repos.entry(id.to_owned()).or_default();
+        if repo.recorded_plugins != rows {
+            repo.recorded_plugins = rows;
+            repo.plugins = None;
+        }
     }
 
     /// One message for each kind of change a check made on this PC. Up to three skills are named, more are counted.
@@ -832,19 +1062,24 @@ fn judge(repo: &RepoConfig, board: Option<&RepoBoard>, rows: &[Row], now: UnixSe
     }
     let outcome = board.and_then(|b| b.check.as_ref());
     if let Some(Outcome::Failed(failure)) = outcome {
-        return (Level::Error, short(failure.kind).to_string(), Some(explain(failure, now)));
+        let status = if repo.kind == SourceKind::Plugins && failure.kind == FailureKind::Local { "Could not check plugins" } else { short(failure.kind) };
+        return (Level::Error, status.to_string(), Some(explain(failure, now)));
     }
     let level = rows.iter().map(|row| row.level).max().unwrap_or(Level::Ok);
     let attention = rows.iter().filter(|row| row.level >= Level::Attention).count();
+    if repo.kind == SourceKind::Plugins && attention == 0 && matches!(outcome, Some(Outcome::NeedsAttention)) {
+        return (Level::Attention, "Needs attention".into(), None);
+    }
     let never_checked = board.is_none_or(|b| b.last_check.is_none());
     // A listing with nothing in it is not "up to date": it is usually a repository added as a whole when its skills
     // are in a subfolder, and without this it would sit there looking fine while nothing was ever installed. Only the
     // listing tells: a repository whose skills were all held or skipped has no rows after a restart either.
     let lists_nothing = board.is_some_and(|b| b.lists_nothing);
-    if lists_nothing && rows.is_empty() && matches!(outcome, None | Some(Outcome::Unchanged | Outcome::Synced)) {
+    if lists_nothing && rows.iter().all(|row| row.tag == "Hosted elsewhere") && matches!(outcome, None | Some(Outcome::Unchanged | Outcome::Synced)) {
         if repo.kind != SourceKind::Skills {
             let status = format!("No {} found", repo.kind.nouns().1);
-            return (Level::Attention, status.clone(), Some(format!("{status} in {}. Check the source type, branch and folder.", repo.label())));
+            let level = if repo.kind == SourceKind::Plugins { Level::Ok } else { Level::Attention };
+            return (level, status.clone(), Some(format!("{status} in {}. Check the source type, branch and folder.", repo.label())));
         }
         return (Level::Attention, NO_SKILLS.to_string(), Some(no_skills_advice(repo)));
     }
@@ -952,13 +1187,85 @@ fn cut(text: &str, max_units: usize) -> String {
 mod tests {
     use std::collections::HashSet;
 
+    #[test]
+    fn plugin_rows_keep_tags_and_explain_each_status() {
+        use ApplyResult::{Done, DryRun, NotApplicable};
+        use Operation::*;
+        let cases = [
+            (
+                Status::NeedsApproval,
+                NotApplicable,
+                "Needs your approval",
+                "Needs your approval. Plugins can run programs on this PC. Approve installs it now and its new versions from this branch automatically.",
+            ),
+            (Status::UpToDate, NotApplicable, "Up to date", "This source has no update to install."),
+            (Status::TurnedOff, NotApplicable, "Turned off in Copilot", "Turned off in Copilot. Updates wait until you turn it on there."),
+            (Status::RemovedInCopilot, NotApplicable, "Removed in Copilot", "Removed in Copilot. Reinstall puts it back."),
+            (
+                Status::RemovedFromGitHub,
+                NotApplicable,
+                "Removed from GitHub",
+                "GitHub no longer lists this plugin. Uninstall removes it from Copilot; Forget stops tracking it and leaves it installed.",
+            ),
+            (Status::AlreadyInstalled, NotApplicable, "Already installed in Copilot", "Already installed in Copilot from somewhere else; left as it is."),
+            (Status::AlreadyTracked("other".into()), NotApplicable, "Already tracked", "Source other already tracks this plugin."),
+            (Status::HostedElsewhere, NotApplicable, "Hosted elsewhere", "Hosted in another repository; this source does not manage it."),
+            (Status::Rejected("The manifest is missing".into()), NotApplicable, "Rejected", "Rejected: The manifest is missing."),
+            (Status::Blocked, DryRun, "Not checked in Copilot", "A dry run does not check the plugins installed in Copilot."),
+            (Status::Blocked, NotApplicable, "Not changed", "The app could not confirm that it was safe to change this plugin."),
+            (Status::WaitingForMarketplace, NotApplicable, "Waiting for the marketplace", "Copilot needs the marketplace before it can install this plugin."),
+            (Status::Planned(Update), NotApplicable, "Waiting for the next check", "The planned change did not finish. Check again to try it."),
+            (Status::Planned(Install), Done, "Installed", "Installed in Copilot from this source."),
+            (Status::Planned(Update), Done, "Updated", "Copilot now has the new version from this source."),
+            (Status::Planned(Uninstall), Done, "Uninstalled", "Removed from Copilot."),
+            (Status::Planned(Forget), Done, "No longer tracked", "The app stopped tracking this plugin without uninstalling it."),
+            (Status::Planned(Adopt), Done, "Up to date", "This source now tracks the plugin already installed in Copilot."),
+            (Status::Planned(Approve), Done, "Up to date", "Approved for automatic updates from this branch."),
+            (Status::Planned(Update), ApplyResult::Failed("Could not update\r\nDetails not shown".into()), "Failed", "Failed: Could not update"),
+            (Status::Planned(Update), ApplyResult::Held("Copilot changed. Try again.".into()), "Not changed", "Copilot changed. Try again."),
+        ];
+        for (status, result, tag, detail) in cases {
+            let report = PluginReport { name: "alpha".into(), version: None, publisher: None, path: None, status, choices: vec![], result };
+            let row = plugin_row(&report);
+            assert_eq!((row.tag, row.text.as_str()), (tag, detail), "{:?}", report.status);
+        }
+    }
+
+    #[test]
+    fn plugin_preview_explains_an_empty_match_without_a_file_destination() {
+        let mut cfg = Config::default();
+        let source = cfg.add_source(SourceKind::Plugins, &crate::config::RepoSpec::parse("https://github.com/o/r/tree/main").unwrap(), None, false);
+        let empty = SourcePreview { kind: source.kind, names: vec![], destination: PreviewDestination::NotChecked, errors: vec![], plugins: None };
+        let description = empty.description(source);
+        assert!(description.contains("Installs with: GitHub Copilot CLI"), "{description}");
+        assert!(description.contains("Matched no plugins."));
+        assert!(empty.blocker(source).unwrap().contains("source folder"));
+        assert!(!description.contains("Destination:"));
+    }
+
     use super::*;
     use crate::engine::{LocalReport, Tracking};
 
     #[test]
+    fn add_source_empty_previews_have_no_list_heading() {
+        let summaries = [SourceKind::Skills, SourceKind::Agents, SourceKind::Instructions].map(|kind| {
+            let empty = SourcePreview { kind, names: vec![], destination: PreviewDestination::NotChecked, errors: vec![], plugins: None };
+            empty.description(&repo("o/r", true)).lines().last().unwrap().to_string()
+        });
+        assert_eq!(summaries, ["Matched no skills.", "Matched no agents.", "Matched no instruction files."]);
+    }
+
+    #[test]
+    fn add_source_empty_skills_preview_says_what_file_was_missing() {
+        let source = RepoConfig::default();
+        let empty = SourcePreview { kind: source.kind, names: vec![], destination: PreviewDestination::NotChecked, errors: vec![], plugins: None };
+        assert_eq!(empty.blocker(&source), Some("No folders with a SKILL.md file were found. Check the source type and folder."));
+    }
+
+    #[test]
     fn continuation_an_empty_loose_source_does_not_say_it_was_looking_for_skills() {
         let source = RepoConfig { kind: SourceKind::Instructions, ..Default::default() };
-        let empty = SourcePreview { kind: source.kind, names: vec![], destination: PreviewDestination::NotChecked, errors: vec![] };
+        let empty = SourcePreview { kind: source.kind, names: vec![], destination: PreviewDestination::NotChecked, errors: vec![], plugins: None };
         assert!(empty.blocker(&source).unwrap().contains("*.instructions.md"), "{:?}", empty.blocker(&source));
         let source = RepoConfig { kind: SourceKind::Agents, ..Default::default() };
         let empty = SourcePreview { kind: source.kind, ..empty };
@@ -1005,6 +1312,7 @@ mod tests {
             label: format!("owner/{id}"),
             outcome,
             skills,
+            plugins: Vec::new(),
             rejected: Vec::new(),
             stats: Stats::default(),
             downloaded: 0,

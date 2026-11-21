@@ -101,6 +101,18 @@ fn preview_state(path: &Path) -> Result<State, String> {
     }
 }
 
+pub(crate) fn assign_fresh_id(path: &Path, cfg: &Config, source: &mut RepoConfig) -> Result<(), EngineError> {
+    let state = preview_state(path).map_err(failed)?;
+    if state.has_source_id(&source.id) {
+        // Use the settings allocator with the state IDs reserved too, including orphans.
+        let mut reserved = cfg.clone();
+        reserved.repos.extend(state.source_ids().map(|id| RepoConfig { id: id.clone(), ..Default::default() }));
+        let spec = crate::config::RepoSpec::parse(&source.repo).map_err(failed)?;
+        source.id.clone_from(&reserved.add_repo(&spec, None, false).id);
+    }
+    Ok(())
+}
+
 fn check_claims(state: &State, source: &RepoConfig, dir: &Path, names: &[String]) -> Result<(), String> {
     let key = |p: &Path| PathBuf::from(pathsafe::fold(&p.to_string_lossy()));
     let dir_key = key(dir);
@@ -136,6 +148,14 @@ pub(super) fn locate_files(
 }
 
 impl Engine {
+    pub(crate) fn check_fresh_id(&self, id: &str) -> Result<(), EngineError> {
+        let state = preview_state(&self.paths.state_file()).map_err(failed)?;
+        if state.has_source_id(id) {
+            return Err(failed(format!("Source ID '{id}' is already used by another source on this PC. Preview it again.")));
+        }
+        Ok(())
+    }
+
     /// Read-only, including on failure or cancellation. The worker supplies the draft itself (which
     /// need not be saved) and the engine's already resolved local/portable skills root. Do not cache
     /// or use the returned display data as authority to install, adopt, or remove anything.
@@ -147,6 +167,10 @@ impl Engine {
         }
         if !source.id.trim().is_empty() && cfg.repos.iter().filter(|r| r.id == source.id).count() > 1 {
             return Err(failed(format!("two sources share the id '{}'", source.id)));
+        }
+        if source.kind == SourceKind::Plugins {
+            preview_state(&self.paths.state_file()).and_then(|state| state.check_plugin_id(&source.id)).map_err(failed)?;
+            return self.preview_plugins(source, cancel);
         }
         let root = self.paths.root(source.kind);
         let len = root.as_deref().map_or(0, |p| if source.kind.is_skills() { path_len(p).max(path_len(&self.paths.work_dir()) + 30) } else { path_len(p) });
@@ -185,7 +209,7 @@ impl Engine {
             PreviewDestination::NotChecked
         };
         stopped(cancel).map_err(failed)?;
-        Ok(SourcePreview { kind: source.kind, names, destination, errors })
+        Ok(SourcePreview { kind: source.kind, names, destination, errors, plugins: None })
     }
 
     fn preview_listing<'a>(&self, source: &'a RepoConfig, len: usize, cancel: &AtomicBool) -> Result<SourceDiscovery<'a>, RemoteError> {

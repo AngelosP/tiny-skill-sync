@@ -428,6 +428,7 @@ impl Shell {
                     last_checks: Vec::new(),
                     kept: Vec::new(),
                     facts: Vec::new(),
+                    plugin_records: Vec::new(),
                     lists_nothing: Vec::new(),
                     private: Vec::new(),
                     stamp: None,
@@ -713,7 +714,9 @@ pub fn take_diff() -> Option<Shown> {
 pub fn want(job: Job) -> bool {
     let queued = with_shell(|s| {
         s.feedback = None;
-        if matches!(job, Job::Resolve { .. } | Job::Remove { .. }) && matches!(s.app.busy(), Some(Job::Poll | Job::Check(_) | Job::DeleteGone(_))) {
+        if matches!(job, Job::Resolve { .. } | Job::ResolvePlugin { .. } | Job::Remove { .. })
+            && matches!(s.app.busy(), Some(Job::Poll | Job::Check(_) | Job::DeleteGone(_)))
+        {
             s.cancel.store(true, Ordering::Relaxed);
         }
         s.app.want(job)

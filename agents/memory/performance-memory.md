@@ -11,6 +11,13 @@
 - `scripts\dev.ps1 bench` measures the release app; coordinate builds and desktop access first.
   It uses the network and throwaway data, not the real installation.
 - Use the [benchmark documentation](../../CONTRIBUTING.md#measuring) rather than inventing thresholds.
+- `scripts\dev.ps1 test -Quick -Filter TEXT` runs only `cargo test -- TEXT` (no fmt or clippy). Run it nested from
+  Windows PowerShell 5.1 and cargo's stderr turns into `NativeCommandError`; the tool may report exit 1 although the
+  script printed "All checks passed." Capture `$LASTEXITCODE` explicitly (observed 0 on 2026-11-20).
+- `-Filter plugin` skips `tests/plugin_manager.rs` (`fake_manager_distinguishes_false_success_failure_and_real_snapshot_change`).
+- No approved size tool: `cargo-bloat` is installed in `~/.cargo/bin` but is not an approved check; no llvm-tools; no
+  dumpbin on PATH. A no-op `cargo build --release` ("Finished" with no "Compiling") proves the exe matches the tree.
+- Release profile (Cargo.toml:78-85): opt-level "z", fat LTO, codegen-units 1, panic abort, strip symbols.
 
 ## Learned
 
@@ -29,6 +36,37 @@
   block.
 - `cargo test --lib only_a_tray_proven_and_held` passed (0.31 s). It covers `proc::start`, `ended_within` (Some(7),
   then None while running), and `stop`.
+- Intervals: `DEFAULT_INTERVAL` is 1 day (config.rs:20), not 6 h. Presets run from 30 min to 1 month (page.rs:35).
+  The custom minimum is 5 min (`MIN_POLL_MINUTES`, interval.rs:12).
+- The Engine is moved into the worker thread (`spawn_worker`, shell.rs:375), so the UI thread cannot call the engine
+  or the Copilot CLI. The UI thread blocks on the worker only at Quit (`QUIT_WAIT` 2 s, after setting cancel).
+
+### Plugins source (issue #7 F, inspection of the uncommitted tree on HEAD 893cebe)
+
+- A timer poll that GitHub answers with 304 starts no process and does no file I/O. Test:
+  `plugin_timer_304_is_one_root_request_with_no_manager_calls_or_state_write` (tests/engine_plugins.rs). On an
+  explicit check, a 304 is followed by a second, unconditional root-tree request (no catalog is cached).
+- `check_plugins_in` (engine/plugins.rs:249-264) stores no ETag while any row needs attention, meaning any status
+  except UpToDate, HostedElsewhere or a completed Planned. `record_verified` (plan.rs:226) also clears it. The
+  scheduler (`due_of`, scheduler.rs:124) checks such a source once in each app run (30 s after a sign-in start) and
+  then at every interval, the same rule as a held Skills repository.
+- One such poll costs: the root tree without ETag, a commit pin (2 API calls), 1+N raw manifest downloads,
+  2 Copilot CLI launches, and a read of `COPILOT_HOME\settings.json` (whenever a non-default market exists).
+- `decide` (plan.rs:402) returns TurnedOff before it checks the fingerprint. NeedsApproval has no decline choice.
+  RemovedInCopilot offers only Reinstall. AlreadyInstalled, AlreadyTracked and Rejected have no choice. Each of
+  these can leave a source unsettled indefinitely.
+- `snapshot()` costs 2 launches. `execute()` costs 5 (before 2, command, after 2), or 4 for Adopt, Approve and
+  Forget. A first check with N installs costs 7 + 5N. The engine lock is held throughout; another process waits
+  `DEFAULT_LOCK_WAIT` (3 s, engine.rs:52) and then reports Busy.
+- CLI timeouts (win/copilot.rs:19-20, 165): 30 s per probe, 180 s for add, install and update, 60 s for uninstall.
+  Only cancel stops the action loop; a TimedOut moves on to the next action.
+- `proc::capture`: a KILL_ON_JOB_CLOSE job, NUL stdin, 2 pipe readers (joined, 1 s deadline plus 100 ms after
+  `CancelSynchronousIo`), and a 50 ms wait that polls cancel. The output cap is `MAX_OUTPUT`.
+  - `create` sets no priority class, so CLI children run at normal priority even for background orders.
+    `THREAD_MODE_BACKGROUND_BEGIN` applies only to the worker thread.
+  - Since F, `gh auth token` (`run_capture`) also goes through `capture`.
+- Bounds: `MAX_TREE_BYTES` is 16 MiB (github.rs:20), `MAX_MANIFEST_BYTES` 256 KiB, and `MAX_SETTINGS` 4 MiB. The
+  plugin listing is always the whole branch root.
 
 ## Baselines
 
@@ -37,9 +75,18 @@
   (+4,096). The exe row is over its 1.1 MiB budget before and after this run; the user deferred size work.
 - Handles grew by 5 between those runs (149 to 154 idle). Not attributed to the restart code; no measurement
   isolates it.
+- `bench-20261120-122900.md` (before plugins): exe 1,287,680 bytes; tray median 9.3 ms; idle threads/handles 5/149;
+  after a poll 9/340 (budget 10/350); an unchanged poll used 15.6 ms of CPU with 0 file I/O.
+- Plugins F4 (verified by a no-op release build on 2026-11-20): tray exe 1,415,680 bytes, 104,960 over the
+  1,310,720 budget; tss.exe 1,204,224. Plugins add about 127 KB. The coordinator's linker map put about 116 KB
+  in plugins.
+- No measurement exists of a Copilot CLI launch (wall time, CPU, memory) or of a plugin poll.
 
 ## Open proposals
 
 - Replace the blocking `ended_within(1 s)` on the UI thread with a timer or a non-blocking check that pumps messages.
 - Poll the old tray's exit at 250 ms, or wait on a signal, instead of 100 ms `CreateMutexW` polling.
 - Update `ARCHITECTURE.md` "Threads and waking up" to describe the restart wait and retry timer.
+- Plugins: treat stable attention as settled, keeping the ETag, or bound native rechecks for unsettled sources.
+  Reuse the previous snapshot in `execute`. Stop the action loop after a TimedOut. Start CLI children below normal
+  priority. Add bench rows for a plugin 304 poll and for an unsettled poll.

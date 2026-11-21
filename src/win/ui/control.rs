@@ -1166,9 +1166,13 @@ fn scroll_to(panel: HWND, to: i32) {
     fill(panel);
 }
 
+/// The current scroll offset in pixels, also used to lay out a question's native edit control.
+pub(super) fn scroll_offset(panel: HWND) -> i32 {
+    panel_of(panel).and_then(|c| c.try_borrow().ok().map(|p| p.scroll)).unwrap_or(0)
+}
+
 fn scroll_by(panel: HWND, delta: i32) {
-    let now = panel_of(panel).and_then(|c| c.try_borrow().ok().map(|p| p.scroll)).unwrap_or(0);
-    scroll_to(panel, now + delta);
+    scroll_to(panel, scroll_offset(panel) + delta);
 }
 
 /// Can it scroll at all?
@@ -1197,7 +1201,7 @@ fn on_vscroll(panel: HWND, code: i32) {
 }
 
 /// Scrolls a child into view when the keyboard moved to it.
-fn reveal(panel: HWND, child: HWND) {
+pub(super) fn reveal(panel: HWND, child: HWND) {
     if unsafe { IsChild(panel, child) } == 0 {
         return;
     }

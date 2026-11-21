@@ -311,6 +311,7 @@ mod tests {
         let old = load(&dir).unwrap().unwrap();
         let mut mixed = old.clone();
         mixed.add_source(SourceKind::Instructions, &RepoSpec::parse("https://github.com/o/r/tree/main/instructions").unwrap(), None, false);
+        mixed.add_source(SourceKind::Plugins, &RepoSpec::parse("https://github.com/o/r/tree/main/plugins").unwrap(), None, false);
         assert_eq!(save_changes(&dir, &old, &mixed).unwrap(), WriteResult { settings_written: false, sources_written: true });
         assert_eq!(fs::read(dir.join(SETTINGS_FILE)).unwrap(), settings.as_bytes());
         let typed = fs::read(dir.join(SOURCES_FILE)).unwrap();
@@ -339,7 +340,7 @@ mod tests {
         let after = Config { default_interval: Interval::new(1, Unit::Week), ..old.clone() };
         for bad in [
             r#"{"version":1,"repos":[{"kind":"instructions"}]}"#,
-            r#"{"version":2,"repos":[{"kind":"plugins"}]}"#,
+            r#"{"version":2,"repos":[{"kind":"packages"}]}"#,
             r#"{"version":2,"repos":[{"kind":null}]}"#,
             r#"{"repos":[{"kind":null}],"version":99}"#,
         ] {

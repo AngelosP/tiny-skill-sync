@@ -177,6 +177,9 @@ pub(crate) fn same_source_scope(source: &RepoConfig, recorded: &RepoConfig) -> b
 /// `snapshot` must be the reply to a request for `source` itself, not a slice of a repository-wide search.
 /// `github::discover_source` keeps the request and its interpretation together.
 pub(crate) fn discover_source<'a>(source: &'a RepoConfig, snapshot: Snapshot, install_root_len: usize) -> Result<SourceDiscovery<'a>, String> {
+    if source.kind == SourceKind::Plugins {
+        return Err("Plugins use the branch-root marketplace catalog".into());
+    }
     let safe_for_absence = check_listing(source.kind, &snapshot)?;
     let (items, rejected, leaf_names) = if let Some(suffix) = loose_suffix(source.kind) {
         loose_files(&snapshot.entries, suffix, install_root_len)
@@ -188,7 +191,7 @@ pub(crate) fn discover_source<'a>(source: &'a RepoConfig, snapshot: Snapshot, in
     Ok(SourceDiscovery { source, tree_id: snapshot.sha, items, rejected, safe_for_absence, leaf_names })
 }
 
-fn check_listing(kind: SourceKind, snapshot: &Snapshot) -> Result<bool, String> {
+pub(crate) fn entry_index(snapshot: &Snapshot) -> Result<HashMap<&str, &TreeEntry>, String> {
     if snapshot.truncated {
         return Err("GitHub cut the folder listing short; nothing was changed".into());
     }
@@ -214,6 +217,11 @@ fn check_listing(kind: SourceKind, snapshot: &Snapshot) -> Result<bool, String> 
             }
         }
     }
+    Ok(paths)
+}
+
+fn check_listing(kind: SourceKind, snapshot: &Snapshot) -> Result<bool, String> {
+    entry_index(snapshot)?;
     // Positive matches can still be displayed independently. But filtering out a malformed entry,
     // non-plain object or Windows alias must never turn it into negative evidence about an owned name.
     let mut folded = HashSet::new();
@@ -230,7 +238,7 @@ fn check_listing(kind: SourceKind, snapshot: &Snapshot) -> Result<bool, String> 
 
 fn loose_suffix(kind: SourceKind) -> Option<&'static str> {
     match kind {
-        SourceKind::Skills => None,
+        SourceKind::Skills | SourceKind::Plugins => None,
         SourceKind::Agents => Some(".agent.md"),
         SourceKind::Instructions => Some(".instructions.md"),
     }

@@ -90,6 +90,7 @@ fn answer(app: &mut App, result: Result<Answer, EngineError>, next_wake: Option<
             last_checks: Vec::new(),
             kept: Vec::new(),
             facts: Vec::new(),
+            plugin_records: Vec::new(),
             lists_nothing: Vec::new(),
             private: Vec::new(),
             stamp: None,
@@ -179,6 +180,7 @@ fn source_preview_dismissal_failure_and_late_answers_cannot_save() {
     assert!(app.queued().is_empty());
 
     let preview = SourcePreview {
+        plugins: None,
         kind: SourceKind::Agents,
         names: vec!["one.agent.md".into()],
         destination: PreviewDestination::Resolved(s.w.root.join("agents")),
@@ -191,15 +193,152 @@ fn source_preview_dismissal_failure_and_late_answers_cannot_save() {
         SourcePreview { destination: PreviewDestination::NotChecked, ..preview.clone() },
     ] {
         let ticket = app.preview_source(&spec, SourceKind::Agents, None).unwrap();
-        answer(&mut app, Ok(Answer::SourcePreview(rejected)), None, T0);
+        let id = app.draft().unwrap().input.source.id.clone();
+        answer(&mut app, Ok(Answer::SourcePreview(id, rejected)), None, T0);
         assert!(app.confirm_source(ticket).is_err());
     }
     let ticket = app.preview_source(&spec, SourceKind::Agents, None).unwrap();
-    answer(&mut app, Ok(Answer::SourcePreview(preview)), None, T0);
+    let id = app.draft().unwrap().input.source.id.clone();
+    answer(&mut app, Ok(Answer::SourcePreview(id, preview)), None, T0);
     app.dismiss_source();
     assert!(app.confirm_source(ticket).is_err());
     assert!(app.is_idle());
     assert_eq!(s.w.snapshot(), before);
+}
+
+#[test]
+fn plugin_app_approves_the_reviewed_plugins_only_after_saving() {
+    let w = World::new("app-plugin-save");
+    let remote = FakeRemote::new();
+    let manager = FakePluginManager::new(w.root.join("native"));
+    let (mut engine, _) = w.plugin_engine(&remote, &manager);
+    let file = w.home.join(tiny_skill_sync::config::CONFIG_FILE);
+    let dir = w.root.join("exe");
+    std::fs::create_dir_all(&dir).unwrap();
+    let initial = Config { skills_dir: Some(w.skills.to_string_lossy().into_owned()), ..Config::default() };
+    initial.save(&file).unwrap();
+    let mut app = App::new(initial, w.skills.clone());
+    app.set_settings_source(SettingsSource::new(file.clone(), dir));
+    run(&mut app, &mut engine, T0);
+    remote.put(REPO, "marketplace.json", r#"{"name":"tools","plugins":[{"name":"alpha","source":"./plug"}]}"#);
+    remote.put(REPO, "plug/plugin.json", r#"{"name":"alpha","version":"1","author":{"name":"Review Team"}}"#);
+    let spec = RepoSpec::parse("https://github.com/o/fixtures/tree/main").unwrap();
+    let ticket = app.preview_source(&spec, SourceKind::Plugins, None).unwrap();
+    run_next(&mut app, &mut engine, T0);
+    assert!(manager.calls().is_empty());
+    assert!(w.state().plugin_sources().is_empty());
+    // Refuse replacement while still allowing the worker to load and recheck settings.
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
+    let held = std::fs::OpenOptions::new().read(true).share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE).open(&file).unwrap();
+    app.confirm_source(ticket).unwrap();
+    run_next(&mut app, &mut engine, T0);
+    assert!(matches!(app.draft().unwrap().stage, DraftStage::Failed(_)));
+    assert!(manager.calls().is_empty(), "a refused save never records approval");
+    assert!(w.state().plugin_sources().is_empty());
+    drop(held);
+
+    let ticket = app.preview_source(&spec, SourceKind::Plugins, None).unwrap();
+    run_next(&mut app, &mut engine, T0);
+    let draft = app.draft().unwrap();
+    let id = draft.input.source.id.clone();
+    let DraftStage::Reviewed(preview) = &draft.stage else { panic!("expected a completed preview") };
+    let preview = preview.clone();
+    app.confirm_source(ticket).unwrap();
+    assert!(matches!(app.queued().front(), Some(Job::SaveSource(_, reviewed)) if std::sync::Arc::ptr_eq(reviewed, &preview)));
+    run_next(&mut app, &mut engine, T0);
+    assert!(Config::load_sources(&file).unwrap().find(&id).is_some());
+    assert_eq!(w.state().plugin_sources()[&id].approved, [("alpha".into(), Some("Review Team".into()))].into());
+    assert_eq!(manager.calls(), [PluginCall::Home]);
+    assert_eq!(app.queued().front(), Some(&Job::Check(Some(id))));
+}
+
+#[test]
+fn plugin_app_keeps_attention_rows_and_choices_on_a_timer_304() {
+    use std::sync::atomic::Ordering;
+
+    let w = World::new("app-plugin-304");
+    let remote = FakeRemote::new();
+    remote.put(REPO, "marketplace.json", r#"{"name":"tools","plugins":[{"name":"alpha","source":"./plug"}]}"#);
+    remote.put(REPO, "plug/plugin.json", r#"{"name":"alpha","version":"1","author":{"name":"Review Team"}}"#);
+    let cfg = config(vec![tiny_skill_sync::config::RepoConfig { kind: SourceKind::Plugins, branch: "main".into(), ..repo("fx", REPO, "") }]);
+    let manager = FakePluginManager::new(w.root.join("native"));
+    let (mut engine, clock) = w.plugin_engine(&remote, &manager);
+    let mut app = App::new(cfg, w.skills.clone());
+    run(&mut app, &mut engine, T0);
+    app.want(Job::Check(None)); // Sync now
+    run(&mut app, &mut engine, T0);
+    let review = row(&app, "alpha");
+    assert_eq!(review.actions, [Action::ApprovePlugin]);
+    assert_eq!(app.health(), Health::Attention);
+    let count = manager.calls().len();
+    let at = app.arm(T0).unwrap();
+    clock.store(at, Ordering::Relaxed);
+    remote.reset();
+    app.on_timer(at);
+    assert_eq!(run_next(&mut app, &mut engine, at), (Job::Poll, true));
+    assert_eq!(row(&app, "alpha"), review);
+    assert_eq!(app.health(), Health::Attention);
+    assert_eq!(remote.calls().conditional, 1);
+    assert_eq!(manager.calls().len(), count);
+
+    app.want(Job::Check(None));
+    remote.reset();
+    assert_eq!(run_next(&mut app, &mut engine, at), (Job::Check(None), false));
+    assert_eq!(manager.calls().len(), count + 3);
+    assert_eq!(remote.calls().conditional, 0);
+}
+
+#[test]
+fn plugin_app_add_chooses_a_fresh_id_before_showing_the_preview() {
+    use tiny_skill_sync::state::State;
+
+    let w = World::new("app-plugin-add-id");
+    let remote = FakeRemote::new();
+    remote.put(REPO, "marketplace.json", r#"{"name":"tools","plugins":[{"name":"alpha","source":"./plug"}]}"#);
+    remote.put(REPO, "plug/plugin.json", r#"{"name":"alpha","version":"1"}"#);
+    let manager = FakePluginManager::new(w.root.join("native"));
+    let (mut engine, _) = w.plugin_engine(&remote, &manager);
+    let file = w.home.join(tiny_skill_sync::config::CONFIG_FILE);
+    let dir = w.root.join("exe");
+    std::fs::create_dir_all(&dir).unwrap();
+    let initial = Config { skills_dir: Some(w.skills.to_string_lossy().into_owned()), ..Config::default() };
+    initial.save(&file).unwrap();
+    let mut state = State::default();
+    state.repo_mut("o-fixtures").last_check = Some(T0);
+    state.save(&w.state_file()).unwrap();
+    let mut app = App::new(initial, w.skills.clone());
+    app.set_settings_source(SettingsSource::new(file.clone(), dir));
+    run(&mut app, &mut engine, T0);
+    let spec = RepoSpec::parse("https://github.com/o/fixtures/tree/main").unwrap();
+    let ticket = app.preview_source(&spec, SourceKind::Plugins, None).unwrap();
+    run_next(&mut app, &mut engine, T0);
+    let draft = app.draft().unwrap();
+    assert!(matches!(draft.stage, DraftStage::Reviewed(_)));
+    assert_eq!(draft.input.source.id, "o-fixtures-2");
+
+    // Another writer may reserve the ID before confirmation, even with no settings entry.
+    let source = draft.input.source.clone();
+    let mut occupied = state.clone();
+    let record = tiny_skill_sync::state::PluginSourceState::new(&source, &w.root.join("native"), "tools");
+    occupied.set_plugin_source(&source.id, record).unwrap();
+    occupied.save(&w.state_file()).unwrap();
+    let before = w.snapshot();
+    app.confirm_source(ticket).unwrap();
+    run_next(&mut app, &mut engine, T0);
+    assert!(matches!(&app.draft().unwrap().stage, DraftStage::Failed(why) if why.contains("'o-fixtures-2'") && why.contains("already used")));
+    assert!(manager.calls().is_empty());
+    assert_eq!(w.snapshot(), before);
+
+    let ticket = app.preview_source(&spec, SourceKind::Plugins, None).unwrap();
+    run_next(&mut app, &mut engine, T0);
+    assert_eq!(app.draft().unwrap().input.source.id, "o-fixtures-3");
+    app.confirm_source(ticket).unwrap();
+    run_next(&mut app, &mut engine, T0);
+    assert!(Config::load_sources(&file).unwrap().find("o-fixtures-3").is_some());
+    let saved = w.state();
+    assert_eq!(saved.repo("o-fixtures"), state.repo("o-fixtures"));
+    assert!(saved.plugin_sources().contains_key("o-fixtures-3"));
 }
 
 #[test]
@@ -552,6 +691,7 @@ fn quitting_drops_what_is_waiting_and_saves_last() {
         last_checks: Vec::new(),
         kept: Vec::new(),
         facts: Vec::new(),
+        plugin_records: Vec::new(),
         lists_nothing: Vec::new(),
         private: Vec::new(),
         stamp: None,
@@ -583,6 +723,7 @@ fn checking_settings_blocks_local_edits_until_the_worker_finishes() {
             last_checks: Vec::new(),
             kept: Vec::new(),
             facts: Vec::new(),
+            plugin_records: Vec::new(),
             lists_nothing: Vec::new(),
             private: Vec::new(),
             stamp: None,

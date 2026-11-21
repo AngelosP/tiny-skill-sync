@@ -76,7 +76,7 @@ impl Engine {
         let record = s.state.loose_sources().get(&repo.id);
         let recorded = record.and_then(|r| r.recorded_source(&repo.id)).unwrap_or_else(|| repo.clone());
         let tag = record.filter(|r| conditional && r.poll.source == source_key(repo)).and_then(|r| r.poll.etag.clone());
-        let (reply, token, private) = self.request_tree(s, repo, &reference, tag.as_deref(), cancel)?;
+        let (reply, token, private) = self.request_tree(Some(s), repo, &reference, tag.as_deref(), cancel)?;
         running(cancel)?;
         let TreeReply::Snapshot { snapshot, etag } = reply else {
             if tag.is_some() {

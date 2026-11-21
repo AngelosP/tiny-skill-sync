@@ -39,6 +39,8 @@ case by case. Code that talks to Windows is kept in `src\win\`.
 | `tree` | Reads a GitHub tree listing and finds entries of the selected type. | yes |
 | `source` | Source kinds, preview data and per-machine selection of flat or repo-named file destinations. | yes, except root lookup |
 | `pathsafe` | Rules for names and paths that come from GitHub (no `..`, no `CON`, no case clashes, length). | yes |
+| `plugins::catalog`, `plugins::plan` | Match plugin manifests at a branch root; decide native actions from the catalog, local consent and Copilot's listings. | yes |
+| `apply::plugins`, `win::copilot` | Run planned actions through `PluginManager` and verify the result with Copilot CLI. | Windows and file I/O |
 | `reconcile` | The decision table: given upstream, the record and the disk, what may be done to each skill? | yes |
 | `scheduler` | When is each repository due; how long to wait after a failure. | yes |
 | `interval` | `30m`, `6h`, `1d`, `2w`, `1mo` and calendar-month arithmetic. | yes |
@@ -125,6 +127,8 @@ the disk with the record. Settings that name another skills folder lead to a sta
 first one, so the change of folder is recorded and reported at once (see [Files on disk](#files-on-disk)).
 
 ## A check
+
+This is the Skills check. [Copilot CLI plugins](#copilot-cli-plugins) have their own rules for conditional requests.
 
 ```mermaid
 flowchart TD
@@ -346,6 +350,47 @@ local evidence before publication. A mismatch requires a new comparison and choi
 the comparison, so it cannot authorize a later retry. This does not change the
 text comparison rules used for ordinary sync, or make unrelated files part of a comparison.
 
+### Copilot CLI plugins
+
+`engine::plugins` polls the branch root even when the source selects a subfolder. A fresh listing must be complete,
+and every downloaded manifest must match its Git blob hash. `plugins::catalog` selects the local entries in scope
+and records what they declare. A preview stops here: it checks for the CLI executable but does not run it.
+
+A complete check keeps the ETag even if some plugins need attention; `PluginPoll` saves `needs_attention` separately.
+A timer poll answered with a 304 starts no process and writes no file. The tray keeps the last rows and choices.
+The first timer check per app run for a source with saved attention skips the ETag if its rows have not been rebuilt
+in that run. A blocker or a choice that no longer applies clears the ETag and marks an existing source as needing
+attention, without changing its last check time or creating a new record. **Sync now**, `tss check` and plugin
+choices always check in full. An update held while a plugin was turned off in Copilot can go through once it is on
+again at the next full check.
+
+`plugins::plan` takes the catalog, the local record and the native plugin and marketplace lists. It produces status
+rows and the actions that are safe to attempt. `apply::plugins` checks the plan against the latest Copilot snapshot:
+the one used for planning, or the one taken to verify the previous command. Adopt, Approve and Forget need no new
+launch. Cancel stops a running command, but once the runner sees the child exit, a late cancel does not discard its
+result. A finished command gets a fresh snapshot for verification; the engine saves state after each verified action.
+A timeout stops the remaining actions until the next check. Upstream removal is a status, not an uninstall.
+Read-only status uses the local record without launching Copilot.
+
+Production uses `win::copilot` and a bounded process runner; tests inject a fake. Copilot CLI and `gh` start in their
+own exe folders with `NoDefaultCurrentDirectoryInExePath=1`. Copilot runs at below-normal priority and with `NO_COLOR=1`;
+the app adds no token. Under isolation, `COPILOT_HOME` and `COPILOT_CACHE_HOME` must be separate absolute drive paths,
+without a UNC or device prefix or a component containing `~`. Neither may contain the other or overlap the real homes.
+The child gets `COPILOT_AUTO_UPDATE=false` only under isolation. The app never writes Copilot's own files.
+It proves marketplace origin from both Copilot's marketplace list and `settings.json`; an unknown field in the origin
+makes the proof fail and blocks the source. Copilot errors mask tokens, URL credentials, Authorization and Bearer
+values, `token=` and `password=` values, and likely hex or base64 runs of 40 or more characters. Ordinary URLs and paths
+stay readable when they can be told apart from those long runs.
+
+Consent (name and publisher) lives in the format-2 `plugin_sources` namespace in local `state.json`, bound to the
+source, marketplace and Copilot home. Adding from a preview saves settings first, then records consent from the same
+preview. IDs must not overlap any other state record. If the origin, marketplace or Copilot home changes while the
+source still lists installed plugins, approval refuses to replace the record. Portable settings carry only the source,
+not consent. Plugin records share an ordered name index with the catalog and plan. They use JSON objects on disk,
+written in key order and read only if the keys are unique. State format 2 refuses unknown top-level keys; format 1
+still ignores them.
+The CLI follows a moving branch; the app cannot force it to install the exact commit used to build the catalog.
+
 ## Finding edits: quick and full checks
 
 `verify.rs` has two strengths.
@@ -556,9 +601,10 @@ everything they show.
   control and panel posts `WM_HOVER` to the window when the pointer enters or leaves it (`control::track_hover`), and
   the window then asks Windows where the pointer is. One gap: leaving from the list's scroll bar straight across the
   window's border sends no message, so the list stays wide until the next mouse move over the window.
-- **`dialogs.rs`** asks questions in a small modal window drawn the same way, with a native edit box for typing. It is
-  not `TaskDialogIndirect`, which lives only in comctl32 version 6; the test executables do not load that, so importing
-  it would stop them from starting.
+- **`dialogs.rs`** asks questions in a small modal window drawn the same way, with a native edit box for typing.
+  The client fits the monitor's work area after allowing for the frame. The panel scrolls to show the rest of the
+  question and brings the focused control into view. It is not `TaskDialogIndirect`, which lives only in comctl32
+  version 6; the test executables do not load that, so importing it would stop them from starting.
 - **The icons** are the logo, which `logo.rs` describes as three shapes in a square from -1 to 1: a rounded tile, two
   sync arrows (a circle cut to two arcs, a round tail, a triangle head) and a four-point spark (four parabolas through
   the centre). `logo::draw` decides each pixel from 16 samples (4 by 4) inside or outside the shapes, so the edges are

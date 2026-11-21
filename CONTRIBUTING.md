@@ -49,7 +49,7 @@ scripts\dev.ps1 test
 ```
 
 This runs `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings` and `cargo test --no-fail-fast`. All three
-must pass. There are 580 tests (365 in the library, 215 integration tests); the whole gate takes about 40 seconds when
+must pass. There are 869 tests (567 in the library, 302 integration tests); the whole gate takes about 40 seconds when
 the code is already built.
 
 If the change can affect speed, memory or disk use (startup, verification, the poll, the tray, the window),
@@ -94,6 +94,35 @@ Quit stays quit, a sign-out holds the restart, and a sign-out, Quit or close dur
 It posts or sends Windows' sign-out messages itself; no real sign-out happens. The regular benchmark disables the
 updater; its idle and normal Quit rows do not measure a retained update or a slow filesystem transaction.
 
+### Plugin checks and runner
+
+For focused checks, run these from the repository root:
+
+```powershell
+scripts\dev.ps1 test -Quick -Filter copilot
+scripts\dev.ps1 test -Quick -Filter plugin
+scripts\dev.ps1 test -Quick -Filter 'win::proc::tests'
+```
+
+A complete plugin check saves the ETag and a separate `needs_attention` flag. Timer 304s start no process, write no
+file and keep the last rows and choices. The first timer check per run for a source with saved attention is full if
+its rows have not been rebuilt. A blocker or stale choice clears the saved ETag so the next timer check is full.
+Explicit checks and plugin choices are always full. Actions reuse the latest Copilot snapshot; Adopt, Approve and
+Forget start nothing. A cancel after the runner sees the child exit does not skip verification. Finished commands
+get a fresh snapshot, and every verified action is saved before the next one. A timeout stops the remaining actions.
+State format 2 rejects unknown top-level keys; legacy format 1 still ignores them.
+
+The app finds `copilot.exe` using `TSS_COPILOT_CLI` (an absolute path to the exe), then
+`%LOCALAPPDATA%\GitHubCopilotCLI\copilot.exe`, then absolute entries on `PATH`, excluding the current folder.
+An invalid explicit override is an error. Copilot CLI and `gh` start in the folder of their own exe with
+`NoDefaultCurrentDirectoryInExePath=1`; Copilot also uses below-normal priority and `NO_COLOR=1`. Under isolation,
+Copilot's two folders must be absolute drive paths without a UNC or device prefix or any component containing `~`.
+They must not overlap each other or the real homes. The app sets `COPILOT_AUTO_UPDATE=false` for an isolated child
+and leaves the user's setting alone otherwise. Unknown fields in a marketplace origin from Copilot's `settings.json`
+block it as unproven. Error text masks tokens, URL credentials, Authorization and Bearer values, `token=` and
+`password=` values, and likely hex or base64 runs of 40 or more characters. Ordinary URLs and paths stay readable
+when they do not look like encoded secrets.
+
 ### Live end-to-end runs
 
 The tests use a fake GitHub and no windows. `scripts\dev.ps1 e2e` is the other half: it starts the real release exes on
@@ -126,6 +155,7 @@ ends up on disk, what the app says and what it leaves alone.
 | `install` | First start: what is installed, how the idle app behaves, how fast it quits. |
 | `places` | With `TSS_HOME` and `TSS_SKILLS_DIR` unset and the profile folders pointed at `%TEMP%`: skills go to `%USERPROFILE%\.copilot\skills` beside a skill written by hand, the settings to `%LOCALAPPDATA%\tiny-skill-sync`, nothing anywhere else except an optional `GitHub CLI` folder when the app asks `gh` for a token. Then `skills_dir` set in `config.json`: the new folder gets its own copies and the old one is left as it is; taken out again while the tray runs, the first folder is managed as before, with an edit made there meanwhile kept and shown. |
 | `portable` | `tss portable` exports two companion files without changing `config.json`; two tray copies read those shared sources but keep separate local state and skills folders. Uses the public fixture's existing branch without pushing. |
+| `plugins` | Preview, install, update and remove real Copilot CLI plugins on a disposable public branch. Verifies installed versions with Copilot, checks that plain remove keeps plugins, and saves preview and row screenshots. |
 | `mixed` | On a disposable branch of the public fixture, two isolated profiles share one portable Skills, Agents and Instructions source list. Exercises CLI preview and checks, tray preview/cancel and add, exact paths, separate state/work, repo-namespaced adoption and an unchanged neighbor. |
 | `changes` | Six kinds of upstream change reach the disk through the tray's **Sync now**. |
 | `local-edit` | An edit made while the app runs, then an upstream change to the same skill. |
@@ -151,6 +181,14 @@ For mixed-source work, use `scripts\dev.ps1 e2e -Only mixed` and inspect its scr
 disposable `USERPROFILE`, `LOCALAPPDATA`, `TSS_HOME`, `TSS_SKILLS_DIR`, `TSS_AGENTS_DIR` and `TSS_INSTRUCTIONS_DIR`
 values. Their sibling work folders must also be separate and disposable. The harness disables saved-token reads and
 app updates and never places test files in the real Copilot folders. Run the normal test and benchmark gates too.
+
+Run `scripts\dev.ps1 e2e -Only plugins` for Plugins changes. The live script uses the full path in `TSS_COPILOT_CLI`
+or `%LOCALAPPDATA%\GitHubCopilotCLI\copilot.exe`; if no executable is found it prints `SKIP`, not a pass. Tests
+that launch Copilot must override **both** `COPILOT_HOME` and `COPILOT_CACHE_HOME` with separate throwaway folders
+and set `COPILOT_AUTO_UPDATE=false`. The script sets these in each child and leaves the caller's environment unchanged.
+The inert fixture's `e2e-*-plugins` branch is deleted on success or failure. Inspect `plugins-preview.png`,
+`plugins-rows.png` and `plugins-uninstall-asks.png` under `bench\out\shots-<time>\`. On a small work area the
+`ui` scenario also saves `03a-add-footer.png` after scrolling the Add source question.
 
 ### Fixing a bug
 
@@ -254,12 +292,14 @@ The budgets, agreed before the app was written:
 | Unchanged poll | 50 ms CPU, 0 file reads or writes, 1 request |
 | After a poll | 20 MiB working set, 5 MiB private, 10 threads, 350 handles |
 | Quit | 2 s at most |
-| `tiny-skill-sync.exe` | 1.25 MiB |
+| `tiny-skill-sync.exe` | 1.40 MiB |
 
 The exe's budget was 1 MiB until the shared-folder settings, the new skill rows and the check that marks an edit
 GitHub also has as in sync took it to 1.01 MiB; the owner raised it to 1.1 MiB. Agents and Instructions sources took
 it to 1.30 MiB; taking the Universal C Runtime from Windows brought it back to 1.23 MiB, and the owner raised the
-budget to 1.25 MiB. The other rows are as first agreed.
+budget to 1.25 MiB. Plugin sources took it to 1.39 MiB; sharing map and JSON code between the plugin records brought
+it back to 1.35 MiB, and the budget became 1.40 MiB (the coordinator's call while the owner was away; the owner may
+change it). The review fixes for plugins left it at 1.37 MiB. The other rows are as first agreed.
 
 The recorded results and their test conditions are in [the user guide](docs/GUIDE.md#measured-cost).
 
@@ -281,8 +321,8 @@ The recorded results and their test conditions are in [the user guide](docs/GUID
 `Cargo.toml` and `.cargo\config.toml` set the release profile: `opt-level = "z"`, fat LTO, one codegen unit,
 `panic = "abort"`, stripped symbols and a static Visual C++ runtime. `build.rs` links the Universal C Runtime part from
 Windows (`ucrtbase.dll`, part of Windows 10 and 11), which saves about 75 KB per exe; no Visual C++ redistributable is
-needed, and `tests\cli.rs` checks that neither exe imports one. The tray budget is 1.25 MiB; the build with Agents and
-Instructions sources measured 1,287,680 bytes. In the earlier size
+needed, and `tests\cli.rs` checks that neither exe imports one. The tray budget is 1.40 MiB; the build with Agents and
+Instructions sources measured 1,287,680 bytes, and with Plugins sources 1,434,112 bytes. In the earlier size
 comparison, `opt-level = "s"` made the 0.89 MiB exe
 1.01 MiB, `opt-level = 3` larger still. Building for size costs about 12% of SHA-1 speed (339 MB/s instead of 384).
 `build.rs` embeds

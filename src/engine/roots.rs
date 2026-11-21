@@ -67,6 +67,10 @@ impl Roots {
 
     pub(super) fn validate_state(&self, state: &State, cfg: &Config) -> Result<(), String> {
         for s in &cfg.repos {
+            if s.kind == SourceKind::Plugins {
+                state.check_plugin_id(&s.id)?;
+                continue;
+            }
             // Let pending work settle at its persisted destination before today's settings can
             // reject or redirect the source that originally created the transaction.
             if state.loose_sources().get(&s.id).is_some_and(|r| r.binding().kind() == s.kind && r.leaves().iter().any(|leaf| leaf.interrupted())) {

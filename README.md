@@ -1,6 +1,6 @@
 # Tiny Skill Sync App
 
-**Keep your Copilot skills, agents and instructions up to date, without copying files by hand.**
+**Keep your Copilot skills, agents, instructions and CLI plugins up to date.**
 
 Add a GitHub repository or one of its folders, and choose one type of content to sync.
 This small Windows tray app checks on a schedule, updates unchanged copies and holds files with your edits.
@@ -17,7 +17,7 @@ You decide what happens next.
 - **Keep your edits.** Review differences in the window before choosing GitHub's version or keeping yours.
 - **Keep your own files.** Files you add to a skill stay yours; the app does not list them as changes.
 - **Stay out of the way.** It lives in the tray, can start with Windows, and does no work between checks.
-  The tray exe is about 1 MiB; [measured idle memory is about 1 MiB](docs/GUIDE.md#measured-cost).
+  The tray exe is about 1.4 MiB; [measured idle memory is about 1 MiB](docs/GUIDE.md#measured-cost).
 
 ## Get started
 
@@ -46,6 +46,11 @@ An **Agents** source installs only direct `*.agent.md` files, and an **Instructi
 `*.instructions.md` files, under the corresponding `agents` and `instructions` folders. Add each kind as its
 own source, even from the same repository. The app can reuse an existing repo-named folder without duplicating
 its files; it adopts only copies that match.
+
+A **Plugins** source uses GitHub Copilot CLI to install plugins from a marketplace on a named GitHub branch.
+Plugins can run programs. Review the preview before trusting updates from that branch. New plugins and publisher
+changes wait for approval on each PC. This does not drive VS Code's plugin installer. See
+[Plugins for GitHub Copilot CLI](docs/GUIDE.md#plugins-for-github-copilot-cli).
 
 On each scheduled check, it installs new skills and updates copies you have not edited. When GitHub removes a skill,
 only its proven upstream files are removed; your added files stay. A network failure never counts as a deletion.

@@ -647,6 +647,7 @@ fn add_choices(kind: SourceKind) -> impl Iterator<Item = SourceKind> {
 fn add_question(default: Interval, form: &AddForm) -> Ask {
     let (mut items, shown) = page::every_choices(form.every, Some(default));
     items.retain(|item| item != CUSTOM);
+    let first = form.kind;
     Ask {
         heading: "Add source".to_string(),
         text: "Choose one type to look for. Previewing a source does not install anything.".to_string(),
@@ -654,7 +655,7 @@ fn add_question(default: Interval, form: &AddForm) -> Ask {
             label: "GitHub repository or folder".to_string(),
             hint: "owner/name, or the address of a folder on GitHub".to_string(),
             initial: form.address.clone(),
-            check: Some(Box::new(page::spec_hint)),
+            check: Some(Box::new(move |text, choice| page::spec_hint(text, add_choices(first).nth(choice).unwrap_or(first)))),
         }),
         combo: Some(("Check every".to_string(), items, shown)),
         choices: add_choices(form.kind).map(|kind| kind.heading().into()).collect(),
@@ -688,7 +689,7 @@ fn add(hwnd: HWND, initial: AddForm) {
 fn preview_source(hwnd: HWND, form: AddForm) {
     let retry_form = form.clone();
     with_state(|st| st.retry_add_form = Some(retry_form.clone()));
-    let spec = match RepoSpec::parse(&form.address) {
+    let spec = match RepoSpec::parse_for_kind(&form.address, form.kind) {
         Ok(spec) => spec,
         Err(e) => {
             shell::tell(sentence(&e));
@@ -800,9 +801,9 @@ fn every(hwnd: HWND, combo: HWND, default: bool) {
 
 fn custom_interval(hwnd: HWND, default: bool) -> Option<String> {
     let check: Check = if default {
-        Box::new(|text| Interval::parse(text).and_then(Interval::validate_poll).map(|i| format!("Every {}", i.describe())).map_err(|e| sentence(&e)))
+        Box::new(|text, _| Interval::parse(text).and_then(Interval::validate_poll).map(|i| format!("Every {}", i.describe())).map_err(|e| sentence(&e)))
     } else {
-        Box::new(|text| match page::parse_every(text) {
+        Box::new(|text, _| match page::parse_every(text) {
             Ok(Some(i)) => Ok(format!("Every {}", i.describe())),
             Ok(None) => Ok("The default".to_string()),
             Err(e) => Err(sentence(&e)),
@@ -906,7 +907,15 @@ fn remove(hwnd: HWND, repo: &RepoConfig) {
     let skills = repo.kind == SourceKind::Skills;
     let question = Ask {
         heading: format!("Remove {}: {} [{}]?", repo.kind.heading(), printable(&repo.label()), printable(&repo.id)),
-        text: format!("Its {} will no longer be kept up to date.{}", repo.kind.nouns().1, if skills { "" } else { " Its files stay installed." }),
+        text: format!(
+            "Its {} will no longer be kept up to date.{}",
+            repo.kind.nouns().1,
+            match repo.kind {
+                SourceKind::Skills => "",
+                SourceKind::Plugins => " They stay installed in Copilot.",
+                _ => " Its files stay installed.",
+            }
+        ),
         choices: if skills {
             vec!["Leave its skills installed; they become yours".into(), "Delete its skills too; skills you edited are kept".into()]
         } else {
@@ -984,27 +993,52 @@ fn skill(hwnd: HWND, index: usize, part: Part) {
             });
             render(hwnd);
         }
-        Part::Compare => compare(hwnd, repo, row, false),
+        Part::Compare if repo.kind != SourceKind::Plugins => compare(hwnd, repo, row, false),
         Part::Open if repo.kind == SourceKind::Skills => open_skill(&row.name),
         Part::Action(k) => {
             if let Some(&action) = row.actions.get(k) {
-                act(hwnd, &repo, &label, row.name, action);
+                if let Some(choice) = row.plugin_choice(action) {
+                    if action == Action::UninstallPlugin {
+                        let question = Ask {
+                            heading: format!("Uninstall {} from Copilot?", printable(&row.name)),
+                            text: "GitHub no longer lists it, so this source cannot install it again.".into(),
+                            ok: "Uninstall".into(),
+                            ..Ask::default()
+                        };
+                        // A check may finish while the question is open. Recheck the source and choice by name.
+                        if dialogs::ask(hwnd, question).is_none()
+                            || shown_repo(|r, v| r == &repo && v.skills.iter().any(|row_now| row_now.name == row.name && row_now.actions.contains(&action)))
+                                != Some(true)
+                        {
+                            return;
+                        }
+                    }
+                    shell::want(Job::ResolvePlugin { repo: repo.id, choice });
+                } else {
+                    act(hwnd, &repo, &label, row.name, action);
+                }
             }
         }
-        Part::Preview => compare(hwnd, repo, row, true),
+        Part::Preview if repo.kind != SourceKind::Plugins => compare(hwnd, repo, row, true),
         Part::CopyPath if repo.kind == SourceKind::Skills => {
             if let Some(dir) = skill_dir(&row.name) {
                 copy(hwnd, dir.as_os_str());
             }
         }
-        Part::CopyLink if repo.kind == SourceKind::Skills => match web_url(&repo, Some(&row.name)) {
-            Some(url) => copy(hwnd, url.as_ref()),
-            None => shell::tell(format!("{} can’t be opened on GitHub.", printable(&row.name))),
-        },
-        Part::OnGitHub if repo.kind == SourceKind::Skills => match web_url(&repo, Some(&row.name)) {
-            Some(url) => open_url(&url),
-            None => shell::tell(format!("{} can’t be opened on GitHub.", printable(&row.name))),
-        },
+        Part::CopyLink | Part::OnGitHub if row.listed => {
+            let path = match repo.kind {
+                SourceKind::Plugins => row.plugin.as_ref().and_then(|p| p.path.as_deref()),
+                SourceKind::Skills => Some(row.name.as_str()),
+                _ => None,
+            };
+            if let Some(path) = path {
+                match web_url(&repo, Some(path)) {
+                    Some(url) if part == Part::CopyLink => copy(hwnd, url.as_ref()),
+                    Some(url) => open_url(&url),
+                    None => shell::tell(format!("{} can’t be opened on GitHub.", printable(&row.name))),
+                }
+            }
+        }
         _ => {}
     }
 }
@@ -1014,7 +1048,7 @@ fn act(hwnd: HWND, repo: &RepoConfig, label: &str, skill: String, action: Action
         Some(how) => {
             shell::want(Job::Resolve { repo: repo.id.clone(), skill, how });
         }
-        None => {
+        None if action == Action::RemoveThem && repo.kind != SourceKind::Plugins => {
             let question = Ask {
                 heading: format!("Delete the {} that are gone from {}?", repo.kind.nouns().1, printable(label)),
                 text: "It lists no matching items now, which can be a mistake upstream. Items you edited are kept.".to_string(),
@@ -1027,6 +1061,7 @@ fn act(hwnd: HWND, repo: &RepoConfig, label: &str, skill: String, action: Action
                 shell::want(Job::DeleteGone(repo.id.clone()));
             }
         }
+        None => {}
     }
 }
 
@@ -1438,6 +1473,50 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn add_source_question_fits_a_small_work_area() {
+        let a = add_question(crate::config::DEFAULT_INTERVAL, &AddForm::default());
+        let Some(Field::Text { label, hint, .. }) = a.field else { panic!("the Add source question needs a field") };
+        assert_eq!(a.choices.len(), 4);
+        let q = page::Question {
+            heading: a.heading,
+            text: a.text,
+            field: Some((label, page::Hint::Plain(hint))),
+            focused: true,
+            combo: a.combo,
+            choices: a.choices,
+            choice: 0,
+            note: a.note,
+            ok: a.ok,
+            cancel: a.cancel,
+        };
+        let (surface, _) = page::ask(&q, &page::tests::fit);
+        let (work_height, frame_height) = (465, 34);
+        let client_height = dialogs::fit_client_height(surface.height, work_height, frame_height);
+        println!("Add source layout: {} DIP; visible client: {client_height} DIP", surface.height);
+        assert!(client_height < surface.height, "this work area should need scrolling");
+        assert_eq!(client_height + frame_height, work_height);
+        for id in [page::ask_id::OK, page::ask_id::CANCEL] {
+            let at = surface.items.iter().find(|i| i.id == id).unwrap().at;
+            let scrolled_y = at[1] - (surface.height - client_height);
+            assert!(scrolled_y >= 0 && scrolled_y + at[3] <= client_height, "scrolling to the bottom reveals the footer");
+        }
+    }
+
+    #[test]
+    fn plugin_source_field_uses_the_selected_types_branch_rules() {
+        let q = add_question(crate::config::DEFAULT_INTERVAL, &AddForm::default());
+        let Some(Field::Text { check: Some(check), .. }) = q.field else { panic!("the Add source field should validate addresses") };
+        let address = "https://github.com/o/r/tree/caf\u{e9}";
+        for file_kind in 0..3 {
+            assert!(check(address, file_kind).is_ok());
+        }
+        assert_eq!(
+            check(address, 3).unwrap_err(),
+            "This branch name has characters the app will not pass to Copilot CLI: use letters, digits, '.', '_', '/', '+' or '-'."
+        );
+    }
 
     #[test]
     fn continuation_edit_preselects_the_drafts_address_type_and_interval() {

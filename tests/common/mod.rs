@@ -8,7 +8,7 @@
 
 #![allow(dead_code)]
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
@@ -19,6 +19,7 @@ use tiny_skill_sync::engine::{Engine, LocalStatus, Outcome, RepoReport, SkillRep
 use tiny_skill_sync::fsx::unique_suffix;
 use tiny_skill_sync::github::{FailureKind, Remote, RemoteError, RepoRef, TokenProvider, TreeReply};
 use tiny_skill_sync::hash::blob_hex;
+use tiny_skill_sync::plugins::native::{ManagerError, NativeMarket, NativePlugin, NativeSnapshot, PluginManager};
 use tiny_skill_sync::reconcile::LocalState;
 use tiny_skill_sync::secret::Secret;
 use tiny_skill_sync::state::State;
@@ -69,6 +70,11 @@ impl World {
         let c = Arc::clone(&clock);
         engine.set_clock(move || c.load(Ordering::Relaxed));
         (engine, clock)
+    }
+
+    pub fn plugin_engine(&self, remote: &Arc<FakeRemote>, manager: &FakePluginManager) -> (Engine, Arc<AtomicI64>) {
+        let (engine, clock) = self.engine_at(remote, &FakeTokens::none());
+        (engine.with_plugin_manager(manager.manager()), clock)
     }
 
     pub fn state_file(&self) -> PathBuf {
@@ -758,5 +764,137 @@ impl Setup {
         let clock = Arc::clone(&self.clock);
         engine.set_clock(move || clock.load(Ordering::Relaxed));
         engine
+    }
+}
+
+// A native Copilot manager with a persistent snapshot and optional exact call/response scripts.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PluginCall {
+    Home,
+    List,
+    Markets,
+    AddMarket { repo: String, branch: String },
+    Install(String),
+    Update(String),
+    Uninstall(String),
+}
+
+#[derive(Clone, Debug)]
+pub enum PluginReply {
+    /// A mutation succeeded. An omitted snapshot simulates exit zero without any change.
+    Done(Option<NativeSnapshot>),
+    /// Return a new snapshot for this probe and preserve it for subsequent calls.
+    Snapshot(NativeSnapshot),
+    Failed(ManagerError),
+}
+
+type PluginHook = Arc<dyn Fn(&PluginCall) + Send + Sync>;
+
+struct FakePluginState {
+    snapshot: NativeSnapshot,
+    calls: Vec<PluginCall>,
+    script: VecDeque<(PluginCall, PluginReply)>,
+    hook: Option<PluginHook>,
+}
+
+#[derive(Clone)]
+pub struct FakePluginManager(Arc<Mutex<FakePluginState>>);
+
+impl FakePluginManager {
+    pub fn new(home: impl Into<PathBuf>) -> Self {
+        Self(Arc::new(Mutex::new(FakePluginState {
+            snapshot: NativeSnapshot { home: home.into(), plugins: vec![], markets: vec![] },
+            calls: vec![],
+            script: VecDeque::new(),
+            hook: None,
+        })))
+    }
+
+    pub fn set_snapshot(&self, snapshot: NativeSnapshot) {
+        self.0.lock().unwrap().snapshot = snapshot;
+    }
+
+    pub fn push(&self, call: PluginCall, reply: PluginReply) {
+        self.0.lock().unwrap().script.push_back((call, reply));
+    }
+
+    pub fn push_first(&self, call: PluginCall, reply: PluginReply) {
+        self.0.lock().unwrap().script.push_front((call, reply));
+    }
+
+    pub fn calls(&self) -> Vec<PluginCall> {
+        self.0.lock().unwrap().calls.clone()
+    }
+
+    pub fn remaining(&self) -> usize {
+        self.0.lock().unwrap().script.len()
+    }
+
+    pub fn after_call(&self, hook: impl Fn(&PluginCall) + Send + Sync + 'static) {
+        self.0.lock().unwrap().hook = Some(Arc::new(hook));
+    }
+
+    pub fn manager(&self) -> Box<dyn PluginManager> {
+        Box::new(self.clone())
+    }
+
+    fn call(&self, call: PluginCall, cancel: Option<&AtomicBool>) -> Result<NativeSnapshot, ManagerError> {
+        let mut s = self.0.lock().unwrap();
+        s.calls.push(call.clone());
+        if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
+            return Err(ManagerError::Cancelled);
+        }
+        let probe = matches!(call, PluginCall::Home | PluginCall::List | PluginCall::Markets);
+        if s.script.front().is_some_and(|(next, _)| *next == call) {
+            match s.script.pop_front().unwrap().1 {
+                PluginReply::Snapshot(snapshot) if probe => s.snapshot = snapshot,
+                PluginReply::Done(snapshot) if !probe => {
+                    if let Some(snapshot) = snapshot {
+                        s.snapshot = snapshot;
+                    }
+                }
+                PluginReply::Failed(error) => return Err(error),
+                reply => panic!("incompatible fake Copilot reply {reply:?} for {call:?}"),
+            }
+        } else if !probe {
+            panic!("unexpected fake Copilot mutation {call:?}");
+        }
+        let snapshot = s.snapshot.clone();
+        let hook = s.hook.clone();
+        drop(s);
+        if let Some(hook) = hook {
+            hook(&call);
+        }
+        Ok(snapshot)
+    }
+}
+
+impl PluginManager for FakePluginManager {
+    fn home(&self) -> Result<PathBuf, ManagerError> {
+        Ok(self.call(PluginCall::Home, None)?.home)
+    }
+
+    fn list(&self, cancel: &AtomicBool) -> Result<Vec<NativePlugin>, ManagerError> {
+        Ok(self.call(PluginCall::List, Some(cancel))?.plugins)
+    }
+
+    fn markets(&self, cancel: &AtomicBool) -> Result<Vec<NativeMarket>, ManagerError> {
+        Ok(self.call(PluginCall::Markets, Some(cancel))?.markets)
+    }
+
+    fn add_market(&self, repo: &str, branch: &str, cancel: &AtomicBool) -> Result<(), ManagerError> {
+        self.call(PluginCall::AddMarket { repo: repo.into(), branch: branch.into() }, Some(cancel)).map(drop)
+    }
+
+    fn install(&self, name_at_market: &str, cancel: &AtomicBool) -> Result<(), ManagerError> {
+        self.call(PluginCall::Install(name_at_market.into()), Some(cancel)).map(drop)
+    }
+
+    fn update(&self, name_at_market: &str, cancel: &AtomicBool) -> Result<(), ManagerError> {
+        self.call(PluginCall::Update(name_at_market.into()), Some(cancel)).map(drop)
+    }
+
+    fn uninstall(&self, name_at_market: &str, cancel: &AtomicBool) -> Result<(), ManagerError> {
+        self.call(PluginCall::Uninstall(name_at_market.into()), Some(cancel)).map(drop)
     }
 }

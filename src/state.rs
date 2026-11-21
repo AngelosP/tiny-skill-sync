@@ -3,7 +3,7 @@
 //!
 //! Only skills listed here are ever updated or deleted. Anything else in the skills folder is the user's.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -12,6 +12,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use crate::config::{RepoConfig, legacy_version};
 use crate::fsx;
 use crate::pathsafe;
+use crate::plugins::{NameMap, normal_name};
 use crate::source::{DestinationBinding, SourceKind};
 use crate::tree::SkillFile;
 
@@ -126,7 +127,8 @@ pub struct RepoState {
 fn skills_marker<'de, D: Deserializer<'de>>(d: D) -> Result<(), D::Error> {
     match SourceKind::deserialize(d)? {
         SourceKind::Skills => Ok(()),
-        _ => Err(serde::de::Error::custom("loose-file records do not belong in skills state")),
+        SourceKind::Agents | SourceKind::Instructions => Err(serde::de::Error::custom("loose-file records do not belong in skills state")),
+        SourceKind::Plugins => Err(serde::de::Error::custom("plugin records do not belong in skills state")),
     }
 }
 
@@ -203,11 +205,21 @@ pub struct State {
     // Outside BOTH v1 repo maps: that reader decodes all Pending values *before* checking the version.
     #[serde(skip_serializing_if = "BTreeMap::is_empty", deserialize_with = "read_loose_sources")]
     loose_sources: BTreeMap<String, LooseSourceState>,
+    #[serde(skip_serializing_if = "NameMap::is_empty")]
+    plugin_sources: NameMap<PluginSourceState>,
 }
 
 impl Default for State {
     fn default() -> Self {
-        State { version: legacy_version(), skills_dir: None, volume: None, repos: BTreeMap::new(), set_aside: Vec::new(), loose_sources: BTreeMap::new() }
+        State {
+            version: legacy_version(),
+            skills_dir: None,
+            volume: None,
+            repos: BTreeMap::new(),
+            set_aside: Vec::new(),
+            loose_sources: BTreeMap::new(),
+            plugin_sources: NameMap::new(),
+        }
     }
 }
 
@@ -221,6 +233,7 @@ pub(crate) fn check_leaf_name(kind: SourceKind, name: &str) -> Result<(), String
         SourceKind::Agents => ".agent.md",
         SourceKind::Instructions => ".instructions.md",
         SourceKind::Skills => return Err("skills cannot own loose files".into()),
+        SourceKind::Plugins => return Err("Plugins cannot own loose files".into()),
     };
     if !name.ends_with(suffix) || name.len() == suffix.len() {
         return Err(format!("expected a file named *{suffix}"));
@@ -403,12 +416,125 @@ fn read_loose_sources<'de, D: Deserializer<'de>>(d: D) -> Result<BTreeMap<String
     d.deserialize_map(Sources)
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PluginOrigin {
+    pub repo: String,
+    pub branch: String,
+    pub path: String,
+}
+
+impl From<&RepoConfig> for PluginOrigin {
+    fn from(source: &RepoConfig) -> Self {
+        Self { repo: source.repo.clone(), branch: source.branch.clone(), path: source.path.clone() }
+    }
+}
+
+impl PluginOrigin {
+    pub fn matches(&self, source: &RepoConfig) -> bool {
+        source.kind == SourceKind::Plugins && self.repo == source.repo && self.branch == source.branch && self.path == source.path
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PluginPoll {
+    pub etag: Option<String>,
+    pub last_check: Option<i64>,
+    pub lists_nothing: bool,
+    pub needs_token: bool,
+    pub needs_attention: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OwnedPlugin {
+    pub fingerprint: String,
+    pub version: Option<String>,
+    /// False for an adopted install, even after the app updates it.
+    pub by_app: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PluginSourceState {
+    pub origin: PluginOrigin,
+    pub copilot_home: PathBuf,
+    pub market: String,
+    pub registered_by_app: bool,
+    #[serde(default)]
+    pub poll: PluginPoll,
+    /// A null publisher is an explicit approval of an unnamed publisher, not a missing approval.
+    pub approved: NameMap<Option<String>>,
+    pub plugins: NameMap<OwnedPlugin>,
+}
+
+impl PluginSourceState {
+    pub fn new(source: &RepoConfig, home: &Path, market: &str) -> Self {
+        Self {
+            origin: source.into(),
+            copilot_home: home.into(),
+            market: market.into(),
+            registered_by_app: false,
+            poll: PluginPoll::default(),
+            approved: NameMap::new(),
+            plugins: NameMap::new(),
+        }
+    }
+
+    pub fn recorded_source(&self, id: &str) -> RepoConfig {
+        RepoConfig {
+            id: id.into(),
+            kind: SourceKind::Plugins,
+            repo: self.origin.repo.clone(),
+            branch: self.origin.branch.clone(),
+            path: self.origin.path.clone(),
+            ..Default::default()
+        }
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        if !self.recorded_source("").problems().is_empty() || !normal_name(&self.market) || crate::source::check_root(&self.copilot_home).is_err() {
+            return Err("invalid plugin source identity in state.json".into());
+        }
+        if self.approved.keys().chain(self.plugins.keys()).any(|name| !normal_name(name))
+            || self.plugins.values().any(|plugin| !crate::hash::is_sha1_hex(&plugin.fingerprint))
+        {
+            return Err("invalid plugin record in state.json".into());
+        }
+        Ok(())
+    }
+}
+
 #[derive(Deserialize)]
 struct StateFormat {
     #[serde(default = "legacy_version")]
     version: u32,
     #[serde(default, deserialize_with = "present")]
     loose_sources: bool,
+    #[serde(default, deserialize_with = "present")]
+    plugin_sources: bool,
+}
+
+// Inspect only the field names, without building any of the records. Keep the legacy
+// header check separate so format 1 still ignores extra keys and newer versions get refused first.
+#[derive(Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct StateKeys {
+    #[serde(rename = "version")]
+    _version: Option<serde::de::IgnoredAny>,
+    #[serde(rename = "skills_dir")]
+    _skills_dir: Option<serde::de::IgnoredAny>,
+    #[serde(rename = "volume")]
+    _volume: Option<serde::de::IgnoredAny>,
+    #[serde(rename = "repos")]
+    _repos: Option<serde::de::IgnoredAny>,
+    #[serde(rename = "set_aside")]
+    _set_aside: Option<serde::de::IgnoredAny>,
+    #[serde(rename = "loose_sources")]
+    _loose_sources: Option<serde::de::IgnoredAny>,
+    #[serde(rename = "plugin_sources")]
+    _plugin_sources: Option<serde::de::IgnoredAny>,
 }
 
 fn present<'de, D: Deserializer<'de>>(d: D) -> Result<bool, D::Error> {
@@ -459,6 +585,9 @@ impl State {
         if !loaded.state.loose_sources.is_empty() {
             return Err(io::Error::other("state.json contains loose-file sources; the skills engine cannot use it"));
         }
+        if !loaded.state.plugin_sources.is_empty() {
+            return Err(io::Error::other("state.json contains plugin sources; the skills engine cannot use it"));
+        }
         Ok(loaded)
     }
 
@@ -480,6 +609,12 @@ impl State {
                 }
                 if format.loose_sources && format.version < 2 {
                     return Err(io::Error::other("loose-file state requires state.json format 2"));
+                }
+                if format.plugin_sources && format.version < 2 {
+                    return Err(io::Error::other("plugin state requires state.json format 2"));
+                }
+                if format.version >= 2 {
+                    serde_json::from_slice::<StateKeys>(&bytes).map_err(io::Error::other)?;
                 }
                 match serde_json::from_slice::<State>(&bytes) {
                     Ok(mut state) => {
@@ -525,7 +660,7 @@ impl State {
     }
 
     fn wire_version(&self) -> u32 {
-        if self.loose_sources.is_empty() { 1 } else { 2 }
+        if self.loose_sources.is_empty() && self.plugin_sources.is_empty() { 1 } else { 2 }
     }
 
     fn has_skills_record(&self, id: &str) -> bool {
@@ -539,6 +674,16 @@ impl State {
             }
             record.validate()?;
         }
+        let mut claimed = HashSet::new();
+        for (id, record) in self.plugin_sources.iter() {
+            self.check_plugin_id(id)?;
+            record.validate()?;
+            for name in record.plugins.keys() {
+                if !claimed.insert((&record.market, name)) {
+                    return Err(format!("plugin '{name}@{}' is tracked by more than one source", record.market));
+                }
+            }
+        }
         Ok(())
     }
 
@@ -546,6 +691,12 @@ impl State {
     pub fn binding_for(&self, source: &RepoConfig) -> Result<Option<&DestinationBinding>, String> {
         if source.id.trim().is_empty() {
             return Err("a destination binding requires a stable source ID".into());
+        }
+        if source.kind == SourceKind::Plugins {
+            return Err("Plugins do not have a file destination".into());
+        }
+        if self.plugin_sources.contains_key(&source.id) {
+            return Err(format!("source '{}' already has a plugin record", source.id));
         }
         if !source.kind.is_skills() && self.has_skills_record(&source.id) {
             return Err(format!("source '{}' already has a skills record", source.id));
@@ -577,12 +728,71 @@ impl State {
         &self.loose_sources
     }
 
+    pub(crate) fn source_ids(&self) -> impl Iterator<Item = &String> {
+        self.repos.keys().chain(self.set_aside.iter().flat_map(|a| a.repos.keys())).chain(self.loose_sources.keys()).chain(self.plugin_sources.keys())
+    }
+
+    pub(crate) fn has_source_id(&self, id: &str) -> bool {
+        self.has_skills_record(id) || self.loose_sources.contains_key(id) || self.plugin_sources.contains_key(id)
+    }
+
+    pub(crate) fn check_plugin_id(&self, id: &str) -> Result<(), String> {
+        if id.trim().is_empty() {
+            return Err("A Plugins source needs a nonempty ID.".into());
+        }
+        if self.has_skills_record(id) || self.loose_sources.contains_key(id) {
+            return Err(format!("Source ID '{id}' is already used by another source on this PC."));
+        }
+        Ok(())
+    }
+
+    pub fn plugin_sources(&self) -> &NameMap<PluginSourceState> {
+        &self.plugin_sources
+    }
+
+    /// An approval alone is not ownership. Disabled sources and orphans still retain their records.
+    pub fn plugin_owner_elsewhere(&self, id: &str, market: &str, name: &str) -> Option<&str> {
+        self.plugin_sources
+            .iter()
+            .find_map(|(other, record)| (other != id && record.market == market && record.plugins.contains_key(name)).then_some(other.as_str()))
+    }
+
+    pub fn set_plugin_source(&mut self, id: &str, record: PluginSourceState) -> Result<(), String> {
+        self.check_plugin_id(id)?;
+        record.validate()?;
+        for name in record.plugins.keys() {
+            if let Some(other) = self.plugin_owner_elsewhere(id, &record.market, name) {
+                return Err(format!("Already tracked by source {other}"));
+            }
+        }
+        self.plugin_sources.insert(id.into(), record);
+        self.version = self.wire_version();
+        Ok(())
+    }
+
+    pub(crate) fn plugin_poll_mut(&mut self, id: &str) -> Option<&mut PluginPoll> {
+        self.plugin_sources.get_mut(id).map(|r| &mut r.poll)
+    }
+
+    /// Removing a record is explicit and never changes anything in Copilot.
+    pub fn forget_plugin_source(&mut self, id: &str) -> bool {
+        let removed = self.plugin_sources.remove(id).is_some();
+        self.version = self.wire_version();
+        removed
+    }
+
     pub fn leaf_poll_mut(&mut self, source: &RepoConfig) -> Result<&mut LeafPoll, String> {
         Ok(&mut self.bound_loose_mut(source)?.poll)
     }
 
     pub(crate) fn last_check_mut(&mut self, id: &str) -> Option<&mut Option<i64>> {
-        if let Some(r) = self.loose_sources.get_mut(id) { Some(&mut r.poll.last_check) } else { self.repos.get_mut(id).map(|r| &mut r.last_check) }
+        if let Some(r) = self.plugin_sources.get_mut(id) {
+            Some(&mut r.poll.last_check)
+        } else if let Some(r) = self.loose_sources.get_mut(id) {
+            Some(&mut r.poll.last_check)
+        } else {
+            self.repos.get_mut(id).map(|r| &mut r.last_check)
+        }
     }
 
     pub(crate) fn bound_loose_mut(&mut self, source: &RepoConfig) -> Result<&mut LooseSourceState, String> {
@@ -996,6 +1206,150 @@ mod tests {
         }
         assert_eq!(state, before);
         assert_eq!(State::default().binding_for(&source).unwrap(), None, "another machine is not bound");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn plugin_format_two_matches_the_golden_state_bytes() {
+        const GOLDEN: &[u8] = br#"{
+  "version": 2,
+  "skills_dir": "C:\\isolated\\skills",
+  "volume": {
+    "serial": 17,
+    "journal": 21
+  },
+  "repos": {},
+  "plugin_sources": {
+    "packages": {
+      "origin": {
+        "repo": "owner/repo",
+        "branch": "test/v1",
+        "path": "tools"
+      },
+      "copilot_home": "C:\\isolated\\copilot",
+      "market": "market",
+      "registered_by_app": true,
+      "poll": {
+        "etag": "W/\"tree\"",
+        "last_check": 1800000000,
+        "lists_nothing": true,
+        "needs_token": true,
+        "needs_attention": true
+      },
+      "approved": {
+        "alpha": "Team",
+        "beta": null
+      },
+      "plugins": {
+        "alpha": {
+          "fingerprint": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "version": "1.0",
+          "by_app": true
+        },
+        "beta": {
+          "fingerprint": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "version": null,
+          "by_app": false
+        }
+      }
+    }
+  }
+}"#;
+        let dir = temp("plugin-golden");
+        let path = dir.join("state.json");
+        std::fs::write(&path, GOLDEN).unwrap();
+        let loaded = State::load_sources_with(&path, false);
+        let actual = loaded.map(|loaded| {
+            assert!(loaded.warning.is_none());
+            loaded.state.save(&path).unwrap();
+            std::fs::read(&path).unwrap()
+        });
+        std::fs::remove_dir_all(dir).unwrap();
+        assert_eq!(String::from_utf8(actual.unwrap()).unwrap(), std::str::from_utf8(GOLDEN).unwrap());
+    }
+
+    #[test]
+    fn only_legacy_state_accepts_an_unknown_top_level_key() {
+        let dir = temp("unknown-state-section");
+        let path = dir.join("state.json");
+        let legacy = br#"{"future_section":{"my-data":true},"repos":{"old":{}},"version":1}"#;
+        std::fs::write(&path, legacy).unwrap();
+        let loaded = State::load_sources_with(&path, true).unwrap();
+        assert!(loaded.warning.is_none() && loaded.state.repo("old").is_some());
+        assert_eq!(std::fs::read(&path).unwrap(), legacy);
+        for version in [2, 3] {
+            let bytes = format!(r#"{{"future_section":{{"my-data":true}},"version":{version}}}"#);
+            for quarantine in [false, true] {
+                std::fs::write(&path, &bytes).unwrap();
+                assert!(State::load_sources_with(&path, quarantine).is_err(), "format {version} accepted an unknown section");
+                assert_eq!(std::fs::read(&path).unwrap(), bytes.as_bytes());
+                assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+            }
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn plugin_state_requires_its_own_namespace_and_wire_version() {
+        let dir = temp("plugin-wire");
+        let path = dir.join("state.json");
+        let record = serde_json::json!({
+            "origin": {"repo":"o/r", "branch":"main", "path":"tools"},
+            "copilot_home": dir.join("copilot"), "market":"tools", "registered_by_app":false,
+            "poll":{}, "approved":{"one":null}, "plugins":{}
+        });
+        let base = serde_json::json!({"version":2, "plugin_sources":{"id":record}});
+        let mut old = base.clone();
+        old["version"] = serde_json::json!(1);
+        let mut current = base.clone();
+        current["repos"] = serde_json::json!({"id":{}});
+        let mut old_folder = base.clone();
+        old_folder["set_aside"] = serde_json::json!([{"repos":{"id":{}}}]);
+        let mut loose = base.clone();
+        loose["loose_sources"] = serde_json::json!({"id":{"binding":{"kind":"agents", "root":dir.join("agents")}}});
+        for bad in [old, current, old_folder, loose] {
+            let bytes = serde_json::to_vec(&bad).unwrap();
+            std::fs::write(&path, &bytes).unwrap();
+            let refused = State::load_sources_with(&path, true).is_err();
+            assert_eq!(std::fs::read(&path).unwrap(), bytes);
+            if !refused {
+                std::fs::remove_dir_all(&dir).unwrap();
+                panic!("accepted invalid plugin state: {bad}");
+            }
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn plugin_records_round_trip_and_keep_exclusive_claims_even_for_orphans() {
+        let dir = temp("plugin-ownership");
+        let path = dir.join("state.json");
+        let source = RepoConfig { id: "first".into(), kind: SourceKind::Plugins, repo: "owner/repo".into(), branch: "main".into(), ..Default::default() };
+        let mut record = PluginSourceState::new(&source, &dir.join("copilot"), "market");
+        record.approved.insert("tool".into(), None);
+        record.plugins.insert("tool".into(), OwnedPlugin { fingerprint: "a".repeat(40), version: Some("1.0".into()), by_app: false });
+        record.poll.etag = Some("test-etag".into());
+        record.registered_by_app = true;
+        let mut state = State::default();
+        state.set_plugin_source(&source.id, record.clone()).unwrap();
+        state.save(&path).unwrap();
+        assert_eq!(v1_reader::load(&path), "refused");
+        assert!(State::load(&path).is_err());
+        assert_eq!(State::load_sources_with(&path, true).unwrap().state, state);
+        assert_eq!(state.plugin_owner_elsewhere("other", "market", "tool"), Some("first"));
+        assert_eq!(state.plugin_owner_elsewhere("other", "different-market", "tool"), None);
+        assert!(state.set_plugin_source("other", record.clone()).is_err());
+        assert!(!state.plugin_sources().contains_key("other"));
+        let saved = std::fs::read(&path).unwrap();
+        let mut duplicate: serde_json::Value = serde_json::from_slice(&saved).unwrap();
+        duplicate["plugin_sources"]["other"] = serde_json::to_value(&record).unwrap();
+        let bytes = serde_json::to_vec(&duplicate).unwrap();
+        std::fs::write(&path, &bytes).unwrap();
+        assert!(State::load_sources_with(&path, true).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        state.forget_plugin_source("first");
+        state.save(&path).unwrap();
+        assert_eq!(v1_reader::load(&path), "usable");
         std::fs::remove_dir_all(dir).unwrap();
     }
 

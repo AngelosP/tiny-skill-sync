@@ -20,7 +20,7 @@ use std::path::Path;
 use std::ptr::{null, null_mut};
 
 use windows_sys::Win32::Foundation::{ERROR_CLASS_ALREADY_EXISTS, FILETIME, GetLastError, HWND, RECT, SYSTEMTIME};
-use windows_sys::Win32::Graphics::Gdi::{COLOR_BTNFACE, HBRUSH};
+use windows_sys::Win32::Graphics::Gdi::{COLOR_BTNFACE, GetMonitorInfoW, HBRUSH, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow};
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, SetProcessWorkingSetSize};
 use windows_sys::Win32::System::Time::{FileTimeToSystemTime, SystemTimeToTzSpecificLocalTime};
@@ -58,23 +58,41 @@ pub fn register_class(name: &str, proc: WNDPROC, icon: HICON) -> bool {
     unsafe { RegisterClassExW(&wc) != 0 || GetLastError() == ERROR_CLASS_ALREADY_EXISTS }
 }
 
+fn work_area(over: HWND) -> RECT {
+    unsafe {
+        if !over.is_null() {
+            let mut monitor: MONITORINFO = zeroed();
+            monitor.cbSize = size_of::<MONITORINFO>() as u32;
+            if GetMonitorInfoW(MonitorFromWindow(over, MONITOR_DEFAULTTONEAREST), &mut monitor) != 0 {
+                return monitor.rcWork;
+            }
+        }
+        let mut work: RECT = zeroed();
+        SystemParametersInfoW(SPI_GETWORKAREA, 0, (&raw mut work).cast(), 0);
+        work
+    }
+}
+
+fn keep_on_screen(work: RECT, [x, y, w, h]: [i32; 4]) -> [i32; 4] {
+    [x.clamp(work.left, (work.right - w).max(work.left)), y.clamp(work.top, (work.bottom - h).max(work.top)), w, h]
+}
+
+fn centered(work: RECT, over: HWND, [w, h]: [i32; 2]) -> [i32; 4] {
+    let mut area = work;
+    if over.is_null() || unsafe { IsWindowVisible(over) } == 0 || unsafe { GetWindowRect(over, &mut area) } == 0 {
+        area = work;
+    }
+    let x = area.left + (area.right - area.left - w) / 2;
+    let y = area.top + (area.bottom - area.top - h) / 2;
+    keep_on_screen(work, [x, y, w, h])
+}
+
 /// Position and outer size of a window with a client area of `client` DIPs, centred over `over` (or the work area)
 /// and kept on the work area.
 pub fn place(style: u32, ex_style: u32, client: (i32, i32), dpi: u32, over: HWND) -> [i32; 4] {
-    unsafe {
-        let mut rc = RECT { left: 0, top: 0, right: scale(client.0, dpi), bottom: scale(client.1, dpi) };
-        AdjustWindowRectExForDpi(&mut rc, style, 0, ex_style, dpi);
-        let (w, h) = (rc.right - rc.left, rc.bottom - rc.top);
-        let mut work: RECT = zeroed();
-        SystemParametersInfoW(SPI_GETWORKAREA, 0, (&raw mut work).cast(), 0);
-        let mut area = work;
-        if over.is_null() || IsWindowVisible(over) == 0 || GetWindowRect(over, &mut area) == 0 {
-            area = work;
-        }
-        let x = (area.left + (area.right - area.left - w) / 2).clamp(work.left, (work.right - w).max(work.left));
-        let y = (area.top + (area.bottom - area.top - h) / 2).clamp(work.top, (work.bottom - h).max(work.top));
-        [x, y, w, h]
-    }
+    let mut rc = RECT { left: 0, top: 0, right: scale(client.0, dpi), bottom: scale(client.1, dpi) };
+    unsafe { AdjustWindowRectExForDpi(&mut rc, style, 0, ex_style, dpi) };
+    centered(work_area(over), over, [rc.right - rc.left, rc.bottom - rc.top])
 }
 
 pub fn text_of(hwnd: HWND) -> String {

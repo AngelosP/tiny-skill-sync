@@ -16,6 +16,7 @@ pub enum SourceKind {
     Skills,
     Agents,
     Instructions,
+    Plugins,
 }
 
 impl TryFrom<String> for SourceKind {
@@ -26,7 +27,8 @@ impl TryFrom<String> for SourceKind {
             "skills" => Ok(Self::Skills),
             "agents" => Ok(Self::Agents),
             "instructions" => Ok(Self::Instructions),
-            _ => Err(format!("unknown source kind '{s}'; expected skills, agents or instructions")),
+            "plugins" => Ok(Self::Plugins),
+            _ => Err(format!("unknown source kind '{s}'; expected skills, agents, instructions or plugins")),
         }
     }
 }
@@ -46,6 +48,7 @@ impl SourceKind {
             Self::Skills => ("skills", "TSS_SKILLS_DIR"),
             Self::Agents => ("agents", "TSS_AGENTS_DIR"),
             Self::Instructions => ("instructions", "TSS_INSTRUCTIONS_DIR"),
+            Self::Plugins => return Err("Plugins do not have a file destination".into()),
         };
         let isolated = ["TSS_HOME", "TSS_SKILLS_DIR", "TSS_TEST_ROOT", "TSS_AGENTS_DIR", "TSS_INSTRUCTIONS_DIR"].iter().any(|key| env(key).is_some());
         if self.is_skills() && !isolated {
@@ -80,7 +83,7 @@ fn folded_path(path: &Path) -> PathBuf {
     PathBuf::from(pathsafe::fold(&path.to_string_lossy()))
 }
 
-fn check_root(path: &Path) -> Result<(), String> {
+pub(crate) fn check_root(path: &Path) -> Result<(), String> {
     if !path.is_absolute() || !matches!(path.components().next(), Some(Component::Prefix(p)) if matches!(p.kind(), Prefix::Disk(_) | Prefix::UNC(_, _))) {
         return Err("the destination root must be a full drive or network share path".into());
     }
@@ -98,10 +101,25 @@ fn check_root(path: &Path) -> Result<(), String> {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DestinationBinding {
+    #[serde(deserialize_with = "loose_kind")]
     kind: SourceKind,
     root: PathBuf,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     child: Option<String>,
+}
+
+fn loose_kind<'de, D: serde::Deserializer<'de>>(d: D) -> Result<SourceKind, D::Error> {
+    let kind = SourceKind::deserialize(d)?;
+    check_loose_kind(kind).map_err(serde::de::Error::custom)?;
+    Ok(kind)
+}
+
+fn check_loose_kind(kind: SourceKind) -> Result<(), &'static str> {
+    match kind {
+        SourceKind::Agents | SourceKind::Instructions => Ok(()),
+        SourceKind::Skills => Err("skills cannot have a loose-file destination"),
+        SourceKind::Plugins => Err("Plugins do not have a file destination"),
+    }
 }
 
 impl DestinationBinding {
@@ -118,9 +136,7 @@ impl DestinationBinding {
     }
 
     pub(crate) fn validate(&self) -> Result<(), String> {
-        if self.kind.is_skills() {
-            return Err("skills cannot have a loose-file destination".into());
-        }
+        check_loose_kind(self.kind)?;
         check_root(&self.root)?;
         if let Some(child) = &self.child {
             pathsafe::check_component(child).map_err(|e| format!("unsafe destination folder: {e}"))?;
@@ -216,6 +232,7 @@ pub enum PreviewDestination {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SourcePreview {
+    pub plugins: Option<crate::plugins::catalog::Catalog>,
     pub kind: SourceKind,
     pub names: Vec<String>,
     pub destination: PreviewDestination,
@@ -318,6 +335,15 @@ mod tests {
             assert!(["", "repo", "one.agent.md", "two.agent.md", r"repo\one.agent.md", r"repo\two.agent.md"].contains(&rel));
             Ok(facts.iter().find(|(name, _)| *name == rel).map_or(Entry::Missing, |(_, entry)| *entry))
         })
+    }
+
+    #[test]
+    fn plugin_sources_never_select_a_file_destination() {
+        let source = RepoConfig { kind: SourceKind::Plugins, ..source() };
+        let root = Path::new(r"D:\isolated\plugins");
+        assert!(source.kind.root_with(root, |_| panic!("no root lookup for plugins")).is_err());
+        assert!(resolve_destination(&source, root, &["tool.agent.md".into()], None, |_| panic!("no file probe for plugins")).is_err());
+        assert!(serde_json::from_str::<DestinationBinding>(r#"{"kind":"plugins","root":"D:\\isolated"}"#).is_err());
     }
 
     #[test]

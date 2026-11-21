@@ -9,6 +9,9 @@ These rules keep that from happening. Read [ARCHITECTURE.md](ARCHITECTURE.md) be
 - Never read, write or delete anything in the real Copilot folders (`%USERPROFILE%\.copilot\skills`,
   `%USERPROFILE%\.copilot\agents`, `%USERPROFILE%\.copilot\instructions`), their work folders (`.tss-work` beside
   Skills and `.tss-leaf-work` beside Agents or Instructions), or the real settings (`%LOCALAPPDATA%\tiny-skill-sync`).
+- Never run GitHub Copilot CLI against `%USERPROFILE%\.copilot` or `%LOCALAPPDATA%\copilot`, even for a list.
+  Tests and live runs that launch it must set both `COPILOT_HOME` and `COPILOT_CACHE_HOME` to separate throwaway
+  folders and set `COPILOT_AUTO_UPDATE=false`. Check both paths before starting; do not inherit real ones.
 - Never run `tss token set` or `tss token clear`, and never start the app with the real settings. The saved GitHub token
   is shared by every copy of the app.
 - Never print, log or save a token.
@@ -20,7 +23,7 @@ These rules keep that from happening. Read [ARCHITECTURE.md](ARCHITECTURE.md) be
 - Run the app only through the scripts (`scripts\dev.ps1 run`, `tss`, `dry-run`, `bench`, `e2e`, `soak`). They set
   `TSS_HOME` and `TSS_SKILLS_DIR` to the sandbox or to a throwaway folder; the one exception, the e2e `places`
   scenario, removes them and points `USERPROFILE` and `LOCALAPPDATA` at a throwaway folder instead, and proves that
-  before the app starts. If you run an exe directly, set both `TSS_` variables first.
+  before the app starts. If you run an exe directly, set both `TSS_` variables and both disposable Copilot paths first.
 - The live scripts (`e2e`, `soak`) push only to their own branches of the fixture repositories (`e2e-*`, `soak-*`), and
   delete them afterwards. Never push to a fixture's `main`, and never point a live script at a repository you do not own.
 - Tests make their own folders under `%TEMP%` (or `TSS_TEST_ROOT`). The test runner sets `TSS_TEST_ROOT` to that base

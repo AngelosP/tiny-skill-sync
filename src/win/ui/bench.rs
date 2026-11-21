@@ -67,7 +67,7 @@ pub fn job_label(job: &Job) -> &'static str {
         Job::SaveSource(..) => "job-source-save",
         Job::AppUpdate(_) | Job::ScheduledUpdate => "job-app-update",
         Job::InstallOnQuit { .. } => "job-quit-install",
-        Job::Resolve { .. } => "job-resolve",
+        Job::Resolve { .. } | Job::ResolvePlugin { .. } => "job-resolve",
         Job::DeleteGone(_) => "job-delete-gone",
         Job::Remove { .. } => "job-remove",
         Job::Diff { .. } => "job-diff",

@@ -19,6 +19,7 @@
     places        with no TSS_ folders: skills go to %USERPROFILE%\.copilot\skills, beside skills written by hand
     portable      export settings once, then run two copies with separate state and skills folders
     mixed         two disposable profiles share Skills, Agents and Instructions sources via the CLI and tray
+    plugins       preview, install, update and remove real Copilot CLI plugins in disposable Copilot folders
     changes       six kinds of upstream change reach the disk through the tray's "Sync now"
     local-edit    an edit made while the app runs, then an upstream change to the same skill
     converged     an edit made here that GitHub has too is marked as in sync; one GitHub does not have stays held
@@ -43,7 +44,7 @@
   The names of the scenarios to run.
 
 .PARAMETER Shots
-  Where the ui scenario saves its screenshots. Default: bench\out\shots-STAMP.
+  Where the ui and plugins scenarios save screenshots. Default: bench\out\shots-STAMP.
 
 .PARAMETER Keep
   Keep the throwaway folders, to look at them afterwards.
@@ -74,6 +75,7 @@ New-Item -ItemType Directory -Force $outDir | Out-Null
 $script:LogPath = Join-Path $outDir "e2e-$stamp.txt"
 if (-not $Shots) { $Shots = Join-Path $outDir "shots-$stamp" }
 $script:Results = New-Object System.Collections.Generic.List[object]
+$script:Skipped = @()
 $script:Scenario = ''
 
 # ---------------------------------------------------------------- reporting
@@ -139,8 +141,8 @@ function Get-EnvOf($c, [hashtable]$More = @{}) {
 }
 
 # Runs the command line on the scenario's folder and writes down what it printed. $Exe runs another copy of tss.exe.
-function Tss($c, [string[]]$TssArgs, [hashtable]$Env = @{}, [string]$Exe = '') {
-    $r = Invoke-LiveTss $c.Root $TssArgs (Get-EnvOf $c $Env) -Exe $Exe
+function Tss($c, [string[]]$TssArgs, [hashtable]$Env = @{}, [string]$Exe = '', [string]$InputLine = '') {
+    $r = Invoke-LiveTss $c.Root $TssArgs (Get-EnvOf $c $Env) -Exe $Exe -InputLine $InputLine
     if ($Exe) { Log "  tss at $Exe" 'DarkGray' }
     Log ('  > tss {0}   (exit {1})' -f ($TssArgs -join ' '), $r.Code) 'DarkGray'
     foreach ($line in ($r.Text -split "`r?`n")) { if ($line.Trim()) { Log "      $line" 'DarkGray' } }
@@ -1716,7 +1718,7 @@ function Test-SkillRow($c, [IntPtr]$Window) {
             [pscustomobject]@{ Handle = $rowH; Icons = $icons }
         }
         try {
-            [void][TssLive]::SetForegroundWindow($Window)
+            [void][TssLive]::Foreground($Window)
             $frame = $width - [int](([TssLive]::Client($Window) -split ',')[0])
             # The supported minimum client width, at this window's DPI. Keep the height and desktop position.
             [void][TssLive]::SetWindowPos($Window, [IntPtr]::Zero, 0, 0, ((& $px 640) + $frame), $height, 0x16)
@@ -1807,14 +1809,34 @@ function Test-Ui {
         Note "the question: $said"
         $note = Read-Ui $ask $AskPanel $AskId.Note
         Check 'it has no box for a token; a note says private repositories work by themselves' ($note -like 'Private repositories work automatically*' -and $said -notmatch 'Use my token|Private repository$') $note
-        $types = @(0, 1, 2 | ForEach-Object { Read-Ui $ask $AskPanel ($AskId.Choice + $_) }) -join ','
-        Check 'it offers the three types, with Skills chosen' ($types -eq 'Skills,Agents,Instructions' -and (Get-Checked $ask $AskPanel $AskId.Choice)) $types
+        $types = @(0..3 | ForEach-Object { Read-Ui $ask $AskPanel ($AskId.Choice + $_) }) -join ','
+        Check 'it offers the four types, with Skills chosen' ($types -eq 'Skills,Agents,Instructions,Plugins' -and (Get-Checked $ask $AskPanel $AskId.Choice)) $types
         Check 'it offers how often to check, starting at the default' ((Read-Ui $ask $AskPanel $AskId.Combo) -eq 'Default (1 day)') (Read-Ui $ask $AskPanel $AskId.Combo)
         Set-UiText (Get-Ui $ask $AskPanel $AskId.Edit) (Get-Address $c)
         $hint = Wait-Maybe { $t = Read-Ui $ask $AskPanel $AskId.Hint; if ($t -match [regex]::Escape($c.Repo) -and $t -match 'skills folder on') { $t } } 5
         Check 'as the address is typed, the question says what it reads it as' ($null -ne $hint) (Read-Ui $ask $AskPanel $AskId.Hint)
+        $askArea = [System.Windows.Forms.Screen]::FromHandle($ask).WorkingArea
+        $askBox = [int[]]([TssLive]::Bounds($ask) -split ',')
+        Check 'the Add source question fits in the work area' ($askBox[1] -ge $askArea.Top -and $askBox[3] -le $askArea.Bottom) (
+            "window $($askBox -join ','); work area top $($askArea.Top), bottom $($askArea.Bottom)")
+        $pane = [TssLive]::GetDlgItem($ask, $AskPanel)
+        $paneBox = [int[]]([TssLive]::Bounds($pane) -split ',')
+        $shows = { param($id)
+            $box = [int[]]([TssLive]::Bounds((Get-Ui $ask $AskPanel $id)) -split ',')
+            $box[1] -ge $paneBox[1] -and $box[3] -le $paneBox[3]
+        }
         $pic = Save-Shot $ask '03-add'
-        Test-Painted $pic $ask 'the Add question' @(@($AskPanel, $AskId.Heading), @($AskPanel, $AskId.Edit), @($AskPanel, $AskId.Choice), @($AskPanel, $AskId.Note), @($AskPanel, $AskId.Ok), @($AskPanel, $AskId.Cancel))
+        $top = @(@($AskPanel, $AskId.Heading), @($AskPanel, $AskId.Edit), @($AskPanel, $AskId.Choice))
+        $foot = @(@($AskPanel, $AskId.Ok), @($AskPanel, $AskId.Cancel))
+        if (-not (& $shows $AskId.Ok)) {
+            Test-Painted $pic $ask 'the Add question at the top' $top
+            [void][TssLive]::SendMessageW($pane, 0x115, [IntPtr]7, [IntPtr]::Zero) # WM_VSCROLL, SB_BOTTOM
+            Check 'scrolling the Add question brings Preview and Cancel into view' ((& $shows $AskId.Ok) -and (& $shows $AskId.Cancel))
+            $pic = Save-Shot $ask '03a-add-footer'
+            Test-Painted $pic $ask 'the Add question at the bottom' $foot
+        } else {
+            Test-Painted $pic $ask 'the Add question' ($top + ,@($AskPanel, $AskId.Note) + $foot)
+        }
         Test-Layout $ask 'the Add question'
         Test-TabOrder $ask 'the Add question'
         Click-Ui $ask $AskPanel $AskId.Ok
@@ -1959,7 +1981,7 @@ function Test-Ui {
         $texts = @($edited.Buttons | ForEach-Object { $_.Text })
         Check 'its row opens by itself, says what changed (not my own file), and offers Show changes, Use the GitHub version and Keep my version' ($edited.Detail -match '^Edited locally' -and $edited.Detail -notmatch 'my-notes' -and $texts -contains 'Show changes' -and $texts -contains 'Use the GitHub version' -and $texts -contains 'Keep my version') ("$($edited.Detail) / " + ($texts -join ', '))
         $editedRow = Get-Ui $win $UiPanel.Page $edited.Id
-        [void][TssLive]::SetForegroundWindow($win)
+        [void][TssLive]::Foreground($win)
         # Enter/Space must reach the row through normal keyboard navigation, not a notification to the panel.
         for ($i = 0; $i -lt 32; $i++) {
             $current = [TssLive]::Focused($win)
@@ -2143,9 +2165,17 @@ function Test-Ui {
                 Set-UiText $edit (Get-Address $c)
                 [void](Wait-Maybe { $t = Read-Ui $ask $AskPanel $AskId.Hint; if ($t -match 'skills folder on') { $t } } 5)
                 Click-Ui $ask $AskPanel $AskId.Ok
-                $told = Wait-Maybe { $s = (Read-Hero $win).Sub; if ($s -match 'already set up') { $s } } 5
-                Check 'previewing the same source twice is refused, and says so' ($null -ne $told -and (Find-Ask $tray) -eq [IntPtr]::Zero -and @(Read-Nav $win).Count -eq 1) $(if ($told) { $told } else { (Read-Hero $win).Sub })
-                [void](Save-Shot $win '15-refused')
+                $saved = Get-Config $c
+                $expected = if ($saved -and @($saved.repos).Count -eq 1) { "This source is already set up. Its ID is '$($saved.repos[0].id)'." }
+                $told = Wait-Maybe { $t = Read-Ui $win $UiPanel.Page $UiId.InfoText; if ($t -and $t -ceq $expected) { $t } } 5
+                Check 'the Add source page refuses the duplicate and shows its full ID, not in the header' (
+                    $null -ne $told -and (Read-Ui $win $UiPanel.Page $UiId.Title) -eq 'Add source' -and
+                    (Read-Hero $win).Sub -notlike '*already set up*' -and (Find-Ask $tray) -eq [IntPtr]::Zero -and
+                    @(Read-Nav $win).Count -eq 1 -and $null -eq (Read-Ui $win $UiPanel.Page $UiId.ConfirmSource)
+                ) "page: $(Read-Ui $win $UiPanel.Page $UiId.InfoText); header: $((Read-Hero $win).Sub)"
+                $pic = Save-Shot $win '15-refused'
+                Test-Painted $pic $win 'a duplicate source refusal' @(@($UiPanel.Page, $UiId.InfoText), @($UiPanel.Page, $UiId.EditSource), @($UiPanel.Page, $UiId.CancelSource))
+                Test-Layout $win 'a duplicate source refusal'
             }
 
             # ---- a repository with no skills at its top: the preview says so and offers no way to add it
@@ -2157,7 +2187,11 @@ function Test-Ui {
                 Set-UiText $edit "https://github.com/$($c.Repo)"
                 [void](Wait-Maybe { $t = Read-Ui $ask $AskPanel $AskId.Hint; if ($t -match 'top of the repository') { $t } } 5)
                 Click-Ui $ask $AskPanel $AskId.Ok
-                $why = Wait-Maybe { $t = Read-Ui $win $UiPanel.Page $UiId.InfoText; if ($t -match 'No matching items were found') { $t } } 40
+                $why = Wait-Maybe {
+                    $t = Read-Ui $win $UiPanel.Page $UiId.InfoText
+                    if ($t -match '(?m)^Matched no skills\.\r?$' -and $t -clike '*No folders with a SKILL.md file were found. Check the source type and folder.*') { $t }
+                } 40
+                Check 'the next preview does not show the duplicate refusal' ((Read-Hero $win).Sub -notlike '*already set up*' -and $why -notlike '*already set up*') ((Read-Hero $win).Sub)
                 Note "the preview: $($why -replace '\s+', ' ')"
                 $offered = @($UiId.ConfirmSource, $UiId.RetrySource, $UiId.EditSource, $UiId.CancelSource | Where-Object { $null -ne (Read-Ui $win $UiPanel.Page $_) }) -join ','
                 $want = "$($UiId.RetrySource),$($UiId.EditSource),$($UiId.CancelSource)"
@@ -2377,6 +2411,187 @@ function Copy-AppTo($c, [string]$Dir) {
     foreach ($exe in 'tiny-skill-sync.exe', 'tss.exe') { [IO.File]::Copy('\\?\' + (Join-Path $c.Root "bin\$exe"), "\\?\$Dir\$exe") }
 }
 
+# ---------------------------------------------------------------- plugins
+
+function Test-Plugins {
+    $exe = Get-LiveCopilotExe
+    if (-not $exe) {
+        Log '  SKIP: GitHub Copilot CLI not found. Set TSS_COPILOT_CLI to the full path of copilot.exe.' 'Yellow'
+        $script:Skipped += 'plugins'
+        return
+    }
+    $c = New-Env 'plugins' -NoBranch -Repo 'AngelosP/tiny-skill-sync-fixtures-public'
+    $c.Ref = "e2e-$stamp-plugins"
+    $created = $false
+    try {
+        $isolated = @{
+            TSS_COPILOT_CLI = $exe
+            COPILOT_HOME = (Join-Path $c.Root 'copilot-home')
+            COPILOT_CACHE_HOME = (Join-Path $c.Root 'copilot-cache')
+            COPILOT_AUTO_UPDATE = 'false'; NO_COLOR = '1'
+            TSS_AGENTS_DIR = (Join-Path $c.Root 'agents')
+            TSS_INSTRUCTIONS_DIR = (Join-Path $c.Root 'instructions')
+            TSS_API_BASE = $null; TSS_RAW_BASE = $null
+        }
+        $child = New-LiveStartInfo $c.Root 'tss.exe' @() $isolated
+        Assert-LiveCopilotEnv $c.Root $child.EnvironmentVariables
+        foreach ($slot in 'COPILOT_HOME', 'COPILOT_CACHE_HOME', 'TSS_AGENTS_DIR', 'TSS_INSTRUCTIONS_DIR') {
+            New-Item -ItemType Directory -Path $isolated[$slot] | Out-Null
+        }
+        Check 'both Copilot directories are isolated before either app starts' $true
+        [void](Invoke-Gh @('api', 'user', '--jq', '.login'))
+        New-RunBranch $c.Repo 'main' $c.Ref
+        $created = $true
+        $market = 'tss-e2e-plugins'
+        $publisher = 'TSS Fixture'
+        $alpha = 'tss-alpha'
+        $beta = 'tss-beta'
+        $makeMarket = {
+            param([string[]]$names)
+            @{ name = $market; owner = @{ name = $publisher }; plugins = @($names | ForEach-Object {
+                @{ name = $_; source = "./e2e-pack/$_"; description = 'Inert test fixture' }
+            }) } | ConvertTo-Json -Depth 5 -Compress
+        }
+        $manifest = {
+            param($name, $version)
+            @{ name = $name; version = $version; author = @{ name = $publisher }; description = 'Inert test fixture' } | ConvertTo-Json -Compress
+        }
+        $changes = @(@{ Path = 'marketplace.json'; Text = (& $makeMarket @($alpha, $beta)) })
+        foreach ($name in $alpha, $beta) {
+            $changes += @{ Path = "e2e-pack/$name/.plugin/plugin.json"; Text = (& $manifest $name '1.0.0') }
+            $changes += @{ Path = "e2e-pack/$name/skills/$name/SKILL.md"; Text = "---`nname: $name`ndescription: Inert test fixture`n---`nFixture text only.`n" }
+        }
+        $pin = Push-Upstream $c.Repo $c.Ref $changes 'inert live plugin fixtures'
+        $url = Get-Address $c 'e2e-pack'
+        $add = @('add', '--type', 'plugins', $url, '--use-token', '--every', '6h')
+        $matchesPreview = { param($text) $text -match 'Matched\s+2\s+plugins:' -and $text -match "$alpha 1\.0\.0, by TSS Fixture" -and $text -match "$beta 1\.0\.0, by TSS Fixture" }
+        $emptyHomes = { (Get-Entries $isolated.COPILOT_HOME) -eq '' -and (Get-Entries $isolated.COPILOT_CACHE_HOME) -eq '' }
+        $preview = Tss $c ($add + '--preview') $isolated
+        Check 'tss preview shows both plugins and does not start Copilot or save settings' (
+            $preview.Code -eq 0 -and (& $matchesPreview $preview.Text) -and $preview.Text.Contains('Plugins can run programs on this PC.') -and
+            $null -eq (Get-Config $c) -and (& $emptyHomes))
+        if ($preview.Code -ne 0) { throw 'Cannot continue without a valid plugin preview.' }
+
+        # The picker reads anonymously. Wait for the public view once; subsequent reads use the token.
+        $core = (Invoke-RestMethod -UseBasicParsing -Uri 'https://api.github.com/rate_limit' -Headers @{'User-Agent' = 'tss-e2e'}).resources.core
+        if ($core.remaining -lt 6) { throw "GitHub anonymous rate limit: $($core.remaining) requests left; not retrying." }
+        [void](Wait-Live { (Get-PublicCommit $c.Repo $c.Ref) -eq $pin } 'the public plugin fixture commit' 65 6000)
+        $marketBlob = (Get-UpstreamFiles $c.Repo $pin)['marketplace.json'].Id
+        [void](Wait-Live { (Get-PublicFiles $c.Repo $c.Ref '')['marketplace.json'] -eq $marketBlob } 'the public plugin fixture listing' 65 6000)
+        [IO.File]::WriteAllText((Join-Path $c.Home 'startup-offer-seen'), "seen`n")
+        [void](Start-Tray $c $isolated)
+        $win = Open-Window $c.Tray
+        Click-Ui $win $UiPanel.Nav $UiId.NavAdd
+        $ask = Wait-Live { $d = Find-Ask $c.Tray; if ($d -ne [IntPtr]::Zero) { $d } } 'the Add source question' 10
+        Set-UiText (Get-Ui $ask $AskPanel $AskId.Edit) $url
+        $fourth = $AskId.Choice + 3
+        Check 'Plugins is the fourth choice in the Add source picker' ((Read-Ui $ask $AskPanel $fourth) -eq 'Plugins')
+        Click-Ui $ask $AskPanel $fourth
+        Click-Ui $ask $AskPanel $AskId.Ok
+        [void](Wait-Live { (Read-Ui $win $UiPanel.Page $UiId.ConfirmSource) -eq 'Add and check' -or (Read-Ui $win $UiPanel.Page $UiId.RetrySource) -eq 'Retry' } 'the tray plugin preview' 60)
+        $previewText = Read-Ui $win $UiPanel.Page $UiId.InfoText
+        Check 'the window previews both plugins without touching Copilot' (
+            (& $matchesPreview $previewText) -and $previewText -match 'GitHub Copilot CLI' -and (& $emptyHomes))
+        Test-Layout $win 'plugin preview'
+        $shot = Save-Shot $win 'plugins-preview'
+        Check 'saved the plugin preview screenshot' ($null -ne $shot) $shot.Path
+        Click-Ui $win $UiPanel.Page $UiId.CancelSource
+        Stop-LiveTray $c.Tray
+        $c.Tray = $null
+
+        $installed = {
+            (@(Get-LivePluginList $c.Root $isolated | Where-Object { $_.marketplace -eq $market -and $_.source -eq 'installed' } |
+                ForEach-Object { "$($_.name)@$($_.marketplace)=$($_.version)" } | Sort-Object) -join ',')
+        }
+        $a = "$alpha@$market=1.0.0"
+        $b = "$beta@$market=1.0.0"
+        $r = Tss $c $add $isolated -InputLine 'yes'
+        if ($r.Code -ne 0 -or $r.Text -notmatch "as '([^']+)'") { throw 'tss did not save the previewed plugin source.' }
+        $c.Id = $Matches[1]
+        $r = Tss $c @('sync', $c.Id) $isolated
+        $list = & $installed
+        Check 'add then sync installs both declared name@marketplace versions' ($r.Code -eq 0 -and $list -eq "$a,$b") $list
+        if ($r.Code -ne 0) { throw 'Cannot continue after an install failed.' }
+
+        [void](Push-Upstream $c.Repo $c.Ref @(@{ Path = "e2e-pack/$beta/.plugin/plugin.json"; Text = (& $manifest $beta '2.0.0') }) 'bump plugin version')
+        $r = Tss $c @('sync', $c.Id) $isolated
+        $b = "$beta@$market=2.0.0"
+        $list = & $installed
+        Check 'sync installs a new version and leaves the other plugin alone' ($r.Code -eq 0 -and $list -eq "$a,$b") $list
+
+        [void](Push-Upstream $c.Repo $c.Ref @(
+            @{ Path = 'marketplace.json'; Text = (& $makeMarket @($beta)) }
+            @{ DeleteFolder = "e2e-pack/$alpha" }
+        ) 'drop one plugin from the marketplace')
+        $r = Tss $c @('sync', $c.Id) $isolated
+        $list = & $installed
+        $gone = 'GitHub no longer lists this plugin. Uninstall removes it from Copilot; Forget stops tracking it and leaves it installed.'
+        Check 'an upstream removal needs attention, explains the choices and does not uninstall the plugin' (
+            $r.Code -eq 1 -and $r.Text.Contains("${alpha}: Removed from GitHub. $gone") -and $list -eq "$a,$b") $list
+
+        [void](Start-Tray $c $isolated)
+        $win = Open-Window $c.Tray
+        [void](Open-Repo $win)
+        [void](Wait-Live { @(Read-Skills $win | Where-Object { $_.Tag -eq 'Removed from GitHub' }).Count -eq 1 } 'the plugin rows in the tray' 90)
+        $rows = @(Read-Skills $win)
+        Check 'tray plugin rows show the version, publisher, and explain the removal choices' (
+            $rows.Count -eq 2 -and $rows[0].Name -eq $alpha -and $rows[0].Facts -match '1.0.0.*TSS Fixture' -and $rows[0].Detail -eq $gone -and
+            ($rows[0].Buttons.Text -join ',') -eq 'Uninstall,Forget' -and $rows[1].Name -eq $beta -and $rows[1].Facts -match '2.0.0.*TSS Fixture')
+        Test-Layout $win 'plugin rows'
+        $shot = Save-Shot $win 'plugins-rows'
+        Check 'saved the plugin rows screenshot' ($null -ne $shot) $shot.Path
+
+        $uninstall = ($rows[0].Buttons | Where-Object { $_.Text -eq 'Uninstall' }).Id
+        $askUninstall = {
+            Click-Ui $win $UiPanel.Page $uninstall
+            Wait-Live { $d = Find-Ask $c.Tray; if ($d -ne [IntPtr]::Zero) { $d } } 'the Uninstall question' 10
+        }
+        $resolved = Get-MarkCount $c.Report 'job-resolve'
+        $ask = & $askUninstall
+        Check 'the tray asks before uninstalling a plugin' (
+            (Read-Ui $ask $AskPanel $AskId.Heading) -eq "Uninstall $alpha from Copilot?" -and
+            (Read-Ui $ask $AskPanel $AskId.Text) -eq 'GitHub no longer lists it, so this source cannot install it again.' -and
+            (Read-Ui $ask $AskPanel $AskId.Ok) -eq 'Uninstall' -and (Read-Ui $ask $AskPanel $AskId.Cancel) -eq 'Cancel')
+        $shot = Save-Shot $ask 'plugins-uninstall-asks'
+        Check 'saved the plugin uninstall question screenshot' ($null -ne $shot) $shot.Path
+        Click-Ui $ask $AskPanel $AskId.Cancel
+        [void](Wait-Live { (Find-Ask $c.Tray) -eq [IntPtr]::Zero } 'the Uninstall question to close' 5)
+        $list = & $installed
+        Check 'Cancel leaves both plugins installed and starts no resolve job' ($list -eq "$a,$b" -and (Get-MarkCount $c.Report 'job-resolve') -eq $resolved) $list
+
+        $ask = & $askUninstall
+        Click-Ui $ask $AskPanel $AskId.Ok
+        [void](Wait-Live { (Get-MarkCount $c.Report 'job-resolve') -gt $resolved } 'the tray to finish uninstalling' 240)
+        $feedback = Wait-Maybe { if ((Read-Hero $win).Sub -eq "${alpha}: Uninstalled.") { $true } } 5
+        $list = & $installed
+        Check 'confirming uninstalls only the plugin gone from GitHub and names it in the feedback' ($list -eq $b -and $null -ne $feedback) $list
+        Stop-LiveTray $c.Tray
+        $c.Tray = $null
+        $r = Tss $c @('remove', $c.Id) $isolated
+        $list = & $installed
+        Check 'plain remove says plugins stay in Copilot and leaves the other plugin installed' (
+            $r.Code -eq 0 -and $r.Text.Contains('Plugins stay installed in Copilot.') -and $list -eq $b -and @((Get-Config $c).repos).Count -eq 0) $list
+
+        $r = Tss $c $add $isolated -InputLine 'yes'
+        if ($r.Code -ne 0 -or $r.Text -notmatch "as '([^']+)'") { throw 'tss could not add the source again.' }
+        $c.Id = $Matches[1]
+        $r = Tss $c @('sync', $c.Id) $isolated
+        if ($r.Code -ne 0) { throw 'Could not track the remaining plugin again.' }
+        $r = Tss $c @('remove', $c.Id, '--uninstall-plugins') $isolated
+        Check 'explicit remove verifies uninstall and then drops the source' (
+            $r.Code -eq 0 -and $r.Text.Contains('Uninstalled 1 plugin') -and (& $installed) -eq '' -and @((Get-Config $c).repos).Count -eq 0)
+    } finally {
+        try { Close-Env $c } finally {
+            if ($created) {
+                try {
+                    Remove-RunBranch $c.Repo $c.Ref
+                    Check 'deleted the disposable fixture branch' $true
+                } catch { Check 'deleted the disposable fixture branch' $false "Could not delete $($c.Ref)." }
+            }
+        }
+    }
+}
+
 # ---- more scenarios go above this line
 
 # ---------------------------------------------------------------- run
@@ -2386,6 +2601,7 @@ $scenarios = [ordered]@{
     'places'       = 'Test-Places'
     'portable'     = 'Test-Portable'
     'mixed'        = 'Test-Mixed'
+    'plugins'      = 'Test-Plugins'
     'changes'      = 'Test-Changes'
     'local-edit'   = 'Test-LocalEdit'
     'converged'    = 'Test-Converged'
@@ -2405,7 +2621,7 @@ $scenarios = [ordered]@{
 $names = if ($Only.Count) { @($Only | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim() } | Where-Object { $_ }) } else { @($scenarios.Keys) }
 foreach ($name in $names) { if (-not $scenarios.Contains($name)) { throw "Unknown scenario '$name'. The scenarios are: $($scenarios.Keys -join ', ')" } }
 if (-not $SkipBuild) { & "$PSScriptRoot\build.ps1" | Out-Host }
-if (@($names | Where-Object { $_ -ne 'portable' }).Count -gt 0) { [void](Invoke-Gh @('api', 'user', '--jq', '.login')) }
+if (@($names | Where-Object { $_ -notin 'portable', 'plugins' }).Count -gt 0) { [void](Invoke-Gh @('api', 'user', '--jq', '.login')) }
 
 Log "e2e ${stamp}: $($names -join ', ')" 'Cyan'
 foreach ($name in $names) {
@@ -2417,6 +2633,7 @@ foreach ($name in $names) {
 
 Log ''
 Log '== Summary' 'Cyan'
+foreach ($skip in $script:Skipped) { Log ('  {0,-14} SKIP (no checks run)' -f $skip) 'Yellow' }
 $failed = @($script:Results | Where-Object { -not $_.Pass })
 foreach ($group in ($script:Results | Group-Object Scenario)) {
     $bad = @($group.Group | Where-Object { -not $_.Pass }).Count

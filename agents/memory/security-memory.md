@@ -27,12 +27,45 @@
 - `--restarted` and `--restarted-open` give a caller no privilege: they wait at most 120 s for the single-instance
   mutex, set a status line, and reopen the window (a caller can already post `CMD_SETTINGS`).
 - PowerShell 5.1 has no `[Text.Encoding]::Latin1`; use `GetEncoding(28591)` for byte searches.
+- Copilot plugins (issue #7 F, reviewed 2026-11-20, uncommitted tree on 893cebe), `src\win\copilot.rs`:
+  - `launch` → `proc::capture`: job via `PROC_THREAD_ATTRIBUTE_JOB_LIST` with KILL_ON_JOB_CLOSE, a 3-handle
+    inherit list, 64 KiB per stream, and 30/180/60 s timeouts with cancel.
+  - `proc::create` passes `lpCurrentDirectory = null`, so the Copilot child inherits the caller's current folder.
+  - Its environment is inherited plus `NO_COLOR=1`. The app sets no token environment variable (`src` has no
+    `set_var`).
+  - `find_exe` order: `TSS_COPILOT_CLI` (an absolute `.exe`, no fallback), then
+    `%LOCALAPPDATA%\GitHubCopilotCLI\copilot.exe`, then absolute PATH entries that pass `check_root` and do not
+    name the current folder.
+  - `isolated` runs only when a `TSS_HOME`/`TSS_SKILLS_DIR`/`TSS_TEST_ROOT`/`TSS_AGENTS_DIR`/`TSS_INSTRUCTIONS_DIR`
+    variable is set. It compares names only against the environment's `USERPROFILE\.copilot` and
+    `LOCALAPPDATA\copilot`.
+  - It misses UNC admin shares, 8.3 names, junctions and a redirected `USERPROFILE`. The e2e `Assert-LiveCopilotEnv`
+    adds an inside-scenario check and a reparse-point check.
+  - `first_error` masks only `ghp_`/`gho_`/`ghu_`/`ghs_`/`ghr_`/`github_pat_` lines. state.json stores no error text,
+    but stores self-declared publisher and version strings with no length bound.
+- Plugin names: `normal_name` is `[a-z0-9]` runs joined by single `-`, at most 64 bytes.
+  - `change()` re-checks both halves of `name@market`.
+  - `add_market` requires a `RepoSpec` round trip and `check_branch`, and refuses `#` and `HEAD`.
+  - `proc::command_line` refuses `"`. Branches may still contain `& | < > % ! ( ) ; $` and the backtick.
+- Origin proof `NativeMarket::confirms` requires all of: a non-default market, the exact name, a listing that
+  shows `GitHub: repo`, and settings.json `extraKnownMarketplaces.<name>.source` {github, repo, `ref` == branch}.
+  Unknown origin fields are ignored.
+- Plugin preview: `printable` escapes control and bidi characters but not zero-width/format characters. The
+  publisher shown is self-declared: `author.name`, else the marketplace `owner.name`.
+- Plugin tests use `FakePluginManager` (`World::plugin_engine`, the cli `TestHost`). `scripts\test.ps1` sets
+  `TSS_TEST_ROOT`, so a real-manager launch in tests is refused unless COPILOT_HOME and COPILOT_CACHE_HOME are set.
 
 ## Baselines
 
 - 2026-11-20 relaunch review: `cargo test --lib only_a_tray_proven` and `cargo test --lib restarted` pass (debug);
   `cargo build --release --bins` was up to date. No scanner is in the profile; none was run. The e2e, soak and
   `relaunch-smoke.ps1` were not run by security. Source inspection is not scanner coverage.
+- 2026-11-20 plugins review (issue #7 F): each of these exited 0.
+  - `scripts\dev.ps1 test -Quick -Filter plugin`: lib 23, app 1, cli 4, engine_plugins 16 passed.
+  - `-Filter isolat`: 4 passed.
+  - `-Filter proc`: 12 passed, including the grandchild kill test.
+  - The `win::copilot` lookup and `first_error` tests match neither filter (use `-Filter copilot`).
+  - No live e2e, real Copilot CLI run or advisory scan.
 
 ## Open proposals
 

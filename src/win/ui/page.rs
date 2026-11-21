@@ -13,7 +13,7 @@ use super::control::{Deco, Item, Kind, Look, Mark, RowCmd, Surface, two_lines};
 use super::paint::{Font, Rect, Tone, glyph};
 use super::sentence;
 use super::theme::Role;
-use crate::app::{DraftStage, SourceDraft};
+use crate::app::{DraftStage, SourceDraft, duplicate_source_message};
 use crate::autostart::{Startup, Via};
 use crate::board::{self, Action, Board, Level, RepoView, Row, ago, repo_name};
 use crate::config::{RepoConfig, RepoSpec, UpdateInterval, UpdatePrefs, UpdateTiming};
@@ -330,7 +330,7 @@ pub fn hero_of(views: &[RepoView], problem: Option<&str>, status: &str, news: bo
         return hero(Tone::Err, glyph::ERR, "Tiny Skill Sync has a problem".to_string(), calm(&sentence(&printable(problem))));
     }
     if views.is_empty() {
-        return hero(Tone::Off, glyph::INFO, "Add a source to start".to_string(), calm("Preview skills, agents or instructions from a GitHub repository."));
+        return hero(Tone::Off, glyph::INFO, "Add a source to start".to_string(), calm("Preview skills, agents, instructions or plugins from GitHub."));
     }
     if on.is_empty() {
         return hero(Tone::Off, glyph::PAUSE, "Every repository is paused".to_string(), calm("Turn on Keep in sync for one to check it again."));
@@ -453,7 +453,7 @@ fn nav_text_width(label: &str, sub: &str, fit: Fit) -> i32 {
 /// The page when no repository is set up yet.
 pub fn welcome(w: i32, fit: Fit) -> Surface {
     let mut o = Out::new(fit);
-    let y = o.head(w, "Add your first source", "Choose skills, agents or instructions and preview what matches before adding anything.");
+    let y = o.head(w, "Add your first source", "Choose skills, agents, instructions or plugins and preview what matches.");
     let bottom = o.flow(PAD_X, y, w - PAD_X, 32, vec![btn(id::WELCOME_ADD, "Add source", Kind::Accent, Some(glyph::ADD))]);
     o.done(bottom + 16)
 }
@@ -476,45 +476,53 @@ pub fn repo_sub(repo: &RepoConfig, view: &RepoView, now: UnixSecs) -> String {
     }
 }
 
-/// Type and folder together identify a source; typing here validates the URL, not a kind not yet chosen.
-pub fn spec_hint(text: &str) -> Result<String, String> {
-    let spec = RepoSpec::parse(text).map_err(|e| sentence(&printable(&e)))?;
+/// What the typed address means, or why the selected source type cannot use it.
+pub fn spec_hint(text: &str, kind: SourceKind) -> Result<String, String> {
+    let spec = RepoSpec::parse_for_kind(text, kind).map_err(|e| sentence(&printable(&e)))?;
     let full = spec.full_name();
     let folder = if spec.path.is_empty() { "the top of the repository".to_string() } else { format!("the {} folder", printable(&spec.path)) };
     let branch = if spec.branch.is_empty() { "the default branch".to_string() } else { printable(&spec.branch).into_owned() };
     Ok(format!("{} · {folder} on {branch}", printable(&full)))
 }
 
-pub const SOURCE_TYPES: &[SourceKind] = &[SourceKind::Skills, SourceKind::Agents, SourceKind::Instructions];
+pub const SOURCE_TYPES: &[SourceKind] = &[SourceKind::Skills, SourceKind::Agents, SourceKind::Instructions, SourceKind::Plugins];
 
 pub fn source_preview(draft: &SourceDraft, w: i32, fit: Fit) -> Surface {
     let mut o = Out::new(fit);
     let source = &draft.input.source;
-    let sub = format!(
-        "{}: {} [{}]\nSource folder: {}",
-        source.kind.heading(),
-        printable(&source.label()),
-        printable(&source.id),
-        printable(board::source_folder(source))
-    );
+    let duplicate = matches!(draft.stage, DraftStage::AlreadySetUp);
+    let sub = if duplicate {
+        String::new()
+    } else {
+        format!(
+            "{}: {} [{}]\nSource folder: {}",
+            source.kind.heading(),
+            printable(&source.label()),
+            printable(&source.id),
+            printable(board::source_folder(source))
+        )
+    };
     let mut y = o.head(w, "Add source", &sub);
     let (body, can_save) = match &draft.stage {
         DraftStage::Loading => ("Reading the source. Nothing has been saved or installed.".into(), false),
+        DraftStage::AlreadySetUp => (printable(&duplicate_source_message(source)).into_owned(), false),
         DraftStage::Failed(why) => (printable(why).into_owned(), false),
         DraftStage::Saving => ("Checking the preview again and saving the source…".into(), false),
         DraftStage::Reviewed(preview) => {
             let blocker = preview.blocker(source);
             let note = blocker.unwrap_or("Nothing has been installed. Add this source to save it and start its first check.");
-            (format!("{}\n\n{note}", preview.description()), blocker.is_none())
+            (format!("{}\n\n{note}", preview.description(source)), blocker.is_none())
         }
     };
     let cw = w - 2 * PAD_X;
-    y += o.para(id::INFO_TEXT, [PAD_X, y, cw], wrap_report(body, cw, fit), Font::Body, Role::Text) + GAP;
+    y += o.para(id::INFO_TEXT, [PAD_X, y, cw], wrap_report(body, cw, Font::Body, fit), Font::Body, Role::Text) + GAP;
     let mut buttons = Vec::new();
     if can_save {
         buttons.push(btn(id::CONFIRM_SOURCE, "Add and check", Kind::Accent, None));
-    } else if matches!(draft.stage, DraftStage::Reviewed(_) | DraftStage::Failed(_)) {
-        buttons.push(btn(id::RETRY_SOURCE, "Retry", Kind::Accent, None));
+    } else if matches!(draft.stage, DraftStage::Reviewed(_) | DraftStage::Failed(_) | DraftStage::AlreadySetUp) {
+        if !duplicate {
+            buttons.push(btn(id::RETRY_SOURCE, "Retry", Kind::Accent, None));
+        }
         buttons.push(btn(id::EDIT_SOURCE, "Edit", Kind::Standard, None));
     }
     if !matches!(draft.stage, DraftStage::Saving) {
@@ -558,9 +566,9 @@ pub fn pill_of(row: &Row) -> (Tone, Option<char>) {
     }
 }
 
-/// Only a sync problem with a repair choice has a card. Inspection and undoing "keep mine" don't need one.
+/// Plugin choices such as Reinstall are available even when the row only reports what the user did.
 pub fn expandable(row: &Row) -> bool {
-    row.level >= Level::Attention && row.actions.iter().any(|a| *a != Action::ManageAgain)
+    (row.plugin.is_some() || row.level >= Level::Attention) && row.actions.iter().any(|a| *a != Action::ManageAgain)
 }
 
 pub fn is_open(row: &Row, toggled: &HashSet<String>) -> bool {
@@ -569,6 +577,9 @@ pub fn is_open(row: &Row, toggled: &HashSet<String>) -> bool {
 
 /// Commands shared by the inline icons and the row's menu, in display order.
 pub fn row_commands(row: &Row, kind: SourceKind, linkable: bool) -> Vec<RowCmd> {
+    if kind == SourceKind::Plugins {
+        return if row.listed && linkable { vec![RowCmd::CopyLink, RowCmd::OnGitHub] } else { Vec::new() };
+    }
     let mut commands = Vec::new();
     if row.has_folder() {
         if kind == SourceKind::Skills {
@@ -641,7 +652,8 @@ pub fn repo_page(p: &RepoPage, w: i32, fit: Fit) -> Surface {
 fn infobar(o: &mut Out, view: &RepoView, detail: &str, x: i32, y: i32, cw: i32) -> i32 {
     let error = view.level == Level::Error;
     let (tone, mark, lead) = if error {
-        (Tone::Err, glyph::ERROR_BADGE, "Can’t read this repository.".to_string())
+        let lead = if view.kind == SourceKind::Plugins { "Could not check this plugin source." } else { "Can’t read this repository." };
+        (Tone::Err, glyph::ERROR_BADGE, lead.to_string())
     } else {
         (Tone::Warn, glyph::WARN, format!("{}.", view.status))
     };
@@ -725,12 +737,23 @@ fn skills(o: &mut Out, p: &RepoPage, x: i32, mut y: i32, cw: i32) -> i32 {
         let (tone, pill) = pill_of(row);
         let open = is_open(row, p.toggled);
         let look = Look::Row { tone, glyph: pill, commands: row_commands(row, p.repo.kind, linkable), disclosure: expandable(row).then_some(open) };
-        let facts = row.facts.as_ref().map(|f| printable(&board::facts_text(f, p.now)).into_owned()).unwrap_or_default();
+        let facts = match &row.plugin {
+            Some(plugin) => printable(&plugin.facts()).into_owned(),
+            None => row.facts.as_ref().map(|f| printable(&board::facts_text(f, p.now)).into_owned()).unwrap_or_default(),
+        };
         let explanation = if !row.plain() || row.facts.is_none() { printable_lines(&row.text) } else { "".into() };
         let text = format!("{}\n{}\n{facts}\n{explanation}", printable(&row.name), row.tag);
         o.item(base, [x + 1, y, cw - 2, ROW_H], text, look, true);
         y += ROW_H;
         let (tx, tw) = (x + 44, cw - 44 - 16);
+        if row.plugin.is_some() {
+            let mut details = facts;
+            if row.tag != row.text {
+                details.push('\n');
+                details.push_str(&explanation);
+            }
+            y += o.para(base + 8, [tx, y, tw], wrap_report(details, tw, Font::Caption, o.fit), Font::Caption, Role::Text2) + 6;
+        }
         if open {
             y = skill_card(o, row, base, [tx, y, tw]) + 6;
         }
@@ -914,7 +937,7 @@ fn app_updates(o: &mut Out, p: &SettingsPage, x: i32, mut y: i32, cw: i32) -> i3
 fn app_report(o: &mut Out, p: &SettingsPage, x: i32, top: i32, cw: i32) -> i32 {
     let (mark, tx, width) = (o.s.decos.len(), x + 16, (cw - 32).max(1));
     let status = format!("Running tray build: {}.\n{}", p.running_version, printable_lines(p.app_update_status));
-    let status = wrap_report(status, width, o.fit);
+    let status = wrap_report(status, width, Font::Caption, o.fit);
     let mut y = top + 12;
     y += o.para(id::APP_STATUS, [tx, y, width], status, Font::Caption, Role::Text) + 8;
     let help = "The last result describes a past check or install. An offered release may differ from the version on disk. Only a pending update is ready to install on Quit.";
@@ -927,16 +950,16 @@ fn app_report(o: &mut Out, p: &SettingsPage, x: i32, top: i32, cw: i32) -> i32 {
 
 /// DrawText with word wrapping can ask for more width than the card if, for example, an error names a long path.
 /// Only break such words; keep the worker's line breaks and every character of its message.
-fn wrap_report(text: String, width: i32, fit: Fit) -> String {
-    if fit(&text, Font::Caption, width).0 <= width {
+fn wrap_report(text: String, width: i32, font: Font, fit: Fit) -> String {
+    if fit(&text, font, width).0 <= width {
         return text;
     }
-    fn push_word(out: &mut String, word: &str, width: i32, fit: Fit) {
+    fn push_word(out: &mut String, word: &str, width: i32, font: Font, fit: Fit) {
         match word.char_indices().nth(word.chars().count() / 2) {
-            Some((cut, _)) if cut > 0 && fit(word, Font::Caption, 0).0 > width => {
-                push_word(out, &word[..cut], width, fit);
+            Some((cut, _)) if cut > 0 && fit(word, font, 0).0 > width => {
+                push_word(out, &word[..cut], width, font, fit);
                 out.push('\n');
-                push_word(out, &word[cut..], width, fit);
+                push_word(out, &word[cut..], width, font, fit);
             }
             _ => out.push_str(word),
         }
@@ -944,7 +967,7 @@ fn wrap_report(text: String, width: i32, fit: Fit) -> String {
     let mut out = String::with_capacity(text.len());
     for part in text.split_inclusive(char::is_whitespace) {
         let word = part.trim_end_matches(char::is_whitespace);
-        push_word(&mut out, word, width, fit);
+        push_word(&mut out, word, width, font, fit);
         out.push_str(&part[word.len()..]);
     }
     out
@@ -1443,7 +1466,7 @@ pub fn ask(q: &Question, fit: Fit) -> (Surface, Option<Rect>) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use crate::config::DEFAULT_INTERVAL;
     use crate::diff::{Content, compare, text_diff, whole};
@@ -1453,14 +1476,14 @@ mod tests {
     const NOW: UnixSecs = 1_700_000_000;
 
     /// 7 DIPs a character, wrapped by characters.
-    fn fit(text: &str, font: Font, width: i32) -> (i32, i32) {
+    pub(in crate::win::ui) fn fit(text: &str, font: Font, width: i32) -> (i32, i32) {
         let w = text.chars().count() as i32 * 7;
         let lh = line_height(font);
         if width <= 0 { (w, lh) } else { (w.min(width), ((w + width - 1) / width).max(1) * lh) }
     }
 
     fn row(name: &str, level: Level, tag: &'static str, actions: Vec<Action>) -> Row {
-        Row { name: name.to_string(), text: format!("about {name}"), tag, level, actions, facts: None, listed: true, folder_missing: false }
+        Row { name: name.to_string(), text: format!("about {name}"), tag, level, actions, facts: None, listed: true, folder_missing: false, plugin: None }
     }
 
     fn ok(name: &str) -> Row {
@@ -1730,6 +1753,66 @@ mod tests {
         assert!(!s.items.iter().any(|i| i.id == id::SKILL + 2), "closed by the user");
         assert!(item(&s, id::SKILL).text.ends_with("about rlo-\\u{202e}gpj"));
         assert!(!is_open(&v.skills[1], &toggled), "a stale toggle cannot open a healthy skill");
+    }
+
+    #[test]
+    fn plugin_rows_show_facts_and_choices_but_no_file_commands() {
+        use RowCmd::{CopyLink, OnGitHub};
+        let r = RepoConfig { kind: SourceKind::Plugins, branch: "main".into(), path: "pack".into(), ..repo("o/a") };
+        let details = board::PluginDetails { version: Some("1.2.3".into()), publisher: Some("Review Team".into()), path: Some("pack/plugin-folder".into()) };
+        let explanation =
+            "Needs your approval. Plugins can run programs on this PC. Approve installs it now and its new versions from this branch automatically.";
+        let plugin =
+            Row { text: explanation.into(), plugin: Some(details), ..row("alpha", Level::Attention, "Needs your approval", vec![Action::ApprovePlugin]) };
+        let v = RepoView {
+            kind: r.kind,
+            ..view(
+                "o/a",
+                vec![
+                    plugin,
+                    Row {
+                        plugin: Some(board::PluginDetails::default()),
+                        listed: false,
+                        ..row("beta", Level::Attention, "Removed from GitHub", vec![Action::UninstallPlugin, Action::ForgetPlugin])
+                    },
+                ],
+            )
+        };
+        for w in [360, 700] {
+            let s = repo_page(&RepoPage { repo: &r, view: &v, default: DEFAULT_INTERVAL, now: NOW, toggled: &HashSet::new() }, w, &fit);
+            let a = skill_id(0, 0);
+            let b = skill_id(1, 0);
+            assert!(matches!(&item(&s, a).look, Look::Row { commands, .. } if commands == &[CopyLink, OnGitHub]));
+            assert!(matches!(&item(&s, b).look, Look::Row { commands, .. } if commands.is_empty()));
+            assert!(item(&s, a + 8).text.contains("Version: 1.2.3. Publisher: Review Team."));
+            assert!(item(&s, a).text.ends_with(explanation));
+            assert_eq!(item(&s, a + 8).text.matches("Plugins can run programs").count(), 1);
+            assert_eq!(item(&s, a + 4).text, "Approve");
+            assert_eq!(item(&s, b + 4).text, "Uninstall");
+            assert_eq!(item(&s, b + 5).text, "Forget");
+            assert!(s.items.iter().all(|item| item.id != a + 2 && item.id != a + 9));
+            fits_in(&s, w);
+        }
+        assert_eq!(crate::github::web_url(&r, Some("pack/plugin-folder")).as_deref(), Some("https://github.com/o/a/tree/main/pack/plugin-folder"));
+    }
+
+    #[test]
+    fn plugin_choice_failure_is_shown_in_the_repo_infobar() {
+        let r = RepoConfig { kind: SourceKind::Plugins, ..repo("o/a") };
+        let v = RepoView { kind: r.kind, ..unreadable("o/a") };
+        let s = repo_page(&RepoPage { repo: &r, view: &v, default: DEFAULT_INTERVAL, now: NOW, toggled: &HashSet::new() }, 600, &fit);
+        assert_eq!(item(&s, id::INFO_LEAD).text, "Could not check this plugin source.");
+        assert_eq!(item(&s, id::INFO_TEXT).text, v.detail.unwrap());
+        assert_eq!(item(&s, id::RETRY).text, "Try again");
+    }
+
+    #[test]
+    fn plugin_reinstall_is_visible_on_an_informational_row() {
+        let r = RepoConfig { kind: SourceKind::Plugins, ..repo("o/a") };
+        let missing = Row { plugin: Some(board::PluginDetails::default()), ..row("alpha", Level::Ok, "Removed in Copilot", vec![Action::ReinstallPlugin]) };
+        let v = RepoView { kind: r.kind, ..view("o/a", vec![missing]) };
+        let s = repo_page(&RepoPage { repo: &r, view: &v, default: DEFAULT_INTERVAL, now: NOW, toggled: &HashSet::new() }, 360, &fit);
+        assert_eq!(item(&s, skill_id(0, 4)).text, "Reinstall");
     }
 
     #[test]
@@ -2217,9 +2300,47 @@ mod tests {
 
     #[test]
     fn add_says_how_it_reads_the_source_folder() {
-        assert_eq!(spec_hint(" owner/other "), Ok("owner/other · the top of the repository on the default branch".to_string()));
-        assert_eq!(spec_hint("https://github.com/o/r/tree/dev/x"), Ok("o/r · the x folder on dev".to_string()));
-        assert_eq!(spec_hint(""), Err("Enter a repository like owner/name".to_string()));
+        assert_eq!(spec_hint(" owner/other ", SourceKind::Skills), Ok("owner/other · the top of the repository on the default branch".to_string()));
+        assert_eq!(spec_hint("https://github.com/o/r/tree/dev/x", SourceKind::Skills), Ok("o/r · the x folder on dev".to_string()));
+        assert_eq!(spec_hint("", SourceKind::Skills), Err("Enter a repository like owner/name".to_string()));
+    }
+
+    #[test]
+    fn add_source_duplicate_refusal_wraps_and_is_replaced_by_the_next_preview() {
+        use crate::app::App;
+        use crate::config::Config;
+
+        let id = format!("saved-{}", "w".repeat(120));
+        let source = RepoConfig { id: id.clone(), ..repo("Team/Tools") };
+        let mut app = App::new(Config { repos: vec![source], ..Config::default() }, "not used".into());
+        let queued = app.queued().len();
+        let spec = RepoSpec::parse("https://github.com/team/tools/tree/main/skills").unwrap();
+        let refused = app.preview_source(&spec, SourceKind::Skills, None).expect("the refusal belongs on the Add source page");
+        assert_eq!(app.queued().len(), queued, "a duplicate needs no worker job");
+        assert!(app.confirm_source(refused).is_err());
+
+        // Like DrawText, report a too-wide word even when asked to wrap the paragraph.
+        let measure = |text: &str, font, width| {
+            let (w, h) = fit(text, font, width);
+            let longest = if width > 0 { text.split_whitespace().map(|word| fit(word, font, 0).0).max().unwrap_or(0) } else { w };
+            (w.max(longest), h)
+        };
+        let width = 980 - NAV_W;
+        let refusal = source_preview(app.draft().unwrap(), width, &measure);
+        let body = item(&refusal, id::INFO_TEXT);
+        assert_eq!(body.look, Look::Text { font: Font::Body, ink: Role::Text, flags: WRAP });
+        assert_eq!(body.text.replace('\n', ""), format!("This source is already set up. Its ID is '{id}'."));
+        assert!(measure(&body.text, Font::Body, body.at[2]).0 <= body.at[2], "the whole ID must fit");
+        assert_eq!(item(&refusal, id::EDIT_SOURCE).text, "Edit");
+        assert_eq!(item(&refusal, id::CANCEL_SOURCE).text, "Cancel");
+        assert!(!refusal.items.iter().any(|i| i.id == id::CONFIRM_SOURCE));
+        assert!(refusal.height <= 680 - HERO_H);
+        fits_in(&refusal, width);
+
+        let different = RepoSpec::parse("team/other").unwrap();
+        app.preview_source(&different, SourceKind::Skills, None).unwrap();
+        let next = source_preview(app.draft().unwrap(), width, &measure);
+        assert!(next.items.iter().all(|i| !i.text.contains("already set up") && !i.text.contains(&id)));
     }
 
     #[test]
@@ -2229,6 +2350,7 @@ mod tests {
         let source = RepoConfig { repo: "team/tools".into(), path: "rules".into(), kind: SourceKind::Instructions, id: "rules".into(), ..Default::default() };
         let input = std::sync::Arc::new(DraftInput { source, ticket: 1 });
         let preview = SourcePreview {
+            plugins: None,
             kind: SourceKind::Instructions,
             names: vec!["style.instructions.md".into()],
             errors: vec![],
@@ -2258,7 +2380,7 @@ mod tests {
         use crate::source::{PreviewDestination, SourcePreview};
         let source = RepoConfig { kind: SourceKind::Agents, ..Default::default() };
         for errors in [vec![], vec!["unsafe file".into()]] {
-            let preview = SourcePreview { kind: source.kind, names: vec![], destination: PreviewDestination::NotChecked, errors };
+            let preview = SourcePreview { kind: source.kind, names: vec![], destination: PreviewDestination::NotChecked, errors, plugins: None };
             let draft =
                 SourceDraft { input: std::sync::Arc::new(DraftInput { source: source.clone(), ticket: 1 }), stage: DraftStage::Reviewed(preview.into()) };
             let surface = source_preview(&draft, 360, &fit);

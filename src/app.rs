@@ -19,13 +19,14 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
-use crate::board::{Board, Health, Level, capitalized};
+use crate::board::{Board, Health, Level, Row, capitalized, recorded_plugin_rows};
 use crate::config::{Config, Paths, RepoConfig, RepoSpec};
 use crate::engine::{
-    Access, DiffReport, Engine, EngineError, Outcome, RemoveReport, Resolution, ResolveReport, SkillFacts, Stamp, StartupReport, SyncOptions, SyncReport,
-    VerifyReport, Which,
+    Access, DiffReport, Engine, EngineError, Outcome, RemoveReport, RepoReport, Resolution, ResolveReport, SkillFacts, Stamp, StartupReport, SyncOptions,
+    SyncReport, VerifyReport, Which, assign_fresh_id,
 };
 use crate::interval::{Interval, UnixSecs};
+use crate::plugins::Choice;
 use crate::replacement::VerifiedTray;
 use crate::source::{SourceKind, SourcePreview};
 use crate::update_clock::ClockState;
@@ -71,6 +72,10 @@ pub enum Job {
         skill: String,
         how: Resolution,
     },
+    ResolvePlugin {
+        repo: String,
+        choice: Choice,
+    },
     /// Upstream lists no skills at all, and the user confirmed that the ones gone from it are deleted.
     DeleteGone(String),
     /// Stop managing a repository's skills before it leaves the settings, deleting the unedited ones if asked.
@@ -107,18 +112,25 @@ pub struct SourceDraft {
 pub enum DraftStage {
     Loading,
     Reviewed(Arc<SourcePreview>),
+    AlreadySetUp,
     Failed(String),
     Saving,
 }
 
-pub(crate) fn existing_source<'a>(cfg: &'a Config, spec: &RepoSpec, kind: SourceKind) -> Option<&'a RepoConfig> {
-    let repo = spec.full_name();
-    cfg.repos.iter().find(|r| r.kind == kind && r.repo.eq_ignore_ascii_case(&repo) && r.branch == spec.branch && r.path == spec.path)
+pub(crate) fn duplicate_source_message(source: &RepoConfig) -> String {
+    format!("This source is already set up. Its ID is '{}'.", source.id)
 }
 
-pub(crate) fn new_source(cfg: &Config, spec: &RepoSpec, kind: SourceKind, every: Option<Interval>, use_token: bool) -> Result<RepoConfig, String> {
-    if let Some(old) = existing_source(cfg, spec, kind) {
-        return Err(format!("{} is already set up, as '{}'", old.label(), old.id));
+pub(crate) fn new_source<'a>(
+    cfg: &'a Config,
+    spec: &RepoSpec,
+    kind: SourceKind,
+    every: Option<Interval>,
+    use_token: bool,
+) -> Result<RepoConfig, &'a RepoConfig> {
+    let repo = spec.full_name();
+    if let Some(old) = cfg.repos.iter().find(|r| r.kind == kind && r.repo.eq_ignore_ascii_case(&repo) && r.branch == spec.branch && r.path == spec.path) {
+        return Err(old);
     }
     Ok(cfg.clone().add_source(kind, spec, every, use_token).clone())
 }
@@ -135,11 +147,20 @@ pub(crate) fn recheck_preview(
     if let Some(why) = reviewed.blocker(source) {
         return Err(EngineError::Failed(why.into()));
     }
+    engine.check_fresh_id(&source.id)?;
     if engine.preview_source(cfg, source, cancel)? != *reviewed {
         return Err(EngineError::Failed("The listing or destination changed. Preview the source again.".into()));
     }
     if cancel.load(Ordering::Acquire) {
         return Err(EngineError::Failed("Adding the source was cancelled.".into()));
+    }
+    Ok(())
+}
+
+/// Called only after the save succeeded, with the very preview the user confirmed.
+pub(crate) fn approve_saved_plugins(engine: &mut Engine, cfg: &Config, id: &str, reviewed: &SourcePreview) -> Result<(), String> {
+    if reviewed.kind == SourceKind::Plugins {
+        engine.approve_plugin_preview(cfg, id, reviewed).map_err(|e| format!("The source was saved, but its plugins could not be approved: {e}"))?;
     }
     Ok(())
 }
@@ -160,14 +181,19 @@ impl Job {
 
     fn target(&self) -> Option<&str> {
         match self {
-            Job::Check(Some(id)) | Job::DeleteGone(id) | Job::Resolve { repo: id, .. } | Job::Remove { repo: id, .. } | Job::Diff { repo: id, .. } => Some(id),
+            Job::Check(Some(id))
+            | Job::DeleteGone(id)
+            | Job::Resolve { repo: id, .. }
+            | Job::ResolvePlugin { repo: id, .. }
+            | Job::Remove { repo: id, .. }
+            | Job::Diff { repo: id, .. } => Some(id),
             _ => None,
         }
     }
 
     /// The user asked for it, so they are told how it went.
     fn by_user(&self) -> bool {
-        matches!(self, Job::Check(_) | Job::AppUpdate(_) | Job::Resolve { .. } | Job::DeleteGone(_) | Job::Remove { .. })
+        matches!(self, Job::Check(_) | Job::AppUpdate(_) | Job::Resolve { .. } | Job::ResolvePlugin { .. } | Job::DeleteGone(_) | Job::Remove { .. })
     }
 
     fn update_request(&self) -> Option<Request> {
@@ -289,6 +315,7 @@ pub struct Order {
     pub settings_initialized: bool,
     pub reload_settings: bool,
     pub config_saves: Vec<ConfigSave>,
+    plugin_rows: Vec<String>,
     update_generation: u64,
     /// Run it as background work: lower CPU, I/O and memory priority, so it never gets in the way.
     pub background: bool,
@@ -300,9 +327,10 @@ pub enum Answer {
     Looked(VerifyReport),
     Checked { verified: Option<VerifyReport>, sync: SyncReport },
     SettingsLoaded,
-    SourcePreview(SourcePreview),
-    SourceSaved,
+    SourcePreview(String, SourcePreview),
+    SourceSaved(Result<(), String>),
     Resolved(ResolveReport),
+    PluginResolved(RepoReport),
     Removed(RemoveReport),
     Diffed(DiffReport),
     Flushed,
@@ -337,6 +365,7 @@ pub struct Done {
     pub kept: Vec<(String, Vec<String>)>,
     /// What the record says about each repository's skills.
     pub facts: Vec<(String, Vec<SkillFacts>)>,
+    pub plugin_records: Vec<(String, Vec<Row>)>,
     /// Whether the last listing of each repository had no skills in it at all.
     pub lists_nothing: Vec<(String, bool)>,
     /// Whether each repository was found to need the token.
@@ -483,7 +512,12 @@ pub(crate) fn perform_with_updates(engine: &mut Engine, order: &Order, cancel: &
             Job::LoadSettings => Ok(Answer::SettingsLoaded),
             Job::Startup => engine.startup(&cfg).map(Answer::Started),
             Job::Look => engine.verify(&cfg, Access::ReadOnly).map(Answer::Looked),
-            Job::PreviewSource(input) => engine.preview_source(&cfg, &input.source, cancel).map(Answer::SourcePreview),
+            Job::PreviewSource(input) => (|| {
+                let mut draft = input.source.clone();
+                assign_fresh_id(&engine.paths().state_file(), &cfg, &mut draft)?;
+                let preview = engine.preview_source(&cfg, &draft, cancel)?;
+                Ok(Answer::SourcePreview(draft.id, preview))
+            })(),
             Job::SaveSource(input, reviewed) => (|| {
                 recheck_preview(engine, &cfg, &input.source, reviewed, cancel)?;
                 let store = source.ok_or_else(|| EngineError::Failed("The settings folder is unavailable.".into()))?;
@@ -497,15 +531,21 @@ pub(crate) fn perform_with_updates(engine: &mut Engine, order: &Order, cancel: &
                     return Err(EngineError::Failed("Adding the source was cancelled.".into()));
                 }
                 store.save(&cfg, &after, portable_mode).map_err(EngineError::Failed)?;
-                Ok(Answer::SourceSaved)
+                let approved = approve_saved_plugins(engine, &after, &input.source.id, reviewed);
+                cfg = after;
+                Ok(Answer::SourceSaved(approved))
             })(),
-            Job::Poll => engine.sync(&cfg, &Which::Due, &SyncOptions::default(), cancel).map(|sync| Answer::Checked { verified: None, sync }),
+            Job::Poll => {
+                engine.retain_plugin_attention_rows(&order.plugin_rows);
+                engine.sync(&cfg, &Which::Due, &SyncOptions::default(), cancel).map(|sync| Answer::Checked { verified: None, sync })
+            }
             Job::Check(which) => engine.verify(&cfg, Access::Write).and_then(|verified| {
                 let which = which.as_ref().map_or(Which::All, |id| Which::One(id.clone()));
                 let sync = engine.sync(&cfg, &which, &SyncOptions::default(), cancel)?;
                 Ok(Answer::Checked { verified: Some(verified), sync })
             }),
             Job::Resolve { repo, skill, how } => engine.resolve(&cfg, repo, skill, *how, cancel).map(Answer::Resolved),
+            Job::ResolvePlugin { repo, choice } => engine.resolve_plugin(&cfg, repo, choice, cancel).map(Answer::PluginResolved),
             Job::DeleteGone(id) => {
                 let opts = SyncOptions { ignore_etag: true, confirm_mass_delete: true, ..SyncOptions::default() };
                 engine.sync(&cfg, &Which::One(id.clone()), &opts, cancel).map(|sync| Answer::Checked { verified: None, sync })
@@ -520,17 +560,26 @@ pub(crate) fn perform_with_updates(engine: &mut Engine, order: &Order, cancel: &
     };
     Done {
         job: order.job.clone(),
-        result,
         next_wake: engine.next_wake(&cfg),
         last_checks: cfg.repos.iter().filter_map(|r| engine.last_check(&r.id).map(|at| (r.id.clone(), at))).collect(),
         kept: cfg.repos.iter().map(|r| (r.id.clone(), engine.kept(&r.id))).collect(),
-        facts: cfg.repos.iter().map(|r| (r.id.clone(), engine.facts(&r.id))).collect(),
+        facts: cfg.repos.iter().filter(|r| r.kind != SourceKind::Plugins).map(|r| (r.id.clone(), engine.facts(&r.id))).collect(),
+        plugin_records: if matches!(result, Ok(Answer::Started(_) | Answer::Looked(_) | Answer::Checked { .. } | Answer::PluginResolved(_))) {
+            cfg.repos
+                .iter()
+                .filter(|r| r.kind == SourceKind::Plugins)
+                .map(|r| (r.id.clone(), engine.plugin_record(r).map(recorded_plugin_rows).unwrap_or_default()))
+                .collect()
+        } else {
+            Vec::new()
+        },
         lists_nothing: cfg.repos.iter().map(|r| (r.id.clone(), engine.lists_nothing(&r.id))).collect(),
         private: cfg.repos.iter().map(|r| (r.id.clone(), engine.needs_token(&r.id))).collect(),
         stamp: engine.state_stamp(),
         settings,
         config_saves,
         settings_checked: loads_settings && probe_portable,
+        result,
         update: updates.map(|u| UpdateState { generation: order.update_generation, clock: u.clock, staged: u.staged(), status: update_status, disk, restart }),
     }
 }
@@ -649,16 +698,23 @@ impl App {
         matches!(self.busy, Some(Job::SaveSource(..))) || self.draft.as_ref().is_some_and(|d| matches!(d.stage, DraftStage::Saving))
     }
 
+    /// A duplicate gets a draft for the refusal, but no worker job.
     pub fn preview_source(&mut self, spec: &RepoSpec, kind: SourceKind, every: Option<Interval>) -> Result<u64, String> {
         if self.quitting || self.saving_source() {
             return Err("Cannot start another preview now.".into());
         }
-        let source = new_source(&self.cfg, spec, kind, every, false)?;
+        let (source, stage) = match new_source(&self.cfg, spec, kind, every, false) {
+            Ok(source) => (source, DraftStage::Loading),
+            Err(old) => (old.clone(), DraftStage::AlreadySetUp),
+        };
         self.dismiss_source();
         self.next_ticket += 1;
         let input = Arc::new(DraftInput { ticket: self.next_ticket, source });
-        self.draft = Some(SourceDraft { input: input.clone(), stage: DraftStage::Loading });
-        self.want(Job::PreviewSource(input));
+        let read = matches!(stage, DraftStage::Loading);
+        self.draft = Some(SourceDraft { input: input.clone(), stage });
+        if read {
+            self.want(Job::PreviewSource(input));
+        }
         Ok(self.next_ticket)
     }
 
@@ -768,6 +824,11 @@ impl App {
         if moved || self.cfg.app_update != cfg.app_update {
             self.revoke_update();
         }
+        for old in self.cfg.repos.iter().filter(|r| r.kind == SourceKind::Plugins) {
+            if cfg.find(&old.id).is_none_or(|new| old.kind != new.kind || old.repo != new.repo || old.branch != new.branch || old.path != new.path) {
+                self.board.forget_repo(&old.id);
+            }
+        }
         self.queue.retain(|job| {
             job.target().is_none_or(|repo| {
                 !moved
@@ -868,8 +929,12 @@ impl App {
             self.sign_in_wait = false;
             self.board.set_waiting(false);
             self.queue.push_front(job);
-        } else if matches!(job, Job::Resolve { .. } | Job::Remove { .. }) {
-            let at = self.queue.iter().position(|j| !matches!(j, Job::Startup | Job::Resolve { .. } | Job::Remove { .. })).unwrap_or(self.queue.len());
+        } else if matches!(job, Job::Resolve { .. } | Job::ResolvePlugin { .. } | Job::Remove { .. }) {
+            let at = self
+                .queue
+                .iter()
+                .position(|j| !matches!(j, Job::Startup | Job::Resolve { .. } | Job::ResolvePlugin { .. } | Job::Remove { .. }))
+                .unwrap_or(self.queue.len());
             self.queue.insert(at, job);
         } else {
             self.queue.push_back(job);
@@ -898,7 +963,13 @@ impl App {
         let background = matches!(job, Job::Poll | Job::ScheduledUpdate) || (matches!(job, Job::LoadSettings | Job::Startup) && self.at_sign_in);
         let reload_settings = std::mem::take(&mut self.reload_settings_pending);
         let config_saves = std::mem::take(&mut self.config_saves);
+        let plugin_rows = if job == Job::Poll {
+            self.cfg.repos.iter().filter(|r| r.kind == SourceKind::Plugins && self.board.has_plugin_rows(&r.id)).map(|r| r.id.clone()).collect()
+        } else {
+            Vec::new()
+        };
         Some(Order {
+            plugin_rows,
             job,
             cfg: self.cfg.clone(),
             skills_dir: self.skills_dir.clone(),
@@ -939,6 +1010,9 @@ impl App {
         let by_user = job.by_user();
         let mut checked = None;
 
+        for (id, rows) in done.plugin_records {
+            self.board.note_recorded_plugins(&id, rows);
+        }
         match done.result {
             Err(e) if matches!(job, Job::PreviewSource(_) | Job::SaveSource(..)) => {
                 let input = match &job {
@@ -967,6 +1041,11 @@ impl App {
             },
             Err(EngineError::Failed(why)) => {
                 if by_user {
+                    if let Job::ResolvePlugin { repo, .. } = &job {
+                        if self.cfg.find(repo).is_some_and(|r| r.kind == SourceKind::Plugins) {
+                            self.board.note_plugin_failure(repo, &why);
+                        }
+                    }
                     self.board.say(now, Level::Error, why.clone());
                     settled.feedback = Some(why);
                 } else if matches!(job, Job::LoadSettings | Job::Startup | Job::Poll | Job::Look) {
@@ -986,27 +1065,36 @@ impl App {
                         | Answer::SettingsLoaded
                         | Answer::Diffed(_)
                         | Answer::AppUpdate(_)
-                        | Answer::SourcePreview(_)
-                        | Answer::SourceSaved
+                        | Answer::SourcePreview(..)
+                        | Answer::SourceSaved(_)
                 ) {
                     self.failures = 0;
                     self.board.note_failure(now, None);
                 }
                 match answer {
-                    Answer::SourcePreview(preview) => {
+                    Answer::SourcePreview(id, preview) => {
                         if let Job::PreviewSource(input) = &job {
                             if let Some(d) = self.draft.as_mut().filter(|d| d.input == *input && matches!(d.stage, DraftStage::Loading)) {
+                                Arc::make_mut(&mut d.input).source.id = id;
                                 d.stage = DraftStage::Reviewed(Arc::new(preview));
                             }
                         }
                     }
-                    Answer::SourceSaved => {
+                    Answer::SourceSaved(approved) => {
                         if let Job::SaveSource(input, _) = &job {
                             if self.draft.as_ref().is_some_and(|d| d.input == *input && matches!(d.stage, DraftStage::Saving)) {
                                 self.draft = None;
                                 self.cfg.repos.push(input.source.clone());
-                                settled.feedback = Some(format!("Added {} [{}].", input.source.label(), input.source.id));
-                                self.want(Job::Check(Some(input.source.id.clone())));
+                                match approved {
+                                    Ok(()) => {
+                                        settled.feedback = Some(format!("Added {} [{}].", input.source.label(), input.source.id));
+                                        self.want(Job::Check(Some(input.source.id.clone())));
+                                    }
+                                    Err(why) => {
+                                        self.board.say(now, Level::Error, why.clone());
+                                        settled.feedback = Some(why);
+                                    }
+                                }
                             } else {
                                 // Settings changed while the worker was replying. Never check a replacement with this ID.
                                 self.reload_before_next_job();
@@ -1046,11 +1134,26 @@ impl App {
                         self.board.say(now, Level::Ok, text);
                         settled.feedback = Some(capitalized(&report.message));
                     }
+                    Answer::PluginResolved(report) => {
+                        self.board.note_source_report(&report, now, &self.cfg);
+                        let feedback = match (&report.outcome, &job) {
+                            (Outcome::Failed(why), _) => Some((Level::Error, why.message.clone())),
+                            (_, Job::ResolvePlugin { repo, choice }) => {
+                                let name = choice.name();
+                                self.board.plugin_tag(repo, name).map(|tag| (Level::Ok, format!("{name}: {tag}.")))
+                            }
+                            _ => None,
+                        };
+                        if let Some((level, text)) = feedback {
+                            self.board.say(now, level, text.clone());
+                            settled.feedback = Some(text);
+                        }
+                    }
                     Answer::Removed(report) => {
                         if let Job::Remove { repo, .. } = &job {
                             let text = self.removed_text(repo, &report);
                             self.board.forget_repo(repo);
-                            self.board.say(now, if report.kept.is_empty() { Level::Ok } else { Level::Attention }, text.clone());
+                            self.board.say(now, if report.kept.is_empty() || report.message.is_some() { Level::Ok } else { Level::Attention }, text.clone());
                             settled.feedback = Some(text);
                             settled.removed = Some(repo.clone());
                         }
@@ -1235,6 +1338,9 @@ impl App {
     fn removed_text(&self, repo: &str, report: &RemoveReport) -> String {
         let label = self.cfg.find(repo).map_or_else(|| repo.to_string(), |r| r.label());
         let mut text = format!("Removed {label}.");
+        if let Some(message) = report.message {
+            return format!("{text} {message}");
+        }
         if !report.deleted.is_empty() {
             text.push_str(&format!(" Deleted: {}.", report.deleted.join(", ")));
         }
@@ -1264,7 +1370,7 @@ fn shown(job: &Job, result: Result<DiffReport, String>) -> Option<Shown> {
 fn summary(report: &SyncReport, all_well: bool, items: &str) -> String {
     let failed: Vec<_> = report.repos.iter().filter_map(|r| if let Outcome::Failed(f) = &r.outcome { Some((r, f)) } else { None }).collect();
     // As the row's "No skills found": the listing was empty and nothing was left to do about it.
-    let empty: Vec<_> = report.repos.iter().filter(|r| r.lists_nothing && r.skills.is_empty()).collect();
+    let empty: Vec<_> = report.repos.iter().filter(|r| r.lists_nothing && r.skills.is_empty() && r.plugins.is_empty()).collect();
     let any = |f: fn(&Outcome) -> bool| report.repos.iter().any(|r| f(&r.outcome));
     match failed.as_slice() {
         _ if report.repos.is_empty() => "There is nothing to check: no repository is enabled".to_string(),
@@ -1292,6 +1398,7 @@ mod tests {
             label: label.to_string(),
             outcome,
             skills: Vec::new(),
+            plugins: Vec::new(),
             rejected: Vec::new(),
             stats: Default::default(),
             downloaded: 0,
@@ -1409,6 +1516,7 @@ mod tests {
             last_checks: vec![],
             kept: vec![],
             facts: vec![],
+            plugin_records: vec![],
             lists_nothing: vec![],
             private: vec![],
             stamp: None,
@@ -1423,6 +1531,69 @@ mod tests {
         assert!(app.want(Job::AppUpdate(Action::Check)));
     }
 
+    #[test]
+    fn plugin_app_does_not_queue_the_first_check_when_approval_fails_after_save() {
+        let mut app = App::new(Config::default(), PathBuf::from("unused"));
+        app.queue.clear();
+        let spec = RepoSpec::parse("https://github.com/o/r/tree/main").unwrap();
+        app.preview_source(&spec, SourceKind::Plugins, None).unwrap();
+        app.queue.clear();
+        let draft = app.draft.as_mut().unwrap();
+        draft.stage = DraftStage::Saving;
+        let id = draft.input.source.id.clone();
+        let job = Job::SaveSource(
+            draft.input.clone(),
+            Arc::new(SourcePreview {
+                kind: SourceKind::Plugins,
+                names: vec![],
+                destination: crate::source::PreviewDestination::NotChecked,
+                errors: vec![],
+                plugins: None,
+            }),
+        );
+        let message = "The source was saved, but its plugins could not be approved.";
+        let done = app_update_done(job, app.update_generation, Ok(Answer::SourceSaved(Err(message.into()))));
+        assert_eq!(app.finish(done, 10).feedback.as_deref(), Some(message));
+        assert!(app.cfg.find(&id).is_some(), "the source was already saved");
+        assert!(app.queue.is_empty(), "do not start the first check after this refusal");
+    }
+
+    #[test]
+    fn plugin_choice_feedback_names_the_chosen_plugins_new_tag() {
+        use crate::engine::{ApplyResult, PluginReport};
+        use crate::plugins::{Operation, Status};
+        let mut cfg = Config::default();
+        let id = cfg.add_source(SourceKind::Plugins, &RepoSpec::parse("https://github.com/o/r/tree/main").unwrap(), None, false).id.clone();
+        let mut app = App::new(cfg, PathBuf::from("unused"));
+        let job = Job::ResolvePlugin { repo: id.clone(), choice: Choice::Approve { name: "alpha".into(), publisher: None } };
+        let plugin =
+            |name: &str, status, result| PluginReport { name: name.into(), version: None, publisher: None, path: None, status, choices: Vec::new(), result };
+        let report = RepoReport {
+            repo_id: id,
+            plugins: vec![
+                plugin("beta", Status::NeedsApproval, ApplyResult::NotApplicable),
+                plugin("alpha", Status::Planned(Operation::Approve), ApplyResult::Done),
+            ],
+            ..repo_report("o/r", Outcome::NeedsAttention)
+        };
+        let done = app_update_done(job, app.update_generation, Ok(Answer::PluginResolved(report)));
+        assert_eq!(app.finish(done, 10).feedback.as_deref(), Some("alpha: Up to date."));
+    }
+
+    #[test]
+    fn plugin_choice_errors_reach_the_source_detail_even_without_a_report() {
+        let mut cfg = Config::default();
+        let id = cfg.add_source(SourceKind::Plugins, &RepoSpec::parse("https://github.com/o/r/tree/main").unwrap(), None, false).id.clone();
+        let mut app = App::new(cfg, PathBuf::from("unused"));
+        let job = Job::ResolvePlugin { repo: id, choice: Choice::Uninstall("alpha".into()) };
+        let why = "Could not save the plugin record.";
+        let done = app_update_done(job, app.update_generation, Err(EngineError::Failed(why.into())));
+        assert_eq!(app.finish(done, 10).feedback.as_deref(), Some(why));
+        let view = app.board.views(&app.cfg, 10).remove(0);
+        assert_eq!(view.detail.as_deref(), Some(why));
+        assert_eq!(view.level, Level::Error);
+    }
+
     fn app_update_done(job: Job, generation: u64, result: Result<Answer, EngineError>) -> Done {
         Done {
             job,
@@ -1432,6 +1603,7 @@ mod tests {
             last_checks: vec![],
             kept: vec![],
             facts: vec![],
+            plugin_records: vec![],
             lists_nothing: vec![],
             private: vec![],
             stamp: None,

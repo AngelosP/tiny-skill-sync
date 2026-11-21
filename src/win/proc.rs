@@ -1,28 +1,32 @@
-//! Starting other programs: the GitHub CLI for its token, File Explorer, and the tray an app update installed, after
-//! its bytes were proven to be the verified release. `gh` is only a token source here; it never makes the requests.
+//! Starting other programs: the GitHub CLI for its token, Copilot for plugins, File Explorer and verified tray updates.
+//! Captured commands run in jobs, so an ended or stopped command cannot leave helpers holding its pipes.
 //!
 //! Programs are started with `CreateProcessW` rather than `std::process`, which costs the tray exe about 60 KB of its
 //! 1 MiB budget.
 
-use std::ffi::{OsStr, OsString};
+use std::ffi::{OsStr, OsString, c_void};
 use std::io;
 use std::mem::{size_of, size_of_val, zeroed};
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
+use std::os::windows::io::AsRawHandle;
 use std::path::{Path, PathBuf};
 use std::ptr::{null, null_mut};
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread::{Builder, JoinHandle};
+use std::time::{Duration, Instant};
 
 use windows_sys::Win32::Foundation::{
-    CloseHandle, GENERIC_READ, GENERIC_WRITE, HANDLE, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, SetHandleInformation, WAIT_OBJECT_0,
+    CloseHandle, ERROR_BROKEN_PIPE, GENERIC_READ, HANDLE, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, SetHandleInformation, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
 use windows_sys::Win32::Storage::FileSystem::{CreateFileW, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING, ReadFile};
+use windows_sys::Win32::System::IO::CancelSynchronousIo;
 use windows_sys::Win32::System::Pipes::CreatePipe;
 use windows_sys::Win32::System::SystemInformation::{GetSystemDirectoryW, GetSystemWindowsDirectoryW};
 use windows_sys::Win32::System::Threading::{
-    CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT, CreateProcessW, DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT, GetExitCodeProcess,
-    InitializeProcThreadAttributeList, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROCESS_INFORMATION, STARTF_USESTDHANDLES, STARTUPINFOEXW, TerminateProcess,
-    UpdateProcThreadAttribute, WaitForSingleObject,
+    BELOW_NORMAL_PRIORITY_CLASS, CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT, CreateProcessW, DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT,
+    GetExitCodeProcess, IO_COUNTERS, InitializeProcThreadAttributeList, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROC_THREAD_ATTRIBUTE_JOB_LIST, PROCESS_INFORMATION,
+    STARTF_USESTDHANDLES, STARTUPINFOEXW, TerminateProcess, UpdateProcThreadAttribute, WaitForSingleObject,
 };
 
 use super::{wide, wide_os};
@@ -32,7 +36,8 @@ pub const GH_TIMEOUT: Duration = Duration::from_secs(5);
 /// Without `--hostname`, gh answers for whichever host it considers the default (`GH_HOST`, or the only host it is signed
 /// in to), and that token would then be sent to github.com.
 const TOKEN_ARGS: [&str; 4] = ["auth", "token", "--hostname", "github.com"];
-const GH_ENV: [(&str, &str); 3] = [("GH_PROMPT_DISABLED", "1"), ("GH_NO_UPDATE_NOTIFIER", "1"), ("NO_COLOR", "1")];
+pub(super) const NO_CWD_EXE_LOOKUP: (&str, &str) = ("NoDefaultCurrentDirectoryInExePath", "1");
+const GH_ENV: [(&str, &str); 4] = [("GH_PROMPT_DISABLED", "1"), ("GH_NO_UPDATE_NOTIFIER", "1"), ("NO_COLOR", "1"), NO_CWD_EXE_LOOKUP];
 const MAX_OUTPUT: usize = 64 * 1024;
 
 struct Owned(HANDLE);
@@ -50,43 +55,150 @@ fn last() -> io::Error {
     io::Error::last_os_error()
 }
 
-/// Runs a program without a console window and returns its exit code and (at most 64 KiB of) standard output. `env`
-/// is added to this process's environment. `None` means it did not finish in time and was killed.
+// These are the kernel32 job APIs and the layout of JOBOBJECT_EXTENDED_LIMIT_INFORMATION.
+// The two imports do not need a new dependency or a change to the crate's Windows features.
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn CreateJobObjectW(attributes: *const SECURITY_ATTRIBUTES, name: *const u16) -> HANDLE;
+    fn SetInformationJobObject(job: HANDLE, class: i32, limits: *const c_void, size: u32) -> i32;
+}
+
+#[repr(C)]
+struct BasicLimits {
+    user_time: [i64; 2],
+    flags: u32,
+    working_set: [usize; 2],
+    active_processes: u32,
+    affinity: usize,
+    priority: u32,
+    scheduling_class: u32,
+}
+
+#[repr(C)]
+struct JobLimits {
+    basic: BasicLimits,
+    io: IO_COUNTERS,
+    memory: [usize; 4],
+}
+
+fn kill_on_close_job() -> io::Result<Owned> {
+    const JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE: u32 = 0x2000;
+    const JOB_OBJECT_EXTENDED_LIMIT_INFORMATION: i32 = 9;
+    let handle = unsafe { CreateJobObjectW(null(), null()) };
+    if handle.is_null() {
+        return Err(last());
+    }
+    let job = Owned(handle);
+    // SAFETY: the C structure contains only integer fields.
+    let mut limits: JobLimits = unsafe { zeroed() };
+    limits.basic.flags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    if unsafe { SetInformationJobObject(job.0, JOB_OBJECT_EXTENDED_LIMIT_INFORMATION, (&raw const limits).cast(), size_of_val(&limits) as u32) } == 0 {
+        return Err(last());
+    }
+    Ok(job)
+}
+
+/// The gh caller supplies a program name and needs only the exit code and stdout. It never prints captured errors.
 pub fn run_capture(program: &str, args: &[&str], env: &[(&str, &str)], timeout: Duration) -> io::Result<Option<(u32, Vec<u8>)>> {
     let path = find(program)?;
+    let dir = path.parent().ok_or(io::ErrorKind::InvalidInput)?;
+    let options = CaptureOptions { dir, env, below_normal: false };
+    match capture(&path, args, options, timeout, &AtomicBool::new(false)) {
+        Ok(result) => Ok(Some((result.code, result.stdout))),
+        Err(e) if e.kind() == io::ErrorKind::TimedOut => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+pub(super) struct Captured {
+    pub code: u32,
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
+    pub stdout_cut: bool,
+}
+
+pub(super) struct CaptureOptions<'a> {
+    pub dir: &'a Path,
+    pub env: &'a [(&'a str, &'a str)],
+    pub below_normal: bool,
+}
+
+/// Runs exactly this executable, with NUL stdin and separate, continuously drained output pipes.
+pub(super) fn capture(path: &Path, args: &[&str], options: CaptureOptions<'_>, timeout: Duration, cancel: &AtomicBool) -> io::Result<Captured> {
+    capture_with_exit_hook(path, args, options, timeout, cancel, || {})
+}
+
+fn capture_with_exit_hook(
+    path: &Path,
+    args: &[&str],
+    options: CaptureOptions<'_>,
+    timeout: Duration,
+    cancel: &AtomicBool,
+    after_exit: impl FnOnce(),
+) -> io::Result<Captured> {
+    check_cancel(cancel)?;
     let args: Vec<&OsStr> = args.iter().map(OsStr::new).collect();
-    let mut line = command_line(&path, &args)?;
-    let block = env_block(std::env::vars_os(), env);
+    let mut line = command_line(path, &args)?;
+    let block = env_block(std::env::vars_os(), options.env);
     let inherit = SECURITY_ATTRIBUTES { nLength: size_of::<SECURITY_ATTRIBUTES>() as u32, lpSecurityDescriptor: null_mut(), bInheritHandle: 1 };
-    let (mut read, mut write) = (null_mut(), null_mut());
-    if unsafe { CreatePipe(&mut read, &mut write, &inherit, 0) } == 0 {
-        return Err(last());
-    }
-    let (read, write) = (Owned(read), Owned(write));
-    if unsafe { SetHandleInformation(read.0, HANDLE_FLAG_INHERIT, 0) } == 0 {
-        return Err(last());
-    }
+    let (stdout, out) = pipe(&inherit)?;
+    let (stderr, err) = pipe(&inherit)?;
     let nul = wide("NUL");
-    let nul = unsafe { CreateFileW(nul.as_ptr(), GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, &inherit, OPEN_EXISTING, 0, null_mut()) };
+    let nul = unsafe { CreateFileW(nul.as_ptr(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, &inherit, OPEN_EXISTING, 0, null_mut()) };
     if nul == INVALID_HANDLE_VALUE {
         return Err(last());
     }
     let nul = Owned(nul);
-    let process = create(&path, &mut line, Some(&block), Some((nul.0, write.0)))?;
-    // Only the child holds the write end now, so the reader sees the end of the output when the child ends.
-    drop((write, nul));
-    let reader = std::thread::spawn(move || read_some(read));
-    let ms = timeout.as_millis().min(u128::from(u32::MAX - 1)) as u32;
-    if unsafe { WaitForSingleObject(process.0, ms) } != WAIT_OBJECT_0 {
-        unsafe { TerminateProcess(process.0, 1) };
-        // The reader is not joined: a grandchild that inherited the pipe could keep it open.
-        return Ok(None);
-    }
-    let mut code = 0u32;
-    if unsafe { GetExitCodeProcess(process.0, &mut code) } == 0 {
+    let job = kill_on_close_job()?;
+    check_cancel(cancel)?;
+    let process = create(path, &mut line, Some(&block), Some(options.dir), Some(([nul.0, out.0, err.0], job.0)), options.below_normal)?;
+    drop((out, err, nul));
+    let mut readers = [None, None];
+    let exited = (|| {
+        let start = Instant::now();
+        for (reader, read) in readers.iter_mut().zip([stdout, stderr]) {
+            *reader = Some(Builder::new().spawn(move || read_some(read))?);
+        }
+        loop {
+            check_cancel(cancel)?;
+            let ms = timeout.saturating_sub(start.elapsed()).as_millis();
+            if ms == 0 {
+                return Err(io::ErrorKind::TimedOut.into());
+            }
+            match unsafe { WaitForSingleObject(process.0, ms.min(50) as u32) } {
+                WAIT_OBJECT_0 => break,
+                WAIT_TIMEOUT => continue,
+                _ => return Err(last()),
+            }
+        }
+        let mut code = 0;
+        if unsafe { GetExitCodeProcess(process.0, &mut code) } == 0 {
+            return Err(last());
+        }
+        after_exit();
+        Ok(code)
+    })();
+    // Only the job owns the tree. Close it before joining so a grandchild cannot keep a pipe open.
+    drop(job);
+    let deadline = Instant::now() + Duration::from_secs(1);
+    let [out, err] = readers.map(|reader| read_result(reader, deadline));
+    // A late cancel must not hide a completed command from verification.
+    let code = exited?;
+    let (stdout, stdout_cut) = out?;
+    Ok(Captured { code, stdout, stderr: err?.0, stdout_cut })
+}
+
+fn check_cancel(cancel: &AtomicBool) -> io::Result<()> {
+    if cancel.load(Ordering::Relaxed) { Err(io::ErrorKind::Interrupted.into()) } else { Ok(()) }
+}
+
+fn pipe(inherit: &SECURITY_ATTRIBUTES) -> io::Result<(Owned, Owned)> {
+    let (mut read, mut write) = (null_mut(), null_mut());
+    if unsafe { CreatePipe(&mut read, &mut write, inherit, 0) } == 0 {
         return Err(last());
     }
-    Ok(Some((code, reader.join().unwrap_or_default())))
+    let (read, write) = (Owned(read), Owned(write));
+    if unsafe { SetHandleInformation(read.0, HANDLE_FLAG_INHERIT, 0) } == 0 { Err(last()) } else { Ok((read, write)) }
 }
 
 /// Starts File Explorer on a folder or a web address, without waiting. Explorer is taken from the Windows folder, never
@@ -94,7 +206,7 @@ pub fn run_capture(program: &str, args: &[&str], env: &[(&str, &str)], timeout: 
 pub fn explorer(arg: &OsStr) -> io::Result<()> {
     let exe = system_dir(GetSystemWindowsDirectoryW).ok_or_else(last)?.join("explorer.exe");
     let mut line = command_line(&exe, &[arg])?;
-    create(&exe, &mut line, None, None).map(drop)
+    create(&exe, &mut line, None, None, None, false).map(drop)
 }
 
 /// A program that was started and left to run. Dropping this closes the handle, not the program.
@@ -119,59 +231,97 @@ impl Started {
 /// program gets this process's environment and current folder, and no handles.
 pub fn start(program: &Path, args: &[&OsStr]) -> io::Result<Started> {
     let mut line = command_line(program, args)?;
-    create(program, &mut line, None, None).map(Started)
+    create(program, &mut line, None, None, None, false).map(Started)
 }
 
-fn read_some(h: Owned) -> Vec<u8> {
-    let mut buf = vec![0u8; MAX_OUTPUT];
-    let mut len = 0;
-    while len < MAX_OUTPUT {
-        let mut got = 0u32;
-        let ok = unsafe { ReadFile(h.0, buf[len..].as_mut_ptr(), (MAX_OUTPUT - len) as u32, &mut got, null_mut()) };
-        if ok == 0 || got == 0 {
+type Stream = io::Result<(Vec<u8>, bool)>;
+
+fn read_some(h: Owned) -> Stream {
+    let mut buf = [0u8; 8192];
+    let mut bytes = Vec::new();
+    let mut clipped = false;
+    loop {
+        let mut got = 0;
+        if unsafe { ReadFile(h.0, buf.as_mut_ptr(), buf.len() as u32, &mut got, null_mut()) } == 0 {
+            let e = last();
+            if e.raw_os_error() != Some(ERROR_BROKEN_PIPE as i32) {
+                return Err(e);
+            }
             break;
         }
-        len += got as usize;
+        let got = got as usize;
+        if got == 0 {
+            break;
+        }
+        let keep = got.min(MAX_OUTPUT - bytes.len());
+        clipped |= keep != got;
+        bytes.extend_from_slice(&buf[..keep]);
     }
-    buf.truncate(len);
-    buf
+    Ok((bytes, clipped))
 }
 
-/// Starts `program` with no console window. With `stdio` (standard input and error, then standard output) the child
-/// gets those handles and no other; without, it inherits nothing.
-fn create(program: &Path, line: &mut [u16], env: Option<&[u16]>, stdio: Option<(HANDLE, HANDLE)>) -> io::Result<Owned> {
+fn read_result(reader: Option<JoinHandle<Stream>>, deadline: Instant) -> Stream {
+    let reader = reader.ok_or(io::ErrorKind::BrokenPipe)?;
+    let handle = reader.as_raw_handle();
+    let ms = deadline.saturating_duration_since(Instant::now()).as_millis() as u32;
+    if unsafe { WaitForSingleObject(handle, ms) } != WAIT_OBJECT_0 {
+        // Defensive fallback for an unexpectedly retained pipe. Never join a busy reader indefinitely.
+        unsafe { CancelSynchronousIo(handle) };
+        if unsafe { WaitForSingleObject(handle, 100) } != WAIT_OBJECT_0 {
+            return Err(io::ErrorKind::TimedOut.into());
+        }
+    }
+    reader.join().map_err(|_| io::ErrorKind::BrokenPipe)?
+}
+
+/// The handle list limits inheritance; the job list assigns membership before any child code runs.
+fn create(
+    program: &Path,
+    line: &mut [u16],
+    env: Option<&[u16]>,
+    dir: Option<&Path>,
+    captured: Option<([HANDLE; 3], HANDLE)>,
+    below_normal: bool,
+) -> io::Result<Owned> {
     let app = wide_os(program.as_os_str());
     // SAFETY: plain integers and pointers, for which all-zero is a valid value.
     let mut si: STARTUPINFOEXW = unsafe { zeroed() };
-    si.StartupInfo.cb = size_of::<STARTUPINFOEXW>() as u32;
+    si.StartupInfo.cb = size_of_val(&si.StartupInfo) as u32;
     let mut flags = CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT;
+    if below_normal {
+        flags |= BELOW_NORMAL_PRIORITY_CLASS;
+    }
     let mut list_mem: Vec<usize> = Vec::new();
-    let handles: [HANDLE; 2];
-    if let Some((nul, out)) = stdio {
+    if let Some((handles, job)) = &captured {
+        si.StartupInfo.cb = size_of_val(&si) as u32;
         si.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
-        (si.StartupInfo.hStdInput, si.StartupInfo.hStdOutput, si.StartupInfo.hStdError) = (nul, out, nul);
-        handles = [nul, out];
+        [si.StartupInfo.hStdInput, si.StartupInfo.hStdOutput, si.StartupInfo.hStdError] = *handles;
         let mut size = 0usize;
-        unsafe { InitializeProcThreadAttributeList(null_mut(), 1, 0, &mut size) };
+        unsafe { InitializeProcThreadAttributeList(null_mut(), 2, 0, &mut size) };
         list_mem = vec![0; size.div_ceil(size_of::<usize>())];
         let list = list_mem.as_mut_ptr().cast();
-        if unsafe { InitializeProcThreadAttributeList(list, 1, 0, &mut size) } == 0 {
+        if unsafe { InitializeProcThreadAttributeList(list, 2, 0, &mut size) } == 0 {
             return Err(last());
         }
         si.lpAttributeList = list;
-        let value = handles.as_ptr().cast();
-        if unsafe { UpdateProcThreadAttribute(list, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST as usize, value, size_of_val(&handles), null_mut(), null()) } == 0 {
-            let e = last();
-            unsafe { DeleteProcThreadAttributeList(list) };
-            return Err(e);
+        for (kind, ptr, bytes) in [
+            (PROC_THREAD_ATTRIBUTE_HANDLE_LIST, handles.as_ptr(), size_of_val(handles)),
+            (PROC_THREAD_ATTRIBUTE_JOB_LIST, job as *const HANDLE, size_of_val(job)),
+        ] {
+            if unsafe { UpdateProcThreadAttribute(list, 0, kind as usize, ptr.cast(), bytes, null_mut(), null()) } == 0 {
+                let e = last();
+                unsafe { DeleteProcThreadAttributeList(list) };
+                return Err(e);
+            }
         }
         flags |= EXTENDED_STARTUPINFO_PRESENT;
     }
-    // SAFETY: as above.
     let mut pi: PROCESS_INFORMATION = unsafe { zeroed() };
     let environment = env.map_or(null(), |e| e.as_ptr().cast());
-    let inherit = i32::from(stdio.is_some());
-    let ok = unsafe { CreateProcessW(app.as_ptr(), line.as_mut_ptr(), null(), null(), inherit, flags, environment, null(), (&raw const si).cast(), &mut pi) };
+    let inherit = i32::from(captured.is_some());
+    let directory = dir.map(|p| wide_os(p.as_os_str()));
+    let current = directory.as_ref().map_or(null(), |d| d.as_ptr());
+    let ok = unsafe { CreateProcessW(app.as_ptr(), line.as_mut_ptr(), null(), null(), inherit, flags, environment, current, (&raw const si).cast(), &mut pi) };
     let failed = (ok == 0).then(last);
     if !si.lpAttributeList.is_null() {
         unsafe { DeleteProcThreadAttributeList(si.lpAttributeList) };
@@ -277,6 +427,8 @@ pub fn gh_token() -> Result<Secret, String> {
 mod tests {
     use std::time::Instant;
 
+    use windows_sys::Win32::System::Threading::GetPriorityClass;
+
     use super::*;
 
     fn line_of(program: &str, args: &[&str]) -> io::Result<String> {
@@ -300,7 +452,7 @@ mod tests {
     fn the_token_asked_for_is_always_the_one_for_github_com() {
         assert_eq!(line_of(r"C:\gh\gh.exe", &TOKEN_ARGS).unwrap(), r#""C:\gh\gh.exe" auth token --hostname github.com"#);
         let set = String::from_utf16_lossy(&env_block(std::iter::empty(), &GH_ENV));
-        assert_eq!(set, "GH_NO_UPDATE_NOTIFIER=1\0GH_PROMPT_DISABLED=1\0NO_COLOR=1\0\0");
+        assert_eq!(set, "GH_NO_UPDATE_NOTIFIER=1\0GH_PROMPT_DISABLED=1\0NoDefaultCurrentDirectoryInExePath=1\0NO_COLOR=1\0\0");
     }
 
     #[test]
@@ -342,6 +494,98 @@ mod tests {
         let start = Instant::now();
         assert!(run_capture("cmd", &["/C", "ping -n 30 127.0.0.1 >nul"], &[], Duration::from_millis(300)).unwrap().is_none());
         assert!(start.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn a_timed_out_child_cannot_leave_its_grandchild_running() {
+        let base = std::env::var_os("TSS_TEST_ROOT").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("target"));
+        let dir = base.join(format!("tss-it-proc-tree-{}", crate::fsx::unique_suffix()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir = std::path::absolute(dir).unwrap();
+        let script = dir.join("grandchild.cmd");
+        std::fs::write(&script, b"@echo off\r\necho ready >\"%TSS_PROC_DIR%\\ready\"\r\n\"%SystemRoot%\\System32\\ping.exe\" -n 4 127.0.0.1 >nul\r\necho escaped >\"%TSS_PROC_DIR%\\escaped\"\r\n").unwrap();
+        let launch = format!(r#"cmd.exe /D /C call "{}""#, script.display());
+        let start = Instant::now();
+        let result = run_capture(
+            "cmd",
+            &["/D", "/C", "%TSS_PROC_LAUNCH%"],
+            &[("TSS_PROC_LAUNCH", &launch), ("TSS_PROC_DIR", dir.to_str().unwrap())],
+            Duration::from_millis(1800),
+        );
+        std::thread::sleep(Duration::from_secs(5).saturating_sub(start.elapsed()));
+        let (ready, escaped) = (dir.join("ready").is_file(), dir.join("escaped").is_file());
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(result.unwrap().is_none(), "the parent must time out");
+        assert!(ready, "the grandchild ran before the timeout");
+        assert!(!escaped, "the grandchild survived and ran after the timeout");
+    }
+
+    #[test]
+    fn capturing_starts_in_the_given_working_folder() {
+        let dir = system_dir(GetSystemDirectoryW).unwrap();
+        let cmd = dir.join("cmd.exe");
+        let options = CaptureOptions { dir: &dir, env: &[], below_normal: false };
+        let out = capture(&cmd, &["/D", "/U", "/C", "cd"], options, Duration::from_secs(10), &AtomicBool::new(false)).unwrap();
+        assert_eq!(out.code, 0);
+        let units: Vec<u16> = out.stdout.chunks_exact(2).map(|pair| u16::from_le_bytes([pair[0], pair[1]])).collect();
+        let got = String::from_utf16(&units).unwrap();
+        assert!(crate::win::fs::same_win_name(got.trim(), dir.to_str().unwrap()), "{got:?} is not {dir:?}");
+    }
+
+    #[test]
+    fn a_child_requested_below_normal_starts_at_that_priority() {
+        let dir = system_dir(GetSystemDirectoryW).unwrap();
+        let cmd = dir.join("cmd.exe");
+        let mut line = command_line(&cmd, &[OsStr::new("/D"), OsStr::new("/K")]).unwrap();
+        let child = Started(create(&cmd, &mut line, None, Some(&dir), None, true).unwrap());
+        let class = unsafe { GetPriorityClass(child.0.0) };
+        child.stop();
+        assert_eq!(class, BELOW_NORMAL_PRIORITY_CLASS);
+    }
+
+    #[test]
+    fn capturing_drains_both_streams_even_after_each_limit() {
+        let cmd = system_dir(GetSystemDirectoryW).unwrap().join("cmd.exe");
+        let command = "echo only-stdout & echo only-stderr 1>&2 & (for /L %i in (1,1,7000) do @echo 1234567890) & (for /L %i in (1,1,7000) do @echo 1234567890 1>&2) & exit 7";
+        let options = CaptureOptions { dir: cmd.parent().unwrap(), env: &[], below_normal: false };
+        let out = capture(&cmd, &["/D", "/C", command], options, Duration::from_secs(10), &AtomicBool::new(false)).unwrap();
+        assert_eq!(out.code, 7);
+        assert_eq!(out.stdout.len(), MAX_OUTPUT);
+        assert_eq!(out.stderr.len(), MAX_OUTPUT);
+        assert!(out.stdout.starts_with(b"only-stdout") && out.stderr.starts_with(b"only-stderr"));
+        assert!(out.stdout_cut);
+    }
+
+    #[test]
+    fn a_cancel_after_child_exit_keeps_the_exit_code_and_output() {
+        let dir = system_dir(GetSystemDirectoryW).unwrap();
+        let cmd = dir.join("cmd.exe");
+        let cancel = AtomicBool::new(false);
+        let options = CaptureOptions { dir: &dir, env: &[], below_normal: false };
+        let out = capture_with_exit_hook(&cmd, &["/D", "/C", "echo finished & exit 7"], options, Duration::from_secs(10), &cancel, || {
+            cancel.store(true, Ordering::Relaxed);
+        })
+        .expect("a cancel after observing child exit must not discard the result");
+        assert!(cancel.load(Ordering::Relaxed));
+        assert_eq!(out.code, 7);
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "finished");
+    }
+
+    #[test]
+    fn cancelling_an_active_command_does_not_wait_for_its_timeout() {
+        let cmd = system_dir(GetSystemDirectoryW).unwrap().join("cmd.exe");
+        let cancel = AtomicBool::new(false);
+        let start = Instant::now();
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                std::thread::sleep(Duration::from_millis(300));
+                cancel.store(true, Ordering::Relaxed);
+            });
+            let options = CaptureOptions { dir: cmd.parent().unwrap(), env: &[], below_normal: false };
+            let output = capture(&cmd, &["/D", "/C", "ping -n 5 127.0.0.1 >nul"], options, Duration::from_secs(7), &cancel);
+            assert!(matches!(output, Err(e) if e.kind() == io::ErrorKind::Interrupted));
+        });
+        assert!(start.elapsed() < Duration::from_secs(3));
     }
 
     #[test]

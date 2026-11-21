@@ -15,8 +15,10 @@
 //!   only used to report status.
 
 mod loose;
+mod plugins;
 mod roots;
 mod source_preview;
+pub(crate) use source_preview::assign_fresh_id;
 
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
@@ -40,6 +42,7 @@ use crate::pathsafe::{self, fold};
 use crate::reconcile::{self, Decision, DirtyInfo, Input, LocalState, OwnedView, Skip, UnmanagedState, Verdict};
 use crate::scheduler::Schedule;
 use crate::secret::Secret;
+use crate::source::SourceKind;
 use crate::state::{Fingerprint, Folder, HistorySearch, LocalEvidence, ManagedFile, OwnedSkill, Pending, State, VolumeId};
 use crate::text;
 use crate::tree::{self, Discovery, Rejected, SkillFile};
@@ -184,11 +187,35 @@ pub struct SkillReport {
 }
 
 #[derive(Clone, Debug)]
+pub struct PluginReport {
+    pub name: String,
+    pub version: Option<String>,
+    pub publisher: Option<String>,
+    /// Branch-root path on GitHub (not a local destination).
+    pub path: Option<String>,
+    pub status: crate::plugins::Status,
+    pub choices: Vec<crate::plugins::Choice>,
+    pub result: ApplyResult,
+}
+
+impl PluginReport {
+    pub(crate) fn needs_attention(&self) -> bool {
+        match self.result {
+            ApplyResult::Failed(_) | ApplyResult::Held(_) => true,
+            // Dry runs always lack the native observations needed to plan.
+            ApplyResult::DryRun if self.status == crate::plugins::Status::Blocked => false,
+            _ => self.status.needs_attention(self.result == ApplyResult::Done),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
 pub struct RepoReport {
     pub repo_id: String,
     pub label: String,
     pub outcome: Outcome,
     pub skills: Vec<SkillReport>,
+    pub plugins: Vec<PluginReport>,
     /// Upstream skills that cannot be installed (and the reason).
     pub rejected: Vec<Rejected>,
     pub stats: Stats,
@@ -206,6 +233,7 @@ impl RepoReport {
             label: repo.label(),
             outcome: Outcome::Unchanged,
             skills: Vec::new(),
+            plugins: Vec::new(),
             rejected: Vec::new(),
             stats: Stats::default(),
             downloaded: 0,
@@ -289,6 +317,7 @@ pub struct ResolveReport {
 
 #[derive(Debug, Default)]
 pub struct RemoveReport {
+    pub message: Option<&'static str>,
     pub deleted: Vec<String>,
     /// Skills that stay installed, with the reason, and are now the user's.
     pub kept: Vec<(String, String)>,
@@ -338,6 +367,10 @@ pub struct Engine {
     settings: Option<(PathBuf, bool)>,
     remote: Box<dyn Remote>,
     tokens: Box<dyn TokenProvider>,
+    plugin_manager: Box<dyn crate::plugins::native::PluginManager>,
+    native_plugin_manager: bool,
+    /// Attention rows that a complete check in this process has reported.
+    plugin_attention_rows: HashSet<String>,
     clock: Box<dyn Fn() -> UnixSecs + Send + Sync>,
     lock_wait: Duration,
     cache: Cache,
@@ -761,6 +794,9 @@ impl Engine {
             settings: None,
             remote,
             tokens,
+            plugin_manager: Box::new(crate::win::copilot::Copilot::new()),
+            native_plugin_manager: true,
+            plugin_attention_rows: HashSet::new(),
             clock: Box::new(now_secs),
             lock_wait: DEFAULT_LOCK_WAIT,
             cache: Cache::default(),
@@ -775,6 +811,11 @@ impl Engine {
 
     pub fn set_skills_dir(&mut self, dir: PathBuf) {
         self.paths.skills = dir;
+        self.plugin_attention_rows.clear();
+    }
+
+    pub(crate) fn retain_plugin_attention_rows(&mut self, ids: &[String]) {
+        self.plugin_attention_rows.retain(|id| ids.contains(id));
     }
 
     pub fn paths(&self) -> &Paths {
@@ -803,10 +844,18 @@ impl Engine {
             let view = if repo.kind.is_skills() {
                 state
             } else {
-                if let Some(p) = state.loose_sources().get(&repo.id).map(|s| &s.poll) {
+                let poll = if repo.kind == SourceKind::Plugins {
+                    state.plugin_sources().get(&repo.id).filter(|r| r.origin.matches(repo)).map(|r| {
+                        let etag = if r.poll.needs_attention && !self.plugin_attention_rows.contains(&repo.id) { &None } else { &r.poll.etag };
+                        (r.poll.last_check, etag)
+                    })
+                } else {
+                    state.loose_sources().get(&repo.id).map(|r| (r.poll.last_check, &r.poll.etag))
+                };
+                if let Some((at, etag)) = poll {
                     let r = timing.repo_mut(&repo.id);
-                    r.last_check = p.last_check;
-                    r.etag.clone_from(&p.etag);
+                    r.last_check = at;
+                    r.etag.clone_from(etag);
                 }
                 &timing
             };
@@ -815,7 +864,12 @@ impl Engine {
     }
 
     pub fn last_check(&self, repo_id: &str) -> Option<UnixSecs> {
-        self.cache.state.repo(repo_id).and_then(|r| r.last_check).or_else(|| self.cache.state.loose_sources().get(repo_id)?.poll.last_check)
+        self.cache
+            .state
+            .repo(repo_id)
+            .and_then(|r| r.last_check)
+            .or_else(|| self.cache.state.loose_sources().get(repo_id)?.poll.last_check)
+            .or_else(|| self.cache.state.plugin_sources().get(repo_id)?.poll.last_check)
     }
 
     /// The skills of a repository the user keeps as their own, as of the last call.
@@ -856,14 +910,23 @@ impl Engine {
             .collect()
     }
 
+    /// Local plugin records as of the last call, for read-only status. No Copilot command is run.
+    pub(crate) fn plugin_record(&self, source: &RepoConfig) -> Option<&crate::state::PluginSourceState> {
+        self.cache.state.plugin_sources().get(&source.id).filter(|r| r.origin.matches(source))
+    }
+
     /// Whether the last listing read for a repository had no skills in it at all, as of the last call.
     pub fn lists_nothing(&self, repo_id: &str) -> bool {
-        self.cache.state.repo(repo_id).is_some_and(|r| r.lists_nothing) || self.cache.state.loose_sources().get(repo_id).is_some_and(|r| r.poll.lists_nothing)
+        self.cache.state.repo(repo_id).is_some_and(|r| r.lists_nothing)
+            || self.cache.state.loose_sources().get(repo_id).is_some_and(|r| r.poll.lists_nothing)
+            || self.cache.state.plugin_sources().get(repo_id).is_some_and(|r| r.poll.lists_nothing)
     }
 
     /// Whether a repository was found to be readable only with the user's GitHub sign-in, as of the last call.
     pub fn needs_token(&self, repo_id: &str) -> bool {
-        self.cache.state.repo(repo_id).is_some_and(|r| r.needs_token) || self.cache.state.loose_sources().get(repo_id).is_some_and(|r| r.poll.needs_token)
+        self.cache.state.repo(repo_id).is_some_and(|r| r.needs_token)
+            || self.cache.state.loose_sources().get(repo_id).is_some_and(|r| r.poll.needs_token)
+            || self.cache.state.plugin_sources().get(repo_id).is_some_and(|r| r.poll.needs_token)
     }
 
     /// The stamp of `state.json` as the last call left it, or `None` when it is not known. A different stamp on disk
@@ -936,6 +999,7 @@ impl Engine {
         let mut state = if reusable {
             std::mem::take(&mut self.cache.state)
         } else {
+            self.plugin_attention_rows.clear();
             let loaded = State::load_sources_with(&path, access == Access::Write).map_err(|e| failed(format!("cannot read {}: {e}", path.display())))?;
             let mut state = loaded.state;
             suspect = loaded.warning.is_some() && access == Access::ReadOnly;
@@ -1098,7 +1162,11 @@ impl Engine {
         let before = s.stats;
         let mut skills = Vec::new();
         for repo in &cfg.repos {
-            let local = if repo.kind.is_skills() { verify_repo(s, &repo.id) } else { s.verify_files(repo) };
+            let local = match repo.kind {
+                SourceKind::Skills => verify_repo(s, &repo.id),
+                SourceKind::Agents | SourceKind::Instructions => s.verify_files(repo),
+                SourceKind::Plugins => Vec::new(),
+            };
             for (name, status) in local {
                 skills.push(LocalReport { repo_id: repo.id.clone(), name, status });
             }
@@ -1111,6 +1179,7 @@ impl Engine {
             .filter(|(id, r)| !known.contains(id.as_str()) && !r.skills.is_empty())
             .map(|(id, _)| id.clone())
             .chain(s.state.loose_sources().keys().filter(|id| !known.contains(id.as_str())).cloned())
+            .chain(s.state.plugin_sources().keys().filter(|id| !known.contains(id.as_str())).cloned())
             .collect();
         let tracking = s.tracking();
         VerifyReport {
@@ -1149,7 +1218,11 @@ impl Engine {
             let Some(repo) = cfg.find(&id) else { continue };
             let before = s.stats;
             let downloaded = s.downloaded;
-            let mut report = if repo.kind.is_skills() { self.sync_repo(s, repo, opts, cancel) } else { self.sync_files(s, repo, opts, cancel) };
+            let mut report = match repo.kind {
+                SourceKind::Skills => self.sync_repo(s, repo, opts, cancel),
+                SourceKind::Agents | SourceKind::Instructions => self.sync_files(s, repo, opts, cancel),
+                SourceKind::Plugins => self.sync_plugins(s, repo, opts, *which != Which::Due, cancel),
+            };
             report.stats = since(s.stats, before);
             report.downloaded = s.downloaded - downloaded;
             report.finished_at = self.now();
@@ -1173,7 +1246,11 @@ impl Engine {
                 }
                 if s.must_save {
                     // A failed save is recorded as a warning and reported with the rest.
-                    let _ = s.save();
+                    if let Err(why) = s.save() {
+                        if repo.kind == SourceKind::Plugins && !matches!(report.outcome, Outcome::Failed(_)) {
+                            report = report.fail(RemoteError::new(FailureKind::Local, why));
+                        }
+                    }
                 }
             }
             reports.push(report);
@@ -1196,7 +1273,7 @@ impl Engine {
         learn: bool,
         cancel: &AtomicBool,
     ) -> Result<(TreeReply, Option<Arc<Secret>>), RemoteError> {
-        let (reply, token, private) = self.request_tree(s, repo, repo_ref, etag, cancel)?;
+        let (reply, token, private) = self.request_tree(Some(s), repo, repo_ref, etag, cancel)?;
         if learn && repo.kind.is_skills() && private != s.state.repo(&repo.id).is_some_and(|r| r.needs_token) {
             s.state.repo_mut(&repo.id).needs_token = private;
             s.must_save = true;
@@ -1206,26 +1283,34 @@ impl Engine {
 
     fn request_tree(
         &self,
-        s: &mut Session,
+        mut s: Option<&mut Session>,
         repo: &RepoConfig,
         repo_ref: &RepoRef,
         etag: Option<&str>,
         cancel: &AtomicBool,
     ) -> Result<(TreeReply, Option<Arc<Secret>>, bool), RemoteError> {
         let tree = |token: Option<&Arc<Secret>>| self.remote.tree(repo_ref, etag, token.map(Arc::as_ref), cancel);
-        let remembered = s.state.repo(&repo.id).is_some_and(|r| r.needs_token) || s.state.loose_sources().get(&repo.id).is_some_and(|r| r.poll.needs_token);
+        let remembered = s.as_ref().is_some_and(|s| {
+            s.state.repo(&repo.id).is_some_and(|r| r.needs_token)
+                || s.state.loose_sources().get(&repo.id).is_some_and(|r| r.poll.needs_token)
+                || s.state.plugin_sources().get(&repo.id).is_some_and(|r| r.origin.matches(repo) && r.poll.needs_token)
+        });
+        let mut token = || match &mut s {
+            Some(s) => s.token(self.tokens.as_ref()),
+            None => self.tokens.token().map(Arc::new),
+        };
         if repo.use_token {
-            let token = s.token(self.tokens.as_ref()).map_err(|why| RemoteError::new(FailureKind::Auth, why))?;
+            let token = token().map_err(|why| RemoteError::new(FailureKind::Auth, why))?;
             return Ok((tree(Some(&token))?, Some(token), remembered));
         }
         if remembered {
-            if let Ok(token) = s.token(self.tokens.as_ref()) {
+            if let Ok(token) = token() {
                 return Ok((tree(Some(&token))?, Some(token), true));
             }
         }
         match tree(None) {
             Ok(reply) => Ok((reply, None, false)),
-            Err(e) if matches!(e.kind, FailureKind::NotFound | FailureKind::RateLimited) => match s.token(self.tokens.as_ref()) {
+            Err(e) if matches!(e.kind, FailureKind::NotFound | FailureKind::RateLimited) && !cancel.load(Ordering::Relaxed) => match token() {
                 Ok(token) => {
                     let reply = tree(Some(&token))?;
                     Ok((reply, Some(token), e.kind == FailureKind::NotFound))
@@ -1827,6 +1912,9 @@ impl Engine {
     /// Settles one skill that needs the user's decision.
     pub fn resolve(&mut self, cfg: &Config, repo_id: &str, skill: &str, how: Resolution, cancel: &AtomicBool) -> Result<ResolveReport, EngineError> {
         let repo = cfg.find(repo_id).ok_or_else(|| failed(format!("no repository '{repo_id}' is set up")))?;
+        if repo.kind == SourceKind::Plugins {
+            return Err(failed("Use a plugin choice to resolve a Copilot plugin."));
+        }
         pathsafe::check_component(skill).map_err(|why| failed(why.to_string()))?;
         let mut s = self.begin_settled(cfg)?.ok_or_else(folder_changed)?;
         let result = if repo.kind.is_skills() {
@@ -1965,6 +2053,9 @@ impl Engine {
     /// enough evidence in memory to check a later overwrite choice.
     pub fn diff(&mut self, cfg: &Config, repo_id: &str, skill: &str, cancel: &AtomicBool) -> Result<DiffReport, EngineError> {
         let repo = cfg.find(repo_id).ok_or_else(|| failed(format!("no repository '{repo_id}' is set up")))?;
+        if repo.kind == SourceKind::Plugins {
+            return Err(failed("Copilot plugins cannot be compared as local files."));
+        }
         pathsafe::check_component(skill).map_err(|e| failed(format!("'{skill}' is not a skill name ({e})")))?;
         let mut s = self.begin(cfg, Access::ReadOnly)?;
         let result = if repo.kind.is_skills() {
@@ -2054,6 +2145,9 @@ impl Engine {
     /// file the user added is never opened. Asks GitHub nothing and changes nothing.
     pub fn preview(&mut self, cfg: &Config, repo_id: &str, skill: &str, cancel: &AtomicBool) -> Result<DiffReport, EngineError> {
         let repo = cfg.find(repo_id).ok_or_else(|| failed(format!("no repository '{repo_id}' is set up")))?;
+        if repo.kind == SourceKind::Plugins {
+            return Err(failed("Copilot plugins cannot be opened as local files."));
+        }
         pathsafe::check_component(skill).map_err(|e| failed(format!("'{skill}' is not a skill name ({e})")))?;
         let mut s = self.begin(cfg, Access::ReadOnly)?;
         let result = if repo.kind.is_skills() {
@@ -2071,8 +2165,28 @@ impl Engine {
     }
 
     pub fn remove_source(&mut self, cfg: &Config, repo_id: &str, delete_skills: bool) -> Result<RemoveReport, EngineError> {
+        self.remove_source_in(cfg, repo_id, delete_skills, None)
+    }
+
+    fn remove_source_in(&mut self, cfg: &Config, repo_id: &str, delete_skills: bool, uninstall: Option<&AtomicBool>) -> Result<RemoveReport, EngineError> {
         let mut s = self.begin_settled(cfg)?.ok_or_else(folder_changed)?;
         let active = cfg.find(repo_id);
+        let is_plugin = active.is_some_and(|r| r.kind == SourceKind::Plugins) || s.state.plugin_sources().contains_key(repo_id);
+        if is_plugin || uninstall.is_some() {
+            let result = if !is_plugin {
+                Err(failed("--uninstall-plugins is only for a Plugins source"))
+            } else if delete_skills {
+                Err(failed("--delete-skills is only for a Skills source"))
+            } else {
+                self.remove_plugins_in(&mut s, active, repo_id, uninstall)
+            };
+            if result.is_ok() {
+                self.schedule.forget(repo_id);
+                self.plugin_attention_rows.remove(repo_id);
+                s.lazy.remove(repo_id);
+            }
+            return self.conclude(s, result);
+        }
         s.authorize().map_err(|e| failed(e.message))?;
         let mut report = RemoveReport::default();
         if let Some(record) = s.state.loose_sources().get(repo_id) {

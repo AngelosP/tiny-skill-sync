@@ -37,6 +37,7 @@ struct TestHost {
     app: Option<FakeApp>,
     change_before_second_home_read: Mutex<Option<Config>>,
     home_reads: std::cell::Cell<u32>,
+    plugins: FakePluginManager,
     confirm_add: std::cell::Cell<Option<bool>>,
 }
 
@@ -108,6 +109,10 @@ impl Host for TestHost {
         self.tokens.provider()
     }
 
+    fn plugin_manager(&self) -> Option<Box<dyn tiny_skill_sync::plugins::native::PluginManager>> {
+        Some(self.plugins.manager())
+    }
+
     fn confirm_source(&self) -> Result<bool, String> {
         Ok(self.confirm_add.take().expect("a command not adding a typed source asked for confirmation"))
     }
@@ -170,6 +175,7 @@ impl TestHost {
         std::fs::create_dir_all(world.root.join("exe")).unwrap();
         let remote = FakeRemote::new();
         TestHost {
+            plugins: FakePluginManager::new(world.root.join("native")),
             world,
             remote,
             tokens: FakeTokens::none(),
@@ -544,7 +550,7 @@ fn repositories_are_added_once_and_named_unambiguously() {
     let repos = host.config().repos;
     assert_eq!((repos.len(), repos[0].interval.map(|i| i.to_string())), (1, Some("6h".to_string())));
 
-    expect(&tss(&host, "add O/Fixtures"), 3, &["already set up, as 'o-fixtures'"]);
+    expect(&tss(&host, "add O/Fixtures"), 3, &["This source is already set up. Its ID is 'o-fixtures'."]);
     expect(&tss(&host, "add not-a-repo"), 3, &[]);
     expect(&tss(&host, "add https://github.com/o/fixtures/tree/main/skills --use-token"), 0, &["as 'o-fixtures-2'", "sends the GitHub token"]);
     assert_eq!(host.config().repos.len(), 2);
@@ -606,6 +612,256 @@ fn source_preview_reports_only_the_selected_type_and_its_rejections() {
     expect(&ran, 2, &["Type: Agents", "Matched 1 agent:", "ordinary.agent.md", "Rejected:", "CON.agent.md", "Nothing was saved or installed"]);
     assert!(!ran.out.contains("other.instructions.md"));
     assert_eq!(host.world.snapshot(), before);
+}
+
+const PLUGIN_URL: &str = "https://github.com/o/fixtures/tree/main/pack";
+
+#[test]
+fn plugin_cli_add_error_points_to_a_named_branch_without_double_punctuation() {
+    let host = plugin_host("cli-plugin-named-branch");
+    let ran = tss(&host, "add --type plugins o/fixtures");
+    expect(&ran, 2, &["Plugins need a named branch, for example https://github.com/OWNER/NAME/tree/main. Nothing was saved or installed."]);
+    assert!(!ran.err.contains(".."), "{}", ran.err);
+    assert!(host.plugins.calls().is_empty());
+}
+
+#[test]
+fn plugin_cli_refuses_unsupported_branch_characters_before_preview_or_add() {
+    let host = plugin_host("cli-plugin-branch-chars");
+    host.confirm_add.set(Some(false));
+    let before = host.world.snapshot();
+    for branch in ["bad~ref", "caf\u{e9}"] {
+        for flag in ["", " --preview"] {
+            let ran = tss(&host, &format!("add --type plugins https://github.com/o/fixtures/tree/{branch}/pack{flag}"));
+            expect(&ran, 3, &["This branch name has characters the app will not pass to Copilot CLI: use letters, digits, '.', '_', '/', '+' or '-'."]);
+        }
+    }
+    assert!(host.plugins.calls().is_empty());
+    assert_eq!(host.remote.calls().tree, 0);
+    assert_eq!(host.world.snapshot(), before);
+}
+
+#[test]
+fn plugin_cli_preview_says_when_a_publisher_is_not_declared() {
+    let host = plugin_host("cli-plugin-no-publisher");
+    host.remote.put(REPO, "pack/alpha/plugin.json", r#"{"name":"alpha","version":"1.0.0"}"#);
+    expect(&tss(&host, &format!("add --type plugins {PLUGIN_URL} --preview")), 0, &["alpha 1.0.0, publisher not declared"]);
+}
+
+fn plugin_host(test: &str) -> TestHost {
+    let host = TestHost::empty(test);
+    host.remote.put(
+        REPO,
+        "marketplace.json",
+        r#"{"name":"tools","plugins":[{"name":"alpha","source":"./pack/alpha"},{"name":"other","source":{"url":"https://example.test/other"}}]}"#,
+    );
+    host.remote.put(REPO, "pack/alpha/plugin.json", r#"{"name":"alpha","version":"1.0.0","author":{"name":"Review Team"},"mcpServers":{}}"#);
+    host
+}
+
+#[test]
+fn plugin_cli_parses_typed_add_and_explicit_choices() {
+    use cli::{AddSource, Command};
+    use tiny_skill_sync::plugins::Choice;
+    let parse = |words: &[&str]| cli::parse(&words.iter().map(|s| (*s).into()).collect::<Vec<_>>());
+    assert_eq!(
+        parse(&["add", "--type", "plugins", PLUGIN_URL, "--preview"]),
+        Ok(Command::Add(AddSource { spec: PLUGIN_URL.into(), kind: Some(SourceKind::Plugins), preview: true, ..AddSource::default() }))
+    );
+    assert_eq!(
+        parse(&["resolve", "r", "alpha", "approve", "Review Team"]),
+        Ok(Command::ResolvePlugin { repo: "r".into(), choice: Choice::Approve { name: "alpha".into(), publisher: Some("Review Team".into()) } })
+    );
+    for (word, choice) in
+        [("reinstall", Choice::Reinstall("alpha".into())), ("uninstall", Choice::Uninstall("alpha".into())), ("forget", Choice::Forget("alpha".into()))]
+    {
+        assert_eq!(parse(&["resolve", "r", "alpha", word]), Ok(Command::ResolvePlugin { repo: "r".into(), choice }));
+    }
+    assert!(parse(&["remove", "r", "--delete-skills", "--uninstall-plugins"]).is_err());
+}
+
+#[test]
+fn plugin_cli_shared_sources_are_held_and_approval_must_name_the_publisher() {
+    let host = plugin_host("cli-plugin-shared");
+    let mut cfg = Config::default();
+    let id = cfg.add_source(SourceKind::Plugins, &RepoSpec::parse(PLUGIN_URL).unwrap(), None, false).id.clone();
+    tiny_skill_sync::portable::export(&host.executable_dir().unwrap(), &cfg).unwrap();
+    let ran = tss(&host, "sync");
+    expect(&ran, 1, &["alpha: Needs your approval", &format!("tss resolve {id} alpha approve \"Review Team\"")]);
+    for publisher in ["", " Wrong"] {
+        let ran = tss(&host, &format!("resolve {id} alpha approve{publisher}"));
+        expect(&ran, 2, &["The plugin 'alpha' is published by 'Review Team'.", &format!("tss resolve {id} alpha approve \"Review Team\"")]);
+        assert!(ran.out.is_ascii() && ran.err.is_ascii());
+    }
+    assert!(host.world.state().plugin_sources()[&id].approved.is_empty());
+    assert!(host.plugins.calls().iter().all(|c| matches!(c, PluginCall::Home | PluginCall::List | PluginCall::Markets)));
+}
+
+#[test]
+fn plugin_cli_choices_are_usage_errors_on_the_wrong_source_type() {
+    let host = TestHost::new("cli-plugin-wrong-kind");
+    let mut cfg = host.config();
+    let id = cfg.add_source(SourceKind::Plugins, &RepoSpec::parse(PLUGIN_URL).unwrap(), None, false).id.clone();
+    host.save(&cfg);
+    expect(&tss(&host, "check fx"), 0, &["alpha"]);
+    let before = host.world.snapshot();
+    for (command, message) in [
+        ("resolve fx alpha forget".into(), "only for Plugins sources"),
+        ("resolve fx ALPHA forget".into(), "only for Plugins sources"),
+        (format!("resolve {id} ALPHA forget"), "Use the plugin name"),
+        (format!("resolve {id} alpha keep"), "For Plugins, use approve, reinstall, uninstall or forget"),
+        ("remove fx --uninstall-plugins".into(), "only for a Plugins source"),
+    ] {
+        expect(&tss(&host, &command), 3, &[message]);
+        assert!(host.plugins.calls().is_empty());
+        assert_eq!(host.world.snapshot(), before);
+    }
+}
+
+#[test]
+fn plugin_cli_check_shows_an_existing_install_without_an_attention_exit_code() {
+    use tiny_skill_sync::plugins::native::{MarketOrigin, NativeMarket, NativePlugin, NativeSnapshot};
+
+    let host = plugin_host("cli-plugin-already-installed");
+    host.confirm_add.set(Some(true));
+    expect(&tss(&host, &format!("add --type plugins {PLUGIN_URL}")), 0, &["Added"]);
+    host.plugins.set_snapshot(NativeSnapshot {
+        home: host.world.root.join("native"),
+        markets: vec![NativeMarket {
+            name: "tools".into(),
+            source: "GitHub: o/fixtures".into(),
+            is_default: false,
+            origin: Some(MarketOrigin { kind: "github".into(), repo: Some(REPO.into()), reference: Some("main".into()) }),
+        }],
+        plugins: vec![NativePlugin { name: "alpha".into(), marketplace: "tools".into(), version: "2".into(), enabled: true, source: "installed".into() }],
+    });
+    expect(&tss(&host, "check"), 0, &["alpha: Already installed in Copilot from somewhere else; left as it is."]);
+    assert!(host.world.state().plugin_sources().values().all(|r| r.plugins.is_empty()));
+}
+
+#[test]
+fn plugin_cli_add_skips_ids_used_by_all_three_state_sections() {
+    use tiny_skill_sync::source::{Entry, resolve_destination};
+    use tiny_skill_sync::state::{PluginSourceState, State};
+
+    let host = plugin_host("cli-plugin-add-id");
+    let mut state = State::default();
+    state.repo_mut("o-fixtures").last_check = Some(T0);
+    let leaf = tiny_skill_sync::config::RepoConfig { kind: SourceKind::Agents, ..repo("o-fixtures-2", REPO, "") };
+    let binding = resolve_destination(&leaf, &host.world.root.join("agents"), &["x.agent.md".into()], None, |_| Ok(Entry::Missing)).unwrap();
+    state.bind_destination(&leaf, binding).unwrap();
+    let native = tiny_skill_sync::config::RepoConfig { kind: SourceKind::Plugins, branch: "main".into(), ..repo("o-fixtures-3", REPO, "pack") };
+    let record = PluginSourceState::new(&native, &host.world.root.join("native"), "tools");
+    state.set_plugin_source(&native.id, record).unwrap();
+    state.save(&host.world.state_file()).unwrap();
+
+    expect(&tss(&host, &format!("add --type plugins {PLUGIN_URL} --preview")), 0, &["[o-fixtures-4]", "Matched 1 plugin"]);
+    assert!(host.plugins.calls().is_empty());
+    host.confirm_add.set(Some(true));
+    expect(&tss(&host, &format!("add --type plugins {PLUGIN_URL}")), 0, &["as 'o-fixtures-4'"]);
+    let saved = host.world.state();
+    assert_eq!(saved.repo("o-fixtures"), state.repo("o-fixtures"));
+    assert_eq!(saved.loose_sources(), state.loose_sources());
+    assert_eq!(saved.plugin_sources().get("o-fixtures-3"), state.plugin_sources().get("o-fixtures-3"));
+    assert!(saved.plugin_sources().contains_key("o-fixtures-4"));
+    assert_eq!(host.plugins.calls(), [PluginCall::Home]);
+}
+
+#[test]
+fn plugin_cli_preview_refuses_a_saved_id_used_by_a_skill_record() {
+    use tiny_skill_sync::state::State;
+
+    let host = plugin_host("cli-plugin-preview-conflict");
+    let mut cfg = Config::default();
+    let id = cfg.add_source(SourceKind::Plugins, &RepoSpec::parse(PLUGIN_URL).unwrap(), None, false).id.clone();
+    host.save(&cfg);
+    let mut state = State::default();
+    state.repo_mut(&id).last_check = Some(T0);
+    state.save(&host.world.state_file()).unwrap();
+    let before = host.world.snapshot();
+    expect(&tss(&host, &format!("add --type plugins {PLUGIN_URL} --preview")), 2, &[&id, "already used"]);
+    assert!(host.plugins.calls().is_empty());
+    assert_eq!(host.world.snapshot(), before);
+}
+
+#[test]
+fn plugin_cli_preview_is_read_only_without_copilot_and_shows_consent() {
+    let host = plugin_host("cli-plugin-preview");
+    let before = host.world.snapshot();
+    let ran = tss(&host, &format!("add --type plugins {PLUGIN_URL} --preview"));
+    expect(
+        &ran,
+        0,
+        &[
+            "Type: Plugins",
+            "Installs with: GitHub Copilot CLI",
+            "Marketplace: tools",
+            "Matched 1 plugin:",
+            "alpha 1.0.0, by Review Team",
+            "MCP servers",
+            "other: Hosted elsewhere; not handled",
+            "Plugins can run programs on this PC.",
+            "new versions from main automatically",
+            "publisher changes, wait for your approval",
+        ],
+    );
+    assert!(ran.out.is_ascii());
+    assert!(host.plugins.calls().is_empty());
+    assert_eq!(host.world.snapshot(), before);
+}
+
+#[test]
+fn plugin_cli_partial_uninstall_keeps_the_source_and_failed_record() {
+    use tiny_skill_sync::plugins::native::{MarketOrigin, NativeMarket, NativePlugin, NativeSnapshot};
+
+    let host = plugin_host("cli-plugin-remove");
+    let home = host.world.root.join("native");
+    let mut snapshot = NativeSnapshot {
+        home,
+        markets: vec![NativeMarket {
+            name: "tools".into(),
+            source: "GitHub: o/fixtures".into(),
+            is_default: false,
+            origin: Some(MarketOrigin { kind: "github".into(), repo: Some(REPO.into()), reference: Some("main".into()) }),
+        }],
+        plugins: vec![],
+    };
+    host.remote.put(REPO, "marketplace.json", r#"{"name":"tools","plugins":[{"name":"alpha","source":"pack/alpha"},{"name":"beta","source":"pack/beta"}]}"#);
+    host.remote.put(REPO, "pack/beta/plugin.json", r#"{"name":"beta","version":"1.0.0"}"#);
+    host.plugins.set_snapshot(snapshot.clone());
+    host.confirm_add.set(Some(true));
+    expect(&tss(&host, &format!("add --type plugins {PLUGIN_URL}")), 0, &["Added"]);
+    assert_eq!(host.plugins.calls(), [PluginCall::Home], "recording approval does not start Copilot");
+    let cfg = host.config();
+    let id = &cfg.repos[0].id;
+    for name in ["alpha", "beta"] {
+        snapshot.plugins.push(NativePlugin {
+            name: name.into(),
+            marketplace: "tools".into(),
+            version: "1.0.0".into(),
+            enabled: true,
+            source: "installed".into(),
+        });
+        host.plugins.push(PluginCall::Install(format!("{name}@tools")), PluginReply::Done(Some(snapshot.clone())));
+    }
+    expect(&tss(&host, "sync"), 0, &["alpha", "beta"]);
+    let calls = host.plugins.calls();
+    expect(&tss(&host, "status"), 0, &["alpha: Last recorded. Version last recorded by this app; sync to check Copilot now", "1.0.0", "Review Team"]);
+    assert_eq!(host.plugins.calls(), calls, "status only reads the local record");
+
+    snapshot.plugins.remove(0);
+    host.plugins.push(PluginCall::Uninstall("alpha@tools".into()), PluginReply::Done(Some(snapshot.clone())));
+    host.plugins.push(PluginCall::Uninstall("beta@tools".into()), PluginReply::Done(None));
+    expect(&tss(&host, &format!("remove {id} --uninstall-plugins")), 2, &["source was kept", "did not confirm"]);
+    assert_eq!(host.config(), cfg);
+    let state = host.world.state();
+    assert_eq!(state.plugin_sources()[id].plugins.keys().collect::<Vec<_>>(), &["beta"]);
+    assert_eq!(host.plugins.remaining(), 0);
+
+    let calls = host.plugins.calls();
+    expect(&tss(&host, &format!("remove {id}")), 0, &["Plugins stay installed in Copilot."]);
+    assert_eq!(host.plugins.calls(), calls);
+    assert!(host.config().repos.is_empty());
 }
 
 #[test]

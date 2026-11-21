@@ -3,6 +3,7 @@
 pub mod autorun;
 mod clip;
 pub mod console;
+pub(crate) mod copilot;
 pub mod cred;
 pub mod fs;
 pub mod http;

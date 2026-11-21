@@ -27,7 +27,29 @@ public static class TssLive {
     [DllImport("user32.dll")] public static extern uint GetDpiForWindow(IntPtr hwnd);
     [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hwnd);
     [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+    [DllImport("user32.dll")] static extern bool AttachThreadInput(uint from, uint to, bool attach);
+    [DllImport("user32.dll")] static extern bool BringWindowToTop(IntPtr hwnd);
+    [DllImport("kernel32.dll")] static extern uint GetCurrentThreadId();
     [DllImport("user32.dll")] static extern bool GetGUIThreadInfo(uint thread, ref GUITHREADINFO info);
+
+    // Windows ignores SetForegroundWindow from a process that did not get the last input, for example once a window
+    // the test opened and closed has handed the foreground to another app. Sharing the foreground thread's input
+    // state for the call lets it through. True when the window is in the foreground afterwards.
+    public static bool Foreground(IntPtr window) {
+        if (SetForegroundWindow(window) && GetForegroundWindow() == window) return true;
+        uint pid;
+        uint me = GetCurrentThreadId();
+        IntPtr front = GetForegroundWindow();
+        uint frontThread = front == IntPtr.Zero ? 0 : GetWindowThreadProcessId(front, out pid);
+        bool attached = frontThread != 0 && frontThread != me && AttachThreadInput(me, frontThread, true);
+        try {
+            BringWindowToTop(window);
+            SetForegroundWindow(window);
+        } finally {
+            if (attached) AttachThreadInput(me, frontThread, false);
+        }
+        return GetForegroundWindow() == window;
+    }
     [StructLayout(LayoutKind.Sequential)] struct GUITHREADINFO {
         public uint Size, Flags;
         public IntPtr Active, Focus, Capture, MenuOwner, MoveSize, Caret;
@@ -488,6 +510,52 @@ function Get-LiveChildEnv($Root, [hashtable]$Env = @{}) {
     $map
 }
 
+# Override both Copilot directories in the child environment, never the caller's environment.
+function Get-LiveCopilotExe {
+    $exe = $env:TSS_COPILOT_CLI
+    if ($null -eq $exe -and $env:LOCALAPPDATA) { $exe = Join-Path $env:LOCALAPPDATA 'GitHubCopilotCLI\copilot.exe' }
+    if ($exe -and $exe -match '^[A-Za-z]:\\|^\\\\[^?\\]' -and $exe -like '*.exe' -and (Test-Path -LiteralPath $exe -PathType Leaf)) {
+        [IO.Path]::GetFullPath($exe)
+    }
+}
+
+function Assert-LiveCopilotEnv([string]$Root, $Env) {
+    if (-not $env:USERPROFILE -or -not $env:LOCALAPPDATA) { throw 'Cannot identify both real Copilot folders.' }
+    $full = { param($p) ([IO.Path]::GetFullPath($p)).TrimEnd('\') + '\' }
+    $within = { param($p, $parent) $p.StartsWith($parent, [StringComparison]::OrdinalIgnoreCase) }
+    $base = & $full $Root
+    $protected = @((& $full (Join-Path $env:USERPROFILE '.copilot')), (& $full (Join-Path $env:LOCALAPPDATA 'copilot')))
+    foreach ($key in 'COPILOT_HOME', 'COPILOT_CACHE_HOME') {
+        if (-not $Env[$key] -or $Env[$key] -notmatch '^[A-Za-z]:\\|^\\\\[^?\\]') { throw "$key must be a full throwaway path." }
+        $dir = & $full $Env[$key]
+        if ($dir -eq $base -or -not (& $within $dir $base)) { throw "$key is not inside the scenario folder." }
+        foreach ($real in $protected) {
+            if ((& $within $dir $real) -or (& $within $real $dir)) { throw "$key overlaps a real Copilot folder." }
+        }
+        # Check parents first so even looking up a child cannot follow a junction.
+        $parts = @()
+        for ($entry = $dir.TrimEnd('\'); $entry; $entry = Split-Path -Parent $entry) { $parts = @($entry) + $parts }
+        foreach ($part in $parts) {
+            $item = Get-Item -LiteralPath $part -Force -ErrorAction SilentlyContinue
+            if ($item -and ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw "$key is reached through a link." }
+        }
+    }
+    if ((& $full $Env['COPILOT_HOME']) -eq (& $full $Env['COPILOT_CACHE_HOME']) -or $Env['COPILOT_AUTO_UPDATE'] -ne 'false') {
+        throw 'Copilot needs separate throwaway folders and automatic updates off.'
+    }
+}
+
+function Get-LivePluginList([string]$Root, [hashtable]$Env) {
+    $psi = New-LiveStartInfo $Root 'copilot.exe' @('plugin', 'list', '--json') $Env
+    $psi.FileName = $Env.TSS_COPILOT_CLI
+    $psi.CreateNoWindow = $true
+    Assert-LiveCopilotEnv $Root $psi.EnvironmentVariables
+    $r = Invoke-LiveConsole $psi 'copilot plugin list --json' 30
+    if ($r.Code -ne 0) { throw "Isolated copilot plugin list failed (exit $($r.Code))." }
+    try { $plugins = ConvertFrom-Json -InputObject $r.Out } catch { throw 'Copilot did not return a readable plugin list.' }
+    foreach ($plugin in $plugins) { $plugin }
+}
+
 # Starts the tray app on the throwaway install.
 function Start-LiveTray($Root, [string[]]$AppArgs = @(), [hashtable]$Env = @{}) {
     $psi = New-LiveStartInfo $Root 'tiny-skill-sync.exe' $AppArgs $Env
@@ -612,7 +680,7 @@ function Get-UpstreamFiles([string]$Repo, [string]$Ref, [string]$Path = '') {
 # for this one, not for the signed-in listing. Paths are relative to the folder. At most a few calls: the limit
 # without a token is 60 an hour.
 function Get-PublicFiles([string]$Repo, [string]$Ref, [string]$Path) {
-    $spec = [uri]::EscapeDataString("${Ref}:${Path}")
+    $spec = [uri]::EscapeDataString($(if ($Path) { "${Ref}:${Path}" } else { $Ref }))
     $headers = @{ 'Accept' = 'application/vnd.github+json'; 'X-GitHub-Api-Version' = '2022-11-28'; 'User-Agent' = 'tss-e2e' }
     $tree = Invoke-RestMethod -UseBasicParsing -Headers $headers -Uri "https://api.github.com/repos/$Repo/git/trees/${spec}?recursive=1"
     if ($tree.truncated) { throw 'the listing is truncated' }
@@ -780,7 +848,10 @@ function Wait-Quiet([string]$Report, [int]$QuietSec = 4, [int]$TimeoutSec = 90) 
 # Opens the window the way the tray menu does (or finds it open), and returns it once it shows.
 function Open-Window([Diagnostics.Process]$P) {
     $h = Find-LiveWindow $P.Id $WINDOW_CLASS -Visible
-    if ($h -eq [IntPtr]::Zero) { Send-LiveCommand $P $CMD_SETTINGS }
+    if ($h -eq [IntPtr]::Zero) {
+        [void](Wait-Live { (Find-LiveWindow $P.Id $TRAY_CLASS) -ne [IntPtr]::Zero } 'the tray window to start' 15 100)
+        Send-LiveCommand $P $CMD_SETTINGS
+    }
     Wait-Live { $w = Find-LiveWindow $P.Id $WINDOW_CLASS -Visible; if ($w -ne [IntPtr]::Zero) { $w } } 'the window' 15 100
 }
 

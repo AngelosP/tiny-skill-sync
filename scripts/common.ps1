@@ -96,10 +96,15 @@ function New-LiveStartInfo($Root, [string]$Exe, [string[]]$AppArgs, [hashtable]$
 
 # Runs the command line on the throwaway install and returns its exit code and output. $Exe runs another
 # copy of tss.exe on the same folders instead (the long-path startup test).
-function Invoke-LiveTss($Root, [string[]]$TssArgs, [hashtable]$Env = @{}, [int]$TimeoutSec = 240, [string]$Exe = '') {
+function Invoke-LiveTss($Root, [string[]]$TssArgs, [hashtable]$Env = @{}, [int]$TimeoutSec = 240, [string]$Exe = '', [string]$InputLine = '') {
     Assert-NotTokenChange $TssArgs
     $psi = New-LiveStartInfo $Root 'tss.exe' $TssArgs $Env
     if ($Exe) { $psi.FileName = $Exe }
+    Invoke-LiveConsole $psi "tss $($TssArgs -join ' ')" $TimeoutSec $InputLine
+}
+
+function Invoke-LiveConsole($psi, [string]$Label, [int]$TimeoutSec, [string]$InputLine = '') {
+    $psi.RedirectStandardInput = [bool]$InputLine
     $psi.RedirectStandardOutput = $true
     $psi.RedirectStandardError = $true
     $psi.StandardOutputEncoding = [Text.Encoding]::UTF8
@@ -107,12 +112,14 @@ function Invoke-LiveTss($Root, [string[]]$TssArgs, [hashtable]$Env = @{}, [int]$
     $p = [Diagnostics.Process]::Start($psi)
     $out = $p.StandardOutput.ReadToEndAsync()
     $err = $p.StandardError.ReadToEndAsync()
+    if ($InputLine) { $p.StandardInput.WriteLine($InputLine); $p.StandardInput.Close() }
     if (-not $p.WaitForExit($TimeoutSec * 1000)) {
         Stop-Process -Id $p.Id -Force
-        throw "tss $($TssArgs -join ' ') did not finish within $TimeoutSec s and was stopped."
+        throw "$Label did not finish within $TimeoutSec s and was stopped."
     }
     $p.WaitForExit()
-    [pscustomobject]@{ Code = $p.ExitCode; Text = ($out.Result + $err.Result).TrimEnd() }
+    [pscustomobject]@{ Code = $p.ExitCode; Out = $out.Result; Text = ($out.Result + $err.Result).TrimEnd() }
+    $p.Dispose()
 }
 
 # Runs $Body with TSS_HOME and TSS_SKILLS_DIR pointing at the sandbox, so it and every program it starts use the
