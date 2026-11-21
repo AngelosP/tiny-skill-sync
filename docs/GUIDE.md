@@ -5,19 +5,22 @@
 A tiny Windows tray app that keeps your user-level Copilot skills, agents, modular instructions and GitHub Copilot CLI
 plugins in sync with GitHub.
 
-You tell it which repositories (or which folder of a repository) hold skills. It installs them into your Copilot skills
-folder, checks GitHub on a schedule, and installs, updates and removes skills as they change upstream. It adopts an
+You give it a GitHub location: a repository, a branch, or a folder in one. It finds the skills, agents, instruction
+files and plugins there, installs them into your Copilot folders, checks GitHub on a schedule, and installs, updates
+and removes them as they change upstream. It adopts an
 existing copy only after proving it matches upstream history, and never overwrites or deletes an edited skill without
 your choice. It removes from your PC only
 what came from GitHub and was later removed there; files you add are yours, and the app does not even show them.
 
-- **Small and quiet.** One exe of about 1.4 MiB, no runtime to install. It starts in about 9 ms, uses about 1 MiB of
+- **Small and quiet.** One exe of about 1.6 MiB, no runtime to install. It starts in about 9 ms, uses about 1 MiB of
   memory while idle, and does no work at all between checks: no CPU, no disk, no network.
 - **Starts with Windows, without slowing it down.** Turn on **Start with Windows** (the app offers it when you add your
   first repository). At sign-in it goes straight to the tray, reads settings on the worker, then waits 30 seconds
   before it looks at your skills or checks GitHub, and then does both at low priority.
-- **Cheap checks.** An unchanged repository costs one small "has anything changed?" request to GitHub, which reads and
-  writes no files.
+- **Cheap checks.** An unchanged source costs one small "has anything changed?" request to GitHub, which reads and
+  writes no files, whatever types it holds. This stays true after a restart, even for a source with nothing installed
+  yet: it waits its normal interval. The one exception is a source with something waiting for your choice (plugins to
+  approve, or a held skill): it is checked once each time the app starts, so the window can show what needs you.
 - **Public and private repositories.** Public ones need nothing. Private ones are read with the GitHub CLI's sign-in
   (`gh auth login`) or a token saved in Windows Credential Manager, without any setting to turn on.
 - **A tray icon and a window** that shows every repository and skill, says in plain words what needs you, and shows
@@ -49,7 +52,8 @@ These are the rules the app follows. Each one is covered by tests (see [CONTRIBU
    (see [An edit that GitHub has too](#an-edit-that-github-has-too)).
 3. **A failure is never a deletion.** No network, a wrong token, a missing repository, a rate limit or a strange answer
    from GitHub only means "could not check". Skills are removed only when GitHub returned a complete listing in which
-   they are gone. If a repository suddenly lists no skills at all, nothing is deleted until you confirm.
+   they are gone. If a source suddenly lists none of a type it installed, nothing of that type is deleted until you
+   confirm. Items bundled in a plugin or skipped by a folder rule don't count as listed.
 4. **Nothing is lost.** A skill is downloaded and checked in full beside the skills folder before it replaces the old
    one. If the app or the computer stops half way, the next start finishes or undoes the change. Whenever the app must
    set aside something you might want, it keeps it as a backup and never deletes it.
@@ -89,19 +93,23 @@ allows the same current-or-historical adoption checks.
    notification area. The first start of a new exe can take up to a second while Microsoft Defender scans it. The exes
    are not signed, so if a browser downloaded them, Windows may ask before the first start (**More info**, **Run
    anyway**).
-3. Click the icon to open the window. Click **Add source**, paste the address of the GitHub folder, choose
-   **Skills** (the default), **Agents**, **Instructions** or **Plugins**, and click **Preview**. For example:
+3. Click the icon to open the window. Click **Add source**, paste `owner/name`, a repository address, or the address
+   of a branch or folder (`.../tree/BRANCH/FOLDER`), and click **Preview**. There is no type to choose: the preview
+   shows what it found. For example:
 
    ```text
    https://github.com/anthropics/skills/tree/main/skills
    ```
 
-4. Check the type, matches and destination. **Cancel** saves and installs nothing. If the preview was rejected
-   or found nothing, use **Retry** with the same details, or **Edit** to change them. If a source attempt is rejected
-   (for example, because that source is already set up), the next **Add source** attempt keeps the address and type
-   you entered. **Add and check**
-   saves the source and starts the first check, then checks once a day by default. Esc does not cancel a save
-   already in progress. The app also asks whether to start with Windows.
+4. Check what was found, grouped as Skills, Agents, Instructions and Plugins, what was skipped and why, and where it
+   will go (see [What a source finds](#what-a-source-finds)). **Cancel** saves and installs nothing. If the preview
+   was rejected, use **Retry** with the same details, or **Edit** to change them; if it found nothing that would sync,
+   **Edit** comes first. If a source attempt
+   is rejected (for example, because that source is already set up), the next **Add source** attempt keeps the
+   address you entered. **Add and check** saves the source and starts the first check, then checks once a day by
+   default. When the location holds plugins, the buttons are **Add without approving plugins** (files only; the
+   plugins wait for your approval) and **Add and approve these plugins**. Esc does not cancel a save already in
+   progress. The app also asks whether to start with Windows.
 
 ### Updating the app
 
@@ -156,8 +164,8 @@ tss portable
 This creates two files beside `tss.exe` and refuses to replace either one if it already exists:
 
 - `tiny-skill-sync.settings.json` holds the default skill interval, optional skills folder and app-update preferences.
-- `tiny-skill-sync.sources.json` holds the sources, including their IDs, type, branch, folder, enabled state,
-  interval and `use_token` choice.
+- `tiny-skill-sync.sources.json` holds the sources, including their IDs, branch, folder, type switches, folder rules,
+  lane IDs, enabled state, interval and `use_token` choice, and the global type switches and folder rules.
 
 The files are deliberately separate, so you can copy or update one without replacing the other. The command does not
 change the local `config.json`. To change shared settings later, edit the companion JSON files or copy in reviewed
@@ -169,21 +177,26 @@ mutex, saved GitHub token, destination bindings and work folders remain local to
 separately on each machine as `%USERPROFILE%\.copilot\skills`. A portable `skills_dir` may use Windows environment
 variables such as `%USERPROFILE%`; they are expanded locally and the stored value is not rewritten. `TSS_SKILLS_DIR`
 still overrides it on that machine. Agents and Instructions use their own local Copilot folders, not paths derived
-from `skills_dir`. Do not share destinations or work folders between machines. Skills-only data can remain in
-format 1. Typed local settings, portable sources and their ownership records use format 2; upgrade older copies
-before adding a typed source. Do not relabel format-2 files as format 1 to use an older copy.
+from `skills_dir`. Do not share destinations or work folders between machines. The settings file is format 1. The
+sources file, like the local `config.json`, is format 3; older sources files (format 1 or 2) are read and moved to
+format 3 the next time the app saves them (see [Files](#files)). Update every copy that reads the share first: an
+older copy refuses a format-3 file. Do not relabel files to use an older copy. Plugin approvals, destination
+bindings, `seen.json` and the window's size and list width stay local.
 
 The app reads and writes companion files on its worker, so a slow or unavailable share does not block the window.
-Changes made on another machine are picked up at the next poll, **Sync now** or check, or when the window opens. There
-is no cross-machine lock or transaction across the two files: avoid editing them from multiple machines at once, and
-check for OneDrive conflict copies before continuing. If the share is unavailable, the check fails and installed
-skills are left alone.
+Changes made on another machine are picked up at the next poll, **Sync now** or check, or when the window opens.
+Writers on different computers take turns through a small lock file beside the exes (`.tss-settings.lock`). A check
+waits up to 10 seconds for another computer's brief hold on it before it fails; a change you make in the window or
+with `tss` fails at once with "try again" if the lock is busy. There is no transaction across the two files, and a
+lock in a folder that OneDrive copies to each PC separately is not shared: avoid editing the files from multiple
+machines at once, and check for OneDrive conflict copies before continuing. If the share is unavailable, the check
+fails and installed skills are left alone.
 
 ### Agents and modular instructions
 
-Select one type per source. **Agents** looks only for regular `*.agent.md` files directly in the folder you gave it.
-**Instructions** looks only for regular `*.instructions.md` files there. It does not import `AGENTS.md`,
-`copilot-instructions.md`, unrelated Markdown or files in subfolders.
+A source finds `*.agent.md` files (agents) and `*.instructions.md` files (instructions) anywhere below its folder, not
+only directly in it; see [What a source finds](#what-a-source-finds). Each file is installed by its own name, flat.
+`AGENTS.md`, `copilot-instructions.md` and Cursor rules are never imported.
 
 The default destinations are `%USERPROFILE%\.copilot\agents` and `%USERPROFILE%\.copilot\instructions`. The app
 can reuse a single existing layout, either flat in that folder or in a child named after the GitHub repository.
@@ -205,17 +218,30 @@ share has not been verified, so try it on your setup before relying on it.
 
 ### Plugins for GitHub Copilot CLI
 
-Install **GitHub Copilot CLI** before adding a Plugins source. Choose **Plugins** in **Add source** and use a named
-branch, for example `https://github.com/OWNER/NAME/tree/main` or a folder on that branch. Use letters, digits,
-`.`, `_`, `/`, `+` or `-` in the branch name. The marketplace manifest must be at the top of the branch. A folder
-limits the matches to plugins under that folder. Entries hosted elsewhere are shown but not handled.
+Install **GitHub Copilot CLI** before syncing plugins. A source turns up plugins by itself when its location holds
+plugin manifests; Copilot CLI installs them from a marketplace (`marketplace.json`) at the top of the branch. A
+folder location limits the plugins to those under that folder, but the marketplace is still read from the top of the
+branch. Copilot CLI can install a plugin from a branch only through a marketplace that lists it, so a plugin the
+marketplace does not list is shown with that reason but never installed (this was measured; see spike S4 in
+[spikes/README.md](../spikes/README.md)). Entries hosted elsewhere are shown but not handled. For plugins the branch
+name may use only letters, digits, `.`, `_`, `/`, `+` or `-`.
 
-**Preview** reads GitHub and does not start Copilot CLI. It shows the marketplace, plugin names, versions,
-publishers and any declared hooks, MCP servers or LSP servers. Publishers are declared by the plugin or its
-marketplace, not verified by GitHub. **Add and check** approves exactly the names and publishers you reviewed on this
-PC. Plugins can run programs: approve only publishers and branches you trust. Updates for an approved plugin with
-the same publisher install automatically. A new plugin, a changed publisher, or a source copied in through shared
-settings needs local approval.
+**Preview** reads GitHub and never starts Copilot CLI. It shows each plugin's name, version, publisher and what it
+can add to Copilot (hooks, MCP servers, LSP servers, agents, skills, commands). That list includes what the plugin
+declares and the files and folders Copilot picks up by name even when undeclared, such as `.mcp.json`,
+`hooks/hooks.json`, `lsp.json` or an `agents`, `skills` or `commands` folder. Publishers are declared by the plugin or
+its marketplace, not verified by GitHub. Then choose:
+
+- **Add without approving plugins** (the default button): the source is saved and its skills, agents and instructions
+  sync. The plugins wait as **Needs your approval** until you approve each one.
+- **Add and approve these plugins**: also approves exactly the names and publishers you reviewed, on this PC.
+
+`tss add LOCATION --approve-plugins` is the same as the second choice; without it, `tss add` leaves them waiting.
+Approve one later with **Approve** in the window or `tss resolve ID PLUGIN approve PUBLISHER`, giving the publisher
+exactly as shown. Plugins can run programs: approve only publishers and branches you trust. Updates for an approved
+plugin with the same publisher install automatically. A new plugin, a changed publisher, a source copied in through
+shared settings, and a source whose default branch has become another branch all need approval again on this PC.
+A missing Copilot CLI or a plugin you have not approved never stops the source's files from syncing.
 
 **Needs your approval**, **Removed from GitHub**, rejected or blocked plugins, plugins waiting for the marketplace,
 unfinished planned changes and failures need attention. **Turned off in Copilot** and **Removed in Copilot** are
@@ -241,7 +267,7 @@ reports a failure and checks again. Copilot CLI also fetches the branch itself: 
 changes in the meantime, the newer plugin may be installed once before the next check sees the change and holds it for
 approval. Bump the plugin version when publishing a change: Copilot may skip an update without a new version. This works
 only with Copilot CLI; the app does not drive VS Code's plugin installer.
-The other source types do not need Copilot CLI.
+Skills, agents and instructions do not need Copilot CLI.
 
 ### Start with Windows
 
@@ -264,25 +290,88 @@ ask it to (**Sync now**).
 - Only readable settings can make it open its window at sign-in: when the local config or a portable companion cannot
   be read, nothing is checked until it is fixed, and the window says why.
 
-## Which folders are skills
+## What a source finds
 
-A skill is a folder with a `SKILL.md` file. For each repository you give the app one folder (the repository root if
-you give only `owner/name`):
+### A source is a location
 
-- If that folder has a `SKILL.md` itself, the whole folder is one skill, with everything under it.
-- Otherwise each folder directly inside it that has a `SKILL.md` is a skill, with everything under it.
+A source is one place on GitHub. You can give it as:
 
-Folders whose name starts with a dot, loose files and folders without a `SKILL.md` are ignored.
+- `owner/name` or `https://github.com/owner/name`: the whole repository on its **default branch**. If the repository
+  makes another branch its default, the source follows it from the next full check.
+- `https://github.com/owner/name/tree/BRANCH`: the whole repository on that named branch. `tree/main` is a different
+  source from the bare repository, even while `main` is the default branch.
+- `https://github.com/owner/name/tree/BRANCH/FOLDER`: only that folder and what is below it.
 
-> **Add the folder that holds the skills.** Many repositories keep their skills in a `skills` folder. If you add only
-> `owner/name` for such a repository, the app finds no skills in the root and installs nothing. The repository then
-> shows "No skills found", and the window and `tss status` say what to do: add the folder's address instead,
-> `https://github.com/OWNER/NAME/tree/BRANCH/skills`.
+There is no type to choose. Branch names with slashes work: the app asks GitHub for the branch names and takes the
+longest one that matches the start of the address. Only HTTPS addresses on github.com are taken. Addresses of a file,
+tag, commit, pull request or raw file are refused, and so is a folder that is not on the branch.
+
+### What is recognised
+
+| Type | What counts | Installed as |
+| --- | --- | --- |
+| **Skills** | A folder with a `SKILL.md`, with everything under it | A folder named after it (the repository's name when the location itself is the skill), in your skills folder |
+| **Agents** | A `*.agent.md` file | That file, by its own name, in your agents folder |
+| **Instructions** | A `*.instructions.md` file | That file, by its own name, in your instructions folder |
+| **Plugins** | A plugin manifest (`plugin.json`, `.plugin/plugin.json`, `.github/plugin/plugin.json` or `.claude-plugin/plugin.json`), with a marketplace at the top of the branch | Installed by GitHub Copilot CLI after you approve it (see [Plugins](#plugins-for-github-copilot-cli)) |
+
+They are found at any depth below the location. **A package owns everything below it**: once a folder is a plugin or
+a skill, the skills, agents and instructions inside it belong to that package and are never listed or installed on
+their own. (A folder that is both a plugin and a skill counts as a plugin.) To sync the parts of a plugin separately,
+add a source for a folder inside it.
+
+When two items of the same type would get the same name on Windows (names that differ only in case, for example),
+neither is synced, the preview says "Same install name on Windows, so none of these sync", and a copy already
+installed is kept.
+
+Some files look similar but are never synced, and the preview and the window list them under **Never synced** with
+the reason:
+
+| File | Why |
+| --- | --- |
+| `AGENTS.md` | Repository guidance for coding agents, not a custom agent |
+| `copilot-instructions.md` | Repository-wide instructions apply only inside that repository |
+| `.cursorrules`, `.cursor/rules/*.mdc` | Cursor rules are not Copilot instructions |
+
+### Turning types on and off
+
+**Settings** has a switch per type: **Sync skills by default**, **Sync agents by default**, **Sync instructions by
+default** and **Sync plugins by default**. All four are on at first. Each source can follow that default, or turn a type
+on or off for itself, in its **What to sync** card (or with `tss source ID types` and `tss settings types`).
+
+Turning a type off deletes nothing. What it installed stays as it is and is shown as **Sync off**: it is not updated
+and not removed. A source whose items are all of types that are off is shown as **Sync off** too, not as having found
+nothing. When you turn the type on again in the window, that type is checked right away, and the check compares those
+copies in full, so an edit you made meanwhile still holds.
+
+### Folder rules
+
+Two rules leave folders out. Both look only at folders **below** the location you gave, so pasting the address of such
+a folder still finds what is in it.
+
+- **Repository-specific folders**: `.github`, `.agents`, `.claude`, `.copilot`, `.codex`, `.cursor` and `.gemini`
+  usually hold skills and agents meant for that repository's own tools. Skills and agents in them are skipped;
+  instructions and plugins in them are not. Turn on **Include repo-specific skills and agents** in Settings, or
+  **Repository-specific skills and agents** for one source (`tss settings repo-items on`,
+  `tss source ID repo-items on`), to sync them.
+- **Ignored folders**: a folder with one of these names is skipped for every type, with everything in it. The list
+  starts as `sample`, `example`, `samples`, `examples`, `test` and `tests`; a name must match a whole folder name, in
+  any case. Change it with **Ignored folders** > **Edit...** in Settings (`tss settings ignore add|remove NAME`); leave
+  the answer empty to ignore no folders. A source can skip more names, or allow a name the list skips, with **Folder
+  rules...** in its card (`tss source ID ignore add|allow|remove NAME`); leave both lists empty to remove its rules.
+
+The preview and the window count what the rules left out ("Skipped 2 by a folder rule: 'tests' is an ignored
+folder."). Like a type that is off, a rule that newly leaves out something already installed keeps it as it is,
+without updates. Rule changes apply at the next check.
+
+### What stops a skill
 
 A skill whose files include something unsafe on Windows (a link, a submodule, a reserved name such as `CON`, two names
 that differ only in case, an over-long path) is not installed, and a version already installed is left as it is. The
 reason is shown in the window and by `tss check` whenever a check reads the repository's listing: the first
 check, each time the repository has changed, and `tss check --full-listing` (see [Limitations](#limitations)).
+
+When a folder location holds no skills, the source shows "No skills found" and says which folder it read.
 
 ## The tray icon
 
@@ -305,26 +394,46 @@ update, the tray starts its new version with `--restarted` (or `--restarted-open
 ## The window
 
 The band across the top says how everything is in one sentence ("All skills are up to date", "1 skill needs your
-attention", "1 repository can't be read"). The line under it counts the skills and repositories and says when they were
-checked and when the next check is; after something you asked for, it says what came of it ("Checked: skills were
-updated", "Checked: nothing new on GitHub"). **Sync now** gets new and updated skills from every repository at once.
-Skills you edited or deleted are never changed by it. Hover over it to read the same.
+attention", "1 source can't be read"); when your sources hold more than one type, it says "items" ("All items are up
+to date"). It counts sources, so one source that syncs several types counts once. When every type found is switched
+off, it says "Nothing is being synced" ("Sync is off for every type found") rather than calling anything up to date. The line under it counts the items
+and sources and says when they were checked and when the next check is; after something you asked for, it says what
+came of it ("Checked: skills were updated", "Checked: nothing new on GitHub"), naming only the types it is about: a
+source that also syncs agents still says "skills were updated" when only its skills changed. **Sync now** checks every
+enabled source at once. Items you edited or deleted are never replaced without asking. Hover over it to read the same.
 
-Down the left are your sources, each with its type and state, and **Add source**, **Activity** and **Settings**. When a
-name is too long to show whole, rest the mouse on the list for a moment: it widens, up to half the window, taking the
-room from the page beside it, and narrows again when the mouse leaves.
+Down the left are your sources, and **Add source**, **Activity** and **Settings**. Each source takes a few lines: the
+repository; the branch ("default branch" until a check names it) and the folder ("whole repository" when there is
+none); an icon for each type it holds, with its count or "off", and a warning mark when that type needs you; and its
+state. A screen reader hears the types spelled out, for example "Skills 3, Instructions: Sync off", and resting the
+mouse on a source shows the same whole text. Drag the splitter
+between the list and the page to see more of a long name. Or Tab to **Resize list** and use Left or Right to move it
+8 pixels at 100% display scale (hold Shift for 32); Home and End go to the narrowest and widest list. The list keeps at least 160 pixels and
+the page at least 360 when the window is wide enough. The window remembers the width you choose on this PC (the third
+number in `window.txt`). Nothing widens or narrows when you move the mouse over it.
 
-- **A repository:** its name (with a **Private** label when it is read with your token), the folder and branch its
-  skills come from, and when it was last checked.
+- **A source:** its location (with a **Private** label when it is read with your token), the folder and branch, and
+  when it was last checked.
   - When it can't be read, a box says why, with **Try again** and **Open Settings** (where the GitHub sign-in is).
   - **Check every** sets how often it is checked: **Default** (the interval in Settings), a common interval, or
     **Custom…**.
-  - **Keep in sync** off pauses it: it is not checked, and nothing in its skills is changed.
-  - The **More** button holds **Sync this repository**, **Open on GitHub**, **Open skills folder** and **Remove
-    repository…**. Removing asks whether to leave its skills installed (they become yours) or to delete them too
-    (skills you edited are kept, and files you added stay where they are).
-- **Its skills,** each on one line with its state. Rest the mouse on the name or status badge to see the explanation
-  and any known version, file count, size and update time. Only a skill with a problem you can act on has an arrow: its choices start open.
+  - **Keep in sync** off pauses it: it is not checked, and nothing it installed is changed.
+  - **What to sync** has a choice per type, **Default (On)** or **Default (Off)** to follow Settings, or **On** or
+    **Off** for this source only; **Repository-specific skills and agents** (**Default**, **Include** or **Skip**); and
+    **Folder rules…**, which asks for folder names this source should also skip and names it should never skip. See
+    [What a source finds](#what-a-source-finds).
+  - The **More** button holds **Check now** (all of the source's types at once), **Open on GitHub**, **Open skills
+    folder** (when the source syncs skills) and **Remove source…**. Removing stops the whole source, every type.
+    When it syncs skills, it asks whether to leave its files installed (they become yours) or to delete its skills too
+    (skills you edited are kept, and files you added stay where they are); agents, instruction files and plugins stay
+    installed either way.
+- **What it holds,** grouped under **Skills**, **Agents**, **Instructions** and **Plugins**, each heading with its count
+  ("2 · Sync off" for a type that is off). A type is shown only when the source holds some of it or the app installed
+  some from it. Under each group are the items, then how many were skipped by folder rules and anything of that type
+  that is not synced, with the reason; at the end, **Never synced** lists files such as `AGENTS.md`. Before the first
+  check it says "What it holds is listed here after the first check."
+- **Each item,** on one line with its state. Rest the mouse on the name or status badge to see the explanation
+  and any known version, file count, size and update time. Only an item with a problem you can act on has an arrow: its choices start open.
   Click the row or press Enter on it to hide or show those choices.
   - For a skill the app installed, one line from its record: the version (the start of the commit it came from), how
     many files GitHub put there and their size, and when the app installed or last updated it ("Version 1a2b3c4 ·
@@ -352,9 +461,8 @@ room from the page beside it, and narrows again when the mouse leaves.
     either: a file that differs only in them is not listed, and blank lines are not shown.
   - Only GitHub's files and the files the app installed are compared. Files you added are never listed: they are yours,
     and taking the GitHub version leaves them where they are.
-  - Rest the mouse on the file list for a quarter of a second to widen it for long paths. It takes room from the
-    comparison, without resizing the window, and narrows when the mouse leaves. Your selected file and scroll
-    positions stay put.
+  - The same splitter resizes the file list for long paths. It uses the width you chose on either view. Your selected
+    file and scroll positions stay put.
   - The chosen file's lines are on the right: `+` on green for a line only on GitHub, `−` on red for a line only on this
     PC, with three lines around each change. Long unchanged stretches are folded.
   - The skill's choices are at the top. **Back** (or Esc) returns.
@@ -365,7 +473,10 @@ room from the page beside it, and narrows again when the mouse leaves.
     4 MiB from either side, and links (never followed) are named but not shown.
 - **Activity:** what the app did recently, newest first, and what went wrong.
 - **Settings:**
-  - **Check for skill updates every**: the default interval, for every repository set to **Default** (1 day at first).
+  - **Check for updates every**: the default interval, for every source set to **Default** (1 day at first).
+  - **Sources**: **Sync skills by default**, **Sync agents by default**, **Sync instructions by default** and **Sync
+    plugins by default** (all on at first), **Include repo-specific skills and agents** (off at first), and
+    **Ignored folders** with **Edit…**. A source can override each of them.
   - **App updates**: manual check and install, plus when the tray checks for and installs new versions of the two programs.
   - **Start with Windows**: a switch, and a line under it that says how it is, also when it was turned off in Task
     Manager or when Windows starts another copy of the app (see [Start with Windows](#start-with-windows)).
@@ -390,7 +501,7 @@ opens and destroyed when it closes, so it costs nothing while closed.
 | Keep my version | The folder is yours: the app never changes or removes it again. |
 | Leave it deleted | A skill you deleted stays deleted. |
 | Manage again | Undo **Keep my version**. |
-| Delete them | Upstream now lists no skills at all: remove the ones the app installed. |
+| Delete them | Upstream now lists none of this type at all: remove the ones the app installed. |
 | Cancel search | Pause this skill's earlier-version search until you choose Resume search. |
 | Resume search | Continue the saved search, rechecking local evidence first. |
 
@@ -425,9 +536,17 @@ also raises GitHub's rate limit: without one, every program on your network shar
 ```text
 tss status                                   what is installed and what needs attention (no network)
 tss update status                            app versions and preferences (not a skill check)
-tss check [REPO] [--dry-run]                 check GitHub now and apply what is safe
-tss add OWNER/NAME|URL [--type skills|agents|instructions|plugins] [--preview] [--every 6h] [--use-token]
-tss remove REPO [--delete-skills|--uninstall-plugins]
+tss check [REPO] [--dry-run] [--full-listing] [--delete-all]   check GitHub now and apply what is safe
+tss add LOCATION [--preview] [--approve-plugins] [--every 6h] [--use-token] [--yes]
+tss source REPO                              one source's types and folder rules
+tss source REPO types skills=on|off|default [agents=...] [instructions=...] [plugins=...]
+tss source REPO ignore add|allow|remove FOLDER
+tss source REPO repo-items on|off|default
+tss settings                                 the defaults every source follows
+tss settings types skills=on|off [agents=on|off] [...]
+tss settings ignore add|remove FOLDER
+tss settings repo-items on|off
+tss remove REPO [--delete-skills] [--uninstall-plugins]
 tss resolve REPO ITEM replace|restore|keep|leave|manage|pause|resume
 tss resolve REPO PLUGIN approve [PUBLISHER]
 tss resolve REPO PLUGIN reinstall|uninstall|forget
@@ -436,19 +555,39 @@ tss startup [status|on|off]                  start the tray app when you sign in
 tss portable                                 export local settings to companion files
 ```
 
-Use the source ID that `tss status` shows for `REPO` when one repository has several sources. `tss check` (also
-`tss sync`) checks sources, not the app. Apply what is safe: install, update, remove.
+`REPO` is a source ID that `tss status` shows, or one of its type IDs, or `OWNER/NAME` when only one source has that
+repository. `tss check` (also `tss sync`) checks sources, not the app. Apply what is safe: install, update, remove.
+`tss check ID` checks every type of that source at once.
 
-Private repositories use the saved token or the GitHub CLI sign-in when needed. `--use-token` sends the token for
-every request. `tss add ... --type agents --preview` checks the source without saving. Omit `--preview` for the
-confirmation prompt; confirming saves settings, then `tss check ID` installs. A bare `tss add` still saves a Skills
-source without a prompt or a download. `--delete-skills` and earlier-version searches are only for Skills sources.
+When a type that has items installed suddenly lists none, its removals wait for you. `tss check TYPE-ID --delete-all`
+confirms them for that one type only, using the type ID that `tss status` shows; the source ID (or `owner/repo`)
+confirms only its skills, and confirms nothing for a source that does not sync skills.
+`--full-listing` reads the whole listing again even when GitHub says nothing changed.
 
-For Plugins, `tss add --type plugins URL --preview` previews without starting Copilot CLI. Omit `--preview` and
-answer `yes` to save the source and record local approval. Then run `tss check ID` (also `tss sync ID`) to install.
+`tss add` takes the same locations as the window (see [A source is a location](#a-source-is-a-location)); there is no
+`--type`. It shows the same preview, then asks you to type `yes`. When its input is not a terminal it refuses unless
+you pass `--yes`. `--preview` shows what was found and saves nothing. Before saving, it reads the location again and
+refuses if anything changed since the preview. Then `tss check ID` installs. Private repositories use the saved token
+or the GitHub CLI sign-in when needed. `--use-token` sends the token for every request.
+
+`tss source ID` shows one source: each type's switch ("Skills: Sync on (the default) [ID]"), whether
+repository-specific skills and agents are skipped, and its ignored folders. `default` follows `tss settings`.
+`ignore allow NAME` keeps a globally ignored name from being skipped in this source only; `remove` takes a name off
+the source's own lists. Turning a type off deletes nothing. Changes apply on the next check.
+
+`tss remove ID` stops following the whole source, every type. Its files and plugins stay installed. `--delete-skills`
+also deletes the skills it installed (edited skills stay); agents and instruction files stay either way.
+Earlier-version searches are only for skills.
+
+For plugins, `tss add ... --preview` never starts Copilot CLI. Without `--approve-plugins`, the plugins wait for your
+approval; with it, saving also approves the plugins shown. Then run `tss check ID` (also `tss sync ID`) to install.
+`--preview` and `--approve-plugins` together are refused.
 `tss status` shows the last recorded versions without starting Copilot. `tss check` shows current plugin status
 and the choices that apply. For `approve`, give the publisher as one argument exactly as shown, for example
 `tss resolve ID example approve "Example Team"`. Omit it only when the publisher is not declared.
+
+`tss status` lists each source once: its location, status and ID, then "Branch: ... Folder: ...", a "Types:" line,
+the last check, and its items grouped by type, with how many were skipped by folder rules and what is not synced.
 
 Exit codes: 0 all fine, 1 something needs attention,
 2 failed, 3 bad command line. The tray notices changes made with `tss` and shows them. Only one of them checks at a
@@ -474,7 +613,9 @@ was interrupted.
 | Local app-release schedule (not shared preferences) | `%LOCALAPPDATA%\tiny-skill-sync\update-clock.json` |
 | Shared settings and repositories (portable mode) | `tiny-skill-sync.settings.json` and `tiny-skill-sync.sources.json` beside the exes |
 | What the app installed (the ownership record) | `%LOCALAPPDATA%\tiny-skill-sync\state.json` |
-| The window's size | `%LOCALAPPDATA%\tiny-skill-sync\window.txt` |
+| The window's size and list width | `%LOCALAPPDATA%\tiny-skill-sync\window.txt` |
+| What each source held at its last complete check, for display only | `%LOCALAPPDATA%\tiny-skill-sync\seen.json` |
+| The lock that lets one writer change the settings at a time | `.tss-settings.lock` beside the exes in portable mode, else in `%LOCALAPPDATA%\tiny-skill-sync` |
 | Skills | `%USERPROFILE%\.copilot\skills`, unless `skills_dir` is set in `config.json` |
 | Agents and modular instructions | `%USERPROFILE%\.copilot\agents` and `%USERPROFILE%\.copilot\instructions` |
 | Work folders: downloads in progress and backups | `.tss-work` beside Skills; `.tss-leaf-work` beside the loose-file destinations |
@@ -490,7 +631,10 @@ work or backups somewhere private before the next change.
 
 The skills folder contains only skill folders; the app keeps its own files elsewhere so Copilot never sees them. A
 damaged `state.json` is kept as `state.json.damaged-*` and the app starts over with an empty record (it then takes over
-skills that match a whole current or historical upstream version and asks about the rest).
+skills that match a whole current or historical upstream version and asks about the rest). `state.json` is saved in
+format 3 once it holds something older versions do not know: installed plugins, or check times for a type that has
+nothing installed yet. v0.8.0 and older copies refuse a format-3 `config.json` or `state.json` without changing it, so
+update every copy on a PC before using this version there.
 
 Pointing the app at another skills folder (`skills_dir`, or `TSS_SKILLS_DIR`) moves nothing. The new folder gets its own
 copies at the next check, which the tray runs at once when the settings change; the skills in the old folder stay as
@@ -508,35 +652,58 @@ In local mode, `config.json` can be edited by hand while the app runs; it is pic
 
 ```json
 {
-  "version": 1,
+  "version": 3,
   "default_interval": "1d",
-  "repos": [
+  "global": {
+    "types": { "plugins": false },
+    "ignore_folders": ["sample", "example", "samples", "examples", "test", "tests", "drafts"]
+  },
+  "sources": [
     {
       "id": "anthropics-skills",
       "repo": "anthropics/skills",
       "branch": "main",
       "path": "skills",
-      "use_token": false,
-      "enabled": true
+      "lanes": { "skills": "anthropics-skills", "agents": "anthropics-skills-agents" }
     },
     {
-      "id": "me-private-skills",
-      "repo": "me/private-skills",
-      "branch": "",
-      "path": "",
+      "id": "me-private-kit",
+      "repo": "me/private-kit",
       "interval": "6h",
       "use_token": true,
-      "enabled": true
+      "types": { "instructions": false },
+      "include_repo_items": true,
+      "ignore_add": ["old"],
+      "ignore_allow": ["examples"]
     }
   ]
 }
 ```
 
-An empty `branch` means the default branch, and an empty `path` the repository root. `use_token` sends the token with
-every request to that repository; without it, a private repository is still read with the token (see
-[Private repositories](#private-repositories)). A missing `kind` means Skills; use `"agents"` or `"instructions"`
-for loose-file sources, or `"plugins"` for a Plugins source, in format 2. An unknown or null kind is an error. Never change an `id`: the installed
-items are recorded under it. Unknown local settings fields are not preserved when the settings are saved.
+A missing or empty `branch` means the default branch, and a missing or empty `path` the repository root.
+`use_token` sends the token with every request to that repository; without it, a private repository is still read
+with the token (see [Private repositories](#private-repositories)). `global` holds the defaults: `types` (all four
+`true` unless set to `false`), `include_repo_items` (`false`) and `ignore_folders` (the list shown in Settings). A
+source's `types` and `include_repo_items` override them (leave a type out to follow the default); `ignore_add` and
+`ignore_allow` add names to skip or never skip. `lanes` holds the ID under which each type's items are recorded. The
+app fills in a missing one from the source's `id` alone (`id`, `id-agents`, `id-instructions`, `id-plugins`), so every
+PC that reads the same file gets the same IDs. When you turn a type on whose ID already holds another type's or
+another location's records on this PC, the app gives that type a new ID and saves it. Never change an `id` or a lane
+ID: the installed items are recorded under it. Unknown local settings fields are not preserved when the settings are
+saved.
+
+**Older settings are moved over by themselves.** A `config.json` or portable sources file in format 1 or 2 had one
+entry per type (`kind`; a missing `kind` meant Skills). Each entry becomes a source with its own type on and the other
+three off, keeping its ID as that type's lane ID, so nothing installed is lost or installed twice. Entries with the same
+repository, branch, folder, `use_token`, interval and enabled state, but different types, become one source. The file
+is written in format 3 the next time the app saves it. A file from a newer version is refused, not changed, and so is
+a file without `"version"` that already uses `sources` or `global`.
+
+**`seen.json`** remembers, per source, the branch and what its last complete listing held, so the window and
+`tss status` can show a source's types and counts before the next check. It is written only after a complete listing
+whose result changed, it stays on this PC, and nothing is installed, kept or removed because of it. The app reads it
+again just before writing, and never overwrites one written by a newer version. If it is missing or damaged, the
+details appear after the next check.
 
 In local `config.json`, `skills_dir`, when set, must be a full path such as `D:\skills`. In portable settings it may
 also contain `%VARIABLE%` references, which are expanded on each machine; unknown variables and relative results are
@@ -606,10 +773,11 @@ updating and removing a skill, taking over a folder of yours, and **Show changes
 
 ## Measured cost
 
-With Plugins sources added, the tray exe measured **1,434,112 bytes** (1.37 MiB), within its 1.40 MiB budget. On the
-three-skill, five-file public fixture, the tray appeared in 8.5 ms median, Settings painted in 37.4 ms median, an
-unchanged poll used 15.6 ms of CPU (one tick) with no file read or written, and ordinary Quit took at most 1.1 ms. Ten
-idle seconds showed zero CPU, I/O and page faults, with a trimmed working set of 1.0 MiB. The
+With mixed sources added (skills, agents, instructions and plugins found in one repository), the tray exe measured
+**1,711,104 bytes** (1.63 MiB), within its 1.70 MiB budget. On the three-skill, five-file public fixture, the tray
+appeared in 7.4 ms median, Settings painted in 36.0 ms median, an unchanged poll used 15.6 ms of CPU (one tick) with no
+file read or written, and ordinary Quit took at most 1.3 ms. Ten idle seconds showed zero CPU, I/O and page faults, with
+a trimmed working set of 1.0 MiB. The
 benchmark suppressed release checks; it does not measure retaining an offered update or installing on a slow share.
 
 Measured with `scripts\bench.ps1` on a Ryzen 7 5800X3D with Windows 11, files in the cache, real installs of
@@ -628,7 +796,7 @@ historical adoption; the larger install is an earlier baseline.
 | Window open: working set | 13.6 MiB | 14.4 MiB | 40 MiB |
 | Window closed: working set (trimmed) | 1.5 MiB | 1.5 MiB | 2 MiB |
 | Unchanged check: CPU, file reads and writes | 0 ms, 0, 0 | 16 ms, 0, 0 | 50 ms, 0 |
-| Exe size | 1,057,280 bytes (1.01 MiB) | 0.93 MiB | 1.40 MiB |
+| Exe size | 1,057,280 bytes (1.01 MiB) | 0.93 MiB | 1.70 MiB |
 
 Every budget row passed in those earlier runs. The 442-file startup check took 48.2 microseconds per file; an unchanged poll took 438 ms
 wall time and changed no files. The eight-candidate historical quick slice took 11.4 seconds in the live fixture
@@ -639,8 +807,8 @@ Windows counts a process's CPU time in ticks of 15.6 ms, so an unchanged check s
 and hashed files about 13% faster (384 instead of 339 MB/s). A list of 463 skills opens almost as fast
 as one of 19, because only
 the rows within about two screens of what is shown are made at first; the rest are made as you scroll (with a row made
-for every skill, it took 120 ms). Widening the list of repositories under the mouse takes 18 ms with those 463 skills
-on the page.
+for every skill, it took 120 ms). Widening the list of repositories took 18 ms with those 463 skills on the page,
+measured when the list still widened under the mouse; it now changes width only when you move the divider.
 
 The start at sign-in (`--background`) is measured against what Task Manager calls a "low" startup impact: under 300 ms
 of CPU and under 300 KB of disk I/O. It was measured later, when the second repository had 464 skills and 1,556 files.
@@ -675,6 +843,18 @@ ended at 3.2 MiB of private memory. Each change reached the disk within one inte
   "medium" impact rather than "low" (see [Measured cost](#measured-cost)).
 - It is not checked yet whether a running Copilot session notices new or changed skills without a restart.
 - A repository that is renamed or moved on GitHub is reported as a failure; update its address yourself.
+- When a source follows the default branch and the repository switches to another default branch, the app notices
+  on the next full check (the first check after a change on GitHub, or `tss check --full-listing`). Its plugins then
+  wait for a fresh approval.
+- When a branch is renamed, plugins already installed from it keep the marketplace name they were installed under.
+- For a source that follows the default branch, the window says "default branch" rather than the branch's name.
+- If removing a whole source fails partway (one type could not be removed), the types it could not remove stay in the
+  settings. Remove the source again.
+- A source whose plugin check keeps failing is listed again on every poll, instead of waiting for its next change.
+- The types of a source are applied one after another from one listing. If one fails to download, the types before it
+  keep what they installed and the rest wait for the next check.
+- A type turned off before anything of it was installed shows no rows in the window; its items appear once the type
+  is on again and the source is checked.
 - A change of display scale while the app runs is followed by the tray icon (it is drawn again at the taskbar's new
   size) but has not been tried on a real scale change.
 - Skill checks use the Windows proxy settings (not tested behind a proxy). The anonymous app-release check
@@ -696,8 +876,9 @@ ended at 3.2 MiB of private memory. Each change reached the disk within one inte
   two of its answers disagree (a file the listing names is different or cannot be found), the check stops with
   "Changed while checking" and changes nothing, and **Show changes** and **Use the GitHub version** say "the
   repository changed on GitHub while (the file) was being read; try again". The next try works.
-- One check downloads at most 512 MiB (the rest waits for the next check), and a file over 64 MiB or a skill with more
-  than 10,000 files is refused. There is no limit on what all the installed skills add up to.
+- One check downloads at most 512 MiB, plugin manifests included (the rest waits for the next check), and a file over
+  64 MiB or a skill with more than 10,000 files is refused. There is no limit on what all the installed skills add up
+  to.
 - The window opens at 980 by 680 at 100% scale (smaller if the screen has less room) and can be made as small as 640
   by 480. It has been tried only at 100% scale.
 - The window's controls are drawn by the app. Each is a real window with its text, and Tab, Enter, Space and Esc work,

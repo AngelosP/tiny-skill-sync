@@ -11,17 +11,24 @@ use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 
+use crate::app::same_location;
 use crate::autostart::{Exe, Keys, Startup, Via};
-use crate::board::{Action, Board, Level, RepoView, Row, recorded_plugin_rows, source_folder};
-use crate::config::{CONFIG_FILE, Config, Paths, RepoConfig, RepoSpec, UpdateInterval, UpdatePrefs, UpdateTiming};
-use crate::engine::{Access, ApplyResult, Engine, EngineError, Outcome, Resolution, SkillReport, SyncOptions, Tracking, Which};
+use crate::board::{
+    Action, Board, Level, RepoView, Row, SourceView, capitalized, preview_lines, previewed_plugins, recorded_plugin_rows, source_folder, source_label,
+};
+use crate::config::{CONFIG_FILE, Config, Paths, RepoConfig, UpdateInterval, UpdatePrefs, UpdateTiming};
+use crate::engine::{
+    Access, ApplyResult, Engine, EngineError, LocationPreview, Outcome, RemoveReport, RepoReport, Resolution, SkillReport, SyncOptions, Tracking, Which,
+};
 use crate::github::{GitHubRemote, Remote, SystemTokens, TokenProvider};
 use crate::interval::{Interval, now_secs};
+use crate::location::{Location, Target};
 use crate::pathsafe::{check_component, fold, printable, printable_lines};
 use crate::plugins::{Choice, normal_name};
 use crate::portable;
 use crate::reconcile::Verdict;
 use crate::source::SourceKind;
+use crate::sources::{GlobalSettings, SourceConfig};
 use crate::state::State;
 use crate::updater::Action as AppAction;
 use crate::verify::Check;
@@ -36,6 +43,8 @@ pub const EXIT_USAGE: i32 = 3;
 const TRAY_EXE: &str = "tiny-skill-sync.exe";
 
 const NO_REPOS: &str = "No repositories are set up. Add one with: tss add OWNER/NAME";
+
+const KINDS: [SourceKind; 4] = [SourceKind::Skills, SourceKind::Agents, SourceKind::Instructions, SourceKind::Plugins];
 
 const HELP: &str = "\
 tss - syncs Copilot skills, agents, instructions and CLI plugins with GitHub.
@@ -74,22 +83,40 @@ Usage:
       omit it only when the publisher is not declared.
       Reinstall restores a plugin removed in Copilot. When GitHub removes a
       plugin, uninstall removes it in Copilot; forget just stops tracking it.
-  tss add OWNER/NAME [--type skills|agents|instructions|plugins] [--preview]
-                     [--every INTERVAL] [--use-token]
-  tss add https://github.com/OWNER/NAME/tree/BRANCH/FOLDER [...]
-      Follow one type from a repository or folder. --preview only lists matches
-      and their destination. It does not save settings or install anything.
-      With --type, review the preview and type yes to save. Without --type or
-      --preview, add a Skills source without a prompt or a request to GitHub.
-      Check now with 'tss check ID' to install, or let the tray check later.
-      Plugins need a named branch and GitHub Copilot CLI. Adding saves approval
-      for the previewed plugins on this PC.
+  tss add LOCATION [--preview] [--approve-plugins] [--every INTERVAL]
+                   [--use-token] [--yes]
+      LOCATION is OWNER/NAME, https://github.com/OWNER/NAME, or the address of
+      a branch or folder: https://github.com/OWNER/NAME/tree/BRANCH/FOLDER.
+      A bare repository follows its default branch. The skills, agents,
+      instructions and plugins in it are found by themselves; there is no
+      --type. Adding shows what was found, then asks you to type yes.
+        --preview          only show what was found; save and install nothing
+        --yes              save without asking (needed when input is a pipe)
+        --approve-plugins  also approve the plugins shown, so they install
+      Plugins can run programs on this PC: without --approve-plugins they
+      wait for your approval. Check now with 'tss check ID' to install, or
+      let the tray check later.
       Private repositories use the saved token or the GitHub CLI sign-in when
       needed. --use-token sends the token for every request.
-  tss remove REPO [--delete-skills|--uninstall-plugins]
-      Stop following a source. Its files or plugins stay installed by default.
-      --delete-skills is only for Skills (edited skills stay).
-      --uninstall-plugins is only for Plugins. If an uninstall fails, the
+  tss source REPO
+  tss source REPO types skills=on|off|default [agents=...] [...]
+  tss source REPO ignore add|allow|remove FOLDER
+  tss source REPO repo-items on|off|default
+      Show or change one source. 'default' follows 'tss settings'. Ignored
+      folder names are skipped wherever they appear; 'allow' takes a name off
+      the list for this source only. repo-items syncs skills and agents from
+      repository-specific folders such as .github. Turning a type off never
+      deletes anything. Changes apply on the next check.
+  tss settings
+  tss settings types skills=on|off [agents=on|off] [...]
+  tss settings ignore add|remove FOLDER
+  tss settings repo-items on|off
+      Show or change the defaults every source follows.
+  tss remove REPO [--delete-skills] [--uninstall-plugins]
+      Stop following a source, with all of its types. Its files and plugins
+      stay installed by default. --delete-skills deletes the skills it
+      installed (edited skills stay; agents and instruction files stay).
+      --uninstall-plugins uninstalls its plugins. If an uninstall fails, the
       source is kept.
   tss token [status | set | clear]
       The GitHub token, saved in Windows Credential Manager. Without one, the
@@ -105,7 +132,8 @@ Usage:
   tss help
   tss --version
 
-REPO is the id shown by 'tss status', or OWNER/NAME when only one entry has it.
+REPO is a source ID shown by 'tss status' (or one of its type IDs), or
+OWNER/NAME when only one source has it.
 INTERVAL is a number and a unit: 30m, 6h, 1d, 2w or 1mo (at least 5 minutes).
 
 Exit codes: 0 all fine, 1 needs attention, 2 failed, 3 bad command line.
@@ -144,8 +172,12 @@ pub trait Host {
     fn plugin_manager(&self) -> Option<Box<dyn crate::plugins::native::PluginManager>> {
         None
     }
-    /// Called only after a typed add displayed its preview; EOF or anything but an explicit yes cancels.
+    /// Called only after an add displayed its preview; EOF or anything but an explicit yes cancels.
     fn confirm_source(&self) -> Result<bool, String>;
+    /// Whether someone can answer a question: input comes from a console, not a pipe or a file.
+    fn interactive(&self) -> bool {
+        false
+    }
     fn token_saved(&self) -> bool;
     fn save_token(&self, token: &str) -> Result<(), String>;
     /// True when a token was saved and is now gone.
@@ -210,6 +242,10 @@ impl Host for SystemHost {
         Ok(line.trim().eq_ignore_ascii_case("yes"))
     }
 
+    fn interactive(&self) -> bool {
+        io::stdin().is_terminal()
+    }
+
     fn token_saved(&self) -> bool {
         cred::has_token()
     }
@@ -265,11 +301,34 @@ pub enum Command {
     Version,
     Status,
     Update(UpdateCommand),
-    Check { repo: Option<String>, dry_run: bool, full_listing: bool, delete_all: bool },
-    Resolve { repo: String, skill: String, how: Resolution },
-    ResolvePlugin { repo: String, choice: Choice },
+    Check {
+        repo: Option<String>,
+        dry_run: bool,
+        full_listing: bool,
+        delete_all: bool,
+    },
+    Resolve {
+        repo: String,
+        skill: String,
+        how: Resolution,
+    },
+    ResolvePlugin {
+        repo: String,
+        choice: Choice,
+    },
     Add(AddSource),
-    Remove { repo: String, delete_skills: bool, uninstall_plugins: bool },
+    Remove {
+        repo: String,
+        delete_skills: bool,
+        uninstall_plugins: bool,
+    },
+    /// Show one source's settings, or change one of them.
+    Source {
+        repo: String,
+        change: Option<SourceChange>,
+    },
+    /// Show the defaults every source follows, or change one of them.
+    Settings(Option<SettingsChange>),
     Token(TokenAction),
     Startup(StartupAction),
     Portable,
@@ -280,9 +339,28 @@ pub struct AddSource {
     pub spec: String,
     pub every: Option<Interval>,
     pub use_token: bool,
-    /// None preserves the original, offline Skills add used by scripts.
-    pub kind: Option<SourceKind>,
     pub preview: bool,
+    pub approve_plugins: bool,
+    /// Save without asking.
+    pub yes: bool,
+}
+
+pub use crate::sources::IgnoreAction;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SourceChange {
+    /// `None` follows the global setting again.
+    Types(Vec<(SourceKind, Option<bool>)>),
+    Ignore(IgnoreAction, String),
+    RepoItems(Option<bool>),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SettingsChange {
+    Types(Vec<(SourceKind, bool)>),
+    /// True adds the folder name, false removes it.
+    Ignore(bool, String),
+    RepoItems(bool),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -344,8 +422,10 @@ fn usage_of(command: &str) -> &'static str {
         "check" => "tss check [REPO] [--dry-run] [--full-listing] [--delete-all]",
         "update" => "tss update [status|check|install|on|off|every 1d|7d|30d|when immediate|quit]",
         "resolve" => "tss resolve REPO ITEM ACTION (see 'tss help' for choices)",
-        "add" => "tss add OWNER/NAME [--type skills|agents|instructions|plugins] [--preview] [--every INTERVAL] [--use-token]",
-        "remove" => "tss remove REPO [--delete-skills|--uninstall-plugins]",
+        "add" => "tss add LOCATION [--preview] [--approve-plugins] [--every INTERVAL] [--use-token] [--yes]",
+        "remove" => "tss remove REPO [--delete-skills] [--uninstall-plugins]",
+        "source" => "tss source REPO [types KIND=on|off|default ... | ignore add|allow|remove FOLDER | repo-items on|off|default]",
+        "settings" => "tss settings [types KIND=on|off ... | ignore add|remove FOLDER | repo-items on|off]",
         "token" => "tss token [status|set|clear]",
         "startup" => "tss startup [status|on|off]",
         "portable" => "tss portable",
@@ -392,6 +472,23 @@ fn word_for(action: Action) -> &'static str {
     }
 }
 
+/// `skills=on` into the type and the value as typed.
+fn type_word(word: &str) -> Result<(SourceKind, &str), String> {
+    let (kind, value) = word.split_once('=').ok_or_else(|| format!("'{word}' is not KIND=VALUE, for example skills=on"))?;
+    Ok((SourceKind::try_from(kind.to_ascii_lowercase())?, value))
+}
+
+/// on, off, or (where allowed) default, which is `None`.
+fn switch_word(word: &str, default_allowed: bool) -> Result<Option<bool>, String> {
+    match word.to_ascii_lowercase().as_str() {
+        "on" => Ok(Some(true)),
+        "off" => Ok(Some(false)),
+        "default" if default_allowed => Ok(None),
+        _ if default_allowed => Err(format!("'{word}' is not on, off or default")),
+        _ => Err(format!("'{word}' is not on or off")),
+    }
+}
+
 pub fn parse(args: &[String]) -> Result<Command, String> {
     let mut words = Vec::new();
     let mut flags = Flags::default();
@@ -414,7 +511,7 @@ pub fn parse(args: &[String]) -> Result<Command, String> {
                 };
                 let value = match value {
                     None if name == "every" => Some(rest.next().cloned().ok_or("--every needs an interval, for example --every 6h")?),
-                    None if name == "type" => Some(rest.next().cloned().ok_or("--type needs skills, agents, instructions or plugins")?),
+                    None if name == "type" => rest.next().cloned(),
                     value => value,
                 };
                 flags.0.push((name.to_string(), value));
@@ -484,24 +581,97 @@ pub fn parse(args: &[String]) -> Result<Command, String> {
         }
         "add" => {
             expect_words(&name, words, 1, 1)?;
+            if !flags.remove("type").is_empty() {
+                return Err("tss add has no --type: the types in a source are found by themselves. \
+                            Switch one off or on with: tss source REPO types skills=on|off|default"
+                    .into());
+            }
             let every = match flags.value("every") {
                 Some(text) => Some(Interval::parse(&text).and_then(Interval::validate_poll).map_err(|e| format!("--every: {e}"))?),
                 None => None,
             };
-            let kind = match flags.remove("type").as_slice() {
-                [] => None,
-                [Some(value)] => Some(SourceKind::try_from(value.clone())?),
-                _ => return Err("choose exactly one --type: skills, agents, instructions or plugins".into()),
-            };
-            Command::Add(AddSource { spec: words[0].clone(), every, use_token: flags.switch("use-token")?, kind, preview: flags.switch("preview")? })
+            Command::Add(AddSource {
+                spec: words[0].clone(),
+                every,
+                use_token: flags.switch("use-token")?,
+                preview: flags.switch("preview")?,
+                approve_plugins: flags.switch("approve-plugins")?,
+                yes: flags.switch("yes")?,
+            })
         }
         "remove" => {
             expect_words(&name, words, 1, 1)?;
             let (delete_skills, uninstall_plugins) = (flags.switch("delete-skills")?, flags.switch("uninstall-plugins")?);
-            if delete_skills && uninstall_plugins {
-                return Err("Choose one of --delete-skills and --uninstall-plugins.".into());
-            }
             Command::Remove { repo: words[0].clone(), delete_skills, uninstall_plugins }
+        }
+        "source" => {
+            expect_words(&name, words, 1, 6)?;
+            let repo = words[0].clone();
+            let verb = words.get(1).map(|w| w.to_ascii_lowercase());
+            let change = match verb.as_deref() {
+                None => None,
+                Some("types") => {
+                    let mut changes = Vec::new();
+                    for word in &words[2..] {
+                        let (kind, value) = type_word(word)?;
+                        changes.push((kind, switch_word(value, true).map_err(|e| format!("{word}: {e}"))?));
+                    }
+                    if changes.is_empty() {
+                        return Err(format!("something is missing; use: {}", usage_of("source")));
+                    }
+                    Some(SourceChange::Types(changes))
+                }
+                Some("ignore") => {
+                    expect_words(&name, words, 4, 4)?;
+                    let action = match words[2].to_ascii_lowercase().as_str() {
+                        "add" => IgnoreAction::Add,
+                        "allow" => IgnoreAction::Allow,
+                        "remove" => IgnoreAction::Remove,
+                        _ => return Err(format!("'{}' is not an ignore action; use add, allow or remove", words[2])),
+                    };
+                    Some(SourceChange::Ignore(action, words[3].clone()))
+                }
+                Some("repo-items") => {
+                    expect_words(&name, words, 3, 3)?;
+                    Some(SourceChange::RepoItems(switch_word(&words[2], true)?))
+                }
+                Some(_) => return Err(format!("'{}' is not a source setting; use: {}", words[1], usage_of("source"))),
+            };
+            Command::Source { repo, change }
+        }
+        "settings" => {
+            expect_words(&name, words, 0, 5)?;
+            let verb = words.first().map(|w| w.to_ascii_lowercase());
+            let change = match verb.as_deref() {
+                None => None,
+                Some("types") => {
+                    let mut changes = Vec::new();
+                    for word in &words[1..] {
+                        let (kind, value) = type_word(word)?;
+                        let on = switch_word(value, false).map_err(|e| format!("{word}: {e}"))?.unwrap_or(true);
+                        changes.push((kind, on));
+                    }
+                    if changes.is_empty() {
+                        return Err(format!("something is missing; use: {}", usage_of("settings")));
+                    }
+                    Some(SettingsChange::Types(changes))
+                }
+                Some("ignore") => {
+                    expect_words(&name, words, 3, 3)?;
+                    let add = match words[1].to_ascii_lowercase().as_str() {
+                        "add" => true,
+                        "remove" => false,
+                        _ => return Err(format!("'{}' is not an ignore action; use add or remove", words[1])),
+                    };
+                    Some(SettingsChange::Ignore(add, words[2].clone()))
+                }
+                Some("repo-items") => {
+                    expect_words(&name, words, 2, 2)?;
+                    Some(SettingsChange::RepoItems(switch_word(&words[1], false)?.unwrap_or(false)))
+                }
+                Some(_) => return Err(format!("'{}' is not a setting; use: {}", words[0], usage_of("settings"))),
+            };
+            Command::Settings(change)
         }
         "token" => {
             expect_words(&name, words, 0, 1)?;
@@ -533,25 +703,72 @@ pub fn parse(args: &[String]) -> Result<Command, String> {
     Ok(command)
 }
 
-/// Finds a repository by its id, or by `owner/name` when only one entry has it. Case does not matter.
-pub fn find_repo<'a>(cfg: &'a Config, query: &str) -> Result<&'a RepoConfig, String> {
-    let hits = repo_matches(cfg, query);
-    let ids = |repos: &mut dyn Iterator<Item = &RepoConfig>| repos.map(|r| r.id.as_str()).collect::<Vec<_>>().join(", ");
+/// Finds a source by its ID or one of its type IDs, or by `owner/name` when only one source has it. Case does not
+/// matter.
+pub fn find_source<'a>(cfg: &'a Config, query: &str) -> Result<&'a SourceConfig, String> {
+    let hits = source_matches(cfg, query);
+    let ids = |sources: &mut dyn Iterator<Item = &SourceConfig>| sources.map(|s| s.id.as_str()).collect::<Vec<_>>().join(", ");
     match hits.as_slice() {
         [one] => Ok(one),
-        [] if cfg.repos.is_empty() => Err(format!("no repository '{query}' is set up; none is (add one with: tss add OWNER/NAME)")),
-        [] => Err(format!("no repository '{query}' is set up; the ids are: {}", ids(&mut cfg.repos.iter()))),
-        many => Err(format!("'{query}' matches several repositories ({}); use the id", ids(&mut many.iter().copied()))),
+        [] if cfg.sources().is_empty() => Err(format!("No source '{query}' is set up; none is (add one with: tss add OWNER/NAME)")),
+        [] => Err(format!("No source '{query}' is set up; the IDs are: {}", ids(&mut cfg.sources().iter()))),
+        many => Err(format!("Several sources match '{query}' ({}); use the ID", ids(&mut many.iter().copied()))),
     }
 }
 
-fn repo_matches<'a>(cfg: &'a Config, query: &str) -> Vec<&'a RepoConfig> {
-    let exact: Vec<_> = cfg.repos.iter().filter(|r| r.id == query).collect();
-    if !exact.is_empty() {
-        return exact;
+fn source_matches<'a>(cfg: &'a Config, query: &str) -> Vec<&'a SourceConfig> {
+    if let Some(exact) = cfg.find_source(query) {
+        return vec![exact];
     }
     let wanted = query.trim().trim_end_matches('/');
-    cfg.repos.iter().filter(|r| r.id.eq_ignore_ascii_case(wanted) || r.repo.eq_ignore_ascii_case(wanted)).collect()
+    let named = |s: &SourceConfig| s.id.eq_ignore_ascii_case(wanted) || KINDS.iter().any(|&k| s.lanes.id(k).is_some_and(|id| id.eq_ignore_ascii_case(wanted)));
+    let by_id: Vec<_> = cfg.sources().iter().filter(|s| named(s)).collect();
+    if !by_id.is_empty() {
+        return by_id;
+    }
+    cfg.sources().iter().filter(|s| s.repo.eq_ignore_ascii_case(wanted)).collect()
+}
+
+/// The lane of a source that acts on `item`: the type ID typed, the only file type that syncs, or the type the item's
+/// name has.
+fn file_lane<'a>(cfg: &'a Config, query: &str, item: &str) -> Result<&'a RepoConfig, String> {
+    let source = find_source(cfg, query)?;
+    let named = KINDS.into_iter().find(|&k| source.lanes.id(k).is_some_and(|id| id != source.id && id.eq_ignore_ascii_case(query.trim())));
+    let lanes = cfg.lanes_of(&source.id);
+    let files: Vec<&RepoConfig> = lanes.iter().copied().filter(|r| r.kind != SourceKind::Plugins).collect();
+    let kind = match (named, files.as_slice()) {
+        (Some(kind), _) => kind,
+        (None, [one]) => one.kind,
+        (None, []) if lanes.iter().any(|r| r.kind == SourceKind::Plugins) => {
+            return Err("For Plugins, use approve, reinstall, uninstall or forget.".into());
+        }
+        _ if item.to_ascii_lowercase().ends_with(".agent.md") => SourceKind::Agents,
+        _ if item.to_ascii_lowercase().ends_with(".instructions.md") => SourceKind::Instructions,
+        _ => SourceKind::Skills,
+    };
+    if kind == SourceKind::Plugins {
+        return Err("For Plugins, use approve, reinstall, uninstall or forget.".into());
+    }
+    lane_of(cfg, source, kind)
+}
+
+/// The lane of one type of a source, when that type syncs.
+fn lane_of<'a>(cfg: &'a Config, source: &SourceConfig, kind: SourceKind) -> Result<&'a RepoConfig, String> {
+    source
+        .lanes
+        .id(kind)
+        .and_then(|id| cfg.find(id))
+        .ok_or_else(|| format!("{} do not sync from '{}'. Turn them on with: tss source {} types {}=on", kind.heading(), source.id, source.id, kind_word(kind)))
+}
+
+/// The word for a type on the command line.
+fn kind_word(kind: SourceKind) -> &'static str {
+    match kind {
+        SourceKind::Skills => "skills",
+        SourceKind::Agents => "agents",
+        SourceKind::Instructions => "instructions",
+        SourceKind::Plugins => "plugins",
+    }
 }
 
 enum Fail {
@@ -645,6 +862,8 @@ fn execute(command: Command, host: &dyn Host, out: &mut String, screen: &mut dyn
         Command::ResolvePlugin { repo, choice } => resolve_plugin(host, out, &repo, &choice),
         Command::Add(options) => add(host, out, screen, options),
         Command::Remove { repo, delete_skills, uninstall_plugins } => remove(host, out, &repo, delete_skills, uninstall_plugins),
+        Command::Source { repo, change } => source_command(host, out, &repo, change),
+        Command::Settings(change) => settings_command(host, out, change),
         Command::Token(action) => token(host, out, action),
         Command::Startup(action) => startup(host, out, action),
         Command::Portable => export_portable(host, out),
@@ -739,7 +958,8 @@ fn update(host: &dyn Host, out: &mut String, command: UpdateCommand) -> Result<i
     if prefs != cfg.app_update {
         let paths = paths(host, &cfg, portable)?;
         crate::updater::Locations { home: &paths.home, dir: &directory, skills: &paths.skills }.check().map_err(Fail::Failed)?;
-        let changed = Config { app_update: prefs, ..cfg.clone() };
+        let mut changed = cfg.clone();
+        changed.app_update = prefs;
         save_config(host, portable.then_some(directory.as_path()), &cfg, &changed).map_err(Fail::Failed)?;
     }
     update_preferences(out, prefs);
@@ -767,8 +987,8 @@ fn load_state(host: &dyn Host, cfg: &Config, portable: bool) -> Result<State, Fa
 /// judged like any other and marked as disabled in the heading.
 fn all_enabled(cfg: &Config) -> Config {
     let mut shown = cfg.clone();
-    for repo in &mut shown.repos {
-        repo.enabled = true;
+    for id in cfg.sources().iter().map(|s| s.id.clone()) {
+        shown.set_enabled(&id, true);
     }
     shown
 }
@@ -840,6 +1060,60 @@ fn header(out: &mut String, view: &RepoView, repo: &RepoConfig) {
     }
 }
 
+/// "the whole repository" for an empty folder.
+fn folder_text(path: &str) -> &str {
+    if path.is_empty() { "the whole repository" } else { path }
+}
+
+/// `enabled` is the source's own setting: the status judges a disabled source like any other.
+fn source_header(out: &mut String, view: &SourceView, enabled: bool) {
+    let off = if enabled { "" } else { " (disabled)" };
+    say!(out, "{} [{}]{off}: {}", printable(&view.label), printable(&view.id), view.status);
+    let branch = match (view.branch.is_empty(), &view.seen_branch) {
+        (false, _) => printable(&view.branch).into_owned(),
+        (true, Some(seen)) => format!("the default branch ({})", printable(seen)),
+        (true, None) => "the default branch".to_string(),
+    };
+    say!(out, "  Branch: {branch}. Folder: {}.", printable(folder_text(&view.folder)));
+    say!(out, "  Types: {}", view.types_line());
+    if let Some(detail) = &view.detail {
+        say!(out, "  {detail}");
+    }
+}
+
+/// The items of a source, grouped by type, with what the last listing skipped or never syncs.
+fn kind_groups(out: &mut String, cfg: &Config, view: &SourceView) {
+    let lanes = cfg.lanes_of(&view.id);
+    if view.kinds.iter().all(|k| k.rows.is_empty()) {
+        if !lanes.is_empty() && lanes.iter().all(|r| r.kind == SourceKind::Plugins) {
+            say!(out, "  No plugins are recorded. Run 'tss check' to check Copilot.");
+        } else {
+            let files: Vec<_> = lanes.iter().filter(|r| r.kind != SourceKind::Plugins).map(|r| r.kind).collect();
+            let nouns = if let [one] = files.as_slice() { one.nouns().1 } else { "items" };
+            say!(out, "  No {nouns} from it are installed.");
+        }
+    }
+    for kind in &view.kinds {
+        if kind.rows.is_empty() && kind.filtered == 0 && kind.notes.is_empty() {
+            continue;
+        }
+        say!(out, "  {}:", kind.summary());
+        rows(out, &kind.lane, &kind.rows, true);
+        if kind.filtered > 0 {
+            say!(out, "    Skipped {} in repository-specific or ignored folders.", kind.filtered);
+        }
+        for note in &kind.notes {
+            say!(out, "    Not synced: {} ({})", printable(&note.path), printable(&note.reason));
+        }
+    }
+    for note in &view.notes {
+        say!(out, "  Not synced: {} ({})", printable(&note.path), printable(&note.reason));
+    }
+    if view.more_notes > 0 {
+        say!(out, "  {} more items are not synced and are not listed.", view.more_notes);
+    }
+}
+
 /// Rows that need the user are marked with '!' and followed by the commands that settle them.
 fn rows(out: &mut String, repo_id: &str, rows: &[Row], all: bool) {
     for row in rows {
@@ -879,8 +1153,8 @@ fn messages(out: &mut String, board: &Board) {
     }
 }
 
-fn schedule_text(cfg: &Config, repo: &RepoConfig, sends_token: bool) -> String {
-    let mut text = match (repo.enabled, repo.interval) {
+fn schedule_text(cfg: &Config, enabled: bool, interval: Option<Interval>, sends_token: bool) -> String {
+    let mut text = match (enabled, interval) {
         (false, _) => "Disabled: checked only when asked".to_string(),
         (true, Some(every)) => format!("Checked every {}", every.describe()),
         (true, None) => format!("Checked every {} (the default)", cfg.default_interval.describe()),
@@ -927,23 +1201,17 @@ fn status(host: &dyn Host, out: &mut String) -> Result<i32, Fail> {
         Err(error) => {
             // Even when verification cannot run, the configured IDs are known and may be
             // needed to disambiguate two sources. Do not invent item or installation status.
-            for r in &cfg.repos {
-                say!(
-                    out,
-                    "{} [{}]: not verified. Type: {}. Source folder: {}.",
-                    printable(&r.label()),
-                    printable(&r.id),
-                    r.kind.heading(),
-                    printable(source_folder(r))
-                );
+            for s in cfg.sources() {
+                say!(out, "{} [{}]: not verified. Folder: {}.", printable(&source_label(s)), printable(&s.id), printable(folder_text(&s.path)));
             }
             return Err(error);
         }
     };
     let now = now_secs();
     let mut board = Board::new();
+    board.set_seen(crate::seen::load(&engine.paths().seen_file()));
     board.note_verify(&report, now);
-    for repo in &cfg.repos {
+    for repo in cfg.repos() {
         if let Some(at) = engine.last_check(&repo.id) {
             board.note_last_check(&repo.id, at);
         }
@@ -954,23 +1222,18 @@ fn status(host: &dyn Host, out: &mut String) -> Result<i32, Fail> {
         board.note_lists_nothing(&repo.id, engine.lists_nothing(&repo.id));
     }
 
-    if cfg.repos.is_empty() {
+    if cfg.sources().is_empty() {
         gap(out);
         say!(out, "{NO_REPOS}");
     }
-    for (view, repo) in board.views(&all_enabled(&cfg), now).iter().zip(&cfg.repos) {
+    for view in board.source_views(&all_enabled(&cfg), now) {
+        let Some(source) = cfg.find_source(&view.id) else { continue };
         gap(out);
-        header(out, view, repo);
-        say!(out, "  Last check: {}. {}", view.last_check_text(now), schedule_text(&cfg, repo, repo.use_token || engine.needs_token(&repo.id)));
-        if view.skills.is_empty() {
-            if repo.kind == SourceKind::Plugins {
-                say!(out, "  No plugins are recorded. Run 'tss check' to check Copilot.");
-            } else {
-                say!(out, "  No {} from it are installed.", repo.kind.nouns().1);
-            }
-        }
-        rows(out, &view.id, &view.skills, true);
-        if repo.enabled {
+        source_header(out, &view, source.enabled);
+        let sends_token = source.use_token || cfg.lanes_of(&source.id).iter().any(|r| engine.needs_token(&r.id));
+        say!(out, "  Last check: {}. {}", view.last_check_text(now), schedule_text(&cfg, source.enabled, source.interval, sends_token));
+        kind_groups(out, &cfg, &view);
+        if source.enabled {
             level = level.max(view.level);
         }
     }
@@ -1031,10 +1294,19 @@ fn size(bytes: u64) -> String {
 fn check(host: &dyn Host, out: &mut String, query: Option<&str>, dry_run: bool, full_listing: bool, delete_all: bool) -> Result<i32, Fail> {
     let (cfg, portable_directory) = load_config(host)?;
     let portable_mode = portable_directory.is_some();
+    let mut confirm = false;
     let which = match query {
-        Some(query) => Which::One(find_repo(&cfg, query).map_err(Fail::Usage)?.id.clone()),
-        None if cfg.repos.iter().any(|r| r.enabled) => Which::All,
-        None if cfg.repos.is_empty() => {
+        Some(query) => {
+            let source = find_source(&cfg, query).map_err(Fail::Usage)?;
+            // A confirmed deletion covers only the type it names: a type ID, or the source as a whole for its skills
+            // lane. A source with no skills lane confirms nothing, never another type's lane.
+            let named = KINDS.into_iter().filter_map(|k| source.lanes.id(k)).find(|id| id.eq_ignore_ascii_case(query.trim()));
+            let lane = named.or(source.lanes.id(SourceKind::Skills)).filter(|_| delete_all);
+            confirm = lane.is_some();
+            Which::One(lane.unwrap_or(&source.id).to_owned())
+        }
+        None if cfg.repos().iter().any(|r| r.enabled) => Which::All,
+        None if cfg.repos().is_empty() => {
             say!(out, "{NO_REPOS}");
             return Ok(EXIT_OK);
         }
@@ -1051,10 +1323,10 @@ fn check(host: &dyn Host, out: &mut String, query: Option<&str>, dry_run: bool, 
     let verified = engine.verify(&cfg, if dry_run { Access::ReadOnly } else { Access::Write })?;
     board.note_verify(&verified, now);
     // What the last listing had in it, for a check that GitHub answers with "not modified".
-    for repo in &cfg.repos {
+    for repo in cfg.repos() {
         board.note_lists_nothing(&repo.id, engine.lists_nothing(&repo.id));
     }
-    let opts = SyncOptions { dry_run, ignore_etag: full_listing, confirm_mass_delete: delete_all, ..SyncOptions::default() };
+    let opts = SyncOptions { dry_run, ignore_etag: full_listing, confirm_mass_delete: confirm, ..SyncOptions::default() };
     let mut report = engine.sync(&cfg, &which, &opts, &AtomicBool::new(false))?;
     if !dry_run {
         if let Err(e) = engine.flush() {
@@ -1064,9 +1336,22 @@ fn check(host: &dyn Host, out: &mut String, query: Option<&str>, dry_run: bool, 
     board.note_source_sync(&report, now, &cfg);
 
     let views = board.views(&all_enabled(&cfg), now);
+    // A type a source does not have is no news while another type of it is there, so it is not shown and does not
+    // count toward the exit code. A source that found nothing at all still says so for each type.
+    let source_of = |id: &str| cfg.find_source(id).map(|s| s.id.as_str());
+    let quiet = |r: &RepoReport| {
+        r.lists_nothing
+            && r.skills.is_empty()
+            && r.plugins.is_empty()
+            && !matches!(r.outcome, Outcome::Failed(_))
+            && views.iter().find(|v| v.id == r.repo_id).is_some_and(|v| v.skills.is_empty())
+    };
     let mut level = Level::Ok;
     for repo_report in &report.repos {
         let (Some(view), Some(repo)) = (views.iter().find(|v| v.id == repo_report.repo_id), cfg.find(&repo_report.repo_id)) else { continue };
+        if quiet(repo_report) && report.repos.iter().any(|other| source_of(&other.repo_id) == source_of(&repo_report.repo_id) && !quiet(other)) {
+            continue;
+        }
         gap(out);
         header(out, view, repo);
         if repo.kind != SourceKind::Plugins && matches!(repo_report.outcome, Outcome::Failed(_)) {
@@ -1097,10 +1382,7 @@ fn check(host: &dyn Host, out: &mut String, query: Option<&str>, dry_run: bool, 
 fn resolve(host: &dyn Host, out: &mut String, query: &str, skill: &str, how: Resolution) -> Result<i32, Fail> {
     let (cfg, portable_directory) = load_config(host)?;
     let portable_mode = portable_directory.is_some();
-    let repo = find_repo(&cfg, query).map_err(Fail::Usage)?;
-    if repo.kind == SourceKind::Plugins {
-        return Err(Fail::Usage("For Plugins, use approve, reinstall, uninstall or forget.".into()));
-    }
+    let repo = file_lane(&cfg, query, skill).map_err(Fail::Usage)?;
     // The engine checks `replace` against upstream itself. The other two only change a list, so a typo would be
     // recorded as it is: the name is checked here.
     let name = match how {
@@ -1125,10 +1407,14 @@ fn resolve(host: &dyn Host, out: &mut String, query: &str, skill: &str, how: Res
 
 fn resolve_plugin(host: &dyn Host, out: &mut String, query: &str, choice: &Choice) -> Result<i32, Fail> {
     let (cfg, portable_directory) = load_config(host)?;
-    let repo = find_repo(&cfg, query).map_err(Fail::Usage)?;
-    if repo.kind != SourceKind::Plugins {
-        return Err(Fail::Usage("Approve, reinstall, uninstall and forget are only for Plugins sources.".into()));
+    let source = find_source(&cfg, query).map_err(Fail::Usage)?;
+    if source.lanes.id(SourceKind::Plugins).and_then(|id| cfg.find(id)).is_none() {
+        return Err(Fail::Usage(format!(
+            "Approve, reinstall, uninstall and forget are only for plugins, and plugins do not sync from '{}'. Turn them on with: tss source {} types plugins=on",
+            source.id, source.id
+        )));
     }
+    let repo = lane_of(&cfg, source, SourceKind::Plugins).map_err(Fail::Usage)?;
     if !normal_name(choice.name()) {
         return Err(Fail::Usage("Use the plugin name as shown by 'tss check'.".into()));
     }
@@ -1188,34 +1474,56 @@ fn kept_name(host: &dyn Host, cfg: &Config, portable: bool, repo: &RepoConfig, s
     })
 }
 
+fn already_set_up(old: &SourceConfig) -> String {
+    crate::app::duplicate_source_message(&old.id)
+}
+
+/// The read-only preview of a location: where it is, and for each type what would sync, what would not and why.
+fn print_preview(out: &mut String, engine: &Engine, preview: &LocationPreview) {
+    for line in preview_lines(preview, &engine.paths().skills) {
+        if line.is_empty() {
+            gap(out);
+        } else {
+            say!(out, "{line}");
+        }
+    }
+}
+
 fn add(host: &dyn Host, out: &mut String, screen: &mut dyn Write, options: AddSource) -> Result<i32, Fail> {
-    let kind = options.kind.unwrap_or_default();
-    let spec = RepoSpec::parse_for_kind(&options.spec, kind).map_err(Fail::Usage)?;
+    let location = Location::parse(&options.spec).map_err(Fail::Usage)?;
+    if options.preview && options.approve_plugins {
+        return Err(Fail::Usage("A preview saves nothing, so it cannot approve plugins. Leave out --preview or --approve-plugins.".into()));
+    }
+    if !options.preview && !options.yes && !host.interactive() {
+        return Err(Fail::Usage(
+            "Cannot ask for confirmation because input is not a terminal. Add --yes to save without asking, or --preview to look first.".into(),
+        ));
+    }
     let (mut cfg, portable_directory) = load_config(host)?;
-    let added = match crate::app::new_source(&cfg, &spec, kind, options.every, options.use_token) {
-        Ok(mut added) => {
-            let file = paths(host, &cfg, portable_directory.is_some())?.state_file();
-            crate::engine::assign_fresh_id(&file, &cfg, &mut added)?;
-            added
+    let repo = format!("{}/{}", location.owner, location.name);
+    if location.target == Target::Bare && !options.preview {
+        if let Some(old) = same_location(&cfg, &repo, "", "") {
+            return Err(Fail::Usage(already_set_up(old)));
         }
-        Err(saved) if options.preview => RepoConfig { use_token: saved.use_token || options.use_token, ..saved.clone() },
-        Err(saved) => return Err(Fail::Usage(crate::app::duplicate_source_message(saved))),
-    };
-    let reviewed = if options.preview || options.kind.is_some() {
-        say!(out, "Read-only preview: {} [{}]\nSource folder: {}", printable(&added.label()), printable(&added.id), printable(source_folder(&added)));
-        let cancel = AtomicBool::new(false);
-        let mut engine = open_engine(host, &cfg, portable_directory.is_some())?;
-        let preview = engine.preview_source(&cfg, &added, &cancel).map_err(|why| {
-            Fail::Failed(format!("Could not preview {}: {}. Nothing was saved or installed.", kind.heading(), why.to_string().trim_end_matches('.')))
-        })?;
-        say!(out, "{}", preview.description(&added));
-        if let Some(why) = preview.blocker(&added) {
-            return Err(Fail::Failed(format!("{why} Nothing was saved or installed.")));
+    }
+    let cancel = AtomicBool::new(false);
+    let mut engine = open_engine(host, &cfg, portable_directory.is_some())?;
+    let preview = engine
+        .preview_location(&cfg, &options.spec, options.use_token, &cancel)
+        .map_err(|why| Fail::Failed(format!("Could not read {repo}: {}. Nothing was saved or installed.", why.to_string().trim_end_matches('.'))))?;
+    print_preview(out, &engine, &preview);
+    gap(out);
+    if let Some(old) = same_location(&cfg, &preview.source.repo, &preview.source.branch, &preview.source.path) {
+        if !options.preview {
+            return Err(Fail::Usage(already_set_up(old)));
         }
-        if options.preview {
-            say!(out, "Nothing was saved or installed.");
-            return Ok(EXIT_OK);
-        }
+        say!(out, "This location is already set up as '{}'.", old.id);
+    }
+    if options.preview {
+        say!(out, "Nothing was saved or installed.");
+        return Ok(EXIT_OK);
+    }
+    if !options.yes {
         say!(out, "Save this source? Type yes to save, or press Enter to cancel.");
         screen.write_all(ascii_lines(out).as_bytes()).and_then(|()| screen.flush()).map_err(|e| Fail::Failed(format!("could not show the preview: {e}")))?;
         out.clear();
@@ -1223,24 +1531,40 @@ fn add(host: &dyn Host, out: &mut String, screen: &mut dyn Write, options: AddSo
             say!(out, "Cancelled. Nothing was saved or installed.");
             return Ok(EXIT_OK);
         }
-        crate::app::recheck_preview(&mut engine, &cfg, &added, &preview, &cancel)?;
-        let (active, directory) = load_config(host)?;
-        if active != cfg || directory != portable_directory || paths(host, &active, directory.is_some())?.skills != engine.paths().skills {
-            return Err(Fail::Failed("The settings changed. Preview the source again.".into()));
-        }
-        Some((engine, preview))
-    } else {
-        None
-    };
-    let before = cfg.clone();
-    cfg.repos.push(added.clone());
-    save_config(host, portable_directory.as_deref(), &before, &cfg).map_err(Fail::Failed)?;
-    if let Some((mut engine, preview)) = reviewed {
-        crate::app::approve_saved_plugins(&mut engine, &cfg, &added.id, &preview).map_err(Fail::Failed)?;
     }
-    say!(out, "Added {} as '{}'. {}", printable(&added.label()), added.id, schedule_text(&cfg, &added, added.use_token));
-    if let Some(command) = command_line("check", &[&added.id], &[]) {
-        say!(out, "Install its {} with: {command}", added.kind.nouns().1);
+    // Save only what was shown: what GitHub has, where it would go and the settings must all be as they were.
+    let again = engine.preview_location(&cfg, &options.spec, options.use_token, &cancel)?;
+    if again != preview {
+        return Err(Fail::Failed("What GitHub has, or where it would go, changed since the preview. Preview the source again.".into()));
+    }
+    let (active, directory) = load_config(host)?;
+    if active != cfg || directory != portable_directory || paths(host, &active, directory.is_some())?.skills != engine.paths().skills {
+        return Err(Fail::Failed("The settings changed. Preview the source again.".into()));
+    }
+    let mut source = preview.source.clone();
+    source.interval = options.every;
+    let before = cfg.clone();
+    cfg.add_source_config(source.clone()).map_err(Fail::Failed)?;
+    save_config(host, portable_directory.as_deref(), &before, &cfg).map_err(Fail::Failed)?;
+    say!(out, "Added {} as '{}'. {}", printable(&source_label(&source)), source.id, schedule_text(&cfg, true, source.interval, source.use_token));
+
+    let plugins = previewed_plugins(&preview);
+    if !plugins.is_empty() {
+        if options.approve_plugins {
+            engine
+                .approve_location_plugins(&cfg, &source.id, &preview)
+                .map_err(|e| Fail::Failed(format!("The source was saved, but its plugins could not be approved: {e}")))?;
+            say!(out, "Approved {} {}: {}", plugins.len(), if plugins.len() == 1 { "plugin" } else { "plugins" }, printable(&plugins.join(", ")));
+        } else {
+            say!(
+                out,
+                "Its plugins wait for your approval: {}. After a check, approve each with the command 'tss status' shows.",
+                printable(&plugins.join(", "))
+            );
+        }
+    }
+    if let Some(command) = command_line("check", &[&source.id], &[]) {
+        say!(out, "Install what it has with: {command}");
     }
     Ok(EXIT_OK)
 }
@@ -1248,71 +1572,244 @@ fn add(host: &dyn Host, out: &mut String, screen: &mut dyn Write, options: AddSo
 fn remove(host: &dyn Host, out: &mut String, query: &str, delete_skills: bool, uninstall_plugins: bool) -> Result<i32, Fail> {
     let (mut cfg, portable_directory) = load_config(host)?;
     let portable_mode = portable_directory.is_some();
-    let before = cfg.clone();
-    // A repository that left the settings while its skills stayed on record can be let go of too.
-    let (id, kind, in_settings) = match find_repo(&cfg, query) {
-        Ok(repo) => (repo.id.clone(), repo.kind, true),
-        Err(e) if repo_matches(&cfg, query).is_empty() => {
-            let record = load_state(host, &cfg, portable_mode)?;
-            let kind = match record.loose_sources().get(query) {
-                Some(r) => r.binding().kind(),
-                None if record.plugin_sources().contains_key(query) => SourceKind::Plugins,
-                None if record.repo(query).is_some_and(|r| !r.skills.is_empty()) => SourceKind::Skills,
-                None => return Err(Fail::Usage(e)),
-            };
-            (query.to_string(), kind, false)
+    let source = match find_source(&cfg, query) {
+        Ok(source) => source.clone(),
+        // A source that left the settings while its items stayed on record can be let go of too.
+        Err(e) if source_matches(&cfg, query).is_empty() => {
+            let flags = (delete_skills, uninstall_plugins);
+            return remove_recorded(host, out, &cfg, portable_mode, query, flags, e);
         }
         Err(e) => return Err(Fail::Usage(e)),
     };
-    if delete_skills && kind != SourceKind::Skills {
-        return Err(Fail::Usage("--delete-skills is only for a Skills source. Remove this source without it to keep its files.".into()));
-    }
-    if uninstall_plugins && kind != SourceKind::Plugins {
-        return Err(Fail::Usage("--uninstall-plugins is only for a Plugins source.".into()));
-    }
-    let items = kind.nouns().1;
     let mut engine = open_engine(host, &cfg, portable_mode)?;
-    let report = if uninstall_plugins {
-        engine.remove_source_with_plugins(&cfg, &id, &AtomicBool::new(false))?
-    } else {
-        crate::app::remove_source(&mut engine, &cfg, &id, delete_skills)?
-    };
-
-    let mut saved = Ok(());
-    if in_settings {
-        let label = cfg.find(&id).map(RepoConfig::label).unwrap_or_default();
-        cfg.repos.retain(|r| r.id != id);
-        saved = save_config(host, portable_directory.as_deref(), &before, &cfg);
-        if saved.is_ok() {
-            say!(out, "Removed {label} [{id}] from the settings.");
-        }
-    } else {
-        say!(out, "Stopped tracking the {items} recorded for '{}'.", printable(&id));
+    let lanes = crate::app::removal_lanes(&engine, &cfg, &source).map_err(Fail::Failed)?;
+    if delete_skills && !lanes.iter().any(|(_, k)| *k == SourceKind::Skills) {
+        return Err(Fail::Usage("--delete-skills is only for a source with skills. Remove this source without it to keep its files.".into()));
     }
-    if uninstall_plugins {
+    if uninstall_plugins && !lanes.iter().any(|(_, k)| *k == SourceKind::Plugins) {
+        return Err(Fail::Usage("--uninstall-plugins is only for a source with plugins.".into()));
+    }
+    let reports = crate::app::remove_whole_source(&mut engine, &cfg, &lanes, delete_skills, uninstall_plugins)?;
+
+    let before = cfg.clone();
+    cfg.remove(&source.id);
+    let saved = save_config(host, portable_directory.as_deref(), &before, &cfg);
+    if saved.is_ok() {
+        say!(out, "Removed {} [{}] from the settings.", printable(&source_label(&source)), source.id);
+    }
+    let mut kept_skills = false;
+    for (_, kind, report) in &reports {
+        kept_skills |= describe_removal(out, *kind, report, delete_skills && *kind == SourceKind::Skills, uninstall_plugins);
+    }
+    if let Err(e) = saved {
+        return Err(Fail::Failed(still_in_settings(host, portable_directory.as_deref(), &e, &source.id)));
+    }
+    Ok(if kept_skills { EXIT_ATTENTION } else { EXIT_OK })
+}
+
+/// Says what letting go of one type did. True when skills that were to be deleted were kept.
+fn describe_removal(out: &mut String, kind: SourceKind, report: &RemoveReport, deleting: bool, uninstall_plugins: bool) -> bool {
+    let items = kind.nouns().1;
+    if kind == SourceKind::Plugins && uninstall_plugins {
         say!(out, "Uninstalled {} {} from Copilot.", report.deleted.len(), if report.deleted.len() == 1 { "plugin" } else { "plugins" });
     } else if !report.deleted.is_empty() {
         say!(out, "Deleted: {}", report.deleted.join(", "));
     }
     if let Some(message) = report.message {
         say!(out, "{message}");
-    } else if delete_skills {
+    } else if deleting {
         for (name, why) in &report.kept {
             say!(out, "Kept {name}, which is now yours: {why}");
         }
+        return !report.kept.is_empty();
     } else if !report.kept.is_empty() {
         let names: Vec<&str> = report.kept.iter().map(|(name, _)| name.as_str()).collect();
         say!(out, "These {items} stay installed and are now yours: {}", names.join(", "));
     }
-    if let Err(e) = saved {
-        let next_step = if let Some(directory) = &portable_directory {
-            format!("update the portable settings beside tss.exe in {} by hand", directory.display())
-        } else {
-            format!("remove it from {} by hand", config_path(host).display())
-        };
-        return Err(Fail::Failed(format!("{e}. The {items} of '{id}' are no longer managed, but it is still in the settings: {next_step}")));
+    false
+}
+
+fn still_in_settings(host: &dyn Host, portable_directory: Option<&Path>, error: &str, id: &str) -> String {
+    let next_step = if let Some(directory) = portable_directory {
+        format!("update the portable settings beside tss.exe in {} by hand", directory.display())
+    } else {
+        format!("remove it from {} by hand", config_path(host).display())
+    };
+    format!("{}. The items of '{id}' are no longer managed, but it is still in the settings: {next_step}", capitalized(error))
+}
+
+/// Let go of items recorded under an ID that is no longer in the settings.
+fn remove_recorded(
+    host: &dyn Host,
+    out: &mut String,
+    cfg: &Config,
+    portable_mode: bool,
+    id: &str,
+    (delete_skills, uninstall_plugins): (bool, bool),
+    not_found: String,
+) -> Result<i32, Fail> {
+    let record = load_state(host, cfg, portable_mode)?;
+    let kind = match record.loose_sources().get(id) {
+        Some(r) => r.binding().kind(),
+        None if record.plugin_sources().contains_key(id) => SourceKind::Plugins,
+        None if record.repo(id).is_some_and(|r| !r.skills.is_empty()) => SourceKind::Skills,
+        None => return Err(Fail::Usage(not_found)),
+    };
+    if delete_skills && kind != SourceKind::Skills {
+        return Err(Fail::Usage("--delete-skills is only for skills. Remove these items without it to keep their files.".into()));
     }
-    Ok(if delete_skills && !report.kept.is_empty() { EXIT_ATTENTION } else { EXIT_OK })
+    if uninstall_plugins && kind != SourceKind::Plugins {
+        return Err(Fail::Usage("--uninstall-plugins is only for plugins.".into()));
+    }
+    let mut engine = open_engine(host, cfg, portable_mode)?;
+    let report = if uninstall_plugins {
+        engine.remove_source_with_plugins(cfg, id, &AtomicBool::new(false))?
+    } else {
+        crate::app::remove_source(&mut engine, cfg, id, delete_skills)?
+    };
+    say!(out, "Stopped tracking the {} recorded for '{}'.", kind.nouns().1, printable(id));
+    let kept = describe_removal(out, kind, &report, delete_skills, uninstall_plugins);
+    Ok(if kept { EXIT_ATTENTION } else { EXIT_OK })
+}
+
+fn on_off(on: bool) -> &'static str {
+    if on { "on" } else { "off" }
+}
+
+/// The ignored folder names: the global list with this source's additions, less what it allows, as typed.
+fn ignored_names(global: &GlobalSettings, source: &SourceConfig) -> Vec<String> {
+    let allowed: Vec<String> = source.ignore_allow.iter().map(|n| fold(n)).collect();
+    let mut names: Vec<String> = Vec::new();
+    for name in global.ignore_folders.iter().chain(&source.ignore_add) {
+        if !allowed.contains(&fold(name)) && !names.iter().any(|n| fold(n) == fold(name)) {
+            names.push(name.clone());
+        }
+    }
+    names
+}
+
+fn list_or_none(names: &[String]) -> String {
+    if names.is_empty() { "none".to_string() } else { names.iter().map(|n| printable(n).into_owned()).collect::<Vec<_>>().join(", ") }
+}
+
+const REPO_FOLDERS_TEXT: &str = ".github, .agents, .claude, .copilot, .codex, .cursor, .gemini";
+
+fn show_source(out: &mut String, cfg: &Config, source: &SourceConfig) {
+    let global = cfg.global();
+    let off = if source.enabled { "" } else { " (disabled)" };
+    say!(out, "{} [{}]{off}", printable(&source_label(source)), printable(&source.id));
+    let branch = if source.branch.is_empty() { "the default branch".into() } else { printable(&source.branch) };
+    say!(out, "  Branch: {branch}. Folder: {}.", printable(folder_text(&source.path)));
+    let types = source.effective_types(global);
+    for kind in KINDS {
+        let own = source.types.get(kind);
+        let why = if own.is_some() { "set for this source" } else { "the default" };
+        let id = source.lanes.id(kind).map(|id| format!(" [{}]", printable(id))).unwrap_or_default();
+        say!(out, "  {}: Sync {} ({why}){id}", kind.heading(), on_off(types.enabled(kind)));
+    }
+    let repo_items = source.include_repo_items.unwrap_or(global.include_repo_items);
+    let why = if source.include_repo_items.is_some() { "set for this source" } else { "the default" };
+    say!(out, "  Skills and agents in repository-specific folders ({REPO_FOLDERS_TEXT}): {} ({why})", if repo_items { "synced" } else { "skipped" });
+    say!(out, "  Ignored folders: {}", list_or_none(&ignored_names(global, source)));
+    if !source.ignore_add.is_empty() {
+        say!(out, "  Also ignored for this source: {}", list_or_none(&source.ignore_add));
+    }
+    if !source.ignore_allow.is_empty() {
+        say!(out, "  Not ignored for this source: {}", list_or_none(&source.ignore_allow));
+    }
+}
+
+fn show_settings(out: &mut String, global: &GlobalSettings) {
+    say!(out, "Defaults for every source:");
+    for kind in KINDS {
+        say!(out, "  {}: Sync {}", kind.heading(), on_off(global.types.enabled(kind)));
+    }
+    say!(out, "  Skills and agents in repository-specific folders ({REPO_FOLDERS_TEXT}): {}", if global.include_repo_items { "synced" } else { "skipped" });
+    say!(out, "  Ignored folders: {}", list_or_none(&global.ignore_folders));
+}
+
+const TURNED_OFF: &str = "Turning a type off deletes nothing: what it installed stays as it is and shows as Sync off.";
+
+fn source_command(host: &dyn Host, out: &mut String, query: &str, change: Option<SourceChange>) -> Result<i32, Fail> {
+    let (mut cfg, portable_directory) = load_config(host)?;
+    let source = find_source(&cfg, query).map_err(Fail::Usage)?.clone();
+    let Some(change) = change else {
+        show_source(out, &cfg, &source);
+        return Ok(EXIT_OK);
+    };
+    let mut edited = source.clone();
+    match change {
+        SourceChange::Types(changes) => {
+            for (kind, value) in changes {
+                edited.set_type(kind, value);
+            }
+        }
+        SourceChange::Ignore(action, name) => edited.ignore(action, &name).map_err(Fail::Usage)?,
+        SourceChange::RepoItems(value) => edited.set_repo_items(value),
+    }
+    if edited == source {
+        say!(out, "Nothing changed: the source already has that setting.");
+        show_source(out, &cfg, &source);
+        return Ok(EXIT_OK);
+    }
+    edited.effective_policy(cfg.global()).map_err(|why| Fail::Usage(capitalized(&why)))?;
+    let (was, now) = (source.effective_types(cfg.global()), edited.effective_types(cfg.global()));
+    let before = cfg.clone();
+    cfg.edit(|sources, _| {
+        if let Some(s) = sources.iter_mut().find(|s| s.id == source.id) {
+            *s = edited.clone();
+        }
+    });
+    if KINDS.iter().any(|&k| !was.enabled(k) && now.enabled(k)) {
+        let state = load_state(host, &cfg, portable_directory.is_some())?;
+        crate::engine::fresh_lane_ids(&state, &before, &mut cfg);
+    }
+    let edited = cfg.find_source(&source.id).cloned().unwrap_or(edited);
+    save_config(host, portable_directory.as_deref(), &before, &cfg).map_err(Fail::Failed)?;
+    say!(out, "Saved. The change applies on the next check of '{}'.", source.id);
+    if KINDS.iter().any(|&k| was.enabled(k) && !now.enabled(k)) {
+        say!(out, "{TURNED_OFF}");
+    }
+    show_source(out, &cfg, &edited);
+    Ok(EXIT_OK)
+}
+
+fn settings_command(host: &dyn Host, out: &mut String, change: Option<SettingsChange>) -> Result<i32, Fail> {
+    let (mut cfg, portable_directory) = load_config(host)?;
+    let Some(change) = change else {
+        show_settings(out, cfg.global());
+        return Ok(EXIT_OK);
+    };
+    let mut global = cfg.global().clone();
+    let mut turned_off = false;
+    match change {
+        SettingsChange::Types(changes) => {
+            for (kind, on) in changes {
+                turned_off |= global.set_type(kind, on);
+            }
+        }
+        SettingsChange::Ignore(add, name) => global.ignore(add, &name).map_err(Fail::Usage)?,
+        SettingsChange::RepoItems(on) => global.set_repo_items(on),
+    }
+    if global == *cfg.global() {
+        say!(out, "Nothing changed: that is already the setting.");
+        show_settings(out, cfg.global());
+        return Ok(EXIT_OK);
+    }
+    let before = cfg.clone();
+    let turned_on = KINDS.iter().any(|&k| !before.global().types.enabled(k) && global.types.enabled(k));
+    cfg.edit(|_, g| *g = global);
+    if turned_on {
+        let state = load_state(host, &cfg, portable_directory.is_some())?;
+        crate::engine::fresh_lane_ids(&state, &before, &mut cfg);
+    }
+    save_config(host, portable_directory.as_deref(), &before, &cfg).map_err(Fail::Failed)?;
+    say!(out, "Saved. The change applies to every source that follows the defaults, on its next check.");
+    if turned_off {
+        say!(out, "{TURNED_OFF}");
+    }
+    show_settings(out, cfg.global());
+    Ok(EXIT_OK)
 }
 
 fn token(host: &dyn Host, out: &mut String, action: TokenAction) -> Result<i32, Fail> {
@@ -1357,13 +1854,13 @@ fn token(host: &dyn Host, out: &mut String, action: TokenAction) -> Result<i32, 
             let sends = |r: &RepoConfig| {
                 r.use_token || state.repo(&r.id).is_some_and(|s| s.needs_token) || state.loose_sources().get(&r.id).is_some_and(|s| s.poll.needs_token)
             };
-            let users: Vec<&str> = cfg.repos.iter().filter(|r| sends(r)).map(|r| r.id.as_str()).collect();
+            let users: Vec<&str> = cfg.repos().iter().filter(|r| sends(r)).map(|r| r.id.as_str()).collect();
             if users.is_empty() {
                 say!(out, "No repository sends the token. It is tried by itself when GitHub cannot find a repository without it.");
             } else {
                 say!(out, "Repositories that send the token: {}", users.join(", "));
             }
-            if !available && cfg.repos.iter().any(|r| sends(r) && r.enabled) {
+            if !available && cfg.repos().iter().any(|r| sends(r) && r.enabled) {
                 say!(out, "They cannot be checked until a token is saved (tss token set) or the GitHub CLI is signed in (gh auth login).");
                 return Ok(EXIT_ATTENTION);
             }
@@ -1438,11 +1935,23 @@ mod tests {
         let every = Some(Interval::new(6, Unit::Hour));
         assert_eq!(parsed("add o/r --every 6h --use-token"), Command::Add(AddSource { every, use_token: true, ..add.clone() }));
         assert_eq!(parsed("add --every=6h o/r"), Command::Add(AddSource { every, ..add.clone() }));
-        assert_eq!(parsed("add --type skills o/r"), Command::Add(AddSource { kind: Some(SourceKind::Skills), ..add.clone() }));
-        assert_eq!(parsed("add o/r --type=agents --preview"), Command::Add(AddSource { kind: Some(SourceKind::Agents), preview: true, ..add.clone() }));
         assert_eq!(parsed("add --preview o/r"), Command::Add(AddSource { preview: true, ..add.clone() }));
-        assert_eq!(parsed("add o/r --type instructions"), Command::Add(AddSource { kind: Some(SourceKind::Instructions), ..add }));
+        assert_eq!(parsed("add o/r --approve-plugins --yes"), Command::Add(AddSource { approve_plugins: true, yes: true, ..add }));
         assert_eq!(parsed("remove fx"), Command::Remove { repo: "fx".into(), delete_skills: false, uninstall_plugins: false });
+        assert_eq!(parsed("source fx"), Command::Source { repo: "fx".into(), change: None });
+        assert_eq!(
+            parsed("source fx types skills=off Agents=default"),
+            Command::Source { repo: "fx".into(), change: Some(SourceChange::Types(vec![(SourceKind::Skills, Some(false)), (SourceKind::Agents, None)])) }
+        );
+        assert_eq!(
+            parsed("source fx ignore allow samples"),
+            Command::Source { repo: "fx".into(), change: Some(SourceChange::Ignore(IgnoreAction::Allow, "samples".into())) }
+        );
+        assert_eq!(parsed("source fx repo-items on"), Command::Source { repo: "fx".into(), change: Some(SourceChange::RepoItems(Some(true))) });
+        assert_eq!(parsed("settings"), Command::Settings(None));
+        assert_eq!(parsed("settings types plugins=off"), Command::Settings(Some(SettingsChange::Types(vec![(SourceKind::Plugins, false)]))));
+        assert_eq!(parsed("settings ignore remove tests"), Command::Settings(Some(SettingsChange::Ignore(false, "tests".into()))));
+        assert_eq!(parsed("settings repo-items on"), Command::Settings(Some(SettingsChange::RepoItems(true))));
         assert_eq!(parsed("remove fx --delete-skills"), Command::Remove { repo: "fx".into(), delete_skills: true, uninstall_plugins: false });
         assert_eq!(parsed("token"), Command::Token(TokenAction::Status));
         assert_eq!(parsed("token set"), Command::Token(TokenAction::Set));
@@ -1484,9 +1993,14 @@ mod tests {
         assert!(refused("add o/r --every").contains("needs an interval"));
         assert!(refused("add o/r --every 1m").contains("--every: polling more often"));
         assert!(refused("add o/r --every soon").contains("--every:"));
-        assert!(refused("add o/r --type").contains("needs skills, agents, instructions or plugins"));
-        assert!(refused("add o/r --type agents --type skills").contains("exactly one"));
-        assert!(refused("add o/r --type packages").contains("expected skills, agents, instructions or plugins"));
+        assert!(refused("add o/r --type agents").contains("tss source REPO types"));
+        assert!(refused("add o/r --type=skills --preview").contains("found by themselves"));
+        assert!(refused("source fx types").contains("something is missing"));
+        assert!(refused("source fx types skills=maybe").contains("not on, off or default"));
+        assert!(refused("source fx types packages=on").contains("packages"));
+        assert!(refused("settings types skills=default").contains("not on or off"));
+        assert!(refused("source fx ignore drop tests").contains("not an ignore action"));
+        assert!(refused("settings ignore allow tests").contains("use add or remove"));
         assert!(refused("remove").contains("something is missing"));
         assert!(refused("token show").contains("'show' is not a token action"));
         assert!(refused("startup maybe").contains("'maybe' is not a startup action; use: tss startup [status|on|off]"));
@@ -1500,21 +2014,22 @@ mod tests {
             .iter()
             .map(|(id, repo, path)| RepoConfig { id: id.to_string(), repo: repo.to_string(), path: path.to_string(), ..RepoConfig::default() })
             .collect();
-        Config { repos, ..Config::default() }
+        Config::from_lanes(repos)
     }
 
     #[test]
     fn repositories_are_found_by_id_or_unique_name() {
         let cfg = cfg_with(&[("fx", "Owner/Fixtures", "skills"), ("a", "o/twice", "x"), ("b", "o/twice", "y")]);
-        assert_eq!(find_repo(&cfg, "fx").unwrap().id, "fx");
-        assert_eq!(find_repo(&cfg, "FX").unwrap().id, "fx");
-        assert_eq!(find_repo(&cfg, "owner/fixtures").unwrap().id, "fx");
-        assert_eq!(find_repo(&cfg, "owner/fixtures/").unwrap().id, "fx");
-        let e = find_repo(&cfg, "o/twice").unwrap_err();
-        assert!(e.contains("matches several") && e.contains("a, b"), "{e}");
-        let e = find_repo(&cfg, "nope").unwrap_err();
+        assert_eq!(find_source(&cfg, "fx").unwrap().id, "fx");
+        assert_eq!(find_source(&cfg, "FX").unwrap().id, "fx");
+        assert_eq!(find_source(&cfg, "owner/fixtures").unwrap().id, "fx");
+        assert_eq!(find_source(&cfg, "owner/fixtures/").unwrap().id, "fx");
+        assert_eq!(find_source(&cfg, "FX-agents").unwrap().id, "fx");
+        let e = find_source(&cfg, "o/twice").unwrap_err();
+        assert!(e.contains("Several sources match") && e.contains("a, b"), "{e}");
+        let e = find_source(&cfg, "nope").unwrap_err();
         assert!(e.contains("fx, a, b"), "{e}");
-        assert!(find_repo(&Config::default(), "fx").unwrap_err().contains("none is"));
+        assert!(find_source(&Config::default(), "fx").unwrap_err().contains("none is"));
     }
 
     #[test]

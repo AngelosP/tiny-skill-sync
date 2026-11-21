@@ -63,10 +63,8 @@ fn selection_uses_cli_precedence_exact_git_scope_and_native_capability_paths() {
     assert_eq!(catalog.hosted_elsewhere(), ["elsewhere", "other-url"]);
     let first = &catalog.plugins()["one"];
     assert_eq!((first.version.as_deref(), first.publisher.as_deref(), first.description.as_deref()), (Some("2"), Some("Team"), Some("Entry details")));
-    assert_eq!(first.capabilities, Capabilities { hooks: true, mcp: true, lsp: true });
     let second = &catalog.plugins()["two"];
     assert_eq!((second.version.as_deref(), second.publisher.as_deref(), second.description.as_deref()), (Some("3"), Some("Org"), Some("Other details")));
-    assert_eq!(second.capabilities, Capabilities::default());
     let record = catalog.approved_record(&source("tools"), Path::new(r"D:\isolated\copilot")).unwrap();
     assert_eq!(record.approved.keys().collect::<Vec<_>>(), ["one", "two"]);
     assert!(record.plugins.is_empty());

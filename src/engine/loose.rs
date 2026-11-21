@@ -1,6 +1,7 @@
 //! A source schedules one conditional listing, not a poll per file. Only a fresh listing of the
 //! recorded scope, corroborated at one commit, supplies negative evidence. Placement isn't ownership.
 
+use super::root::RootListing;
 use super::*;
 use crate::apply::STALE_REVIEW;
 use crate::apply::leaf::{LeafTarget, PinnedLeaf};
@@ -63,78 +64,106 @@ impl Listing<'_> {
 }
 
 impl Engine {
-    /// None means exactly one valid 304: do not open even one destination leaf on this path.
-    fn file_listing<'a>(&self, s: &mut Session, repo: &'a RepoConfig, conditional: bool, cancel: &AtomicBool) -> Result<Option<Listing<'a>>, RemoteError> {
+    /// The lane's view of a fresh branch-root listing, corroborated at one commit when it is complete.
+    fn lane_files<'a>(&self, s: &mut Session, repo: &'a RepoConfig, root: &RootListing, cancel: &AtomicBool) -> Result<Listing<'a>, RemoteError> {
         running(cancel)?;
         let problems = repo.problems();
         if !problems.is_empty() {
             return Err(local(problems.join("; ")));
         }
         let bound = s.state.binding_for(repo).map_err(local)?.cloned();
-        let root = s.roots.path(repo.kind).map_err(local)?.to_owned();
+        let dest = s.roots.path(repo.kind).map_err(local)?.to_owned();
         let reference = RepoRef::of(repo).map_err(local)?;
         let record = s.state.loose_sources().get(&repo.id);
         let recorded = record.and_then(|r| r.recorded_source(&repo.id)).unwrap_or_else(|| repo.clone());
-        let tag = record.filter(|r| conditional && r.poll.source == source_key(repo)).and_then(|r| r.poll.etag.clone());
-        let (reply, token, private) = self.request_tree(Some(s), repo, &reference, tag.as_deref(), cancel)?;
-        running(cancel)?;
-        let TreeReply::Snapshot { snapshot, etag } = reply else {
-            if tag.is_some() {
-                return Ok(None);
-            }
-            return Err(RemoteError::new(FailureKind::Protocol, "GitHub answered 'not modified' without an ETag"));
-        };
-        if snapshot.truncated {
-            return Err(RemoteError::new(FailureKind::TooLarge, "GitHub cut the folder listing short; nothing was changed"));
-        }
         // A case-only suffix change can be filtered out by type discovery yet still occupy the
         // very same Windows name. That is not evidence that the owner's object went away.
         if let Some(record) = s.state.loose_sources().get(&repo.id) {
-            for entry in snapshot.entries.iter().filter(|e| !e.path.contains('/')) {
-                if crate::state::check_leaf_name(repo.kind, &entry.path).is_err() && record.leaves().iter().any(|l| winfs::same_win_name(&entry.path, &l.name))
-                {
+            let prefix = if repo.path.is_empty() { String::new() } else { format!("{}/", repo.path) };
+            for entry in root.snapshot.entries.iter().filter(|e| e.path.starts_with(&prefix)) {
+                let name = entry.path.rsplit('/').next().unwrap_or_default();
+                // Two ASCII names are the same to Windows exactly when their case folds are; only other names need to ask it.
+                let same = |l: &str| if name.is_ascii() && l.is_ascii() { name.eq_ignore_ascii_case(l) } else { winfs::same_win_name(name, l) };
+                if crate::state::check_leaf_name(repo.kind, name).is_err() && record.leaves().iter().any(|l| same(&l.name)) {
                     return Err(local("the listing filtered a spelling of a managed file; nothing was removed"));
                 }
             }
         }
-        let found =
-            tree::discover_source(repo, snapshot, root.to_string_lossy().encode_utf16().count()).map_err(|why| RemoteError::new(FailureKind::Protocol, why))?;
-        if !found.complete_for(&recorded) {
-            let reason = found.rejected().first().map(|r| format!("{}: {}", r.name, r.reason)).unwrap_or_else(|| "unsafe or inconsistent entries".into());
-            return Err(RemoteError::new(FailureKind::Protocol, format!("the listing cannot confirm this source ({reason}); nothing was changed")));
+        let found = tree::lane_discovery(repo, &root.snapshot, &root.inventory).map_err(|why| RemoteError::new(FailureKind::Protocol, why))?;
+        if !found.same_scope(&recorded) {
+            return Err(RemoteError::new(FailureKind::Protocol, "the listing cannot confirm this source (it moved); nothing was changed"));
         }
         // Only a new source needs a scan for placement. A bound source still checks the
         // alternate destination for EACH name before touching that file.
         let names = if bound.is_none() { found.names() } else { Vec::new() };
-        let binding = source_preview::locate_files(repo, &root, &names, bound.as_ref(), cancel).map_err(local)?;
-        let pin = self.remote.commit(&reference, token.as_deref(), cancel)?;
-        confirm_source_at(self.remote.as_ref(), &recorded, &found, &pin, token.as_deref(), cancel)?;
-        Ok(Some(Listing { found, recorded, root, binding, pin, reference, token, private, etag }))
+        let binding = source_preview::locate_files(repo, &dest, &names, bound.as_ref(), cancel).map_err(local)?;
+        let pin = match &root.pin {
+            Some(pin) => pin.clone(),
+            None => self.remote.commit(&reference, root.token.as_deref(), cancel)?,
+        };
+        // An incomplete listing proves no absence: an owned name it does not show then fails its own decision.
+        if found.complete_for(&recorded) {
+            // Lanes of one location see the same branch-root tree: once it is proved at this pin, it stays proved.
+            let key = found.is_lane_view().then(|| format!("{}\n{}\n{}\n{}\n{}", recorded.repo, recorded.branch, recorded.path, pin, found.tree_id()));
+            if key.is_some() && *root.confirmed.borrow() == key {
+                running(cancel)?;
+            } else {
+                confirm_source_at(self.remote.as_ref(), &recorded, &found, &pin, root.token.as_deref(), cancel)?;
+                *root.confirmed.borrow_mut() = key;
+            }
+        }
+        Ok(Listing { found, recorded, root: dest, binding, pin, reference, token: root.token.clone(), private: root.private, etag: root.etag.clone() })
+    }
+
+    /// A fresh, unconditional listing for one choice the user made.
+    fn file_listing<'a>(&self, s: &mut Session, repo: &'a RepoConfig, cancel: &AtomicBool) -> Result<Listing<'a>, RemoteError> {
+        let root = self.fresh_root(s, repo, cancel)?;
+        self.lane_files(s, repo, &root, cancel)
     }
 
     fn file_bytes(&self, list: &Listing, file: &SkillFile, cancel: &AtomicBool) -> Result<Vec<u8>, RemoteError> {
-        download(self.remote.as_ref(), &list.reference, &list.pin, &file.path, file, list.token.as_deref(), cancel)
+        let rel = list.found.remote_path(&file.path).unwrap_or(&file.path);
+        download(self.remote.as_ref(), &list.reference, &list.pin, rel, file, list.token.as_deref(), cancel)
     }
 
-    pub(super) fn sync_files(&self, s: &mut Session, repo: &RepoConfig, opts: &SyncOptions, cancel: &AtomicBool) -> RepoReport {
+    pub(super) fn sync_files(&self, s: &mut Session, repo: &RepoConfig, opts: &SyncOptions, cancel: &AtomicBool, root: &RootListing) -> RepoReport {
         let mut report = RepoReport::new(repo);
-        match self.sync_files_in(s, repo, opts, cancel, &mut report) {
+        match self.sync_files_in(s, repo, opts, cancel, root, &mut report) {
             Ok(()) => report,
             Err(e) if e.kind == FailureKind::Cancelled => RepoReport { outcome: Outcome::Cancelled, ..report },
             Err(e) => report.fail(e),
         }
     }
 
-    fn sync_files_in(&self, s: &mut Session, repo: &RepoConfig, opts: &SyncOptions, cancel: &AtomicBool, report: &mut RepoReport) -> Result<(), RemoteError> {
-        let Some(list) = self.file_listing(s, repo, !opts.ignore_etag && !opts.confirm_mass_delete, cancel)? else {
-            report.lists_nothing = s.state.loose_sources()[&repo.id].poll.lists_nothing;
-            if !opts.dry_run {
-                s.touch_check(&repo.id, self.now());
+    fn sync_files_in(
+        &self,
+        s: &mut Session,
+        repo: &RepoConfig,
+        opts: &SyncOptions,
+        cancel: &AtomicBool,
+        root: &RootListing,
+        report: &mut RepoReport,
+    ) -> Result<(), RemoteError> {
+        // A lane with nothing on record and nothing of its type to place has no destination to choose yet: it is
+        // a source that simply holds none of this type.
+        if !s.state.loose_sources().contains_key(&repo.id) {
+            let found = tree::lane_discovery(repo, &root.snapshot, &root.inventory).map_err(|why| RemoteError::new(FailureKind::Protocol, why))?;
+            if found.names().is_empty() {
+                report.lists_nothing = found.rejected().is_empty() && found.protected().is_empty();
+                report.outcome = Outcome::Unchanged;
+                if !opts.dry_run {
+                    s.remember_lane_poll(repo, root.etag.clone(), self.now(), report.lists_nothing, false);
+                }
+                return Ok(());
             }
-            return Ok(());
-        };
+        }
+        if !opts.dry_run {
+            // About to choose a destination: the record it gets replaces this lane's check data.
+            s.state.forget_lane_poll(&repo.id);
+        }
+        let list = self.lane_files(s, repo, root, cancel)?;
         let mut names = list.found.names();
-        report.lists_nothing = names.is_empty();
+        report.lists_nothing = names.is_empty() && list.found.rejected().is_empty() && list.found.protected().is_empty();
         let mut seen: HashSet<_> = names.iter().map(|n| fold(n)).collect();
         if let Some(r) = s.state.loose_sources().get(&repo.id) {
             names.extend(r.leaves().iter().filter(|l| seen.insert(fold(&l.name))).map(|l| l.name.clone()));
@@ -248,7 +277,7 @@ impl Engine {
             Resolution::PauseHistory | Resolution::ResumeHistory => return Err(local("earlier-version searches are for skills, not individual files")),
             Resolution::KeepMine => {
                 if leaf.is_none() && !ignored {
-                    let list = self.file_listing(s, repo, false, cancel)?.ok_or_else(|| local("a fresh listing is required"))?;
+                    let list = self.file_listing(s, repo, cancel)?;
                     let item = list.item(name, false)?;
                     if item.desired().is_none() || matches!(s.applier.leaf_decision(&s.state, list.target(), item, None)?, Verdict::Skipped(_)) {
                         return Err(local("this file is not managed or available from this source"));
@@ -265,7 +294,7 @@ impl Engine {
             Resolution::Overwrite if ignored => return Err(local("this file is marked as yours; choose 'manage again' first")),
             Resolution::Overwrite => {
                 let review = self.file_review.as_ref().filter(|r| r.source.id == repo.id && fold(&r.name) == fold(name));
-                let list = self.file_listing(s, repo, false, cancel)?.ok_or_else(|| local("a fresh listing is required"))?;
+                let list = self.file_listing(s, repo, cancel)?;
                 let item = list.item(name, false)?;
                 if review.is_some_and(|r| r.source != *repo || r.binding != list.binding || r.desired.as_ref() != item.desired()) {
                     return Err(local(STALE_REVIEW));
@@ -302,7 +331,7 @@ impl Engine {
     ) -> Result<(DiffReport, Option<FileReview>), RemoteError> {
         running(cancel)?;
         crate::state::check_leaf_name(repo.kind, name).map_err(local)?;
-        let list = if whole { None } else { self.file_listing(s, repo, false, cancel)? };
+        let list = if whole { None } else { Some(self.file_listing(s, repo, cancel)?) };
         let r = s.state.loose_sources().get(&repo.id);
         let leaf = r.and_then(|r| r.leaf(name));
         if leaf.is_some_and(|l| l.interrupted()) {

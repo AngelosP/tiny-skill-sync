@@ -15,19 +15,24 @@ use super::sentence;
 use super::theme::Role;
 use crate::app::{DraftStage, SourceDraft, duplicate_source_message};
 use crate::autostart::{Startup, Via};
-use crate::board::{self, Action, Board, Level, RepoView, Row, ago, repo_name};
-use crate::config::{RepoConfig, RepoSpec, UpdateInterval, UpdatePrefs, UpdateTiming};
+use crate::board::{self, Action, Board, KindView, Level, Row, SourceView, ago, repo_name};
+use crate::config::{Config, RepoConfig, UpdateInterval, UpdatePrefs, UpdateTiming};
 use crate::diff::{Body, FileChange, Presence, Row as Line, TextDiff};
 use crate::engine::DiffReport;
 use crate::interval::{Interval, UnixSecs};
+use crate::location::{Location, Target};
 use crate::pathsafe::{printable, printable_lines};
 use crate::source::SourceKind;
+use crate::sources::{GlobalSettings, SourceConfig, validate_ignore_names};
 use crate::updater::Action as AppAction;
 
 /// Measures text in DIPs: (width, height), on one line when the width given is 0, else wrapped at it.
 pub type Fit<'a> = &'a dyn Fn(&str, Font, i32) -> (i32, i32);
 
 pub const NAV_W: i32 = 248;
+pub const MIN_LIST_W: i32 = 160;
+const MIN_PAGE_W: i32 = 360;
+const SPLITTER_W: i32 = 12;
 pub const HERO_H: i32 = 66;
 pub const SYNC_NOW: &str = "Sync now";
 pub const SYNC_TIP: &str = "Checks every enabled source now. Items you edited or deleted are never replaced without asking.";
@@ -56,6 +61,7 @@ pub mod id {
     pub const NAV_ACTIVITY: i32 = 301;
     pub const NAV_SETTINGS: i32 = 302;
     pub const NAV_HEAD: i32 = 303;
+    pub const SPLITTER: i32 = 304;
     pub const WELCOME_ADD: i32 = 305;
     pub const MORE: i32 = 310;
     pub const EVERY: i32 = 311;
@@ -66,12 +72,15 @@ pub mod id {
     pub const CANCEL_SOURCE: i32 = 316;
     pub const RETRY_SOURCE: i32 = 317;
     pub const EDIT_SOURCE: i32 = 318;
+    pub const APPROVE_SOURCE: i32 = 319;
     pub const DEFAULT_EVERY: i32 = 320;
     pub const OPEN_SKILLS: i32 = 321;
     pub const OPEN_BACKUPS: i32 = 322;
     pub const SAVE_TOKEN: i32 = 323;
     pub const DELETE_TOKEN: i32 = 324;
     pub const STARTUP: i32 = 325;
+    /// Plus the index of the type (skills, agents, instructions, plugins): a source's "What to sync" choice.
+    pub const SOURCE_TYPE: i32 = 326;
     pub const BACK: i32 = 330;
     /// Plus the index of the action in the skill's row.
     pub const DIFF_ACTION: i32 = 333;
@@ -80,10 +89,19 @@ pub mod id {
     pub const SUB: i32 = 402;
     pub const INFO_LEAD: i32 = 403;
     pub const INFO_TEXT: i32 = 404;
+    pub const REPO_ITEMS: i32 = 405;
+    pub const FOLDER_RULES: i32 = 406;
+    pub const FOLDER_RULES_TEXT: i32 = 407;
     pub const SKILLS_DIR: i32 = 410;
     pub const TOKEN_TEXT: i32 = 411;
     pub const EMPTY: i32 = 412;
     pub const STARTUP_TEXT: i32 = 413;
+    /// Plus the index of the type: whether it syncs by default, in Settings.
+    pub const GLOBAL_TYPE: i32 = 414;
+    pub const GLOBAL_REPO_ITEMS: i32 = 418;
+    pub const IGNORED_EDIT: i32 = 419;
+    pub const IGNORED_TEXT: i32 = 429;
+    pub const SOURCES_HEADING: i32 = 430;
     pub const APP_HEADING: i32 = 420;
     pub const APP_STATUS: i32 = 421;
     pub const APP_CHECK: i32 = 422;
@@ -172,13 +190,15 @@ pub enum Page {
     Settings,
 }
 
-/// The page to show now: the one shown while it is still there, else the first repository that needs the user, else
-/// the first repository. `None` is the welcome page, for when there are none.
-pub fn settle(shown: Option<Page>, views: &[RepoView]) -> Option<Page> {
+/// The page to show now: the one shown while it is still there, else the first source that needs the user, else the
+/// first source. `None` is the welcome page, for when there are none. A lane ID (from a check, the tray or a source
+/// just added) shows its source.
+pub fn settle(shown: Option<Page>, sources: &[SourceView], cfg: &Config) -> Option<Page> {
+    let source_of = |id: &str| cfg.find_source(id).map(|s| s.id.as_str()).filter(|sid| sources.iter().any(|v| v.id == *sid));
     match shown {
-        Some(Page::Repo(id)) if views.iter().any(|v| v.id == id) => Some(Page::Repo(id)),
+        Some(Page::Repo(id)) if source_of(&id).is_some() => source_of(&id).map(|sid| Page::Repo(sid.to_string())),
         Some(page @ (Page::Activity | Page::Settings | Page::Add)) => Some(page),
-        _ => views.iter().find(|v| v.enabled && v.level >= Level::Attention).or(views.first()).map(|v| Page::Repo(v.id.clone())),
+        _ => sources.iter().find(|v| v.enabled && v.level >= Level::Attention).or(sources.first()).map(|v| Page::Repo(v.id.clone())),
     }
 }
 
@@ -308,9 +328,14 @@ pub struct Hero {
 }
 
 /// `status` is what the app is doing or will do next; `news` says it is worth more than the summary (the app is busy,
-/// or the user was just told something), so it replaces it.
-pub fn hero_of(views: &[RepoView], problem: Option<&str>, status: &str, news: bool, now: UnixSecs) -> Hero {
-    let on: Vec<&RepoView> = views.iter().filter(|v| v.enabled).collect();
+/// or the user was just told something), so it replaces it. Everything is counted by source: a source's level is its
+/// own, and its items are those of its types that sync.
+pub fn hero_of(sources: &[SourceView], problem: Option<&str>, status: &str, news: bool, now: UnixSecs) -> Hero {
+    fn kinds(v: &SourceView) -> Vec<&KindView> {
+        v.kinds.iter().filter(|k| k.on).collect()
+    }
+    let none = sources.is_empty();
+    let on: Vec<&SourceView> = sources.iter().filter(|v| v.enabled).collect();
     let checked = on.iter().filter_map(|v| v.last_check).max().map(|at| format!("checked {}", ago(now, at)));
     let sub = |head: String| -> String {
         if news {
@@ -322,35 +347,36 @@ pub fn hero_of(views: &[RepoView], problem: Option<&str>, status: &str, news: bo
     let calm = |text: &str| if news { status.to_string() } else { text.to_string() };
     let hero = |tone, glyph, title: String, sub: String| Hero { tone, glyph, title, sub };
     let sources = |n| plural(n, "source", "sources");
-    let place = |views: &[&RepoView]| match views {
+    let place = |views: &[&SourceView]| match views {
         [one] => format!("In {}", printable(repo_name(&one.label))),
         many => format!("In {}", sources(many.len())),
     };
     if let Some(problem) = problem {
         return hero(Tone::Err, glyph::ERR, "Tiny Skill Sync has a problem".to_string(), calm(&sentence(&printable(problem))));
     }
-    if views.is_empty() {
+    if none {
         return hero(Tone::Off, glyph::INFO, "Add a source to start".to_string(), calm("Preview skills, agents, instructions or plugins from GitHub."));
     }
     if on.is_empty() {
         return hero(Tone::Off, glyph::PAUSE, "Every repository is paused".to_string(), calm("Turn on Keep in sync for one to check it again."));
     }
-    let unreadable: Vec<&RepoView> = on.iter().copied().filter(|v| v.level == Level::Error && v.detail.is_some()).collect();
+    let unreadable: Vec<&SourceView> = on.iter().copied().filter(|v| v.level == Level::Error && v.detail.is_some()).collect();
     if !unreadable.is_empty() {
         let title = format!("{} can’t be read", sources(unreadable.len()));
         return hero(Tone::Err, glyph::ERR, title, sub(place(&unreadable)));
     }
     let needs = |row: &Row| row.level >= Level::Attention;
-    let count: usize = on.iter().map(|v| v.skills.iter().filter(|r| needs(r)).count()).sum();
+    let needy: Vec<&KindView> = on.iter().flat_map(|v| kinds(v)).filter(|k| k.rows.iter().any(needs)).collect();
+    let count: usize = needy.iter().map(|k| k.rows.iter().filter(|r| needs(r)).count()).sum();
     if count > 0 {
-        let with: Vec<&RepoView> = on.iter().copied().filter(|v| v.skills.iter().any(needs)).collect();
-        let failed = on.iter().any(|v| v.skills.iter().any(|r| r.level == Level::Error));
-        let (one, many) = board::item_nouns(with.iter().map(|v| v.kind));
+        let with: Vec<&SourceView> = on.iter().copied().filter(|v| kinds(v).iter().any(|k| k.rows.iter().any(needs))).collect();
+        let failed = needy.iter().any(|k| k.rows.iter().any(|r| r.level == Level::Error));
+        let (one, many) = board::item_nouns(needy.iter().map(|k| k.kind));
         let title = if count == 1 { format!("1 {one} needs your attention") } else { format!("{count} {many} need your attention") };
         let (tone, mark) = if failed { (Tone::Err, glyph::ERR) } else { (Tone::Warn, glyph::WARN) };
         return hero(tone, mark, title, sub(place(&with)));
     }
-    let empty: Vec<&RepoView> = on.iter().copied().filter(|v| v.level >= Level::Attention).collect();
+    let empty: Vec<&SourceView> = on.iter().copied().filter(|v| v.level >= Level::Attention).collect();
     if !empty.is_empty() {
         let title = match empty.len() {
             1 => "1 source needs your attention".to_string(),
@@ -363,8 +389,12 @@ pub fn hero_of(views: &[RepoView], problem: Option<&str>, status: &str, news: bo
         let title = if pending == on.len() { "Waiting for the first check".to_string() } else { format!("Waiting to check {}", sources(pending)) };
         return hero(Tone::Off, glyph::SYNC, title, sub(String::new()));
     }
-    let skills: usize = on.iter().map(|v| v.skills.len()).sum();
-    let (one, many) = board::item_nouns(on.iter().map(|v| v.kind));
+    let present: Vec<&KindView> = on.iter().flat_map(|v| kinds(v)).collect();
+    if present.is_empty() && on.iter().any(|v| !v.kinds.is_empty()) {
+        return hero(Tone::Off, glyph::PAUSE, "Nothing is being synced".to_string(), sub("Sync is off for every type found".to_string()));
+    }
+    let skills: usize = present.iter().map(|k| k.rows.len()).sum();
+    let (one, many) = board::item_nouns(present.iter().map(|k| k.kind));
     let head = format!("{} from {}", plural(skills, one, many), sources(on.len()));
     hero(Tone::Ok, glyph::OK, format!("All {many} are up to date"), sub(head))
 }
@@ -384,25 +414,7 @@ pub fn hero(h: &Hero, can_sync: bool, w: i32, fit: Fit) -> Surface {
     o.done(HERO_H)
 }
 
-/// The second line of a repository in the list.
-pub fn nav_sub(v: &RepoView) -> String {
-    if !v.enabled {
-        return "Paused".to_string();
-    }
-    let n = v.skills.len();
-    if v.detail.is_some() || n == 0 {
-        return v.status.clone();
-    }
-    let (one, many) = v.kind.nouns();
-    let skills = plural(n, one, many);
-    match v.skills.iter().filter(|r| r.level >= Level::Attention).count() {
-        0 => format!("{skills} · {}", lower_first(&v.status)),
-        1 => format!("{skills} · 1 needs you"),
-        k => format!("{skills} · {k} need you"),
-    }
-}
-
-fn nav_mark(v: &RepoView) -> Mark {
+fn source_mark(v: &SourceView) -> Mark {
     match v.level {
         _ if !v.enabled => Mark::Dot(Tone::Off),
         Level::Error => Mark::Dot(Tone::Err),
@@ -412,17 +424,99 @@ fn nav_mark(v: &RepoView) -> Mark {
     }
 }
 
-/// The list on the left: the repositories, Add repository, and at the bottom Activity and Settings.
-pub fn nav(views: &[RepoView], page: &Page, w: i32, h: i32, fit: Fit) -> Surface {
+/// The icon of a type, in the list and on a source's page.
+pub fn kind_glyph(kind: SourceKind) -> char {
+    match kind {
+        SourceKind::Skills => glyph::SKILL,
+        SourceKind::Agents => glyph::AGENT,
+        SourceKind::Instructions => glyph::INSTRUCTION,
+        SourceKind::Plugins => glyph::PLUGIN,
+    }
+}
+
+/// The branch the last listing read, else the one set, else "default branch".
+fn branch_text(v: &SourceView) -> String {
+    let branch = v.seen_branch.as_deref().filter(|b| !b.is_empty()).unwrap_or(&v.branch);
+    if branch.is_empty() { "default branch".to_string() } else { printable(branch).into_owned() }
+}
+
+fn folder_text(v: &SourceView) -> String {
+    if v.folder.is_empty() { "whole repository".to_string() } else { printable(&v.folder).into_owned() }
+}
+
+/// What the list shows beside a type's icon ("3", or "off" when it does not sync), and whether it needs the user.
+pub fn kind_badge(k: &KindView) -> (String, bool) {
+    if !k.on {
+        return ("off".to_string(), false);
+    }
+    let n = k.found.map_or(k.rows.len(), |n| n as usize);
+    let warn = k.rows.iter().any(|r| r.level >= Level::Attention || r.actions.contains(&Action::ApprovePlugin));
+    (n.to_string(), warn)
+}
+
+/// The window text of a source's entry, which a screen reader reads: "owner/repo, default branch, whole repository.
+/// Skills 3, Instructions: Sync off. Up to date".
+pub fn nav_name(v: &SourceView) -> String {
+    let mut text = format!("{}, {}, {}.", printable(&v.repo), branch_text(v), folder_text(v));
+    if !v.kinds.is_empty() {
+        text.push(' ');
+        text.push_str(&v.kinds.iter().map(KindView::summary).collect::<Vec<_>>().join(", "));
+        text.push('.');
+    }
+    text.push(' ');
+    text.push_str(&printable(&v.status));
+    text
+}
+
+/// Where the text of a source's entry starts, from its left edge.
+const ENTRY_LEFT: i32 = 40;
+
+/// A source's entry in the list, `w` wide: its height, and what is drawn in it relative to its top-left corner. The
+/// repository, then the branch and folder, then an icon per type with its count (going on to more lines rather than
+/// being cut), then the status.
+pub fn source_entry(v: &SourceView, w: i32, fit: Fit) -> (i32, Vec<Deco>) {
+    let (x, tw) = (ENTRY_LEFT, (w - ENTRY_LEFT - 8).max(1));
+    let line = |at, text: String, font, ink| Deco::Text { at, text, font, ink, flags: ONE_LINE };
+    let mut parts = vec![
+        line([x, 6, tw, 20], printable(&v.repo).into_owned(), Font::Body, Role::Text),
+        line([x, 26, tw, 16], format!("{} · {}", branch_text(v), folder_text(v)), Font::Caption, Role::Text2),
+    ];
+    let mut y = 44;
+    if !v.kinds.is_empty() {
+        let (mut cx, mut cy) = (x, y);
+        for k in &v.kinds {
+            let (label, warn) = kind_badge(k);
+            let lw = fit(&label, Font::Caption, 0).0 + 2;
+            let chip = 18 + lw + if warn { 16 } else { 0 };
+            if cx > x && cx + chip > x + tw {
+                (cx, cy) = (x, cy + 18);
+            }
+            let ink = if k.on { Role::Text } else { Role::Text3 };
+            parts.push(Deco::Glyph { at: [cx, cy, 16, 18], ch: kind_glyph(k.kind), size: 14, ink });
+            parts.push(line([cx + 18, cy, lw, 18], label, Font::Caption, Role::Text2));
+            if warn {
+                parts.push(Deco::Glyph { at: [cx + 18 + lw + 2, cy, 14, 18], ch: glyph::WARN, size: 12, ink: Tone::Warn.ink() });
+            }
+            cx += chip + 10;
+        }
+        y = cy + 20;
+    }
+    parts.push(line([x, y, tw, 16], printable(&v.status).into_owned(), Font::Caption, Role::Text2));
+    (y + 16 + 6, parts)
+}
+
+/// The list on the left: the sources, Add source, and at the bottom Activity and Settings.
+pub fn nav(sources: &[SourceView], page: &Page, w: i32, h: i32, fit: Fit) -> Surface {
     let mut o = Out::new(fit);
     let iw = w - 16;
     o.label(id::NAV_HEAD, [16, 4, w - 32, 20], "Sources", Font::Strong, Role::Text);
     let mut y = 30;
-    for (i, v) in views.iter().enumerate() {
+    for (i, v) in sources.iter().enumerate() {
         let selected = *page == Page::Repo(v.id.clone());
-        let look = Look::Nav { mark: nav_mark(v), ink: Role::Text, selected };
-        o.item(id::NAV_REPO + i as i32, [8, y + 1, iw, 48], two_lines(&nav_label(v), &nav_sub(v)), look, true);
-        y += 50;
+        let (eh, parts) = source_entry(v, iw, fit);
+        let look = Look::Source { mark: source_mark(v), selected, parts };
+        o.item(id::NAV_REPO + i as i32, [8, y + 1, iw, eh], nav_name(v), look, true);
+        y += eh + 2;
     }
     let plain = |ch, ink, selected| Look::Nav { mark: Mark::Glyph(ch, ink), ink, selected };
     o.item(id::NAV_ADD, [8, y + 1, iw, 36], "Add source", plain(glyph::ADD, Role::AccentText, *page == Page::Add), true);
@@ -432,36 +526,23 @@ pub fn nav(views: &[RepoView], page: &Page, w: i32, h: i32, fit: Fit) -> Surface
     o.done(bottom + 82)
 }
 
-/// How wide the list on the left is while the mouse rests on it: wide enough for the longest name or second line of a
-/// repository, with room for a scroll bar of `bar` DIPs, but never more than half the window `w`. Never narrower than
-/// [`NAV_W`], so names that fit leave it as it is.
-pub fn nav_width(views: &[RepoView], w: i32, bar: i32, fit: Fit) -> i32 {
-    let text = views.iter().map(|v| nav_text_width(&nav_label(v), &nav_sub(v), fit)).max().unwrap_or(0);
-    // An entry is 8 DIPs in from each side, and draws its lines from 40 DIPs in to 8 before its end; 2 more for rounding.
-    let wanted = text + 16 + 40 + 8 + 2 + bar;
-    wanted.min(w / 2).max(NAV_W)
-}
-
-fn nav_label(v: &RepoView) -> String {
-    format!("{}: {} [{}]", v.kind.heading(), printable(&v.label), printable(&v.id))
-}
-
-fn nav_text_width(label: &str, sub: &str, fit: Fit) -> i32 {
-    fit(&printable(label), Font::Body, 0).0.max(fit(sub, Font::Caption, 0).0)
-}
-
-/// The page when no repository is set up yet.
+/// The page when no source is set up yet.
 pub fn welcome(w: i32, fit: Fit) -> Surface {
     let mut o = Out::new(fit);
-    let y = o.head(w, "Add your first source", "Choose skills, agents, instructions or plugins and preview what matches.");
+    let sub =
+        "Give a GitHub repository, branch or folder. The app finds the skills, agents, instructions and plugins in it and shows you before anything is saved.";
+    let y = o.head(w, "Add your first source", sub);
     let bottom = o.flow(PAD_X, y, w - PAD_X, 32, vec![btn(id::WELCOME_ADD, "Add source", Kind::Accent, Some(glyph::ADD))]);
     o.done(bottom + 16)
 }
 
 /// "Public · the skills folder on main · checked 2 minutes ago".
-pub fn repo_sub(repo: &RepoConfig, view: &RepoView, now: UnixSecs) -> String {
-    let folder = if repo.path.is_empty() { "the top of the repository".to_string() } else { format!("the {} folder", printable(&repo.path)) };
-    let branch = if repo.branch.is_empty() { "the default branch".to_string() } else { printable(&repo.branch).into_owned() };
+pub fn source_sub(view: &SourceView, now: UnixSecs) -> String {
+    let folder = if view.folder.is_empty() { "the whole repository".to_string() } else { format!("the {} folder", printable(&view.folder)) };
+    let branch = match branch_text(view) {
+        b if b == "default branch" => "the default branch".to_string(),
+        b => b,
+    };
     let checked = match view.last_check {
         Some(at) => format!("checked {}", ago(now, at)),
         None if view.level == Level::Error => "not checked successfully yet".to_string(),
@@ -476,51 +557,61 @@ pub fn repo_sub(repo: &RepoConfig, view: &RepoView, now: UnixSecs) -> String {
     }
 }
 
-/// What the typed address means, or why the selected source type cannot use it.
-pub fn spec_hint(text: &str, kind: SourceKind) -> Result<String, String> {
-    let spec = RepoSpec::parse_for_kind(text, kind).map_err(|e| sentence(&printable(&e)))?;
-    let full = spec.full_name();
-    let folder = if spec.path.is_empty() { "the top of the repository".to_string() } else { format!("the {} folder", printable(&spec.path)) };
-    let branch = if spec.branch.is_empty() { "the default branch".to_string() } else { printable(&spec.branch).into_owned() };
-    Ok(format!("{} · {folder} on {branch}", printable(&full)))
+/// The forms of location the Add source question takes.
+pub const LOCATION_FORMS: &str = "Enter owner/name, the GitHub address of a repository, or the address of a branch or folder in it (…/tree/branch/folder). The app finds the skills, agents, instruction files and plugins in it.";
+
+/// What the typed location means, or why it cannot be used.
+pub fn location_hint(text: &str) -> Result<String, String> {
+    let location = Location::parse(text).map_err(|e| sentence(&printable(&e)))?;
+    let repo = printable(&format!("{}/{}", location.owner, location.name)).into_owned();
+    Ok(match location.target {
+        Target::Bare => format!("{repo} · the whole repository on the default branch"),
+        Target::Tree(parts) => format!("{repo} · {} (GitHub tells where the branch name ends)", printable(&parts.join("/"))),
+    })
 }
 
-pub const SOURCE_TYPES: &[SourceKind] = &[SourceKind::Skills, SourceKind::Agents, SourceKind::Instructions, SourceKind::Plugins];
-
-pub fn source_preview(draft: &SourceDraft, w: i32, fit: Fit) -> Surface {
+/// The Add source page for a draft. `skills_dir` is where skills would go.
+pub fn source_preview(draft: &SourceDraft, skills_dir: &std::path::Path, w: i32, fit: Fit) -> Surface {
     let mut o = Out::new(fit);
-    let source = &draft.input.source;
-    let duplicate = matches!(draft.stage, DraftStage::AlreadySetUp);
-    let sub = if duplicate {
-        String::new()
-    } else {
-        format!(
-            "{}: {} [{}]\nSource folder: {}",
-            source.kind.heading(),
-            printable(&source.label()),
-            printable(&source.id),
-            printable(board::source_folder(source))
-        )
+    let sub = match &draft.stage {
+        DraftStage::Reviewed(preview) => format!("{} [{}]", printable(&board::source_label(&preview.source)), printable(&preview.source.id)),
+        DraftStage::AlreadySetUp(_) => String::new(),
+        _ => printable(draft.input.text.trim()).into_owned(),
     };
     let mut y = o.head(w, "Add source", &sub);
-    let (body, can_save) = match &draft.stage {
-        DraftStage::Loading => ("Reading the source. Nothing has been saved or installed.".into(), false),
-        DraftStage::AlreadySetUp => (printable(&duplicate_source_message(source)).into_owned(), false),
-        DraftStage::Failed(why) => (printable(why).into_owned(), false),
-        DraftStage::Saving => ("Checking the preview again and saving the source…".into(), false),
+    // (body, can save, plugins that would be approved)
+    let (body, can_save, plugins) = match &draft.stage {
+        DraftStage::Loading => ("Reading the source. Nothing has been saved or installed.".into(), false, false),
+        DraftStage::AlreadySetUp(id) => (printable(&duplicate_source_message(id)).into_owned(), false, false),
+        DraftStage::Failed(why) => (printable(why).into_owned(), false, false),
+        DraftStage::Saving => ("Checking the preview again and saving the source…".into(), false, false),
         DraftStage::Reviewed(preview) => {
-            let blocker = preview.blocker(source);
-            let note = blocker.unwrap_or("Nothing has been installed. Add this source to save it and start its first check.");
-            (format!("{}\n\n{note}", preview.description(source)), blocker.is_none())
+            let syncs = KINDS.iter().any(|&kind| board::preview_syncs(preview, kind));
+            let plugins = !board::previewed_plugins(preview).is_empty();
+            let note = if !syncs {
+                "Nothing here would sync. Check the branch and folder, or edit the location."
+            } else if plugins {
+                "Nothing has been saved or installed. Add without approving plugins to sync the files only; GitHub Copilot CLI installs the plugins above only after you approve them."
+            } else {
+                "Nothing has been saved or installed. Add this source to save it and start its first check."
+            };
+            (format!("{}\n\n{note}", board::preview_lines(preview, skills_dir).join("\n")), syncs, plugins)
         }
     };
     let cw = w - 2 * PAD_X;
     y += o.para(id::INFO_TEXT, [PAD_X, y, cw], wrap_report(body, cw, Font::Body, fit), Font::Body, Role::Text) + GAP;
     let mut buttons = Vec::new();
-    if can_save {
+    if can_save && plugins {
+        buttons.push(btn(id::CONFIRM_SOURCE, "Add without approving plugins", Kind::Accent, None));
+        buttons.push(btn(id::APPROVE_SOURCE, "Add and approve these plugins", Kind::Standard, None));
+    } else if can_save {
         buttons.push(btn(id::CONFIRM_SOURCE, "Add and check", Kind::Accent, None));
-    } else if matches!(draft.stage, DraftStage::Reviewed(_) | DraftStage::Failed(_) | DraftStage::AlreadySetUp) {
-        if !duplicate {
+    } else if matches!(draft.stage, DraftStage::Reviewed(_)) {
+        // Nothing here would sync, so editing the location is the way on.
+        buttons.push(btn(id::EDIT_SOURCE, "Edit", Kind::Accent, None));
+        buttons.push(btn(id::RETRY_SOURCE, "Retry", Kind::Standard, None));
+    } else if matches!(draft.stage, DraftStage::Failed(_) | DraftStage::AlreadySetUp(_)) {
+        if !matches!(draft.stage, DraftStage::AlreadySetUp(_)) {
             buttons.push(btn(id::RETRY_SOURCE, "Retry", Kind::Accent, None));
         }
         buttons.push(btn(id::EDIT_SOURCE, "Edit", Kind::Standard, None));
@@ -531,6 +622,8 @@ pub fn source_preview(draft: &SourceDraft, w: i32, fit: Fit) -> Surface {
     let bottom = o.flow(PAD_X, y, w - PAD_X, 32, buttons);
     o.done(bottom + 16)
 }
+
+const KINDS: [SourceKind; 4] = [SourceKind::Skills, SourceKind::Agents, SourceKind::Instructions, SourceKind::Plugins];
 
 /// The entries of a Check every list, and the one shown. With a `default`, the first entry is "Default (…)" and stands
 /// for no interval of its own.
@@ -571,8 +664,8 @@ pub fn expandable(row: &Row) -> bool {
     (row.plugin.is_some() || row.level >= Level::Attention) && row.actions.iter().any(|a| *a != Action::ManageAgain)
 }
 
-pub fn is_open(row: &Row, toggled: &HashSet<String>) -> bool {
-    expandable(row) && !toggled.contains(&row.name)
+pub fn is_open(row: &Row, lane: &str, toggled: &HashSet<String>) -> bool {
+    expandable(row) && !toggled.contains(&toggle_key(lane, &row.name))
 }
 
 /// Commands shared by the inline icons and the row's menu, in display order.
@@ -614,48 +707,213 @@ fn action_glyph(action: Action) -> Option<char> {
     }
 }
 
-pub struct RepoPage<'a> {
-    pub view: &'a RepoView,
-    pub repo: &'a RepoConfig,
+/// The settings of one lane of a source, as the engine runs it (the same whether its type is on or off).
+pub fn lane_config(source: &SourceConfig, kind: SourceKind, lane: &str) -> RepoConfig {
+    RepoConfig {
+        id: lane.to_string(),
+        repo: source.repo.clone(),
+        branch: source.branch.clone(),
+        path: source.path.clone(),
+        interval: source.interval,
+        use_token: source.use_token,
+        enabled: source.enabled,
+        kind,
+        source: source.id.clone(),
+    }
+}
+
+/// The type and row a source's page shows at `index`: rows are numbered across its sections, in order.
+pub fn row_at(view: &SourceView, index: usize) -> Option<(&KindView, &Row)> {
+    view.kinds.iter().flat_map(|k| k.rows.iter().map(move |r| (k, r))).nth(index)
+}
+
+/// The index on its source's page of the row named `name` of `lane`.
+pub fn row_index(view: &SourceView, lane: &str, name: &str) -> Option<usize> {
+    view.kinds.iter().flat_map(|k| k.rows.iter().map(move |r| (k, r))).position(|(k, r)| k.lane == lane && r.name == name)
+}
+
+/// What remembers that a row was opened or closed: its lane and name, so rows of two types never share it.
+pub fn toggle_key(lane: &str, name: &str) -> String {
+    format!("{lane}\n{name}")
+}
+
+/// The commands of a row of a type. A type that is off only offers what reads the files already there.
+pub fn kind_commands(row: &Row, k: &KindView, linkable: bool) -> Vec<RowCmd> {
+    let mut commands = row_commands(row, k.kind, linkable);
+    if !k.on {
+        commands.retain(|c| matches!(c, RowCmd::Open | RowCmd::CopyPath | RowCmd::CopyLink | RowCmd::OnGitHub));
+    }
+    commands
+}
+
+fn on_off(on: bool) -> &'static str {
+    if on { "On" } else { "Off" }
+}
+
+/// The entries of a type's "What to sync" list, and the one shown.
+pub fn type_choices(value: Option<bool>, global: bool) -> (Vec<String>, String) {
+    let items = vec![format!("Default ({})", on_off(global)), "On".to_string(), "Off".to_string()];
+    let shown = match value {
+        None => items[0].clone(),
+        Some(on) => on_off(on).to_string(),
+    };
+    (items, shown)
+}
+
+/// The entries of the repository-specific items list, and the one shown.
+pub fn repo_items_choices(value: Option<bool>, global: bool) -> (Vec<String>, String) {
+    let items = vec![format!("Default ({})", if global { "include" } else { "skip" }), "Include".to_string(), "Skip".to_string()];
+    let shown = match value {
+        None => items[0].clone(),
+        Some(true) => items[1].clone(),
+        Some(false) => items[2].clone(),
+    };
+    (items, shown)
+}
+
+/// A change to one source's settings, chosen on its page.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SourceEdit {
+    /// `None` follows the global setting again.
+    Type(SourceKind, Option<bool>),
+    RepoItems(Option<bool>),
+    FolderRules {
+        add: Vec<String>,
+        allow: Vec<String>,
+    },
+}
+
+impl SourceEdit {
+    pub fn apply(self, s: &mut SourceConfig) {
+        match self {
+            SourceEdit::Type(kind, value) => s.set_type(kind, value),
+            SourceEdit::RepoItems(value) => s.set_repo_items(value),
+            SourceEdit::FolderRules { add, allow } => {
+                s.ignore_add = add;
+                s.ignore_allow = allow;
+            }
+        }
+    }
+}
+
+/// What choosing `value` in the "What to sync" list with id `n` changes.
+pub fn source_choice(n: i32, value: &str) -> Option<SourceEdit> {
+    let choice = match value {
+        "On" | "Include" => Some(true),
+        "Off" | "Skip" => Some(false),
+        v if v.starts_with("Default") => None,
+        _ => return None,
+    };
+    match n {
+        id::REPO_ITEMS => Some(SourceEdit::RepoItems(choice)),
+        _ => {
+            let kind = *KINDS.get(usize::try_from(n - id::SOURCE_TYPE).ok()?)?;
+            value.starts_with(['O', 'D']).then_some(SourceEdit::Type(kind, choice))
+        }
+    }
+}
+
+/// Folder names typed with commas between them, checked the way the settings are.
+pub fn parse_folders(text: &str) -> Result<Vec<String>, String> {
+    let names: Vec<String> = text.split(',').map(str::trim).filter(|n| !n.is_empty()).map(str::to_string).collect();
+    validate_ignore_names(&names).map_err(|why| sentence(&why))?;
+    Ok(names)
+}
+
+/// A source's folder rules from what was typed: the names it also skips and the ones it never skips.
+pub fn folder_rules(add: &str, allow: &str) -> Result<SourceEdit, String> {
+    let (add, allow) = (parse_folders(add)?, parse_folders(allow)?);
+    if let Some(both) = add.iter().find(|a| allow.iter().any(|b| crate::pathsafe::fold(a) == crate::pathsafe::fold(b))) {
+        return Err(format!("Folder '{}' cannot be both skipped and never skipped.", printable(both)));
+    }
+    Ok(SourceEdit::FolderRules { add, allow })
+}
+
+/// A change to the settings every source follows, chosen in Settings.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum GlobalEdit {
+    Type(SourceKind, bool),
+    RepoItems(bool),
+    Ignore(Vec<String>),
+}
+
+impl GlobalEdit {
+    pub fn apply(self, g: &mut GlobalSettings) {
+        match self {
+            GlobalEdit::Type(kind, on) => {
+                g.set_type(kind, on);
+            }
+            GlobalEdit::RepoItems(on) => g.set_repo_items(on),
+            GlobalEdit::Ignore(names) => g.ignore_folders = names,
+        }
+    }
+}
+
+/// What switching the Settings switch with id `n` to `on` changes.
+pub fn global_switch(n: i32, on: bool) -> Option<GlobalEdit> {
+    match n {
+        id::GLOBAL_REPO_ITEMS => Some(GlobalEdit::RepoItems(on)),
+        _ => KINDS.get(usize::try_from(n - id::GLOBAL_TYPE).ok()?).map(|&kind| GlobalEdit::Type(kind, on)),
+    }
+}
+
+/// "Also skips: a, b. Never skips: c." for a source's folder rules.
+pub fn folder_rules_text(source: &SourceConfig) -> String {
+    let list = |names: &[String]| printable(&names.join(", ")).into_owned();
+    match (source.ignore_add.is_empty(), source.ignore_allow.is_empty()) {
+        (true, true) => "Skips the ignored folders set in Settings.".to_string(),
+        (false, true) => format!("Also skips: {}.", list(&source.ignore_add)),
+        (true, false) => format!("Never skips: {}.", list(&source.ignore_allow)),
+        (false, false) => format!("Also skips: {}. Never skips: {}.", list(&source.ignore_add), list(&source.ignore_allow)),
+    }
+}
+
+pub struct SourcePage<'a> {
+    pub view: &'a SourceView,
+    pub source: &'a SourceConfig,
+    pub global: &'a GlobalSettings,
     pub default: Interval,
     pub now: UnixSecs,
-    /// The skills, by name, the user opened or closed.
+    /// The rows the user opened or closed, by [`toggle_key`].
     pub toggled: &'a HashSet<String>,
 }
 
-pub fn repo_page(p: &RepoPage, w: i32, fit: Fit) -> Surface {
+pub fn source_page(p: &SourcePage, w: i32, fit: Fit) -> Surface {
     let mut o = Out::new(fit);
     let (x, cw) = (PAD_X, w - 2 * PAD_X);
     let right = x + cw;
     let mut y = PAD_TOP;
     o.item(id::MORE, [right - 32, y, 32, 32], "More", Look::Button { kind: Kind::Icon, glyph: Some(glyph::MORE) }, true);
     let room = right - 32 - 8 - x;
-    let title = printable(&p.repo.repo).into_owned();
+    let title = printable(&p.view.repo).into_owned();
     let pill_w = o.width("Private", Font::CaptionStrong) + 18 + 16;
     let title_w = (o.width(&title, Font::Title) + 2).min(room - if p.view.private { pill_w + 10 } else { 0 }).max(0);
     o.label(id::TITLE, [x, y, title_w, 28], title, Font::Title, Role::Text);
     if p.view.private {
         o.item(id::PRIVATE, [x + title_w + 10, y, pill_w, 28], "Private", Look::Pill { tone: Tone::Off, glyph: Some(glyph::LOCK) }, true);
     }
-    let sub = format!("{} [{}] · {}", p.repo.kind.heading(), printable(&p.repo.id), repo_sub(p.repo, p.view, p.now));
-    let h = o.para(id::SUB, [x, y + 28, room], sub, Font::Caption, Role::Text2);
+    let h = o.para(id::SUB, [x, y + 28, room], source_sub(p.view, p.now), Font::Caption, Role::Text2);
     y = (y + 28 + h).max(y + 32) + GAP + 4;
     if let Some(detail) = &p.view.detail {
         y = infobar(&mut o, p.view, detail, x, y, cw) + GAP;
     }
-    y = interval_card(&mut o, p, x, y, cw) + GAP;
-    y = skills(&mut o, p, x, y, cw);
+    y = interval_card(&mut o, p.source.interval, p.source.enabled, p.default, x, y, cw) + GAP;
+    y = what_to_sync(&mut o, p, x, y, cw) + GAP;
+    y = sections(&mut o, p, x, y, cw);
+    y = never_synced(&mut o, p.view, x, y, cw);
     o.done(y + 16)
 }
 
-/// Why a repository can't be read, or why it lists nothing, with what can be done about it.
-fn infobar(o: &mut Out, view: &RepoView, detail: &str, x: i32, y: i32, cw: i32) -> i32 {
+/// Why a source can't be read, or why it lists nothing, with what can be done about it.
+fn infobar(o: &mut Out, view: &SourceView, detail: &str, x: i32, y: i32, cw: i32) -> i32 {
     let error = view.level == Level::Error;
     let (tone, mark, lead) = if error {
-        let lead = if view.kind == SourceKind::Plugins { "Could not check this plugin source." } else { "Can’t read this repository." };
+        let mut failed = view.kinds.iter().filter(|k| k.level == Level::Error).peekable();
+        let plugins = failed.peek().is_some() && failed.all(|k| k.kind == SourceKind::Plugins);
+        let lead = if plugins { "Could not check this plugin source." } else { "Can’t read this repository." };
         (Tone::Err, glyph::ERROR_BADGE, lead.to_string())
     } else {
-        (Tone::Warn, glyph::WARN, format!("{}.", view.status))
+        (Tone::Warn, glyph::WARN, format!("{}.", printable(&view.status)))
     };
     let mark_at = o.s.decos.len();
     o.glyph([x + 16, y + 12, 16, 20], mark, 16, tone.ink());
@@ -672,14 +930,14 @@ fn infobar(o: &mut Out, view: &RepoView, detail: &str, x: i32, y: i32, cw: i32) 
     bottom
 }
 
-/// Check every and Keep in sync, on one row when they fit, else on two.
-fn interval_card(o: &mut Out, p: &RepoPage, x: i32, y: i32, cw: i32) -> i32 {
-    let (items, shown) = every_choices(p.repo.interval, Some(p.default));
+/// Check every and Keep in sync, for the whole source, on one row when they fit, else on two.
+fn interval_card(o: &mut Out, interval: Option<Interval>, enabled: bool, default: Interval, x: i32, y: i32, cw: i32) -> i32 {
+    let (items, shown) = every_choices(interval, Some(default));
     let (every, keep) = ("Check every", "Keep in sync");
     let labels = o.width(every, Font::Body).max(o.width(keep, Font::Body));
     let fixed = 16 + 20 + 16 + 16 + COMBO_W + 16 + 1 + 16 + 16 + TOGGLE_W + 16;
     let mark = o.s.decos.len();
-    let toggle = Look::Toggle { on: p.repo.enabled };
+    let toggle = Look::Toggle { on: enabled };
     let h = if (cw - fixed) / 2 >= labels {
         let flex = (cw - fixed) / 2;
         o.glyph([x + 16, y, 20, 56], glyph::TIMER, 16, Role::Text);
@@ -706,37 +964,139 @@ fn interval_card(o: &mut Out, p: &RepoPage, x: i32, y: i32, cw: i32) -> i32 {
     y + h
 }
 
-/// The skills of a repository, each with its status and, once opened, what can be done about it.
-fn skills(o: &mut Out, p: &RepoPage, x: i32, mut y: i32, cw: i32) -> i32 {
-    let rows = &p.view.skills;
-    if rows.is_empty() {
-        let items = p.repo.kind.nouns().1;
-        let text = if !p.repo.enabled {
-            format!("Its {items} are not kept up to date while Keep in sync is off.")
-        } else if p.view.detail.is_some() {
-            return y - GAP;
-        } else if p.view.last_check.is_none() {
-            format!("Its {items} are listed here after the first check.")
+/// Which types the source syncs, whether it takes repository-specific items, and its folder rules.
+fn what_to_sync(o: &mut Out, p: &SourcePage, x: i32, y: i32, cw: i32) -> i32 {
+    let mark = o.s.decos.len();
+    o.text([x + 16, y + 12, cw - 32, 20], "What to sync", Font::Strong, Role::Text, ONE_LINE);
+    let mut ly = y + 12 + 20 + 4;
+    let mut rows = KINDS
+        .into_iter()
+        .enumerate()
+        .map(|(i, kind)| {
+            let choices = type_choices(p.source.types.get(kind), p.global.types.enabled(kind));
+            (kind_glyph(kind), kind.heading(), id::SOURCE_TYPE + i as i32, choices, format!("Sync {}", kind.nouns().1))
+        })
+        .collect::<Vec<_>>();
+    let title = "Repository-specific skills and agents";
+    rows.push((glyph::FOLDER, title, id::REPO_ITEMS, repo_items_choices(p.source.include_repo_items, p.global.include_repo_items), title.to_string()));
+    // One layout for every list: wide enough for its longest choice (a combo paints its value in its width less 44),
+    // beside the titles when all of them fit, else under each title.
+    let room = cw - 52 - 16;
+    let longest = rows.iter().flat_map(|r| r.3.0.iter()).map(|c| o.width(c, Font::Body) + 44).max().unwrap_or(0);
+    let combo = longest.max(COMBO_W).min(room).max(0);
+    let titles = rows.iter().map(|r| o.width(r.1, Font::Body) + 2).max().unwrap_or(0);
+    let beside = room - combo - 8 >= titles;
+    for (mark, title, n, (items, shown), purpose) in rows {
+        let text = two_lines(&purpose, &shown);
+        if beside {
+            o.glyph([x + 16, ly, 20, 44], mark, 16, Role::Text);
+            o.text([x + 52, ly, room - combo - 8, 44], title, Font::Body, Role::Text, ONE_LINE);
+            o.item(n, [x + cw - 16 - combo, ly + 6, combo, 32], text, Look::Combo { items }, true);
+            ly += 44;
         } else {
-            format!("There are no {items} to show.")
+            let one = o.width(title, Font::Body) + 2 <= room;
+            let th = if one { line_height(Font::Body) } else { (o.fit)(title, Font::Body, room.max(1)).1.max(line_height(Font::Body)) };
+            o.glyph([x + 16, ly + 8, 20, line_height(Font::Body)], mark, 16, Role::Text);
+            o.text([x + 52, ly + 8, room, th], title, Font::Body, Role::Text, if one { ONE_LINE } else { WRAP });
+            o.item(n, [x + 52, ly + 8 + th + 4, combo, 32], text, Look::Combo { items }, true);
+            ly += 8 + th + 4 + 32 + 4;
+        }
+    }
+    if !beside {
+        ly += 4;
+    }
+    let b = btn(id::FOLDER_RULES, "Folder rules…", Kind::Standard, None);
+    let bw = o.button_width(&b.text, b.glyph);
+    let beside = cw - 52 - 16 - bw - 8;
+    let tw = if beside >= 120 { beside } else { cw - 52 - 16 };
+    o.glyph([x + 16, ly + 8, 20, 20], glyph::FILE, 16, Role::Text);
+    o.text([x + 52, ly + 8, tw, 20], "Folder rules", Font::Body, Role::Text, ONE_LINE);
+    let dh = o.para(id::FOLDER_RULES_TEXT, [x + 52, ly + 28, tw], folder_rules_text(p.source), Font::Caption, Role::Text2);
+    let bottom = if beside >= 120 {
+        o.button(b, x + cw - 16 - bw, ly + 8, 32);
+        (ly + 28 + dh).max(ly + 40) + 12
+    } else {
+        o.button(b, x + 52, ly + 28 + dh + 8, 32);
+        ly + 28 + dh + 8 + 32 + 12
+    };
+    o.card(mark, [x, y, cw, bottom - y]);
+    bottom
+}
+
+/// The items of a source, by type in the order skills, agents, instructions, plugins: each with its icon, count and
+/// rows, then what its folder rules skipped and what is never synced, with the reason.
+fn sections(o: &mut Out, p: &SourcePage, x: i32, mut y: i32, cw: i32) -> i32 {
+    let v = p.view;
+    if v.kinds.is_empty() {
+        let text = if !v.enabled {
+            "Nothing from this source is kept up to date while Keep in sync is off."
+        } else if v.detail.is_some() {
+            return y - GAP;
+        } else if v.last_check.is_none() {
+            "What it holds is listed here after the first check."
+        } else {
+            "Nothing to sync was found here."
         };
         return y + o.para(id::EMPTY, [x, y, cw], text, Font::Body, Role::Text2);
     }
-    let head = p.repo.kind.heading();
-    let head_w = o.width(head, Font::Strong) + 2;
-    o.text([x, y, head_w, 20], head, Font::Strong, Role::Text, ONE_LINE);
-    o.text([x + head_w + 8, y, 60, 20], rows.len().to_string(), Font::Caption, Role::Text2, ONE_LINE);
-    y += 28;
+    let mut index = 0;
+    for k in &v.kinds {
+        let head = k.kind.heading();
+        let head_w = o.width(head, Font::Strong) + 2;
+        o.glyph([x, y, 20, 24], kind_glyph(k.kind), 16, Role::Text);
+        o.text([x + 28, y, head_w, 24], head, Font::Strong, Role::Text, ONE_LINE);
+        let count = k.found.map_or(k.rows.len(), |n| n as usize).to_string();
+        let count = if k.on { count } else { format!("{count} · Sync off") };
+        o.text([x + 28 + head_w + 8, y, (cw - 36 - head_w).max(0), 24], count, Font::Caption, Role::Text2, ONE_LINE);
+        y += 30;
+        if !k.rows.is_empty() {
+            y = rows_card(o, p, k, index, x, y, cw) + 8;
+            index += k.rows.len();
+        } else if k.on && k.notes.is_empty() && k.filtered == 0 {
+            let text = format!("Its {} are listed here after the next check.", k.kind.nouns().1);
+            y += o.para(0, [x, y, cw], text, Font::Caption, Role::Text2) + 8;
+        }
+        if k.filtered > 0 {
+            y += o.para(0, [x, y, cw], format!("{} skipped by folder rules", k.filtered), Font::Caption, Role::Text2) + 4;
+        }
+        for note in &k.notes {
+            let text = format!("Not synced: {}: {}", printable(&note.path), printable(&note.reason));
+            y += o.para(0, [x, y, cw], wrap_report(text, cw, Font::Caption, o.fit), Font::Caption, Role::Text2) + 4;
+        }
+        y += GAP;
+    }
+    y - GAP
+}
+
+/// Files the listing had that are never synced, such as AGENTS.md.
+fn never_synced(o: &mut Out, v: &SourceView, x: i32, mut y: i32, cw: i32) -> i32 {
+    if v.notes.is_empty() {
+        return y;
+    }
+    y += GAP;
+    for note in &v.notes {
+        let text = format!("Never synced: {}: {}", printable(&note.path), printable(&note.reason));
+        y += o.para(0, [x, y, cw], wrap_report(text, cw, Font::Caption, o.fit), Font::Caption, Role::Text2) + 4;
+    }
+    if v.more_notes > 0 {
+        y += o.para(0, [x, y, cw], format!("and {} more", v.more_notes), Font::Caption, Role::Text2) + 4;
+    }
+    y
+}
+
+/// The rows of one type, each with its status and, once opened, what can be done about it. `first` is the index of
+/// its first row on the page.
+fn rows_card(o: &mut Out, p: &SourcePage, k: &KindView, first: usize, x: i32, mut y: i32, cw: i32) -> i32 {
     let (mark, top) = (o.s.decos.len(), y);
-    let linkable = crate::github::web_url(p.repo, None).is_some();
-    for (j, row) in rows.iter().enumerate() {
+    let linkable = crate::github::web_url(&lane_config(p.source, k.kind, &k.lane), None).is_some();
+    for (j, row) in k.rows.iter().enumerate() {
         if j > 0 {
             o.fill([x + 1, y, cw - 2, 1], 0, Role::Divider, Role::None);
         }
-        let base = skill_id(j, 0);
+        let base = skill_id(first + j, 0);
         let (tone, pill) = pill_of(row);
-        let open = is_open(row, p.toggled);
-        let look = Look::Row { tone, glyph: pill, commands: row_commands(row, p.repo.kind, linkable), disclosure: expandable(row).then_some(open) };
+        let open = is_open(row, &k.lane, p.toggled);
+        let look = Look::Row { tone, glyph: pill, commands: kind_commands(row, k, linkable), disclosure: expandable(row).then_some(open) };
         let facts = match &row.plugin {
             Some(plugin) => printable(&plugin.facts()).into_owned(),
             None => row.facts.as_ref().map(|f| printable(&board::facts_text(f, p.now)).into_owned()).unwrap_or_default(),
@@ -785,6 +1145,7 @@ pub struct SettingsPage<'a> {
     pub running_version: &'a str,
     pub app_update: UpdatePrefs,
     pub app_update_status: &'a str,
+    pub global: &'a GlobalSettings,
 }
 
 pub const APP_INTERVALS: &[(&str, UpdateInterval)] =
@@ -885,8 +1246,9 @@ pub fn settings_page(p: &SettingsPage, w: i32, fit: Fit) -> Surface {
     let mut y = o.head(w, "Settings", "Changes are saved as soon as you make them.");
     let (items, shown) = every_choices(Some(p.default), None);
     let every = Ctl::Combo { id: id::DEFAULT_EVERY, items, shown };
-    let desc = Desc::Text(0, "Used by every repository set to Default".to_string());
-    y = setting(&mut o, x, y, cw, glyph::TIMER, "Check for skill updates every", desc, vec![every]) + GAP;
+    let desc = Desc::Text(0, "Used by every source set to Default".to_string());
+    y = setting(&mut o, x, y, cw, glyph::TIMER, "Check for updates every", desc, vec![every]) + GAP;
+    y = sources_settings(&mut o, p.global, x, y, cw);
     let (on, enabled, note) = match p.startup {
         Ok(state) => (state.is_on(), state.can_change(), state.note(Via::Window)),
         Err(e) => (false, false, format!("Whether Windows starts it can’t be read: {e}")),
@@ -909,6 +1271,45 @@ pub fn settings_page(p: &SettingsPage, w: i32, fit: Fit) -> Surface {
     y = setting(&mut o, x, y, cw, glyph::INFO, "About", Desc::Text(0, about), Vec::new()) + GAP;
     y = app_updates(&mut o, p, x, y, cw);
     o.done(y + 16)
+}
+
+/// What each type is, in Settings.
+fn kind_text(kind: SourceKind) -> &'static str {
+    match kind {
+        SourceKind::Skills => "Folders with a SKILL.md, copied to your skills folder.",
+        SourceKind::Agents => "Custom agents (.agent.md files), copied to your agents folder.",
+        SourceKind::Instructions => "Instructions (.instructions.md files), copied to your instructions folder.",
+        SourceKind::Plugins => "Copilot plugins, installed with GitHub Copilot CLI after you approve them.",
+    }
+}
+
+/// The ignored folders as Settings lists them.
+pub fn ignored_text(names: &[String]) -> String {
+    if names.is_empty() {
+        "No folder is skipped. Every folder in a source is searched.".to_string()
+    } else {
+        format!("Folders with these names are skipped in every source: {}.", printable(&names.join(", ")))
+    }
+}
+
+/// What every source syncs unless it says otherwise: the four types, repository-specific items and ignored folders.
+fn sources_settings(o: &mut Out, g: &GlobalSettings, x: i32, mut y: i32, cw: i32) -> i32 {
+    o.label(id::SOURCES_HEADING, [x, y, cw, 28], "Sources", Font::Title, Role::Text);
+    y += 28 + 8;
+    for (i, kind) in KINDS.into_iter().enumerate() {
+        let text = format!("Sync {} by default", kind.nouns().1);
+        let switch = Ctl::Toggle { id: id::GLOBAL_TYPE + i as i32, text: text.clone(), on: g.types.enabled(kind), enabled: true };
+        let desc = Desc::Text(0, format!("{} A source can turn this on or off for itself.", kind_text(kind)));
+        y = setting(o, x, y, cw, kind_glyph(kind), &text, desc, vec![switch]) + GAP;
+    }
+    let title = "Include repo-specific skills and agents";
+    let switch = Ctl::Toggle { id: id::GLOBAL_REPO_ITEMS, text: title.to_string(), on: g.include_repo_items, enabled: true };
+    let desc =
+        "Also sync skills and agents kept for one repository's own tools, in its .github, .agents, .claude, .copilot, .codex, .cursor and .gemini folders.";
+    y = setting(o, x, y, cw, glyph::FOLDER, title, Desc::Text(0, desc.to_string()), vec![switch]) + GAP;
+    let edit = Ctl::Button(btn(id::IGNORED_EDIT, "Edit…", Kind::Standard, None));
+    let desc = Desc::Text(id::IGNORED_TEXT, ignored_text(&g.ignore_folders));
+    setting(o, x, y, cw, glyph::FILE, "Ignored folders", desc, vec![edit]) + GAP
 }
 
 fn app_updates(o: &mut Out, p: &SettingsPage, x: i32, mut y: i32, cw: i32) -> i32 {
@@ -1035,47 +1436,73 @@ pub fn activity_page(notes: &[Note], when: &dyn Fn(UnixSecs) -> String, w: i32, 
     o.done(y + 16)
 }
 
-/// What the window paints behind the pages: the raised layer under the hero, right of a list `nav` DIPs wide. Only its
-/// top-left corner is rounded; the others are past the edges.
-pub fn backdrop(nav: i32, w: i32, h: i32) -> Vec<Deco> {
-    vec![Deco::Fill { at: [nav, HERO_H, w - nav + 20, h - HERO_H + 20], radius: 8, fill: Role::Layer, border: Role::LayerBorder }]
+/// The displayed list width is bounded, but the caller retains the preferred width.
+pub fn list_width(window_w: i32, preferred: i32) -> i32 {
+    preferred.clamp(MIN_LIST_W, (window_w.saturating_sub(SPLITTER_W + MIN_PAGE_W)).max(MIN_LIST_W))
 }
 
-/// Where the parts of the diff view go: the header, then the list of files and the lines of one file, each in a card
-/// whose own header is drawn by the header panel.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy)]
+pub enum SplitKey {
+    Left,
+    Right,
+    Home,
+    End,
+}
+
+pub fn width_after_key(window_w: i32, preferred: i32, key: SplitKey, shift: bool) -> i32 {
+    let shown = list_width(window_w, preferred);
+    let step = if shift { 32 } else { 8 };
+    let wanted = match key {
+        SplitKey::Left => shown - step,
+        SplitKey::Right => shown + step,
+        SplitKey::Home => MIN_LIST_W,
+        SplitKey::End => i32::MAX,
+    };
+    list_width(window_w, wanted)
+}
+
+pub struct SplitLayout {
+    pub list: Rect,
+    pub splitter: Rect,
+    pub page: Rect,
+}
+
+/// The same partition is used below either header, with a strip of its own for the splitter.
+pub fn split_layout(w: i32, top: i32, height: i32, preferred: i32) -> SplitLayout {
+    let list = list_width(w, preferred);
+    let strip = (w - list).clamp(0, SPLITTER_W);
+    let right = list + strip;
+    SplitLayout { list: [0, top, list, height], splitter: [list, top, strip, height], page: [right, top, (w - right).max(0), height] }
+}
+
+pub fn splitter(w: i32, h: i32) -> Surface {
+    // The strip is fixed, not a scrolling surface.
+    let item = Item { id: id::SPLITTER, at: [0, 0, w, h], text: "Resize list".into(), look: Look::Splitter, enabled: true };
+    Surface { items: vec![item], ..Surface::default() }
+}
+
+/// The raised layer under the hero and to the right of the splitter.
+pub fn backdrop(page_x: i32, w: i32, h: i32) -> Vec<Deco> {
+    vec![Deco::Fill { at: [page_x, HERO_H, w - page_x + 20, h - HERO_H + 20], radius: 8, fill: Role::Layer, border: Role::LayerBorder }]
+}
+
+/// The diff header and the list and comparison below it, each with a card that starts in the header.
 pub struct DiffLayout {
     pub head: Rect,
     pub files_card: Rect,
     pub code_card: Rect,
-    pub files: Rect,
-    pub code: Rect,
+    pub split: SplitLayout,
 }
 
 const DIFF_TOP: i32 = 70;
 const CARD_HEAD: i32 = 41;
-pub const DIFF_FILES_W: i32 = 236;
 
-pub fn diff_layout(w: i32, h: i32, files_w: i32) -> DiffLayout {
-    let ch = (h - DIFF_TOP - 16).max(CARD_HEAD + 2);
-    let files_card = [20, DIFF_TOP, files_w, ch];
-    let code_card = [32 + files_w, DIFF_TOP, (w - files_w - 52).max(2), ch];
-    let inner = (ch - CARD_HEAD - 1).max(0);
-    DiffLayout {
-        head: [0, 0, w, DIFF_TOP + CARD_HEAD],
-        files_card,
-        code_card,
-        files: [21, DIFF_TOP + CARD_HEAD, files_w - 2, inner],
-        code: [code_card[0] + 1, DIFF_TOP + CARD_HEAD, code_card[2] - 2, inner],
-    }
-}
-
-/// Fits both lines of each file entry, while leaving at least half the cards' available width for the comparison.
-pub fn diff_files_width(v: &DiffView, w: i32, bar: i32, fit: Fit) -> i32 {
-    let text = v.files().iter().map(|f| nav_text_width(&f.path, &v.summary(f).2, fit)).max().unwrap_or(0);
-    // Card borders, entry insets, the icon and text padding, plus 2 DIPs for rounding.
-    let wanted = text + 2 + 8 + 40 + 8 + 2 + bar;
-    wanted.min((w - 52) / 2).max(DIFF_FILES_W)
+pub fn diff_layout(w: i32, h: i32, preferred: i32) -> DiffLayout {
+    let top = DIFF_TOP + CARD_HEAD;
+    let body = (h - top - 17).max(0);
+    let split = split_layout(w, top, body, preferred);
+    let card = |[x, _, width, _]: Rect| [x, DIFF_TOP, width, CARD_HEAD + body + 1];
+    DiffLayout { head: [0, 0, w, top], files_card: card(split.list), code_card: card(split.page), split }
 }
 
 pub fn diff_backdrop(l: &DiffLayout, w: i32, h: i32) -> Vec<Deco> {
@@ -1494,28 +1921,59 @@ pub(super) mod tests {
         row(name, Level::Attention, board::EDITED_TAG, vec![Action::Overwrite, Action::KeepMine])
     }
 
-    fn view(label: &str, skills: Vec<Row>) -> RepoView {
-        let level = skills.iter().map(|r| r.level).max().unwrap_or(Level::Ok);
-        RepoView {
-            id: label.to_string(),
-            label: label.to_string(),
-            kind: SourceKind::Skills,
+    fn repo(name: &str) -> RepoConfig {
+        RepoConfig { id: name.to_string(), repo: name.to_string(), path: "skills".to_string(), branch: "main".to_string(), ..RepoConfig::default() }
+    }
+
+    fn kind_view(kind: SourceKind, lane: &str, rows: Vec<Row>) -> KindView {
+        let level = rows.iter().map(|r| r.level).max().unwrap_or(Level::Ok);
+        KindView { kind, lane: lane.to_string(), on: true, found: None, filtered: 0, notes: Vec::new(), rows, status: "Up to date".to_string(), level }
+    }
+
+    fn source_view(name: &str, kinds: Vec<KindView>) -> SourceView {
+        let level = kinds.iter().map(|k| k.level).max().unwrap_or(Level::Ok);
+        SourceView {
+            id: name.to_string(),
+            label: name.to_string(),
+            repo: name.to_string(),
+            branch: "main".to_string(),
+            seen_branch: None,
+            folder: "skills".to_string(),
             enabled: true,
             status: "Up to date".to_string(),
             detail: None,
             level,
             last_check: Some(NOW - 120),
             private: false,
-            skills,
+            kinds,
+            notes: Vec::new(),
+            more_notes: 0,
         }
     }
 
-    fn unreadable(label: &str) -> RepoView {
-        RepoView { level: Level::Error, status: "Not found".to_string(), detail: Some("GitHub answered not found.".to_string()), ..view(label, Vec::new()) }
+    /// A source with only skills, whose skills lane has the source's ID.
+    fn skills_view(name: &str, rows: Vec<Row>) -> SourceView {
+        source_view(name, vec![kind_view(SourceKind::Skills, name, rows)])
     }
 
-    fn repo(name: &str) -> RepoConfig {
-        RepoConfig { id: name.to_string(), repo: name.to_string(), path: "skills".to_string(), branch: "main".to_string(), ..RepoConfig::default() }
+    fn unreadable_source(name: &str) -> SourceView {
+        let failed = KindView { level: Level::Error, status: "Not found".to_string(), ..kind_view(SourceKind::Skills, name, Vec::new()) };
+        SourceView {
+            level: Level::Error,
+            status: "Not found".to_string(),
+            detail: Some("GitHub answered not found.".to_string()),
+            ..source_view(name, vec![failed])
+        }
+    }
+
+    fn source_cfg(name: &str) -> SourceConfig {
+        let lanes = crate::sources::Lanes::default().with(SourceKind::Skills, name.to_string());
+        SourceConfig { id: name.to_string(), repo: name.to_string(), path: "skills".to_string(), branch: "main".to_string(), lanes, ..SourceConfig::default() }
+    }
+
+    fn page_of(v: &SourceView, s: &SourceConfig, toggled: &HashSet<String>, w: i32) -> Surface {
+        let global = GlobalSettings::default();
+        source_page(&SourcePage { view: v, source: s, global: &global, default: DEFAULT_INTERVAL, now: NOW, toggled }, w, &fit)
     }
 
     fn settings<'a>(startup: Result<&'a Startup, &'a str>) -> SettingsPage<'a> {
@@ -1527,6 +1985,7 @@ pub(super) mod tests {
             running_version: "0.2.0",
             app_update: UpdatePrefs::default(),
             app_update_status: "Not checked in this session.",
+            global: Box::leak(Box::new(GlobalSettings::default())),
         }
     }
 
@@ -1559,20 +2018,20 @@ pub(super) mod tests {
     #[test]
     fn the_hero_says_the_most_important_thing_first() {
         let status = "Next check in 1 hour";
-        let hero = |views: &[RepoView], problem: Option<&str>| hero_of(views, problem, status, false, NOW);
-        let fine = view("o/a", vec![ok("x"), ok("y")]);
-        let other = view("o/b", vec![ok("z")]);
+        let hero = |views: &[SourceView], problem: Option<&str>| hero_of(views, problem, status, false, NOW);
+        let fine = skills_view("o/a", vec![ok("x"), ok("y")]);
+        let other = skills_view("o/b", vec![ok("z")]);
 
         let got = hero(&[fine.clone(), other.clone()], None);
         assert_eq!((got.tone, got.title.as_str()), (Tone::Ok, "All skills are up to date"));
         assert_eq!(got.sub, "3 skills from 2 sources · checked 2 minutes ago · next check in 1 hour");
 
-        let needy = view("o/\u{202e}b@main : skills", vec![edited("e"), ok("z")]);
+        let needy = skills_view("o/\u{202e}b@main : skills", vec![edited("e"), ok("z")]);
         let got = hero(&[fine.clone(), needy.clone()], None);
         assert_eq!((got.tone, got.title.as_str()), (Tone::Warn, "1 skill needs your attention"));
         assert_eq!(got.sub, "In o/\\u{202e}b · checked 2 minutes ago · next check in 1 hour", "a name from the settings is escaped");
 
-        let got = hero(&[needy.clone(), unreadable("o/c"), unreadable("o/d")], None);
+        let got = hero(&[needy.clone(), unreadable_source("o/c"), unreadable_source("o/d")], None);
         assert_eq!(
             (got.tone, got.title.as_str(), got.sub.as_str()),
             (Tone::Err, "2 sources can’t be read", "In 2 sources · checked 2 minutes ago · next check in 1 hour")
@@ -1582,10 +2041,11 @@ pub(super) mod tests {
         assert_eq!((got.title.as_str(), got.sub.as_str()), ("Tiny Skill Sync has a problem", "The skills folder is a file"));
 
         assert_eq!(hero(&[], None).title, "Add a source to start");
-        assert_eq!(hero(&[RepoView { enabled: false, ..fine.clone() }], None).title, "Every repository is paused");
-        let empty = RepoView { level: Level::Attention, status: "No skills found".to_string(), detail: Some("…".to_string()), ..view("o/e", Vec::new()) };
+        assert_eq!(hero(&[SourceView { enabled: false, ..fine.clone() }], None).title, "Every repository is paused");
+        let empty =
+            SourceView { level: Level::Attention, status: "No skills found".to_string(), detail: Some("…".to_string()), ..skills_view("o/e", Vec::new()) };
         assert_eq!(hero(&[fine.clone(), empty], None).title, "1 source needs your attention");
-        let fresh = RepoView { last_check: None, ..view("o/f", Vec::new()) };
+        let fresh = SourceView { last_check: None, ..skills_view("o/f", Vec::new()) };
         assert_eq!(
             hero(&[fresh], None),
             Hero { tone: Tone::Off, glyph: glyph::SYNC, title: "Waiting for the first check".to_string(), sub: "next check in 1 hour".to_string() }
@@ -1602,17 +2062,98 @@ pub(super) mod tests {
     #[test]
     fn issue7_dashboard_waits_for_both_same_repo_sources() {
         let mut sources = [
-            RepoView { id: "agents".into(), kind: SourceKind::Agents, ..view("team/tools@main : agents", vec![ok("review.agent.md")]) },
-            RepoView { id: "rules".into(), kind: SourceKind::Instructions, ..view("team/tools@main : rules", vec![ok("style.instructions.md")]) },
+            source_view("team/tools@main : agents", vec![kind_view(SourceKind::Agents, "agents", vec![ok("review.agent.md")])]),
+            source_view("team/tools@main : rules", vec![kind_view(SourceKind::Instructions, "rules", vec![ok("style.instructions.md")])]),
         ];
         let complete = hero_of(&sources, None, "", false, NOW);
         assert_eq!(complete.tone, Tone::Ok, "both sources checked: {complete:?}");
 
         sources[1].last_check = None;
         sources[1].status = "Not checked yet".into();
-        sources[1].skills.clear();
+        sources[1].kinds[0].rows.clear();
         let partial = hero_of(&sources, None, "", false, NOW);
         assert!(partial.tone != Tone::Ok && partial.title != complete.title, "one source checked: {partial:?}; both checked: {complete:?}");
+    }
+
+    /// Source `o/fixtures` with a lane for every type, all on.
+    fn fixtures_cfg() -> Config {
+        let mut cfg = Config::default();
+        let (id, lanes) = crate::sources::allocate_source_ids("fixtures", &mut cfg.taken_ids());
+        cfg.add_source_config(SourceConfig { id, repo: "o/fixtures".into(), path: String::new(), branch: "main".into(), lanes, ..SourceConfig::default() })
+            .unwrap();
+        cfg
+    }
+
+    /// A board after one check of every lane of `o/fixtures` that ended with `outcome`. A check that got an answer read
+    /// a listing with these skills and agents in it, all up to date, and nothing else.
+    fn fixtures_board(cfg: &Config, outcome: crate::engine::Outcome, skills: &[&str], agents: &[&str]) -> Board {
+        use crate::engine::{ApplyResult, Outcome, RepoReport, SkillReport, SyncReport};
+        let answered = !matches!(outcome, Outcome::Failed(_));
+        let lane = |id: &str, names: &[&str]| RepoReport {
+            repo_id: id.to_string(),
+            label: "o/fixtures@main".to_string(),
+            outcome: outcome.clone(),
+            skills: names
+                .iter()
+                .map(|n| SkillReport { name: n.to_string(), verdict: crate::reconcile::Verdict::InSync, result: ApplyResult::NotApplicable })
+                .collect(),
+            plugins: Vec::new(),
+            rejected: Vec::new(),
+            stats: crate::verify::Stats::default(),
+            downloaded: 0,
+            finished_at: NOW - 120,
+            lists_nothing: answered && names.is_empty(),
+        };
+        let repos = vec![lane("fixtures", skills), lane("fixtures-agents", agents), lane("fixtures-instructions", &[]), lane("fixtures-plugins", &[])];
+        let found = [skills.len() as u32, agents.len() as u32, 0, 0];
+        let summary = crate::inventory::Summary { found, installable: found, ..Default::default() };
+        let seen = if answered { vec![("fixtures".to_string(), crate::seen::Seen { summary, ..Default::default() })] } else { Vec::new() };
+        let mut board = Board::new();
+        board.note_source_sync(&SyncReport { repos, notes: Vec::new(), warnings: Vec::new(), seen }, NOW, cfg);
+        board
+    }
+
+    #[test]
+    fn issue8_the_hero_counts_one_skills_only_source_as_one_source() {
+        let cfg = fixtures_cfg();
+        let board = fixtures_board(&cfg, crate::engine::Outcome::Unchanged, &["alpha", "beta", "gamma"], &[]);
+        let got = hero_of(&board.source_views(&cfg, NOW), None, "Next check in 1 hour", false, NOW);
+        assert_eq!((got.tone, got.title.as_str()), (Tone::Ok, "All skills are up to date"), "{got:?}");
+        assert_eq!(got.sub.split(" · ").next(), Some("3 skills from 1 source"), "{got:?}");
+    }
+
+    #[test]
+    fn issue8_the_hero_counts_one_mixed_source_as_one_source_with_all_its_items() {
+        let cfg = fixtures_cfg();
+        let board = fixtures_board(&cfg, crate::engine::Outcome::Unchanged, &["alpha", "beta", "gamma"], &["review.agent.md"]);
+        let got = hero_of(&board.source_views(&cfg, NOW), None, "Next check in 1 hour", false, NOW);
+        assert_eq!((got.tone, got.title.as_str()), (Tone::Ok, "All items are up to date"), "types that list nothing need no attention: {got:?}");
+        assert_eq!(got.sub.split(" · ").next(), Some("4 items from 1 source"), "{got:?}");
+    }
+
+    #[test]
+    fn issue8_the_hero_counts_one_source_that_cannot_be_read_as_one_source() {
+        let cfg = fixtures_cfg();
+        let failure = crate::engine::Failure { kind: crate::github::FailureKind::Network, message: "no network".to_string(), retry_at: None };
+        let board = fixtures_board(&cfg, crate::engine::Outcome::Failed(failure), &[], &[]);
+        let got = hero_of(&board.source_views(&cfg, NOW), None, "Next check in 1 hour", false, NOW);
+        assert_eq!((got.tone, got.title.as_str()), (Tone::Err, "1 source can’t be read"), "{got:?}");
+    }
+
+    #[test]
+    fn issue8_the_hero_does_not_call_types_that_are_off_up_to_date() {
+        let status = "Next check in 1 hour";
+        let off = |v: SourceView| SourceView { kinds: v.kinds.into_iter().map(|k| KindView { on: false, ..k }).collect(), ..v };
+        let skills_off = off(skills_view("o/a", vec![ok("x"), ok("y"), ok("z")]));
+        let got = hero_of(std::slice::from_ref(&skills_off), None, status, false, NOW);
+        assert_eq!((got.tone, got.glyph, got.title.as_str()), (Tone::Off, glyph::PAUSE, "Nothing is being synced"), "{got:?}");
+        assert_eq!(got.sub, "Sync is off for every type found · checked 2 minutes ago · next check in 1 hour");
+        let busy = hero_of(std::slice::from_ref(&skills_off), None, "Checking for updates…", true, NOW);
+        assert_eq!((busy.title.as_str(), busy.sub.as_str()), ("Nothing is being synced", "Checking for updates…"));
+
+        let agents = source_view("o/b", vec![kind_view(SourceKind::Agents, "o/b", vec![ok("review.agent.md")])]);
+        let got = hero_of(&[skills_off, agents], None, status, false, NOW);
+        assert_eq!((got.tone, got.title.as_str()), (Tone::Ok, "All agents are up to date"), "only what syncs is counted: {got:?}");
     }
 
     #[test]
@@ -1625,65 +2166,301 @@ pub(super) mod tests {
         }
     }
 
-    #[test]
-    fn the_list_says_how_each_repository_is_in_a_few_words() {
-        assert_eq!(nav_sub(&view("o/a", vec![ok("x"), ok("y")])), "2 skills · up to date");
-        assert_eq!(nav_sub(&view("o/a", vec![ok("x"), edited("e")])), "2 skills · 1 needs you");
-        assert_eq!(nav_sub(&view("o/a", vec![edited("d"), edited("e")])), "2 skills · 2 need you");
-        assert_eq!(nav_sub(&view("o/a", vec![ok("x")])), "1 skill · up to date");
-        assert_eq!(nav_sub(&unreadable("o/c")), "Not found");
-        assert_eq!(nav_sub(&RepoView { enabled: false, ..unreadable("o/c") }), "Paused");
-        assert_eq!(nav_sub(&RepoView { status: "Not checked yet".to_string(), last_check: None, ..view("o/a", Vec::new()) }), "Not checked yet");
+    /// A source with all four types: three skills, an agent, instructions that do not sync and a plugin to approve.
+    fn four_types() -> SourceView {
+        let approve = Row { plugin: Some(board::PluginDetails::default()), ..row("p", Level::Attention, "Needs your approval", vec![Action::ApprovePlugin]) };
+        source_view(
+            "o/a",
+            vec![
+                KindView { found: Some(3), ..kind_view(SourceKind::Skills, "o/a", vec![ok("x")]) },
+                KindView { found: Some(1), ..kind_view(SourceKind::Agents, "o/a-agents", vec![ok("r.agent.md")]) },
+                KindView { on: false, ..kind_view(SourceKind::Instructions, "o/a-instructions", vec![ok("s.instructions.md")]) },
+                kind_view(SourceKind::Plugins, "o/a-plugins", vec![approve]),
+            ],
+        )
+    }
 
-        // Both lines are the entry's window text, for a screen reader; Add repository has only one.
-        let views = [view("o/a", vec![ok("x"), edited("e")])];
-        let s = nav(&views, &Page::Activity, NAV_W, 600, &fit);
-        assert_eq!(item(&s, id::NAV_REPO).text, "Skills: o/a [o/a]\n2 skills · 1 needs you");
+    #[test]
+    fn the_list_has_one_entry_per_source_with_a_labelled_icon_per_type() {
+        let v = four_types();
+        assert_eq!(nav_name(&v), "o/a, main, skills. Skills 3, Agents 1, Instructions: Sync off, Plugins 1 (needs approval). Up to date");
+        let page = Page::Repo("o/a".to_string());
+        for w in [MIN_LIST_W, NAV_W] {
+            let s = nav(std::slice::from_ref(&v), &page, w, 600, &fit);
+            fits_in(&s, w);
+            let entry = item(&s, id::NAV_REPO);
+            assert_eq!(entry.text, nav_name(&v), "the window text spells out what the icons show");
+            let Look::Source { selected: true, parts, .. } = &entry.look else { panic!("{:?}", entry.look) };
+            let icons: Vec<(char, Rect)> = parts
+                .iter()
+                .filter_map(|d| match d {
+                    Deco::Glyph { ch, at, .. } if *ch != glyph::WARN => Some((*ch, *at)),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(icons.iter().map(|i| i.0).collect::<Vec<_>>(), [glyph::SKILL, glyph::AGENT, glyph::INSTRUCTION, glyph::PLUGIN]);
+            let labels: Vec<&str> = parts
+                .iter()
+                .filter_map(|d| match d {
+                    Deco::Text { text, font: Font::Caption, at, .. } if at[1] >= 44 && at[2] < 60 => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(labels, ["3", "1", "off", "1"]);
+            assert_eq!(parts.iter().filter(|d| matches!(d, Deco::Glyph { ch: glyph::WARN, .. })).count(), 1, "the plugin to approve is marked");
+            // Nothing is cut or drawn over anything else: the icons go on to another line instead.
+            let [_, _, ew, eh] = entry.at;
+            for (k, a) in parts.iter().map(deco_at).enumerate() {
+                assert!(a[0] >= 0 && a[1] >= 0 && a[0] + a[2] <= ew && a[1] + a[3] <= eh, "{a:?} is outside {ew}x{eh}");
+                for b in parts.iter().skip(k + 1).map(deco_at) {
+                    let apart = a[0] + a[2] <= b[0] || b[0] + b[2] <= a[0] || a[1] + a[3] <= b[1] || b[1] + b[3] <= a[1];
+                    assert!(apart, "{a:?} overlaps {b:?} at {w}");
+                }
+            }
+            let lines: HashSet<i32> = icons.iter().map(|i| i.1[1]).collect();
+            assert_eq!(lines.len() > 1, w == MIN_LIST_W, "the icons wrap only when the list is narrow ({w}): {icons:?}");
+            assert!(item(&s, id::NAV_ADD).at[1] > entry.at[1] + entry.at[3], "rows never overlap");
+        }
+
+        let fresh = SourceView {
+            last_check: None,
+            status: "Not checked yet".to_string(),
+            branch: String::new(),
+            folder: String::new(),
+            ..source_view("o/b", Vec::new())
+        };
+        assert_eq!(nav_name(&fresh), "o/b, default branch, whole repository. Not checked yet");
+        let s = nav(std::slice::from_ref(&fresh), &Page::Activity, NAV_W, 600, &fit);
+        let Look::Source { parts, selected: false, .. } = &item(&s, id::NAV_REPO).look else { panic!() };
+        assert!(!parts.iter().any(|d| matches!(d, Deco::Glyph { .. })), "no icons before the first listing");
+        assert!(parts.iter().any(|d| matches!(d, Deco::Text { text, .. } if text == "Not checked yet")));
         assert_eq!(item(&s, id::NAV_ADD).text, "Add source");
     }
 
-    #[test]
-    fn the_list_widens_just_enough_for_whole_names_and_never_past_half_the_window() {
-        // An entry draws its two lines from 40 DIPs in to 8 DIPs before its right edge.
-        let shows_whole = |s: &Surface, n: i32, text: &str, font: Font| item(s, n).at[2] - 48 >= fit(text, font, 0).0;
-        let short = [view("o/a", vec![ok("x")]), view("o/b", Vec::new())];
-        assert_eq!(nav_width(&short, 980, 0, &fit), NAV_W, "names that fit leave the list as it is");
-
-        let name = "an-owner/a-repository-with-a-long-name@a-branch : a/folder";
-        let long = [view("o/a", vec![ok("x")]), RepoView { id: "two".into(), ..view(name, vec![ok("x")]) }];
-        let label = nav_label(&long[1]);
-        let w = nav_width(&long, 1400, 0, &fit);
-        assert!(w > NAV_W && w <= fit(&label, Font::Body, 0).0 + 64 + 4, "{w}");
-        let s = nav(&long, &Page::Activity, w, 600, &fit);
-        assert!(shows_whole(&s, id::NAV_REPO + 1, &label, Font::Body), "{:?}", item(&s, id::NAV_REPO + 1).at);
-        fits_in(&s, w);
-        assert_eq!(nav_width(&long, 1400, 17, &fit), w + 17, "room is kept for a scroll bar");
-
-        let status = "Can't read the repository because GitHub answered that the token has expired";
-        let busy = [RepoView { status: status.to_string(), ..unreadable("o/a") }];
-        let w = nav_width(&busy, 1400, 0, &fit);
-        assert!(shows_whole(&nav(&busy, &Page::Activity, w, 600, &fit), id::NAV_REPO, status, Font::Caption), "the second line counts too: {w}");
-
-        assert_eq!(nav_width(&long, 640, 0, &fit), 320, "the page keeps at least half the window");
-        assert_eq!(nav_width(&long, 400, 0, &fit), NAV_W, "a window too small to widen the list in");
-        assert_eq!(nav_width(&[], 980, 0, &fit), NAV_W);
+    /// Every text a surface shows, in its controls and drawn on it.
+    fn all_text(s: &Surface) -> Vec<String> {
+        let drawn = s.decos.iter().filter_map(|d| match d {
+            Deco::Text { text, .. } => Some(text.clone()),
+            _ => None,
+        });
+        s.items.iter().map(|i| i.text.clone()).chain(drawn).collect()
     }
 
     #[test]
-    fn a_repository_says_where_its_skills_come_from_and_how_it_is_read() {
-        let r = repo("o/a");
-        assert_eq!(repo_sub(&r, &view("o/a", Vec::new()), NOW), "Public · the skills folder on main · checked 2 minutes ago");
-        let private = RepoView { private: true, ..view("o/a", Vec::new()) };
-        assert_eq!(repo_sub(&r, &private, NOW), "The skills folder on main · read with your GitHub sign-in · checked 2 minutes ago");
-        let top = RepoConfig { path: String::new(), branch: String::new(), ..repo("o/a") };
-        assert_eq!(
-            repo_sub(&top, &RepoView { last_check: None, ..view("o/a", Vec::new()) }, NOW),
-            "The top of the repository on the default branch · not checked yet"
-        );
-        assert_eq!(
-            repo_sub(&top, &RepoView { last_check: None, ..unreadable("o/a") }, NOW),
-            "The top of the repository on the default branch · not checked successfully yet"
-        );
+    fn a_sources_page_groups_its_items_by_type_and_each_row_leads_to_its_lane() {
+        let mut v = four_types();
+        v.kinds[0].rows.push(edited("y"));
+        v.kinds[0].filtered = 2;
+        v.kinds[1].notes.push(crate::inventory::SummaryNote {
+            kind: Some(SourceKind::Agents),
+            path: "x/b.agent.md".into(),
+            reason: "the name is taken".into(),
+        });
+        v.notes.push(crate::inventory::SummaryNote { kind: None, path: "AGENTS.md".into(), reason: "it is never synced".into() });
+        v.more_notes = 3;
+        let mut cfg = source_cfg("o/a");
+        cfg.lanes = cfg
+            .lanes
+            .with(SourceKind::Agents, "o/a-agents".into())
+            .with(SourceKind::Instructions, "o/a-instructions".into())
+            .with(SourceKind::Plugins, "o/a-plugins".into());
+        for w in [344, 900] {
+            let s = page_of(&v, &cfg, &HashSet::new(), w);
+            fits_in(&s, w);
+            let heads: Vec<(i32, &str)> = s
+                .decos
+                .iter()
+                .filter_map(|d| match d {
+                    Deco::Text { text, font: Font::Strong, at, .. } if ["Skills", "Agents", "Instructions", "Plugins"].contains(&text.as_str()) => {
+                        Some((at[1], text.as_str()))
+                    }
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(heads.iter().map(|h| h.1).collect::<Vec<_>>(), ["Skills", "Agents", "Instructions", "Plugins"]);
+            assert!(heads.windows(2).all(|p| p[0].0 < p[1].0), "in that order down the page");
+            let text = all_text(&s);
+            for expected in [
+                "3",
+                "1 · Sync off",
+                "2 skipped by folder rules",
+                "Not synced: x/b.agent.md: the name is taken",
+                "Never synced: AGENTS.md: it is never synced",
+                "and 3 more",
+            ] {
+                assert!(text.iter().any(|t| t == expected), "{expected:?} is not in {text:?}");
+            }
+            assert!(!text.iter().any(|t| t.contains("Skills [")), "the sub line does not name a lane");
+            // Rows are numbered across the sections.
+            assert!(item(&s, skill_id(2, 0)).text.starts_with("r.agent.md\n"));
+            assert!(item(&s, skill_id(3, 0)).text.starts_with("s.instructions.md\nUp to date"));
+            assert!(matches!(&item(&s, skill_id(3, 0)).look, Look::Row { commands, .. } if commands.is_empty()), "a type that is off offers no comparison");
+            assert_eq!(item(&s, skill_id(4, 4)).text, "Approve");
+        }
+        let (k, r) = row_at(&v, 2).unwrap();
+        assert_eq!((k.lane.as_str(), r.name.as_str()), ("o/a-agents", "r.agent.md"));
+        let (k, r) = row_at(&v, 4).unwrap();
+        assert_eq!((k.kind, r.name.as_str()), (SourceKind::Plugins, "p"));
+        assert!(row_at(&v, 5).is_none());
+        assert_eq!(row_index(&v, "o/a-plugins", "p"), Some(4));
+        assert_eq!(row_index(&v, "o/a", "r.agent.md"), None, "a name is looked for in its own lane");
+        let lane = lane_config(&cfg, SourceKind::Agents, "o/a-agents");
+        assert_eq!((lane.id.as_str(), lane.kind, lane.source.as_str(), lane.path.as_str()), ("o/a-agents", SourceKind::Agents, "o/a", "skills"));
+    }
+
+    #[test]
+    fn what_to_sync_offers_the_default_on_and_off_for_every_type() {
+        let v = skills_view("o/a", vec![ok("x")]);
+        let mut cfg = source_cfg("o/a");
+        cfg.types.set(SourceKind::Agents, false);
+        for w in [344, 900] {
+            let s = page_of(&v, &cfg, &HashSet::new(), w);
+            fits_in(&s, w);
+            assert_eq!(item(&s, id::SOURCE_TYPE).text, "Sync skills\nDefault (On)");
+            assert_eq!(item(&s, id::SOURCE_TYPE + 1).text, "Sync agents\nOff");
+            assert_eq!(item(&s, id::SOURCE_TYPE + 3).look, Look::Combo { items: vec!["Default (On)".into(), "On".into(), "Off".into()] });
+            assert_eq!(item(&s, id::REPO_ITEMS).look, Look::Combo { items: vec!["Default (skip)".into(), "Include".into(), "Skip".into()] });
+            assert_eq!(item(&s, id::FOLDER_RULES).text, "Folder rules…");
+            assert_eq!(item(&s, id::FOLDER_RULES_TEXT).text, "Skips the ignored folders set in Settings.");
+        }
+        assert_eq!(source_choice(id::SOURCE_TYPE + 2, "Off"), Some(SourceEdit::Type(SourceKind::Instructions, Some(false))));
+        assert_eq!(source_choice(id::SOURCE_TYPE + 1, "Default (On)"), Some(SourceEdit::Type(SourceKind::Agents, None)));
+        assert_eq!(source_choice(id::REPO_ITEMS, "Include"), Some(SourceEdit::RepoItems(Some(true))));
+        assert_eq!(source_choice(id::SOURCE_TYPE + 4, "On"), None);
+        source_choice(id::SOURCE_TYPE + 2, "Off").unwrap().apply(&mut cfg);
+        source_choice(id::SOURCE_TYPE + 1, "Default (Off)").unwrap().apply(&mut cfg);
+        source_choice(id::REPO_ITEMS, "Skip").unwrap().apply(&mut cfg);
+        let expected = crate::sources::TypeOverrides { instructions: Some(false), ..Default::default() };
+        assert_eq!((cfg.types, cfg.include_repo_items), (expected, Some(false)));
+
+        assert_eq!(folder_rules(" a,, b ", "c"), Ok(SourceEdit::FolderRules { add: vec!["a".into(), "b".into()], allow: vec!["c".into()] }));
+        assert!(folder_rules("a", "A").is_err(), "a name cannot be skipped and never skipped");
+        assert!(folder_rules("a/b", "").is_err());
+        assert!(parse_folders("x, x").is_err());
+        folder_rules("tests", "examples").unwrap().apply(&mut cfg);
+        assert_eq!(folder_rules_text(&cfg), "Also skips: tests. Never skips: examples.");
+    }
+
+    /// Where a text between two heights is, whether it wraps, and its font, from the decorations or the controls.
+    fn text_at(s: &Surface, text: &str, (top, bottom): (i32, i32)) -> (Rect, u32, Font) {
+        let same = |t: &str| t.split_whitespace().collect::<String>() == text.split_whitespace().collect::<String>();
+        let decos = s.decos.iter().filter_map(|d| match d {
+            Deco::Text { at, text: t, font, flags, .. } if same(t) => Some((*at, *flags, *font)),
+            _ => None,
+        });
+        let items = s.items.iter().filter_map(|i| match &i.look {
+            Look::Text { font, flags, .. } if same(&i.text) => Some((i.at, *flags, *font)),
+            _ => None,
+        });
+        decos.chain(items).find(|(at, ..)| top <= at[1] && at[1] < bottom).unwrap_or_else(|| panic!("no text {text:?}"))
+    }
+
+    #[test]
+    fn issue8_what_to_sync_shows_every_title_and_value_whole_with_the_lists_lined_up() {
+        let v = skills_view("o/a", vec![ok("x")]);
+        let cfg = source_cfg("o/a");
+        let ids = [id::SOURCE_TYPE, id::SOURCE_TYPE + 1, id::SOURCE_TYPE + 2, id::SOURCE_TYPE + 3, id::REPO_ITEMS];
+        let titles = ["Skills", "Agents", "Instructions", "Plugins", "Repository-specific skills and agents"];
+        for w in [344, 420, 560, 900] {
+            let s = page_of(&v, &cfg, &HashSet::new(), w);
+            fits_in(&s, w);
+            let combos: Vec<Rect> = ids.iter().map(|&n| item(&s, n).at).collect();
+            for (&n, at) in ids.iter().zip(&combos) {
+                let Look::Combo { items } = &item(&s, n).look else { panic!("{n} is not a list") };
+                let longest = items.iter().map(|i| fit(i, Font::Body, 0).0).max().unwrap();
+                assert!(at[2] - 44 >= longest, "at {w}: list {n} is {} wide, too narrow for its longest choice ({longest} + 44)", at[2]);
+            }
+            assert!(combos.iter().all(|c| c[0] == combos[0][0] && c[2] == combos[0][2]), "at {w}: the lists do not line up: {combos:?}");
+            let card = (text_at(&s, "What to sync", (0, i32::MAX)).0[1] + 1, text_at(&s, "Folder rules", (0, i32::MAX)).0[1]);
+            for (title, combo) in titles.iter().zip(&combos) {
+                let (at, flags, font) = text_at(&s, title, card);
+                if flags & WRAP != 0 {
+                    assert!(at[3] >= fit(title, font, at[2]).1, "at {w}: {title:?} is cut off: {at:?}");
+                } else {
+                    assert!(at[2] >= fit(title, font, 0).0, "at {w}: {title:?} is cut off: {at:?}");
+                }
+                let [x, y, tw, th] = at;
+                let [cx, cy, cw, ch] = *combo;
+                let over = x < cx + cw && cx < x + tw && y < cy + ch && cy < y + th;
+                assert!(!over, "at {w}: {title:?} at {at:?} is under its list at {combo:?}");
+                if w == 900 {
+                    assert!(cy < y + th && y < cy + ch, "at {w}: {title:?} at {at:?} and its list at {combo:?} are not on one line");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_settings_sources_switches_change_the_global_settings() {
+        let mut g = GlobalSettings::default();
+        assert_eq!(global_switch(id::GLOBAL_TYPE + 3, false), Some(GlobalEdit::Type(SourceKind::Plugins, false)));
+        assert_eq!(global_switch(id::GLOBAL_REPO_ITEMS, true), Some(GlobalEdit::RepoItems(true)));
+        assert_eq!(global_switch(id::GLOBAL_TYPE - 1, true), None);
+        global_switch(id::GLOBAL_TYPE + 3, false).unwrap().apply(&mut g);
+        global_switch(id::GLOBAL_REPO_ITEMS, true).unwrap().apply(&mut g);
+        GlobalEdit::Ignore(vec!["node_modules".into()]).apply(&mut g);
+        assert!(!g.types.enabled(SourceKind::Plugins) && g.types.enabled(SourceKind::Skills));
+        assert!(g.include_repo_items);
+        assert_eq!(g.ignore_folders, ["node_modules"]);
+        let page = SettingsPage { global: Box::leak(Box::new(g)), ..settings(Ok(&Startup::Off)) };
+        for w in [344, 900] {
+            let s = settings_page(&page, w, &fit);
+            fits_in(&s, w);
+            assert_eq!(item(&s, id::GLOBAL_TYPE).text, "Sync skills by default");
+            assert_eq!(item(&s, id::GLOBAL_TYPE + 3).look, Look::Toggle { on: false });
+            assert_eq!(item(&s, id::GLOBAL_REPO_ITEMS).look, Look::Toggle { on: true });
+            assert_eq!(item(&s, id::IGNORED_EDIT).text, "Edit…");
+            assert_eq!(item(&s, id::IGNORED_TEXT).text, "Folders with these names are skipped in every source: node_modules.");
+        }
+    }
+
+    #[test]
+    fn the_splitter_clamps_both_views_without_changing_the_preference() {
+        for (window, list, page) in [(400, 160, 228), (520, 160, 348), (532, 160, 360), (640, 268, 360), (980, 520, 448), (1400, 520, 868)] {
+            let main = split_layout(window, HERO_H, 520, 520);
+            let diff = diff_layout(window, 600, 520);
+            for layout in [&main, &diff.split] {
+                assert_eq!((layout.list[2], layout.page[2]), (list, page), "window of {window} DIP");
+                assert_eq!(layout.list[0] + layout.list[2], layout.splitter[0]);
+                assert_eq!(layout.splitter[0] + layout.splitter[2], layout.page[0]);
+                assert_eq!(layout.page[0] + layout.page[2], window);
+            }
+            assert_eq!(list_width(window, 1), 160);
+            assert_eq!(diff.head[3], diff.split.splitter[1]);
+        }
+        let surface = splitter(SPLITTER_W, 520);
+        assert_eq!(surface.items.len(), 1);
+        let handle = item(&surface, id::SPLITTER);
+        assert_eq!((handle.text.as_str(), &handle.look, handle.enabled), ("Resize list", &Look::Splitter, true));
+        fits_in(&surface, SPLITTER_W);
+    }
+
+    #[test]
+    fn splitter_keys_step_from_the_displayed_width_and_stop_at_the_bounds() {
+        use SplitKey::{End, Home, Left, Right};
+        assert_eq!(width_after_key(980, 248, Left, false), 240);
+        assert_eq!(width_after_key(980, 248, Right, false), 256);
+        assert_eq!(width_after_key(980, 248, Left, true), 216);
+        assert_eq!(width_after_key(980, 248, Right, true), 280);
+        assert_eq!(width_after_key(980, 248, Home, false), 160);
+        assert_eq!(width_after_key(980, 248, End, false), 608);
+        assert_eq!(width_after_key(640, 500, Left, false), 260, "start at the displayed width, not the saved width");
+        assert_eq!(width_after_key(640, 265, Right, true), 268);
+        assert_eq!(width_after_key(640, 161, Left, true), 160);
+        assert_eq!(width_after_key(400, 248, End, false), 160);
+    }
+
+    #[test]
+    fn a_source_says_where_its_items_come_from_and_how_it_is_read() {
+        let v = skills_view("o/a", Vec::new());
+        assert_eq!(source_sub(&v, NOW), "Public · the skills folder on main · checked 2 minutes ago");
+        let private = SourceView { private: true, ..v.clone() };
+        assert_eq!(source_sub(&private, NOW), "The skills folder on main · read with your GitHub sign-in · checked 2 minutes ago");
+        let top = SourceView { folder: String::new(), branch: String::new(), last_check: None, ..v.clone() };
+        assert_eq!(source_sub(&top, NOW), "The whole repository on the default branch · not checked yet");
+        let seen = SourceView { seen_branch: Some("trunk".to_string()), ..top.clone() };
+        assert_eq!(source_sub(&seen, NOW), "The whole repository on trunk · not checked yet", "the branch the listing read");
+        assert_eq!(source_sub(&SourceView { level: Level::Error, ..top }, NOW), "The whole repository on the default branch · not checked successfully yet");
     }
 
     #[test]
@@ -1730,10 +2507,10 @@ pub(super) mod tests {
 
     #[test]
     fn skill_rows_show_names_written_out_and_their_ids_lead_to_the_real_rows() {
-        let r = repo("o/a");
-        let v = view("o/a", vec![edited("rlo-\u{202e}gpj"), ok("alpha")]);
+        let r = source_cfg("o/a");
+        let v = skills_view("o/a", vec![edited("rlo-\u{202e}gpj"), ok("alpha")]);
         let none = HashSet::new();
-        let page = |toggled: &HashSet<String>| repo_page(&RepoPage { view: &v, repo: &r, default: DEFAULT_INTERVAL, now: NOW, toggled }, 600, &fit);
+        let page = |toggled: &HashSet<String>| page_of(&v, &r, toggled, 600);
 
         let s = page(&none);
         // The status is in the window text too, after a line break, so a screen reader reads it with the name.
@@ -1748,38 +2525,35 @@ pub(super) mod tests {
         assert_eq!(hit(id::SKILL + 3), Hit::Skill(0, Part::Open));
         fits_in(&s, 600);
 
-        let toggled: HashSet<String> = ["rlo-\u{202e}gpj".to_string(), "alpha".to_string()].into();
+        let toggled: HashSet<String> = [toggle_key("o/a", "rlo-\u{202e}gpj"), toggle_key("o/a", "alpha")].into();
         let s = page(&toggled);
         assert!(!s.items.iter().any(|i| i.id == id::SKILL + 2), "closed by the user");
         assert!(item(&s, id::SKILL).text.ends_with("about rlo-\\u{202e}gpj"));
-        assert!(!is_open(&v.skills[1], &toggled), "a stale toggle cannot open a healthy skill");
+        assert!(!is_open(&v.kinds[0].rows[1], "o/a", &toggled), "a stale toggle cannot open a healthy skill");
+        let other: HashSet<String> = [toggle_key("o/a-agents", "rlo-\u{202e}gpj")].into();
+        assert!(page(&other).items.iter().any(|i| i.id == id::SKILL + 2), "closing a row of another type leaves this one open");
     }
 
     #[test]
     fn plugin_rows_show_facts_and_choices_but_no_file_commands() {
         use RowCmd::{CopyLink, OnGitHub};
-        let r = RepoConfig { kind: SourceKind::Plugins, branch: "main".into(), path: "pack".into(), ..repo("o/a") };
+        let r = SourceConfig { path: "pack".into(), lanes: crate::sources::Lanes::default().with(SourceKind::Plugins, "o/a".into()), ..source_cfg("o/a") };
         let details = board::PluginDetails { version: Some("1.2.3".into()), publisher: Some("Review Team".into()), path: Some("pack/plugin-folder".into()) };
         let explanation =
             "Needs your approval. Plugins can run programs on this PC. Approve installs it now and its new versions from this branch automatically.";
         let plugin =
             Row { text: explanation.into(), plugin: Some(details), ..row("alpha", Level::Attention, "Needs your approval", vec![Action::ApprovePlugin]) };
-        let v = RepoView {
-            kind: r.kind,
-            ..view(
-                "o/a",
-                vec![
-                    plugin,
-                    Row {
-                        plugin: Some(board::PluginDetails::default()),
-                        listed: false,
-                        ..row("beta", Level::Attention, "Removed from GitHub", vec![Action::UninstallPlugin, Action::ForgetPlugin])
-                    },
-                ],
-            )
-        };
+        let rows = vec![
+            plugin,
+            Row {
+                plugin: Some(board::PluginDetails::default()),
+                listed: false,
+                ..row("beta", Level::Attention, "Removed from GitHub", vec![Action::UninstallPlugin, Action::ForgetPlugin])
+            },
+        ];
+        let v = source_view("o/a", vec![kind_view(SourceKind::Plugins, "o/a", rows)]);
         for w in [360, 700] {
-            let s = repo_page(&RepoPage { repo: &r, view: &v, default: DEFAULT_INTERVAL, now: NOW, toggled: &HashSet::new() }, w, &fit);
+            let s = page_of(&v, &r, &HashSet::new(), w);
             let a = skill_id(0, 0);
             let b = skill_id(1, 0);
             assert!(matches!(&item(&s, a).look, Look::Row { commands, .. } if commands == &[CopyLink, OnGitHub]));
@@ -1793,25 +2567,31 @@ pub(super) mod tests {
             assert!(s.items.iter().all(|item| item.id != a + 2 && item.id != a + 9));
             fits_in(&s, w);
         }
-        assert_eq!(crate::github::web_url(&r, Some("pack/plugin-folder")).as_deref(), Some("https://github.com/o/a/tree/main/pack/plugin-folder"));
+        assert_eq!(
+            crate::github::web_url(&lane_config(&r, SourceKind::Plugins, "o/a"), Some("pack/plugin-folder")).as_deref(),
+            Some("https://github.com/o/a/tree/main/pack/plugin-folder")
+        );
     }
 
     #[test]
     fn plugin_choice_failure_is_shown_in_the_repo_infobar() {
-        let r = RepoConfig { kind: SourceKind::Plugins, ..repo("o/a") };
-        let v = RepoView { kind: r.kind, ..unreadable("o/a") };
-        let s = repo_page(&RepoPage { repo: &r, view: &v, default: DEFAULT_INTERVAL, now: NOW, toggled: &HashSet::new() }, 600, &fit);
+        let r = source_cfg("o/a");
+        let mut v = unreadable_source("o/a");
+        v.kinds[0].kind = SourceKind::Plugins;
+        let s = page_of(&v, &r, &HashSet::new(), 600);
         assert_eq!(item(&s, id::INFO_LEAD).text, "Could not check this plugin source.");
-        assert_eq!(item(&s, id::INFO_TEXT).text, v.detail.unwrap());
+        assert_eq!(item(&s, id::INFO_TEXT).text, v.detail.clone().unwrap());
         assert_eq!(item(&s, id::RETRY).text, "Try again");
+        v.kinds.insert(0, KindView { level: Level::Error, ..kind_view(SourceKind::Skills, "o/a", Vec::new()) });
+        assert_eq!(item(&page_of(&v, &r, &HashSet::new(), 600), id::INFO_LEAD).text, "Can’t read this repository.");
     }
 
     #[test]
     fn plugin_reinstall_is_visible_on_an_informational_row() {
-        let r = RepoConfig { kind: SourceKind::Plugins, ..repo("o/a") };
+        let r = source_cfg("o/a");
         let missing = Row { plugin: Some(board::PluginDetails::default()), ..row("alpha", Level::Ok, "Removed in Copilot", vec![Action::ReinstallPlugin]) };
-        let v = RepoView { kind: r.kind, ..view("o/a", vec![missing]) };
-        let s = repo_page(&RepoPage { repo: &r, view: &v, default: DEFAULT_INTERVAL, now: NOW, toggled: &HashSet::new() }, 360, &fit);
+        let v = source_view("o/a", vec![kind_view(SourceKind::Plugins, "o/a-plugins", vec![missing])]);
+        let s = page_of(&v, &r, &HashSet::new(), 360);
         assert_eq!(item(&s, skill_id(0, 4)).text, "Reinstall");
     }
 
@@ -1870,7 +2650,7 @@ pub(super) mod tests {
         use RowCmd::*;
         let known = |row: Row| Row { facts: Some(facts(&row.name)), ..row };
         let explanation = "This skill could not be updated. ".repeat(5);
-        let v = view(
+        let v = skills_view(
             "o/a",
             vec![
                 known(ok("alpha")),
@@ -1880,11 +2660,11 @@ pub(super) mod tests {
                 ok("epsilon"),
             ],
         );
-        let toggled: HashSet<String> = ["beta", "alpha"].map(String::from).into();
+        let toggled: HashSet<String> = ["beta", "alpha"].map(|n| toggle_key("o/a", n)).into();
         let at = |j: i32, k: i32| id::SKILL + id::STRIDE * j + k;
         let has = |s: &Surface, n: i32| s.items.iter().any(|i| i.id == n);
         for w in [344, 600, 900] {
-            let s = repo_page(&RepoPage { view: &v, repo: &repo("o/a"), default: DEFAULT_INTERVAL, now: NOW, toggled: &toggled }, w, &fit);
+            let s = page_of(&v, &source_cfg("o/a"), &toggled, w);
             fits_in(&s, w);
             let look = |j, tone, glyph, commands, disclosure| {
                 assert_eq!(item(&s, at(j, 0)).look, Look::Row { tone, glyph, commands, disclosure });
@@ -1909,22 +2689,22 @@ pub(super) mod tests {
         }
 
         // No link is made to a repository whose name can't be put in one as it is.
-        let odd = RepoConfig { repo: "o/\u{202e}a".to_string(), ..repo("o/a") };
-        let s = repo_page(&RepoPage { view: &v, repo: &odd, default: DEFAULT_INTERVAL, now: NOW, toggled: &toggled }, 600, &fit);
+        let odd = SourceConfig { repo: "o/\u{202e}a".to_string(), ..source_cfg("o/a") };
+        let s = page_of(&v, &odd, &toggled, 600);
         assert!(matches!(&item(&s, at(0, 0)).look, Look::Row { commands, .. } if commands == &[Open, Preview, CopyPath]));
     }
 
     #[test]
     fn every_page_fits_a_narrow_and_a_wide_window() {
-        let r = RepoConfig { interval: Some(Interval::new(2, Unit::Hour)), ..repo("o/a") };
-        let v = RepoView { private: true, detail: Some("GitHub answered not found.".to_string()), ..view("o/a", vec![edited("e"), ok("x")]) };
+        let r = SourceConfig { interval: Some(Interval::new(2, Unit::Hour)), ..source_cfg("o/a") };
+        let v = SourceView { private: true, detail: Some("GitHub answered not found.".to_string()), ..four_types() };
+        let needy = SourceView { private: true, ..skills_view("o/a", vec![edited("e"), ok("x")]) };
         let none = HashSet::new();
         // The longest note there is, with a path that has no spaces to break at.
         let other = Startup::OtherCopy(format!(r"D:\{}\tiny-skill-sync.exe", "d".repeat(200)));
         let settings = SettingsPage { skills_dir: r"C:\Users\someone\.copilot\skills", token_saved: true, ..settings(Ok(&other)) };
         for w in [344, 900] {
-            let p = RepoPage { view: &v, repo: &r, default: DEFAULT_INTERVAL, now: NOW, toggled: &none };
-            let s = repo_page(&p, w, &fit);
+            let s = page_of(&v, &r, &none, w);
             fits_in(&s, w);
             assert_eq!(item(&s, id::EVERY).text, "2 hours");
             assert!(item(&s, id::PRIVATE).at[0] > 24);
@@ -1934,7 +2714,7 @@ pub(super) mod tests {
             fits_in(&settings_page(&settings, w, &fit), w);
             fits_in(&welcome(w, &fit), w);
             fits_in(&nav(std::slice::from_ref(&v), &Page::Settings, NAV_W, 480, &fit), NAV_W);
-            fits_in(&hero(&hero_of(std::slice::from_ref(&v), None, "", false, NOW), true, w + NAV_W, &fit), w + NAV_W);
+            fits_in(&hero(&hero_of(std::slice::from_ref(&needy), None, "", false, NOW), true, w + NAV_W, &fit), w + NAV_W);
         }
     }
 
@@ -2107,13 +2887,13 @@ pub(super) mod tests {
         assert_eq!(v.summary(&v.files()[0]).0, glyph::FILE);
 
         for w in [640, 900, 1400] {
-            let l = diff_layout(w, 600, diff_files_width(&v, w, 17, &fit));
+            let l = diff_layout(w, 600, NAV_W);
             let head = diff_head(&v, &l, &fit);
             assert!(head.items.iter().all(|i| !matches!(hit(i.id), Hit::DiffAction(_))), "Preview changes nothing, so it offers no choice");
             assert!(head.decos.iter().any(|d| deco_text(d) == "5 files"));
             assert!(!head.decos.iter().any(|d| deco_text(d).starts_with("Only on")), "and has nothing to tell apart");
             fits_in(&head, w);
-            fits_in(&diff_files(&v, l.files[2] - 17, &fit), l.files[2] - 17);
+            fits_in(&diff_files(&v, l.split.list[2] - 17, &fit), l.split.list[2] - 17);
         }
 
         let s = diff_code(&v, 500, &fit);
@@ -2135,7 +2915,7 @@ pub(super) mod tests {
         v.file = 4;
         assert_eq!(message(&v).as_deref(), Some("This file is not shown: it is too big to show."));
         let one = DiffView { report: Report::Ready(DiffReport { on_github: true, here: true, files: v.files()[..1].to_vec() }), ..v.clone() };
-        let head = diff_head(&one, &diff_layout(900, 600, DIFF_FILES_W), &fit);
+        let head = diff_head(&one, &diff_layout(900, 600, NAV_W), &fit);
         assert!(head.decos.iter().any(|d| deco_text(d) == "1 file"));
         let loading = DiffView { report: Report::Loading, ..v };
         assert_eq!(diff_sub(&loading), "Reading the files…");
@@ -2143,34 +2923,25 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn the_diff_list_fits_whole_paths_and_summaries_without_taking_the_comparisons_half() {
-        let mut v = diff_of("", "new\n");
-        let Report::Ready(r) = &mut v.report else { unreachable!() };
-        r.files[0].presence = Presence::OnlyOnGitHub;
-        assert_eq!(diff_files_width(&v, 1400, 0, &fit), DIFF_FILES_W);
+    fn hovering_over_long_list_labels_does_not_change_the_width() {
+        let long = "team/a-repository-with-a-very-long-name";
+        let named = [SourceView { folder: "a/folder/with/a/long/path".to_string(), ..skills_view(long, vec![ok("x")]) }];
+        let main = split_layout(980, HERO_H, 600, NAV_W);
+        let source = nav(&named, &Page::Activity, main.list[2], 600, &fit);
+        let entry = item(&source, id::NAV_REPO);
+        assert!(fit(&printable(long), Font::Body, 0).0 > entry.at[2] - 48, "a long name is clipped, not given more space");
+        fits_in(&source, NAV_W);
 
+        let mut v = diff_of("old\n", "new\n");
+        let Report::Ready(r) = &mut v.report else { unreachable!() };
         let path = "references/library/component-with-a-long-name\u{202e}.md";
-        let Report::Ready(r) = &mut v.report else { unreachable!() };
         r.files[0].path = path.to_string();
-        let width = diff_files_width(&v, 1400, 0, &fit);
-        assert!(width > DIFF_FILES_W && width < 674);
-        for bar in [0, 17] {
-            let wide = diff_files_width(&v, 1400, bar, &fit);
-            assert_eq!(wide, width + bar);
-            let s = diff_files(&v, wide - 2 - bar, &fit);
-            let entry = item(&s, id::FILE);
-            assert!(entry.at[2] - 48 >= fit(&printable(path), Font::Body, 0).0, "escaped paths must fit too");
-            fits_in(&s, wide - 2 - bar);
-        }
-        assert_eq!(diff_files_width(&v, 640, 17, &fit), (640 - 52) / 2);
-
-        let summary = diff_of("old\n", "new\n");
-        let width = diff_files_width(&summary, 1400, 0, &fit);
-        let s = diff_files(&summary, width - 2, &fit);
-        assert!(item(&s, id::FILE).at[2] - 48 >= fit(&file_summary(&summary.files()[0]).2, Font::Caption, 0).0);
-        for report in [Report::Loading, Report::Failed("No connection".to_string()), Report::Ready(DiffReport { on_github: true, here: true, files: vec![] })] {
-            assert_eq!(diff_files_width(&DiffView { report, ..v.clone() }, 980, 17, &fit), DIFF_FILES_W);
-        }
+        let diff = diff_layout(980, 600, NAV_W);
+        assert_eq!(diff.split.list[2], main.list[2]);
+        let files = diff_files(&v, diff.split.list[2], &fit);
+        let entry = item(&files, id::FILE);
+        assert!(fit(&printable(path), Font::Body, 0).0 > entry.at[2] - 48, "a long path is clipped, not given more space");
+        fits_in(&files, NAV_W);
     }
 
     #[test]
@@ -2182,20 +2953,18 @@ pub(super) mod tests {
         v.file = 1;
         v.gaps.push(0);
         for w in [640, 980, 1400] {
-            let narrow = diff_layout(w, 680, DIFF_FILES_W);
-            let wide = diff_layout(w, 680, diff_files_width(&v, w, 17, &fit));
-            let delta = wide.files[2] - narrow.files[2];
+            let narrow = diff_layout(w, 680, NAV_W);
+            let wide = diff_layout(w, 680, NAV_W + 20);
+            let delta = wide.split.list[2] - narrow.split.list[2];
             assert!(delta > 0);
-            assert_eq!(wide.code[2], narrow.code[2] - delta);
-            assert_eq!(wide.code[0], narrow.code[0] + delta);
-            assert_eq!(wide.code_card[0] + wide.code_card[2], w - 20);
-            assert!(wide.code_card[2] >= wide.files_card[2]);
-            for l in [narrow, wide, narrow] {
-                for (card, content) in [(l.files_card, l.files), (l.code_card, l.code)] {
-                    assert_eq!(content[0], card[0] + 1);
-                    assert_eq!(content[2], card[2] - 2);
+            assert_eq!(wide.split.page[2], narrow.split.page[2] - delta);
+            assert_eq!(wide.split.page[0], narrow.split.page[0] + delta);
+            assert_eq!(wide.code_card[0] + wide.code_card[2], w);
+            for l in [&narrow, &wide, &narrow] {
+                for (card, content) in [(l.files_card, l.split.list), (l.code_card, l.split.page)] {
+                    assert_eq!((content[0], content[2]), (card[0], card[2]));
                 }
-                let head = diff_head(&v, &l, &fit);
+                let head = diff_head(&v, l, &fit);
                 let path = head.decos.iter().find(|d| deco_text(d) == v.files()[1].path).unwrap();
                 assert_eq!(deco_at(path)[0], l.code_card[0] + 14);
                 for d in head.decos.iter().filter(|d| deco_at(d)[1] >= DIFF_TOP) {
@@ -2203,9 +2972,9 @@ pub(super) mod tests {
                     let card = if deco_text(d).ends_with("files are different") { l.files_card } else { l.code_card };
                     assert!(x >= card[0] && x + width <= card[0] + card[2], "{d:?}");
                 }
-                let files = diff_files(&v, l.files[2] - 17, &fit);
+                let files = diff_files(&v, l.split.list[2] - 17, &fit);
                 assert!(matches!(item(&files, id::FILE + 1).look, Look::Nav { selected: true, .. }));
-                let code = diff_code(&v, l.code[2], &fit);
+                let code = diff_code(&v, l.split.page[2], &fit);
                 assert!(code.decos.iter().any(|d| deco_text(d) == "line 2"), "the opened unchanged lines stay open");
             }
         }
@@ -2260,7 +3029,7 @@ pub(super) mod tests {
     #[test]
     fn the_diff_header_offers_the_skills_choices_with_the_github_version_accented() {
         let v = diff_of("a\n", "b\n");
-        let s = diff_head(&v, &diff_layout(900, 600, DIFF_FILES_W), &fit);
+        let s = diff_head(&v, &diff_layout(900, 600, NAV_W), &fit);
         assert_eq!(item(&s, id::DIFF_ACTION).look, Look::Button { kind: Kind::Accent, glyph: None });
         assert_eq!(item(&s, id::DIFF_ACTION + 1).text, "Keep my version");
         assert!(item(&s, id::DIFF_ACTION).at[0] > item(&s, id::DIFF_ACTION + 1).at[0], "the accented choice is last");
@@ -2287,22 +3056,44 @@ pub(super) mod tests {
     #[test]
     fn the_page_shown_stays_while_it_is_there_and_otherwise_the_repository_that_needs_the_user_comes_first() {
         let shown = |id: &str| Some(Page::Repo(id.to_string()));
-        let views = vec![view("o/a", vec![ok("x")]), view("o/b", vec![edited("e")]), unreadable("o/c")];
-        assert_eq!(settle(shown("o/a"), &views), shown("o/a"));
-        assert_eq!(settle(Some(Page::Settings), &views), Some(Page::Settings));
-        assert_eq!(settle(Some(Page::Activity), &[]), Some(Page::Activity));
-        assert_eq!(settle(shown("o/removed"), &views), shown("o/b"));
-        assert_eq!(settle(None, &views), shown("o/b"));
-        let paused = vec![view("o/a", vec![ok("x")]), RepoView { enabled: false, ..view("o/b", vec![edited("e")]) }];
-        assert_eq!(settle(None, &paused), shown("o/a"), "a paused repository does not ask for the user");
-        assert_eq!(settle(shown("o/a"), &[]), None, "the welcome page, when there is nothing else");
+        let mut cfg = Config::default();
+        cfg.edit(|s, _| {
+            s.extend(["o/a", "o/b", "o/c"].map(source_cfg));
+            s[0].lanes = s[0].lanes.clone().with(SourceKind::Agents, "o/a-agents".to_string());
+        });
+        let views = vec![skills_view("o/a", vec![ok("x")]), skills_view("o/b", vec![edited("e")]), unreadable_source("o/c")];
+        assert_eq!(settle(shown("o/a"), &views, &cfg), shown("o/a"));
+        assert_eq!(settle(shown("o/a-agents"), &views, &cfg), shown("o/a"), "a lane ID leads to its source");
+        assert_eq!(settle(Some(Page::Settings), &views, &cfg), Some(Page::Settings));
+        assert_eq!(settle(Some(Page::Activity), &[], &cfg), Some(Page::Activity));
+        assert_eq!(settle(shown("o/removed"), &views, &cfg), shown("o/b"));
+        assert_eq!(settle(None, &views, &cfg), shown("o/b"));
+        let paused = vec![skills_view("o/a", vec![ok("x")]), SourceView { enabled: false, ..skills_view("o/b", vec![edited("e")]) }];
+        assert_eq!(settle(None, &paused, &cfg), shown("o/a"), "a paused repository does not ask for the user");
+        assert_eq!(settle(shown("o/a"), &[], &cfg), None, "the welcome page, when there is nothing else");
+        let a = cfg.find_source("o/a").unwrap();
+        assert_eq!(cfg.find("o/a-agents"), Some(&lane_config(a, SourceKind::Agents, "o/a-agents")), "a row's lane equals the one the settings build");
     }
 
     #[test]
-    fn add_says_how_it_reads_the_source_folder() {
-        assert_eq!(spec_hint(" owner/other ", SourceKind::Skills), Ok("owner/other · the top of the repository on the default branch".to_string()));
-        assert_eq!(spec_hint("https://github.com/o/r/tree/dev/x", SourceKind::Skills), Ok("o/r · the x folder on dev".to_string()));
-        assert_eq!(spec_hint("", SourceKind::Skills), Err("Enter a repository like owner/name".to_string()));
+    fn add_says_how_it_reads_the_location() {
+        assert_eq!(location_hint(" owner/other "), Ok("owner/other · the whole repository on the default branch".to_string()));
+        assert_eq!(location_hint("https://github.com/o/r/tree/dev/x"), Ok("o/r · dev/x (GitHub tells where the branch name ends)".to_string()));
+        assert_eq!(location_hint(""), Err("Enter a repository like owner/name or paste its GitHub address.".to_string()));
+        assert!(location_hint("https://github.com/o/r/blob/main/a.md").is_err());
+    }
+
+    fn location_preview(plugin: bool) -> crate::engine::LocationPreview {
+        use crate::inventory::{Inventory, Item, PluginDetails, Status};
+        use crate::sources::{Lanes, SourceConfig, Types};
+        let lanes = Lanes::default().with(SourceKind::Skills, "tools".into()).with(SourceKind::Plugins, "tools-plugins".into());
+        let source = SourceConfig { id: "tools".into(), repo: "team/tools".into(), branch: "main".into(), lanes, ..SourceConfig::default() };
+        let mut inventory = Inventory::default();
+        inventory.skills.push(Item { path: "skills/alpha".into(), install_name: "alpha".into(), status: Status::Installable, data: vec![] });
+        let status = if plugin { Status::Installable } else { Status::Standalone };
+        let data = PluginDetails { publisher: Some("Team".into()), version: Some("1.0.0".into()), ..PluginDetails::default() };
+        inventory.plugins.push(Item { path: "plugins/x".into(), install_name: "x".into(), status, data });
+        crate::engine::LocationPreview { source, branch: "main".into(), follows_default: true, types: Types::default(), inventory, destinations: vec![] }
     }
 
     #[test]
@@ -2311,13 +3102,12 @@ pub(super) mod tests {
         use crate::config::Config;
 
         let id = format!("saved-{}", "w".repeat(120));
-        let source = RepoConfig { id: id.clone(), ..repo("Team/Tools") };
-        let mut app = App::new(Config { repos: vec![source], ..Config::default() }, "not used".into());
+        let source = RepoConfig { id: id.clone(), path: String::new(), branch: String::new(), ..repo("Team/Tools") };
+        let mut app = App::new(Config::from_lanes(vec![source]), "not used".into());
         let queued = app.queued().len();
-        let spec = RepoSpec::parse("https://github.com/team/tools/tree/main/skills").unwrap();
-        let refused = app.preview_source(&spec, SourceKind::Skills, None).expect("the refusal belongs on the Add source page");
+        let refused = app.preview_location("team/tools", None).expect("the refusal belongs on the Add source page");
         assert_eq!(app.queued().len(), queued, "a duplicate needs no worker job");
-        assert!(app.confirm_source(refused).is_err());
+        assert!(app.confirm_source(refused, false).is_err());
 
         // Like DrawText, report a too-wide word even when asked to wrap the paragraph.
         let measure = |text: &str, font, width| {
@@ -2326,7 +3116,8 @@ pub(super) mod tests {
             (w.max(longest), h)
         };
         let width = 980 - NAV_W;
-        let refusal = source_preview(app.draft().unwrap(), width, &measure);
+        let skills = std::path::Path::new(r"X:\skills");
+        let refusal = source_preview(app.draft().unwrap(), skills, width, &measure);
         let body = item(&refusal, id::INFO_TEXT);
         assert_eq!(body.look, Look::Text { font: Font::Body, ink: Role::Text, flags: WRAP });
         assert_eq!(body.text.replace('\n', ""), format!("This source is already set up. Its ID is '{id}'."));
@@ -2337,60 +3128,92 @@ pub(super) mod tests {
         assert!(refusal.height <= 680 - HERO_H);
         fits_in(&refusal, width);
 
-        let different = RepoSpec::parse("team/other").unwrap();
-        app.preview_source(&different, SourceKind::Skills, None).unwrap();
-        let next = source_preview(app.draft().unwrap(), width, &measure);
+        app.preview_location("team/other", None).unwrap();
+        let next = source_preview(app.draft().unwrap(), skills, width, &measure);
         assert!(next.items.iter().all(|i| !i.text.contains("already set up") && !i.text.contains(&id)));
     }
 
     #[test]
-    fn source_preview_only_offers_to_add_a_confirmable_listing() {
+    fn source_preview_asks_for_plugin_consent_only_when_plugins_would_sync() {
         use crate::app::DraftInput;
-        use crate::source::{PreviewDestination, SourcePreview};
-        let source = RepoConfig { repo: "team/tools".into(), path: "rules".into(), kind: SourceKind::Instructions, id: "rules".into(), ..Default::default() };
-        let input = std::sync::Arc::new(DraftInput { source, ticket: 1 });
-        let preview = SourcePreview {
-            plugins: None,
-            kind: SourceKind::Instructions,
-            names: vec!["style.instructions.md".into()],
-            errors: vec![],
-            destination: PreviewDestination::Resolved(r"X:\example\rules".into()),
-        };
-        for (stage, add, cancel) in [
-            (DraftStage::Loading, false, true),
-            (DraftStage::Failed("Cannot read the listing.".into()), false, true),
-            (DraftStage::Reviewed(SourcePreview { names: vec![], ..preview.clone() }.into()), false, true),
-            (DraftStage::Reviewed(preview.into()), true, true),
-            (DraftStage::Saving, false, false),
+        let input = std::sync::Arc::new(DraftInput { ticket: 1, text: "team/tools".into(), every: None });
+        let skills = std::path::Path::new(r"X:\skills");
+        let mut nothing = location_preview(false);
+        nothing.inventory.skills.clear();
+        // (stage, Add and check, both consent buttons, Cancel)
+        for (stage, add, consent, cancel) in [
+            (DraftStage::Loading, false, false, true),
+            (DraftStage::Failed("Cannot read the listing.".into()), false, false, true),
+            (DraftStage::Reviewed(nothing.into()), false, false, true),
+            (DraftStage::Reviewed(location_preview(false).into()), true, false, true),
+            (DraftStage::Reviewed(location_preview(true).into()), false, true, true),
+            (DraftStage::Saving, false, false, false),
         ] {
-            let surface = source_preview(&SourceDraft { input: input.clone(), stage }, 360, &fit);
-            assert_eq!(surface.items.iter().any(|i| i.id == id::CONFIRM_SOURCE), add);
-            assert_eq!(surface.items.iter().any(|i| i.id == id::CANCEL_SOURCE), cancel);
-            if add {
-                let body = &item(&surface, id::INFO_TEXT).text;
-                assert!(body.contains("Matched 1 instruction file:") && body.contains("style.instructions.md") && body.contains("Destination:"));
+            for width in [360, 980 - NAV_W] {
+                let surface = source_preview(&SourceDraft { input: input.clone(), stage: stage.clone() }, skills, width, &fit);
+                let text = |id| surface.items.iter().find(|i| i.id == id).map(|i| i.text.as_str());
+                assert_eq!(text(id::CONFIRM_SOURCE) == Some("Add and check"), add, "{stage:?}");
+                assert_eq!(text(id::CONFIRM_SOURCE) == Some("Add without approving plugins"), consent, "{stage:?}");
+                assert_eq!(text(id::APPROVE_SOURCE) == Some("Add and approve these plugins"), consent, "{stage:?}");
+                assert_eq!(text(id::CANCEL_SOURCE).is_some(), cancel);
+                if add || consent {
+                    let body = text(id::INFO_TEXT).unwrap().replace('\n', " ");
+                    assert!(body.contains("Branch: main (default branch)") && body.contains("alpha") && body.contains(r"X:\skills"), "{body}");
+                    assert!(body.contains("Plugins: Sync on"), "{body}");
+                }
+                if consent {
+                    let body = text(id::INFO_TEXT).unwrap().replace('\n', " ");
+                    assert!(body.contains("Publisher: Team") && body.contains("1.0.0"), "{body}");
+                }
+                fits_in(&surface, width);
+                no_overlaps(&surface);
             }
+        }
+    }
+
+    fn no_overlaps(surface: &Surface) {
+        for (n, a) in surface.items.iter().enumerate() {
+            for b in &surface.items[n + 1..] {
+                let apart = a.at[0] + a.at[2] <= b.at[0] || b.at[0] + b.at[2] <= a.at[0] || a.at[1] + a.at[3] <= b.at[1] || b.at[1] + b.at[3] <= a.at[1];
+                assert!(apart, "{} and {} overlap: {:?} {:?}", a.id, b.id, a.at, b.at);
+            }
+        }
+    }
+
+    #[test]
+    fn continuation_failed_and_empty_previews_offer_both_retry_and_edit() {
+        use crate::app::DraftInput;
+        let mut nothing = location_preview(false);
+        nothing.inventory.skills.clear();
+        for stage in [DraftStage::Reviewed(nothing.into()), DraftStage::Failed("No such branch.".into())] {
+            let draft = SourceDraft { input: std::sync::Arc::new(DraftInput { ticket: 1, text: "team/tools".into(), every: None }), stage };
+            let surface = source_preview(&draft, std::path::Path::new(r"X:\skills"), 360, &fit);
+            assert!(surface.items.iter().any(|i| i.text == "Retry"), "a preview that could not be added needs Retry");
+            assert!(surface.items.iter().any(|i| i.text == "Edit"), "a preview that could not be added needs Edit");
+            assert!(!surface.items.iter().any(|i| i.id == id::CONFIRM_SOURCE || i.id == id::APPROVE_SOURCE));
             fits_in(&surface, 360);
         }
     }
 
     #[test]
-    fn continuation_empty_and_rejected_previews_offer_both_retry_and_edit() {
+    fn issue8_a_preview_that_finds_nothing_to_sync_leads_with_edit() {
         use crate::app::DraftInput;
-        use crate::source::{PreviewDestination, SourcePreview};
-        let source = RepoConfig { kind: SourceKind::Agents, ..Default::default() };
-        for errors in [vec![], vec!["unsafe file".into()]] {
-            let preview = SourcePreview { kind: source.kind, names: vec![], destination: PreviewDestination::NotChecked, errors, plugins: None };
-            let draft =
-                SourceDraft { input: std::sync::Arc::new(DraftInput { source: source.clone(), ticket: 1 }), stage: DraftStage::Reviewed(preview.into()) };
-            let surface = source_preview(&draft, 360, &fit);
-            assert!(surface.items.iter().any(|i| i.text == "Retry"), "a preview that could not be added needs Retry");
-            assert!(surface.items.iter().any(|i| i.text == "Edit"), "a preview that could not be added needs Edit");
-            assert!(!surface.items.iter().any(|i| i.id == id::CONFIRM_SOURCE));
-            fits_in(&surface, 360);
+        let mut nothing = location_preview(false);
+        nothing.inventory.skills.clear();
+        let input = std::sync::Arc::new(DraftInput { ticket: 1, text: "team/tools".into(), every: None });
+        let (accent, standard) = (Look::Button { kind: Kind::Accent, glyph: None }, Look::Button { kind: Kind::Standard, glyph: None });
+        let cases = [
+            (DraftStage::Reviewed(nothing.into()), id::EDIT_SOURCE, id::RETRY_SOURCE),
+            (DraftStage::Failed("No network.".into()), id::RETRY_SOURCE, id::EDIT_SOURCE),
+        ];
+        for (stage, lead, other) in cases {
+            let draft = SourceDraft { input: input.clone(), stage };
+            let s = source_preview(&draft, std::path::Path::new(r"X:\skills"), 360, &fit);
+            let (first, second) = (item(&s, lead), item(&s, other));
+            assert_eq!((&first.look, &second.look), (&accent, &standard), "{:?} leads with {:?}", draft.stage, first.text);
+            assert!((first.at[1], first.at[0]) < (second.at[1], second.at[0]), "{:?}: the leading button comes first", draft.stage);
         }
     }
-
     #[test]
     fn a_question_has_a_text_box_only_with_a_field_and_its_buttons_below_everything() {
         let q = Question {

@@ -10,11 +10,11 @@ use tiny_skill_sync::app::{
     self, Answer, App, BUSY_RETRY, Done, DraftStage, FAILURE_BACKOFF, Job, MIN_POLL_GAP, RESUME_GRACE, SIGN_IN_GRACE, SettingsSource, Settled,
 };
 use tiny_skill_sync::board::{Action, Health, Level, Row};
-use tiny_skill_sync::config::{Config, RepoSpec};
+use tiny_skill_sync::config::Config;
 use tiny_skill_sync::engine::{self, Engine, EngineError, Resolution, SyncReport};
 use tiny_skill_sync::interval::{Interval, Unit};
 use tiny_skill_sync::reconcile::Verdict;
-use tiny_skill_sync::source::{PreviewDestination, SourceKind, SourcePreview};
+use tiny_skill_sync::source::SourceKind;
 
 const DAY: i64 = 24 * 60 * 60;
 
@@ -98,6 +98,7 @@ fn answer(app: &mut App, result: Result<Answer, EngineError>, next_wake: Option<
             config_saves: Vec::new(),
             settings_checked: false,
             update: None,
+            seen: None,
         },
         now,
     )
@@ -108,7 +109,7 @@ fn broken() -> Result<Answer, EngineError> {
 }
 
 fn checked_nothing() -> Result<Answer, EngineError> {
-    Ok(Answer::Checked { verified: None, sync: SyncReport { repos: Vec::new(), notes: Vec::new(), warnings: Vec::new() } })
+    Ok(Answer::Checked { verified: None, sync: SyncReport { repos: Vec::new(), notes: Vec::new(), warnings: Vec::new(), seen: Vec::new() } })
 }
 
 fn app_for(s: &Setup) -> App {
@@ -152,7 +153,7 @@ fn write_portable(exe_dir: &std::path::Path, cfg: &Config) {
     });
     let sources = serde_json::json!({
         "version": 1,
-        "repos": serde_json::to_value(&cfg.repos).unwrap()
+        "repos": serde_json::to_value(cfg.repos()).unwrap()
     });
     std::fs::write(exe_dir.join(tiny_skill_sync::portable::SETTINGS_FILE), serde_json::to_vec_pretty(&settings).unwrap()).unwrap();
     std::fs::write(exe_dir.join(tiny_skill_sync::portable::SOURCES_FILE), serde_json::to_vec_pretty(&sources).unwrap()).unwrap();
@@ -162,53 +163,45 @@ fn write_portable(exe_dir: &std::path::Path, cfg: &Config) {
 fn source_preview_dismissal_failure_and_late_answers_cannot_save() {
     let mut s = Setup::fresh("app-source-preview");
     let mut app = started(&mut s);
-    let spec = RepoSpec::parse("o/new").unwrap();
     s.remote.put("o/new", "alpha/SKILL.md", "one");
     let before = s.w.snapshot();
-    let first = app.preview_source(&spec, SourceKind::Skills, None).unwrap();
+    assert!(app.preview_location("o/new/extra", None).is_err(), "a malformed location is refused at once");
+    assert!(app.queued().is_empty());
+    let first = app.preview_location("o/new", None).unwrap();
     let order = app.next_order().unwrap();
     let late = app::perform(&mut s.engine, &order, &cancel_flag());
     app.dismiss_source();
-    let second = app.preview_source(&spec, SourceKind::Agents, None).unwrap();
+    let second = app.preview_location("https://github.com/o/new", None).unwrap();
     app.finish(late, T0);
     assert!(matches!(app.draft().unwrap().stage, DraftStage::Loading));
-    assert!(app.confirm_source(first).is_err());
-    assert!(app.confirm_source(second).is_err());
+    assert!(app.confirm_source(first, false).is_err());
+    assert!(app.confirm_source(second, false).is_err());
     answer(&mut app, broken(), None, T0);
     assert!(matches!(app.draft().unwrap().stage, DraftStage::Failed(_)));
-    assert!(app.confirm_source(second).is_err());
+    assert!(app.confirm_source(second, false).is_err());
     assert!(app.queued().is_empty());
 
-    let preview = SourcePreview {
-        plugins: None,
-        kind: SourceKind::Agents,
-        names: vec!["one.agent.md".into()],
-        destination: PreviewDestination::Resolved(s.w.root.join("agents")),
-        errors: vec![],
-    };
-    for rejected in [
-        SourcePreview { kind: SourceKind::Skills, ..preview.clone() },
-        SourcePreview { errors: vec!["unsafe name".into()], ..preview.clone() },
-        SourcePreview { destination: PreviewDestination::Held("ambiguous".into()), ..preview.clone() },
-        SourcePreview { destination: PreviewDestination::NotChecked, ..preview.clone() },
-    ] {
-        let ticket = app.preview_source(&spec, SourceKind::Agents, None).unwrap();
-        let id = app.draft().unwrap().input.source.id.clone();
-        answer(&mut app, Ok(Answer::SourcePreview(id, rejected)), None, T0);
-        assert!(app.confirm_source(ticket).is_err());
-    }
-    let ticket = app.preview_source(&spec, SourceKind::Agents, None).unwrap();
-    let id = app.draft().unwrap().input.source.id.clone();
-    answer(&mut app, Ok(Answer::SourcePreview(id, preview)), None, T0);
+    let ticket = app.preview_location("o/new", None).unwrap();
+    run_next(&mut app, &mut s.engine, T0);
+    let DraftStage::Reviewed(preview) = &app.draft().unwrap().stage else { panic!("expected a finished preview") };
+    assert_eq!((preview.source.repo.as_str(), preview.branch.as_str(), preview.follows_default), ("o/new", "main", true));
+    assert_eq!(preview.inventory.skills[0].install_name, "alpha");
+    let mut empty = (**preview).clone();
+    empty.inventory.skills.clear();
     app.dismiss_source();
-    assert!(app.confirm_source(ticket).is_err());
+    assert!(app.confirm_source(ticket, false).is_err());
+
+    let ticket = app.preview_location("o/new", None).unwrap();
+    answer(&mut app, Ok(Answer::SourcePreview(empty.into())), None, T0);
+    assert!(matches!(app.draft().unwrap().stage, DraftStage::Reviewed(_)));
+    assert!(app.confirm_source(ticket, false).is_err(), "nothing would sync");
     assert!(app.is_idle());
     assert_eq!(s.w.snapshot(), before);
 }
 
-#[test]
-fn plugin_app_approves_the_reviewed_plugins_only_after_saving() {
-    let w = World::new("app-plugin-save");
+/// An app with local settings in a file, on a fake GitHub with a marketplace plugin and a skill in `o/fixtures`.
+fn plugin_app(name: &str) -> (World, std::sync::Arc<FakeRemote>, FakePluginManager, Engine, App, PathBuf) {
+    let w = World::new(name);
     let remote = FakeRemote::new();
     let manager = FakePluginManager::new(w.root.join("native"));
     let (mut engine, _) = w.plugin_engine(&remote, &manager);
@@ -222,8 +215,14 @@ fn plugin_app_approves_the_reviewed_plugins_only_after_saving() {
     run(&mut app, &mut engine, T0);
     remote.put(REPO, "marketplace.json", r#"{"name":"tools","plugins":[{"name":"alpha","source":"./plug"}]}"#);
     remote.put(REPO, "plug/plugin.json", r#"{"name":"alpha","version":"1","author":{"name":"Review Team"}}"#);
-    let spec = RepoSpec::parse("https://github.com/o/fixtures/tree/main").unwrap();
-    let ticket = app.preview_source(&spec, SourceKind::Plugins, None).unwrap();
+    remote.put(REPO, "skills/beta/SKILL.md", "beta");
+    (w, remote, manager, engine, app, file)
+}
+
+#[test]
+fn plugin_app_approves_the_reviewed_plugins_only_after_saving() {
+    let (w, _remote, manager, mut engine, mut app, file) = plugin_app("app-plugin-save");
+    let ticket = app.preview_location(REPO, None).unwrap();
     run_next(&mut app, &mut engine, T0);
     assert!(manager.calls().is_empty());
     assert!(w.state().plugin_sources().is_empty());
@@ -231,28 +230,44 @@ fn plugin_app_approves_the_reviewed_plugins_only_after_saving() {
     use std::os::windows::fs::OpenOptionsExt;
     use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
     let held = std::fs::OpenOptions::new().read(true).share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE).open(&file).unwrap();
-    app.confirm_source(ticket).unwrap();
+    app.confirm_source(ticket, true).unwrap();
     run_next(&mut app, &mut engine, T0);
     assert!(matches!(app.draft().unwrap().stage, DraftStage::Failed(_)));
     assert!(manager.calls().is_empty(), "a refused save never records approval");
     assert!(w.state().plugin_sources().is_empty());
     drop(held);
 
-    let ticket = app.preview_source(&spec, SourceKind::Plugins, None).unwrap();
+    let ticket = app.preview_location(REPO, None).unwrap();
     run_next(&mut app, &mut engine, T0);
-    let draft = app.draft().unwrap();
-    let id = draft.input.source.id.clone();
-    let DraftStage::Reviewed(preview) = &draft.stage else { panic!("expected a completed preview") };
+    let DraftStage::Reviewed(preview) = &app.draft().unwrap().stage else { panic!("expected a completed preview") };
     let preview = preview.clone();
-    app.confirm_source(ticket).unwrap();
-    assert!(matches!(app.queued().front(), Some(Job::SaveSource(_, reviewed)) if std::sync::Arc::ptr_eq(reviewed, &preview)));
+    let id = preview.source.id.clone();
+    let plugins = preview.source.lanes.id(SourceKind::Plugins).unwrap().to_owned();
+    let skills = preview.source.lanes.id(SourceKind::Skills).unwrap().to_owned();
+    app.confirm_source(ticket, true).unwrap();
+    assert!(matches!(app.queued().front(), Some(Job::SaveSource(_, reviewed, true)) if std::sync::Arc::ptr_eq(reviewed, &preview)));
     run_next(&mut app, &mut engine, T0);
-    assert!(Config::load_sources(&file).unwrap().find(&id).is_some());
-    assert_eq!(w.state().plugin_sources()[&id].approved, [("alpha".into(), Some("Review Team".into()))].into());
+    assert!(Config::load_sources(&file).unwrap().find_source(&id).is_some());
+    assert_eq!(w.state().plugin_sources()[&plugins].approved, [("alpha".into(), Some("Review Team".into()))].into());
     assert_eq!(manager.calls(), [PluginCall::Home]);
-    assert_eq!(app.queued().front(), Some(&Job::Check(Some(id))));
+    assert_eq!(app.queued().front(), Some(&Job::Check(Some(skills))));
 }
 
+#[test]
+fn plugin_app_adds_without_approval_and_never_asks_copilot() {
+    let (w, _remote, manager, mut engine, mut app, file) = plugin_app("app-plugin-no-approval");
+    let ticket = app.preview_location(REPO, None).unwrap();
+    run_next(&mut app, &mut engine, T0);
+    let DraftStage::Reviewed(preview) = &app.draft().unwrap().stage else { panic!("expected a completed preview") };
+    let id = preview.source.id.clone();
+    app.confirm_source(ticket, false).unwrap();
+    let (job, _) = run_next(&mut app, &mut engine, T0);
+    assert!(matches!(job, Job::SaveSource(_, _, false)));
+    let saved = Config::load_sources(&file).unwrap();
+    assert!(saved.find_source(&id).is_some());
+    assert!(manager.calls().is_empty(), "adding without approval never launches Copilot CLI");
+    assert!(w.state().plugin_sources().values().all(|r| r.approved.is_empty()));
+}
 #[test]
 fn plugin_app_keeps_attention_rows_and_choices_on_a_timer_304() {
     use std::sync::atomic::Ordering;
@@ -285,60 +300,88 @@ fn plugin_app_keeps_attention_rows_and_choices_on_a_timer_304() {
     app.want(Job::Check(None));
     remote.reset();
     assert_eq!(run_next(&mut app, &mut engine, at), (Job::Check(None), false));
-    assert_eq!(manager.calls().len(), count + 3);
-    assert_eq!(remote.calls().conditional, 0);
+    assert_eq!(manager.calls().len(), count, "plugins nobody approved are shown without asking Copilot CLI");
+    assert_eq!(remote.calls().conditional, 1, "with nothing approved, an unchanged source costs one request like any other");
+    assert_eq!(row(&app, "alpha"), review);
 }
 
 #[test]
-fn plugin_app_add_chooses_a_fresh_id_before_showing_the_preview() {
+fn plugin_app_add_reserves_fresh_ids_and_refuses_one_taken_before_saving() {
     use tiny_skill_sync::state::State;
 
-    let w = World::new("app-plugin-add-id");
-    let remote = FakeRemote::new();
-    remote.put(REPO, "marketplace.json", r#"{"name":"tools","plugins":[{"name":"alpha","source":"./plug"}]}"#);
-    remote.put(REPO, "plug/plugin.json", r#"{"name":"alpha","version":"1"}"#);
-    let manager = FakePluginManager::new(w.root.join("native"));
-    let (mut engine, _) = w.plugin_engine(&remote, &manager);
-    let file = w.home.join(tiny_skill_sync::config::CONFIG_FILE);
-    let dir = w.root.join("exe");
-    std::fs::create_dir_all(&dir).unwrap();
-    let initial = Config { skills_dir: Some(w.skills.to_string_lossy().into_owned()), ..Config::default() };
-    initial.save(&file).unwrap();
+    let (w, _remote, manager, mut engine, mut app, file) = plugin_app("app-plugin-add-id");
     let mut state = State::default();
     state.repo_mut("o-fixtures").last_check = Some(T0);
     state.save(&w.state_file()).unwrap();
-    let mut app = App::new(initial, w.skills.clone());
-    app.set_settings_source(SettingsSource::new(file.clone(), dir));
-    run(&mut app, &mut engine, T0);
-    let spec = RepoSpec::parse("https://github.com/o/fixtures/tree/main").unwrap();
-    let ticket = app.preview_source(&spec, SourceKind::Plugins, None).unwrap();
+    let lanes = |app: &App| {
+        let DraftStage::Reviewed(preview) = &app.draft().unwrap().stage else { panic!("expected a finished preview") };
+        let ids: Vec<String> = [SourceKind::Skills, SourceKind::Agents, SourceKind::Instructions, SourceKind::Plugins]
+            .into_iter()
+            .filter_map(|kind| preview.source.lanes.id(kind).map(str::to_owned))
+            .collect();
+        (preview.source.id.clone(), ids)
+    };
+    let ticket = app.preview_location(REPO, None).unwrap();
     run_next(&mut app, &mut engine, T0);
-    let draft = app.draft().unwrap();
-    assert!(matches!(draft.stage, DraftStage::Reviewed(_)));
-    assert_eq!(draft.input.source.id, "o-fixtures-2");
+    let (_, ids) = lanes(&app);
+    assert!(!ids.is_empty() && !ids.contains(&"o-fixtures".to_string()), "{ids:?}");
 
-    // Another writer may reserve the ID before confirmation, even with no settings entry.
-    let source = draft.input.source.clone();
+    // Another writer may take a lane ID before confirmation, even with no settings entry.
     let mut occupied = state.clone();
-    let record = tiny_skill_sync::state::PluginSourceState::new(&source, &w.root.join("native"), "tools");
-    occupied.set_plugin_source(&source.id, record).unwrap();
+    occupied.repo_mut(&ids[0]).last_check = Some(T0);
     occupied.save(&w.state_file()).unwrap();
     let before = w.snapshot();
-    app.confirm_source(ticket).unwrap();
+    app.confirm_source(ticket, true).unwrap();
     run_next(&mut app, &mut engine, T0);
-    assert!(matches!(&app.draft().unwrap().stage, DraftStage::Failed(why) if why.contains("'o-fixtures-2'") && why.contains("already used")));
+    assert!(matches!(&app.draft().unwrap().stage, DraftStage::Failed(why) if why.contains("again")), "{:?}", app.draft().unwrap().stage);
     assert!(manager.calls().is_empty());
     assert_eq!(w.snapshot(), before);
 
-    let ticket = app.preview_source(&spec, SourceKind::Plugins, None).unwrap();
+    let ticket = app.preview_location(REPO, None).unwrap();
     run_next(&mut app, &mut engine, T0);
-    assert_eq!(app.draft().unwrap().input.source.id, "o-fixtures-3");
-    app.confirm_source(ticket).unwrap();
+    let (id, fresh) = lanes(&app);
+    assert!(fresh.iter().all(|lane| !ids.contains(lane)), "{fresh:?} {ids:?}");
+    app.confirm_source(ticket, false).unwrap();
     run_next(&mut app, &mut engine, T0);
-    assert!(Config::load_sources(&file).unwrap().find("o-fixtures-3").is_some());
-    let saved = w.state();
-    assert_eq!(saved.repo("o-fixtures"), state.repo("o-fixtures"));
-    assert!(saved.plugin_sources().contains_key("o-fixtures-3"));
+    assert!(Config::load_sources(&file).unwrap().find_source(&id).is_some());
+    assert_eq!(w.state().repo("o-fixtures"), occupied.repo("o-fixtures"));
+    assert_eq!(w.state().repo(&ids[0]), occupied.repo(&ids[0]));
+}
+
+#[test]
+fn a_listing_that_changed_after_the_preview_saves_nothing() {
+    let (w, remote, manager, mut engine, mut app, file) = plugin_app("app-source-changed");
+    let ticket = app.preview_location(REPO, None).unwrap();
+    run_next(&mut app, &mut engine, T0);
+    remote.put(REPO, "skills/gamma/SKILL.md", "gamma");
+    let before = w.snapshot();
+    let saved = std::fs::read(&file).unwrap();
+    app.confirm_source(ticket, true).unwrap();
+    run_next(&mut app, &mut engine, T0);
+    assert!(matches!(&app.draft().unwrap().stage, DraftStage::Failed(why) if why.contains("changed since the preview")), "{:?}", app.draft().unwrap().stage);
+    assert_eq!(std::fs::read(&file).unwrap(), saved, "the settings were not touched");
+    assert!(app.cfg().sources().is_empty());
+    assert!(manager.calls().is_empty());
+    assert_eq!(w.snapshot(), before);
+    assert!(app.queued().is_empty());
+}
+
+#[test]
+fn a_location_already_set_up_is_refused_without_saving() {
+    let mut s = Setup::fresh("app-source-duplicate");
+    s.cfg = config(vec![repo("nw", "o/new", ""), tiny_skill_sync::config::RepoConfig { branch: "main".into(), ..repo("fx", REPO, "skills") }]);
+    let mut app = started(&mut s);
+    let before = s.w.snapshot();
+    app.preview_location("O/New", None).unwrap();
+    assert!(app.queued().is_empty(), "a bare duplicate needs no worker job");
+    assert!(matches!(&app.draft().unwrap().stage, DraftStage::AlreadySetUp(id) if id == "nw"));
+
+    let ticket = app.preview_location("https://github.com/o/fixtures/tree/main/skills", None).unwrap();
+    run_next(&mut app, &mut s.engine, T0);
+    assert!(matches!(&app.draft().unwrap().stage, DraftStage::AlreadySetUp(id) if id == "fx"), "{:?}", app.draft().unwrap().stage);
+    assert!(app.confirm_source(ticket, false).is_err());
+    assert!(app.queued().is_empty());
+    assert_eq!(s.w.snapshot(), before);
 }
 
 #[test]
@@ -351,29 +394,30 @@ fn source_preview_portable_save_must_finish_before_a_check_is_queued() {
     app.set_settings_source(store);
     run(&mut app, &mut s.engine, T0);
     s.remote.put("o/new", "one/SKILL.md", "one");
-    let spec = RepoSpec::parse("o/new").unwrap();
     for conflict in [true, false] {
         let before = s.w.snapshot();
-        let ticket = app.preview_source(&spec, SourceKind::Skills, None).unwrap();
+        let ticket = app.preview_location("o/new", None).unwrap();
         run_next(&mut app, &mut s.engine, T0);
         assert_eq!(s.w.snapshot(), before, "the preview changed a file");
-        app.confirm_source(ticket).unwrap();
+        let DraftStage::Reviewed(preview) = &app.draft().unwrap().stage else { panic!("expected a finished preview") };
+        let skills = preview.source.lanes.id(SourceKind::Skills).unwrap().to_owned();
+        app.confirm_source(ticket, false).unwrap();
         assert!(matches!(app.queued().as_slices(), ([Job::SaveSource(..)], [])));
         assert_eq!(app.cfg(), &shared);
         if conflict {
             let mut other = shared.clone();
-            other.repos.clear();
+            other.clear_sources();
             write_portable(&dir, &other);
         }
         run_next(&mut app, &mut s.engine, T0);
         if conflict {
-            assert!(app.is_idle() && matches!(app.draft().unwrap().stage, DraftStage::Failed(_)));
+            assert!(app.is_idle() && matches!(&app.draft().unwrap().stage, DraftStage::Failed(why) if why.contains("settings changed")));
             assert_eq!(app.cfg(), &shared);
-            assert!(tiny_skill_sync::portable::load_sources(&dir).unwrap().unwrap().repos.is_empty());
+            assert!(tiny_skill_sync::portable::load_sources(&dir).unwrap().unwrap().repos().is_empty());
             write_portable(&dir, &shared);
         } else {
-            assert_eq!(app.queued(), &[Job::Check(Some("o-new".into()))]);
-            assert_eq!(app.cfg().repos.len(), 2);
+            assert_eq!(app.queued(), &[Job::Check(Some(skills))]);
+            assert_eq!(app.cfg().sources().len(), 2);
             assert_eq!(tiny_skill_sync::portable::load_sources(&dir).unwrap().as_ref(), Some(app.cfg()));
         }
         assert!(s.w.skill_names().is_empty());
@@ -391,10 +435,11 @@ fn dismissing_a_source_during_portable_save_keeps_the_save_and_following_check()
     run(&mut app, &mut s.engine, T0);
 
     s.remote.put("o/new", "one/SKILL.md", "one");
-    let spec = RepoSpec::parse("o/new").unwrap();
-    let ticket = app.preview_source(&spec, SourceKind::Skills, None).unwrap();
+    let ticket = app.preview_location("o/new", Some(Interval::parse("6h").unwrap())).unwrap();
     run_next(&mut app, &mut s.engine, T0);
-    app.confirm_source(ticket).unwrap();
+    let DraftStage::Reviewed(preview) = &app.draft().unwrap().stage else { panic!("expected a finished preview") };
+    let (id, skills) = (preview.source.id.clone(), preview.source.lanes.id(SourceKind::Skills).unwrap().to_owned());
+    app.confirm_source(ticket, false).unwrap();
     let order = app.next_order().unwrap();
     assert!(matches!(order.job, Job::SaveSource(..)));
 
@@ -404,38 +449,94 @@ fn dismissing_a_source_during_portable_save_keeps_the_save_and_following_check()
 
     assert!(settled.feedback.as_deref().is_some_and(|text| text.starts_with("Added ")));
     assert!(app.draft().is_none());
-    assert_eq!(app.cfg().repos.len(), shared.repos.len() + 1);
+    assert_eq!(app.cfg().sources().len(), shared.sources().len() + 1);
+    assert_eq!(app.cfg().find_source(&id).unwrap().interval, Some(Interval::parse("6h").unwrap()));
     assert_eq!(tiny_skill_sync::portable::load_sources(&dir).unwrap().as_ref(), Some(app.cfg()));
-    assert_eq!(app.queued(), &[Job::Check(Some("o-new".into()))]);
+    assert_eq!(app.queued(), &[Job::Check(Some(skills.clone()))]);
 
-    assert_eq!(run_next(&mut app, &mut s.engine, T0).0, Job::Check(Some("o-new".into())));
+    assert_eq!(run_next(&mut app, &mut s.engine, T0).0, Job::Check(Some(skills)));
     assert_eq!(s.w.read("one/SKILL.md"), "one");
 }
 
 #[test]
+fn source_and_global_edits_are_checked_then_saved_by_the_worker() {
+    use tiny_skill_sync::sources::IgnoreAction;
+
+    let mut s = Setup::fresh("app-source-edit");
+    let file = s.w.home.join(tiny_skill_sync::config::CONFIG_FILE);
+    let initial = Config { skills_dir: Some(s.w.skills.to_string_lossy().into_owned()), ..s.cfg.clone() };
+    initial.save(&file).unwrap();
+    let mut app = App::new(initial.clone(), s.w.skills.clone());
+    app.set_settings_source(SettingsSource::new(file.clone(), s.w.root.join("exe")));
+    run(&mut app, &mut s.engine, T0);
+
+    assert!(app.edit_source("fx", |source| source.ignore_add.push("a/b".into())).is_err(), "a folder name cannot hold a slash");
+    assert!(app.edit_global(|global| global.ignore_folders.push("..".into())).is_err());
+    assert!(app.edit_source("missing", |_| {}).is_err());
+    assert_eq!(app.edit_source("fx", |_| {}), Ok(false));
+    assert!(app.queued().is_empty());
+    assert_eq!(Config::load_sources(&file).unwrap(), initial);
+
+    assert_eq!(app.edit_source("fx", |source| source.ignore(IgnoreAction::Add, "drafts").unwrap()), Ok(true));
+    assert_eq!(app.edit_global(|global| global.include_repo_items = true), Ok(true));
+    assert!(!app.queued().is_empty());
+    run(&mut app, &mut s.engine, T0);
+    let saved = Config::load_sources(&file).unwrap();
+    assert_eq!(saved.find_source("fx").unwrap().ignore_add, ["drafts"]);
+    assert!(saved.global().include_repo_items);
+    assert_eq!(&saved, app.cfg());
+}
+
+#[test]
+fn removing_by_any_lane_id_lets_go_of_the_whole_source() {
+    let (w, _remote, manager, mut engine, mut app, _file) = plugin_app("app-remove-source");
+    let ticket = app.preview_location(REPO, None).unwrap();
+    run_next(&mut app, &mut engine, T0);
+    let DraftStage::Reviewed(preview) = &app.draft().unwrap().stage else { panic!("expected a finished preview") };
+    let id = preview.source.id.clone();
+    let plugins = preview.source.lanes.id(SourceKind::Plugins).unwrap().to_owned();
+    let skills = preview.source.lanes.id(SourceKind::Skills).unwrap().to_owned();
+    app.confirm_source(ticket, false).unwrap();
+    run(&mut app, &mut engine, T0);
+    assert_eq!(w.skill_names(), ["beta"]);
+    assert!(w.state().repo(&skills).is_some());
+    let calls = manager.calls().len();
+
+    assert!(app.want(Job::Remove { repo: plugins.clone(), delete_skills: false }));
+    let settled = last(run(&mut app, &mut engine, T0));
+    assert_eq!(settled.removed.as_deref(), Some(id.as_str()));
+    assert!(settled.feedback.as_deref().is_some_and(|text| text.starts_with("Removed ")), "{:?}", settled.feedback);
+    let state = w.state();
+    assert!(state.plugin_sources().is_empty() && state.repo(&skills).is_none(), "every lane was let go of");
+    assert_eq!(w.skill_names(), ["beta"], "kept skills become the user's");
+    assert!(manager.calls()[calls..].iter().all(|c| matches!(c, PluginCall::Home | PluginCall::List | PluginCall::Markets)), "nothing was uninstalled");
+}
+#[test]
 fn enabling_a_source_waits_for_the_local_settings_save() {
     let mut s = Setup::fresh("app-deferred-enable");
     let mut before = Config { skills_dir: Some(s.w.skills.to_string_lossy().into_owned()), ..s.cfg.clone() };
-    before.repos[0].enabled = false;
+    before.update_lane_at(0, |r| r.enabled = false);
     let file = s.w.home.join(tiny_skill_sync::config::CONFIG_FILE);
     before.save(&file).unwrap();
     let mut app = App::new(before.clone(), s.w.skills.clone());
     app.set_settings_source(SettingsSource::new(file.clone(), s.w.root.join("exe")));
     run(&mut app, &mut s.engine, T0);
     let mut after = before.clone();
-    after.repos[0].enabled = true;
+    after.update_lane_at(0, |r| r.enabled = true);
     for conflict in [true, false] {
         app.queue_config_save(before.clone(), after.clone(), false, false);
         assert_eq!(app.cfg(), &before);
         assert_eq!(app.queued(), &[Job::Plan]);
         if conflict {
-            Config { repos: vec![], ..before.clone() }.save(&file).unwrap();
+            let mut emptied = before.clone();
+            emptied.clear_sources();
+            emptied.save(&file).unwrap();
         }
         run_next(&mut app, &mut s.engine, T0);
         if conflict {
             assert!(app.is_idle());
             assert_eq!(app.cfg(), &before);
-            assert!(Config::load_sources(&file).unwrap().repos.is_empty());
+            assert!(Config::load_sources(&file).unwrap().repos().is_empty());
             before.save(&file).unwrap();
         } else {
             assert_eq!(Config::load_sources(&file).unwrap(), after);
@@ -460,7 +561,7 @@ fn startup_loads_portable_settings_on_the_worker_before_the_first_engine_job() {
 
     assert!(app.started());
     assert!(app.portable_mode());
-    assert_eq!(app.cfg().repos, shared.repos);
+    assert_eq!(app.cfg().repos(), shared.repos());
     assert_eq!(s.w.skill_names(), ["alpha", "beta", "gamma"]);
 }
 
@@ -493,14 +594,14 @@ fn opening_the_window_can_reload_shared_settings_without_a_folder_watch() {
     let mut app = App::new(Config::default(), s.w.skills.clone());
     app.set_settings_source(source);
     run(&mut app, &mut s.engine, T0);
-    assert!(app.cfg().repos[0].enabled);
+    assert!(app.cfg().repos()[0].enabled);
 
-    shared.repos[0].enabled = false;
+    shared.update_lane_at(0, |r| r.enabled = false);
     write_portable(&exe_dir, &shared);
     app.request_settings_reload();
     run(&mut app, &mut s.engine, T0 + 1);
 
-    assert!(!app.cfg().repos[0].enabled);
+    assert!(!app.cfg().repos()[0].enabled);
 }
 
 #[test]
@@ -517,13 +618,13 @@ fn a_timer_poll_reloads_portable_settings_before_syncing() {
     run(&mut app, &mut s.engine, T0);
     assert_eq!(app.arm(T0), Some(T0 + DAY));
 
-    shared.repos[0].enabled = false;
+    shared.update_lane_at(0, |r| r.enabled = false);
     write_portable(&exe_dir, &shared);
     app.on_timer(T0 + DAY);
     assert_eq!(app.queued(), &[Job::Poll]);
     run(&mut app, &mut s.engine, T0 + DAY);
 
-    assert!(!app.cfg().repos[0].enabled);
+    assert!(!app.cfg().repos()[0].enabled);
 }
 
 #[test]
@@ -544,7 +645,7 @@ fn a_portable_source_disappearing_makes_skills_orphans_not_deletions() {
     app.want(Job::Check(None));
     run(&mut app, &mut s.engine, T0 + 1);
 
-    assert!(app.cfg().repos.is_empty());
+    assert!(app.cfg().repos().is_empty());
     assert_eq!(s.w.skill_names(), ["alpha", "beta", "gamma"]);
     assert!(s.w.state().repo("fx").is_some(), "unlisted sources remain recorded as orphans");
 }
@@ -699,6 +800,7 @@ fn quitting_drops_what_is_waiting_and_saves_last() {
         config_saves: Vec::new(),
         settings_checked: false,
         update: None,
+        seen: None,
     };
     app.finish(done, T0);
     assert!(app.is_idle());
@@ -731,6 +833,7 @@ fn checking_settings_blocks_local_edits_until_the_worker_finishes() {
             config_saves: Vec::new(),
             settings_checked: true,
             update: None,
+            seen: None,
         },
         T0,
     );
@@ -1046,7 +1149,7 @@ fn skills_gone_upstream_all_at_once_are_deleted_only_when_the_user_says_so() {
     // GitHub now answers "not modified": the listing it stands for is still empty, and the user is told so again.
     app.want(Job::Check(Some(fx())));
     let told = last(run(&mut app, &mut s.engine, T0));
-    let label = app.cfg().repos[0].label();
+    let label = app.cfg().repos()[0].label();
     assert_eq!(told.feedback, Some(format!("Checked: no skills found ({label})")));
     assert_eq!(app.board.views(app.cfg(), T0)[0].status, "No skills found");
 }
@@ -1110,7 +1213,7 @@ fn new_settings_are_planned_for_before_the_timer_is_set() {
     assert_eq!(app.arm(T0), Some(T0 + DAY));
 
     let mut cfg = s.cfg.clone();
-    cfg.repos.push(repo("two", "o/two", "skills"));
+    cfg.push_lane(repo("two", "o/two", "skills"));
     app.set_cfg(cfg, s.w.skills.clone());
     assert_eq!(app.queued(), &[Job::Plan]);
     assert_eq!(app.arm(T0), None, "the plan comes first");

@@ -8,6 +8,7 @@ use serde_json::Value;
 
 use crate::config::RepoConfig;
 use crate::hash;
+use crate::inventory::{Item, PluginDetails, Status as ItemStatus};
 use crate::pathsafe;
 use crate::source::SourceKind;
 use crate::state::{PluginOrigin, PluginSourceState};
@@ -18,13 +19,10 @@ use super::{NameMap, name_key, normal_name, read_json_object};
 pub const MAX_MANIFEST_BYTES: u64 = 256 * 1024;
 pub const MARKETPLACE_PATHS: &[&str] = &["marketplace.json", ".plugin/marketplace.json", ".github/plugin/marketplace.json", ".claude-plugin/marketplace.json"];
 pub const PLUGIN_PATHS: &[&str] = &[".plugin/plugin.json", "plugin.json", ".github/plugin/plugin.json", ".claude-plugin/plugin.json"];
-
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct Capabilities {
-    pub hooks: bool,
-    pub mcp: bool,
-    pub lsp: bool,
-}
+/// Files Copilot CLI loads from a plugin folder by convention, whether or not the manifest names them.
+pub const HOOK_PATHS: &[&str] = &["hooks.json", "hooks/hooks.json", "com.github.copilot/hooks/hooks.json"];
+pub const MCP_PATHS: &[&str] = &[".mcp.json", ".github/mcp.json", "mcp.json"];
+pub const LSP_PATHS: &[&str] = &["lsp.json", ".github/lsp.json", "com.github.copilot/lsp.json"];
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Plugin {
@@ -34,7 +32,6 @@ pub struct Plugin {
     pub version: Option<String>,
     pub publisher: Option<String>,
     pub description: Option<String>,
-    pub capabilities: Capabilities,
     pub fingerprint: String,
 }
 
@@ -47,7 +44,22 @@ pub struct Catalog {
     pub(super) plugins: NameMap<Plugin>,
     pub(super) hosted_elsewhere: Vec<String>,
     pub(super) rejected: Vec<Rejected>,
+    /// Plugin names the source has that are not installed from it (see `restrict`).
+    pub(super) held: Vec<Held>,
 }
+
+/// A plugin name present in the source's folder that this app does not install: standalone, filtered, bundled, or
+/// known by another name. An owned plugin with such a name is kept as it is and never removed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Held {
+    pub name: String,
+    pub reason: String,
+    /// Shown as a row even when no plugin with this name is owned. Bundled items and other names are not.
+    pub shown: bool,
+}
+
+/// Why a plugin root that is not listed by the branch-root marketplace is never installed (spike S4).
+pub const NOT_LISTED: &str = "Copilot CLI can install a plugin from a branch only through a marketplace that lists it";
 
 impl Catalog {
     #[cfg(test)]
@@ -59,6 +71,7 @@ impl Catalog {
             plugins: [(plugin.name.clone(), plugin)].into(),
             hosted_elsewhere: vec![],
             rejected: vec![],
+            held: vec![],
         }
     }
 
@@ -77,6 +90,61 @@ impl Catalog {
     pub fn rejected(&self) -> &[Rejected] {
         &self.rejected
     }
+    pub fn held(&self) -> &[Held] {
+        &self.held
+    }
+
+    /// Keeps only the plugins the source's inventory says may be installed: an installable plugin root, listed by the
+    /// branch-root marketplace, at the same root and with the same name. Its publisher is the one the inventory (and
+    /// so the user's review) shows. Every other plugin name in the inventory is held with its reason, and rejected or
+    /// colliding items are rejected, so an owned plugin with such a name is never treated as gone.
+    pub fn restrict(&mut self, items: &[Item<PluginDetails>]) {
+        let same = |item: &Item<PluginDetails>, p: &Plugin| item.path == p.path && name_key(&item.install_name) == name_key(&p.name);
+        let mut kept = NameMap::new();
+        let mut unused = Vec::new();
+        for (name, mut plugin) in std::mem::take(&mut self.plugins).into_entries() {
+            match items.iter().find(|i| i.status == ItemStatus::Installable && i.data.listed_by_marketplace && same(i, &plugin)) {
+                Some(item) => {
+                    plugin.publisher.clone_from(&item.data.publisher);
+                    kept.insert(name, plugin);
+                }
+                None => unused.push(plugin),
+            }
+        }
+        self.plugins = kept;
+        let known = |held: &[Held], rejected: &[Rejected], plugins: &NameMap<Plugin>, name: &str| {
+            plugins.contains_key(name) || rejected.iter().any(|r| r.name == name) || held.iter().any(|h| h.name == name)
+        };
+        for item in items {
+            let installed = self.plugins.get(&item.install_name).is_some_and(|p| same(item, p));
+            if !installed && !known(&self.held, &self.rejected, &self.plugins, &item.install_name) {
+                match &item.status {
+                    ItemStatus::Rejected(_) | ItemStatus::Collision => {
+                        self.rejected.push(Rejected { name: item.install_name.clone(), reason: item.status.reason().unwrap_or_default() });
+                    }
+                    status => {
+                        let reason = match status {
+                            ItemStatus::Installable if !item.data.listed_by_marketplace => NOT_LISTED.into(),
+                            ItemStatus::Installable => "The marketplace entry for this plugin could not be used".into(),
+                            other => other.reason().unwrap_or_default(),
+                        };
+                        let shown = !matches!(status, ItemStatus::Bundled { .. });
+                        self.held.push(Held { name: item.install_name.clone(), reason, shown });
+                    }
+                }
+            }
+            for other in &item.data.other_names {
+                if !known(&self.held, &self.rejected, &self.plugins, other) {
+                    self.held.push(Held { name: other.clone(), reason: "This source has the plugin under another name".into(), shown: false });
+                }
+            }
+        }
+        for plugin in unused {
+            if !known(&self.held, &self.rejected, &self.plugins, &plugin.name) {
+                self.held.push(Held { name: plugin.name, reason: "This plugin is not part of this source".into(), shown: false });
+            }
+        }
+    }
 
     /// Use the exact catalog the user approved. Creating a record does not adopt any native installs.
     pub fn approved_record(&self, source: &RepoConfig, home: &Path) -> Result<PluginSourceState, String> {
@@ -87,6 +155,7 @@ impl Catalog {
         let mut record = PluginSourceState::new(source, home, &self.market);
         for plugin in self.plugins.values() {
             record.approved.insert(plugin.name.clone(), plugin.publisher.clone());
+            record.roots.insert(plugin.name.clone(), plugin.path.clone());
         }
         Ok(record)
     }
@@ -181,6 +250,7 @@ impl<'a> CatalogTree<'a> {
             plugins: NameMap::new(),
             hosted_elsewhere: Vec::new(),
             rejected: Vec::new(),
+            held: Vec::new(),
         };
         let mut matched = Vec::new();
         for entry in market.plugins {
@@ -207,17 +277,7 @@ impl<'a> CatalogTree<'a> {
                             &self.entry(folder)?.filter(|e| plain_tree(e)).ok_or("The plugin source is not a plain folder in this branch")?.sha
                         };
                         let file = self.manifest(folder, PLUGIN_PATHS)?.ok_or("No plugin manifest (plugin.json) was found in the plugin folder")?;
-                        Ok(Some(Matched {
-                            name: name.into(),
-                            folder: folder.into(),
-                            tree: sha.into(),
-                            file,
-                            capabilities: Capabilities {
-                                hooks: self.has_any(folder, &["hooks.json", "hooks/hooks.json", "com.github.copilot/hooks/hooks.json"]),
-                                mcp: self.has_any(folder, &[".mcp.json", ".github/mcp.json", "mcp.json"]),
-                                lsp: self.has_any(folder, &["lsp.json", ".github/lsp.json", "com.github.copilot/lsp.json"]),
-                            },
-                        }))
+                        Ok(Some(Matched { name: name.into(), folder: folder.into(), tree: sha.into(), file }))
                     })();
                     match candidate {
                         Ok(Some(m)) => matched.push((entry, m)),
@@ -231,7 +291,8 @@ impl<'a> CatalogTree<'a> {
         Ok(PendingCatalog { catalog, matched })
     }
 
-    fn has_any(&self, folder: &str, candidates: &[&str]) -> bool {
+    /// Whether the listing has any of `candidates` below `folder`, in any spelling Windows treats as the same.
+    pub(crate) fn has_any(&self, folder: &str, candidates: &[&str]) -> bool {
         candidates.iter().any(|rel| self.paths.contains_key(&path_key(&join(folder, rel))))
     }
 }
@@ -248,7 +309,6 @@ struct Matched {
     folder: String,
     file: SkillFile,
     tree: String,
-    capabilities: Capabilities,
 }
 
 pub struct PendingCatalog {
@@ -311,11 +371,6 @@ impl Matched {
             version,
             publisher,
             description: string(manifest.get("description")).or_else(|| string(entry.get("description"))),
-            capabilities: Capabilities {
-                hooks: self.capabilities.hooks || manifest.contains_key("hooks"),
-                mcp: self.capabilities.mcp || manifest.contains_key("mcpServers"),
-                lsp: self.capabilities.lsp || manifest.contains_key("lspServers"),
-            },
             fingerprint: hash::hex(&sha.finish()),
         })
     }
@@ -357,6 +412,85 @@ fn string(value: Option<&Value>) -> Option<String> {
 }
 fn author_name(value: Option<&Value>) -> Option<String> {
     string(value?.get("name"))
+}
+
+impl CatalogTree<'_> {
+    pub(crate) fn inventory_marketplace_file(&self) -> Result<Option<SkillFile>, String> {
+        self.manifest("", MARKETPLACE_PATHS)
+    }
+
+    pub(crate) fn inventory_plugin_file(&self, folder: &str) -> Result<Option<SkillFile>, String> {
+        self.manifest(folder, PLUGIN_PATHS)
+    }
+}
+
+pub(crate) fn inventory_manifest_candidate(entry: &TreeEntry) -> Option<SkillFile> {
+    let size = entry.size?;
+    (entry.kind == EntryKind::Blob && matches!(entry.mode.as_str(), "100644" | "100755") && size <= MAX_MANIFEST_BYTES).then(|| SkillFile {
+        path: entry.path.clone(),
+        blob: entry.sha.clone(),
+        size,
+    })
+}
+
+pub(crate) struct InventoryMarketplace {
+    pub name: String,
+    pub owner: Option<String>,
+    pub entries: Vec<InventoryMarketEntry>,
+    pub problem: Option<String>,
+}
+
+pub(crate) struct InventoryMarketEntry {
+    pub folder: String,
+    pub fields: Value,
+    pub problem: Option<String>,
+}
+
+/// The inventory needs the rows even if their manifests are broken or missing. This is not a Catalog eligible for approval.
+pub(crate) fn inventory_marketplace(bytes: &[u8]) -> Result<InventoryMarketplace, String> {
+    let market: Marketplace = read_json_object(bytes).ok_or("The marketplace is not a readable JSON object with the expected fields")?;
+    let problem = (!normal_name(&market.name)).then(|| "The marketplace name is not in Copilot's normal form".into());
+    let mut counts = HashMap::new();
+    for name in market.plugins.iter().filter_map(|row| row.get("name").and_then(Value::as_str)) {
+        *counts.entry(name_key(name)).or_insert(0usize) += 1;
+    }
+    let mut entries = Vec::new();
+    for fields in market.plugins {
+        let Some(source) = fields.get("source").and_then(Value::as_str).filter(|s| !s.is_empty() && !is_url(s)) else { continue };
+        let name = fields.get("name").and_then(Value::as_str).unwrap_or_default();
+        let checked = if source == "./" { Ok("") } else { checked_folder(source) };
+        let problem = checked.as_ref().err().cloned().or_else(|| {
+            if !normal_name(name) {
+                Some("The plugin name is not in Copilot's normal form".into())
+            } else if counts[&name_key(name)] != 1 {
+                Some("Duplicate plugin name".into())
+            } else {
+                None
+            }
+        });
+        let folder = checked.unwrap_or_else(|_| source.strip_prefix("./").unwrap_or(source)).to_owned();
+        entries.push(InventoryMarketEntry { folder, fields, problem });
+    }
+    Ok(InventoryMarketplace { name: market.name, owner: inventory_author(market.owner.as_ref()), entries, problem })
+}
+
+/// Both inventory parsers take bytes the caller has checked against the exact entry in the branch listing.
+pub(crate) fn inventory_plugin_document(bytes: &[u8]) -> Result<NameMap<Value>, String> {
+    read_json_object(bytes).ok_or_else(|| "The plugin manifest is not a readable JSON object".into())
+}
+
+pub(crate) fn inventory_author(author: Option<&Value>) -> Option<String> {
+    author_name(author).or_else(|| string(author))
+}
+
+pub(crate) fn inventory_metadata_problem(field: &str, value: &str) -> Option<String> {
+    if value.chars().count() > 64 {
+        Some(format!("The plugin {field} is longer than 64 characters"))
+    } else if value.chars().any(|ch| ch.is_control() || invisible_format(ch)) {
+        Some(format!("The plugin {field} contains a control or invisible formatting character"))
+    } else {
+        None
+    }
 }
 
 #[cfg(test)]

@@ -19,16 +19,19 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
-use crate::board::{Board, Health, Level, Row, capitalized, recorded_plugin_rows};
-use crate::config::{Config, Paths, RepoConfig, RepoSpec};
+use crate::board::{Board, Health, Level, Row, capitalized, preview_syncs, previewed_plugins, recorded_plugin_rows, source_label};
+use crate::config::{Config, Paths};
 use crate::engine::{
-    Access, DiffReport, Engine, EngineError, Outcome, RemoveReport, RepoReport, Resolution, ResolveReport, SkillFacts, Stamp, StartupReport, SyncOptions,
-    SyncReport, VerifyReport, Which, assign_fresh_id,
+    Access, DiffReport, Engine, EngineError, LocationPreview, Outcome, RemoveReport, RepoReport, Resolution, ResolveReport, SkillFacts, Stamp, StartupReport,
+    SyncOptions, SyncReport, VerifyReport, Which,
 };
 use crate::interval::{Interval, UnixSecs};
+use crate::location::{Location, Target};
 use crate::plugins::Choice;
 use crate::replacement::VerifiedTray;
-use crate::source::{SourceKind, SourcePreview};
+use crate::source::SourceKind;
+use crate::sources::{GlobalSettings, SourceConfig};
+use crate::state::State;
 use crate::update_clock::ClockState;
 use crate::updater::{Action, Locations, Request, Updates};
 
@@ -45,6 +48,7 @@ pub const LATE_TIMER: UnixSecs = 60;
 /// The first wait after the engine could not work at all. It doubles with every failure in a row.
 pub const FAILURE_BACKOFF: UnixSecs = 5 * 60;
 pub const MAX_FAILURE_BACKOFF: UnixSecs = 60 * 60;
+const KINDS: [SourceKind; 4] = [SourceKind::Skills, SourceKind::Agents, SourceKind::Instructions, SourceKind::Plugins];
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Job {
@@ -60,7 +64,8 @@ pub enum Job {
     /// The user asked: look at the disk, then check every enabled repository (`None`) or one.
     Check(Option<String>),
     PreviewSource(Arc<DraftInput>),
-    SaveSource(Arc<DraftInput>, Arc<SourcePreview>),
+    /// Save the reviewed location; with `true`, approve the reviewed plugins after the save.
+    SaveSource(Arc<DraftInput>, Arc<LocationPreview>, bool),
     AppUpdate(Action),
     ScheduledUpdate,
     /// Only after receiving a successful Flush during an explicit Quit, not on logoff.
@@ -78,7 +83,8 @@ pub enum Job {
     },
     /// Upstream lists no skills at all, and the user confirmed that the ones gone from it are deleted.
     DeleteGone(String),
-    /// Stop managing a repository's skills before it leaves the settings, deleting the unedited ones if asked.
+    /// Stop managing a whole source (given its source ID or any lane ID) before it leaves the settings, deleting the
+    /// unedited skills if asked.
     Remove {
         repo: String,
         delete_skills: bool,
@@ -99,7 +105,9 @@ pub enum Job {
 #[derive(Clone, Debug, PartialEq)]
 pub struct DraftInput {
     pub ticket: u64,
-    pub source: RepoConfig,
+    /// The location as the user typed it.
+    pub text: String,
+    pub every: Option<Interval>,
 }
 
 #[derive(Clone, Debug)]
@@ -111,58 +119,101 @@ pub struct SourceDraft {
 #[derive(Clone, Debug)]
 pub enum DraftStage {
     Loading,
-    Reviewed(Arc<SourcePreview>),
-    AlreadySetUp,
+    Reviewed(Arc<LocationPreview>),
+    /// The location is already a source, with this ID.
+    AlreadySetUp(String),
     Failed(String),
     Saving,
 }
 
-pub(crate) fn duplicate_source_message(source: &RepoConfig) -> String {
-    format!("This source is already set up. Its ID is '{}'.", source.id)
+pub(crate) fn duplicate_source_message(id: &str) -> String {
+    format!("This source is already set up. Its ID is '{id}'.")
 }
 
-pub(crate) fn new_source<'a>(
-    cfg: &'a Config,
-    spec: &RepoSpec,
-    kind: SourceKind,
-    every: Option<Interval>,
-    use_token: bool,
-) -> Result<RepoConfig, &'a RepoConfig> {
-    let repo = spec.full_name();
-    if let Some(old) = cfg.repos.iter().find(|r| r.kind == kind && r.repo.eq_ignore_ascii_case(&repo) && r.branch == spec.branch && r.path == spec.path) {
-        return Err(old);
-    }
-    Ok(cfg.clone().add_source(kind, spec, every, use_token).clone())
+/// The source already saved for the same repository (in any case), branch and folder.
+pub(crate) fn same_location<'a>(cfg: &'a Config, repo: &str, branch: &str, path: &str) -> Option<&'a SourceConfig> {
+    cfg.sources().iter().find(|s| s.repo.eq_ignore_ascii_case(repo) && s.branch == branch && s.path == path)
 }
 
-/// Re-list after confirmation. Neither a changed set of names nor a newly held or moved destination
-/// is what the user saw. The eventual sync still does all its own safety checks.
-pub(crate) fn recheck_preview(
+fn already_added(cfg: &Config, preview: &LocationPreview) -> Option<String> {
+    let s = &preview.source;
+    same_location(cfg, &s.repo, &s.branch, &s.path).map(|old| old.id.clone())
+}
+
+/// Save a reviewed location as a new source, after proving that what GitHub has, where it would go and the settings
+/// are all as they were when the user looked. Plugins are approved only after the save, and only the reviewed ones.
+#[allow(clippy::too_many_arguments)]
+fn save_source(
     engine: &mut Engine,
-    cfg: &Config,
-    source: &RepoConfig,
-    reviewed: &SourcePreview,
+    cfg: &mut Config,
+    store: Option<&SettingsSource>,
+    (portable_mode, skills_dir): (bool, &PathBuf),
+    input: &DraftInput,
+    reviewed: &LocationPreview,
+    approve_plugins: bool,
     cancel: &AtomicBool,
-) -> Result<(), EngineError> {
-    if let Some(why) = reviewed.blocker(source) {
-        return Err(EngineError::Failed(why.into()));
+) -> Result<Answer, EngineError> {
+    if let Some(id) = already_added(cfg, reviewed) {
+        return Err(EngineError::Failed(duplicate_source_message(&id)));
     }
-    engine.check_fresh_id(&source.id)?;
-    if engine.preview_source(cfg, source, cancel)? != *reviewed {
-        return Err(EngineError::Failed("The listing or destination changed. Preview the source again.".into()));
+    if engine.preview_location(cfg, &input.text, false, cancel)? != *reviewed {
+        return Err(EngineError::Failed("What GitHub has, or where it would go, changed since the preview. Preview the source again.".into()));
     }
+    // A record left on this PC under one of the new lane IDs would be taken over by the new source.
+    for id in KINDS.into_iter().filter_map(|kind| reviewed.source.lanes.id(kind)) {
+        engine.check_fresh_id(id)?;
+    }
+    let store = store.ok_or_else(|| EngineError::Failed("The settings folder is unavailable.".into()))?;
+    let active = store.load(portable_mode, true, true).map_err(EngineError::Failed)?;
+    if !active.is_some_and(|s| s.config == *cfg && s.portable == portable_mode && s.skills_dir == *skills_dir) {
+        return Err(EngineError::Failed("The settings changed. Preview the source again.".into()));
+    }
+    let mut source = reviewed.source.clone();
+    source.interval = input.every;
+    let mut after = cfg.clone();
+    after.add_source_config(source.clone()).map_err(EngineError::Failed)?;
     if cancel.load(Ordering::Acquire) {
         return Err(EngineError::Failed("Adding the source was cancelled.".into()));
     }
-    Ok(())
+    store.save(cfg, &after, portable_mode).map_err(EngineError::Failed)?;
+    let approved = if approve_plugins && !previewed_plugins(reviewed).is_empty() {
+        engine.approve_location_plugins(&after, &source.id, reviewed).map_err(|e| format!("The source was saved, but its plugins could not be approved: {e}"))
+    } else {
+        Ok(())
+    };
+    *cfg = after;
+    Ok(Answer::SourceSaved { source, approved })
 }
 
-/// Called only after the save succeeded, with the very preview the user confirmed.
-pub(crate) fn approve_saved_plugins(engine: &mut Engine, cfg: &Config, id: &str, reviewed: &SourcePreview) -> Result<(), String> {
-    if reviewed.kind == SourceKind::Plugins {
-        engine.approve_plugin_preview(cfg, id, reviewed).map_err(|e| format!("The source was saved, but its plugins could not be approved: {e}"))?;
+/// The lanes of a source to let go of: every type that syncs, and every type that is off but still has items on record.
+pub(crate) fn removal_lanes(engine: &Engine, cfg: &Config, source: &SourceConfig) -> Result<Vec<(String, SourceKind)>, String> {
+    let file = engine.paths().state_file();
+    let state = State::load_sources_with(&file, false).map(|loaded| loaded.state).map_err(|e| format!("cannot read {}: {e}", file.display()))?;
+    let recorded = |id: &str| state.source_ids().any(|s| s == id);
+    Ok(KINDS.into_iter().filter_map(|kind| source.lanes.id(kind).filter(|id| cfg.find(id).is_some() || recorded(id)).map(|id| (id.to_owned(), kind))).collect())
+}
+
+/// Let go of a whole source, lane by lane. Plugins go first: when an uninstall fails, nothing else has been let go of
+/// and the source stays. `delete_skills` applies to the skills lane only. The caller removes the source from the
+/// settings afterwards.
+pub(crate) fn remove_whole_source(
+    engine: &mut Engine,
+    cfg: &Config,
+    lanes: &[(String, SourceKind)],
+    delete_skills: bool,
+    uninstall_plugins: bool,
+) -> Result<Vec<(String, SourceKind, RemoveReport)>, EngineError> {
+    let plugins_first = lanes.iter().filter(|(_, k)| *k == SourceKind::Plugins).chain(lanes.iter().filter(|(_, k)| *k != SourceKind::Plugins));
+    let mut reports = Vec::new();
+    for (id, kind) in plugins_first {
+        let report = if *kind == SourceKind::Plugins && uninstall_plugins {
+            engine.remove_source_with_plugins(cfg, id, &AtomicBool::new(false))?
+        } else {
+            remove_source(engine, cfg, id, delete_skills && *kind == SourceKind::Skills)?
+        };
+        reports.push((id.clone(), *kind, report));
     }
-    Ok(())
+    Ok(reports)
 }
 
 pub(crate) fn remove_source(engine: &mut Engine, cfg: &Config, id: &str, delete_skills: bool) -> Result<RemoveReport, EngineError> {
@@ -292,14 +343,22 @@ pub struct ConfigSave {
 #[derive(Clone, Debug)]
 pub struct ConfigSaveOutcome {
     pub before: Config,
+    /// What was saved: the settings asked for, with any lane the worker had to give a fresh ID.
     pub after: Config,
+    /// The settings the window asked to save, which it is showing.
+    pub requested: Config,
     pub revert_on_failure: bool,
     pub result: Result<(), String>,
 }
 
 impl ConfigSave {
     pub(crate) fn outcome(self, result: Result<(), String>) -> ConfigSaveOutcome {
-        ConfigSaveOutcome { before: self.before, after: self.after, revert_on_failure: self.revert_on_failure, result }
+        let requested = self.after.clone();
+        self.outcome_of(requested, result)
+    }
+
+    fn outcome_of(self, requested: Config, result: Result<(), String>) -> ConfigSaveOutcome {
+        ConfigSaveOutcome { before: self.before, after: self.after, requested, revert_on_failure: self.revert_on_failure, result }
     }
 }
 
@@ -327,11 +386,11 @@ pub enum Answer {
     Looked(VerifyReport),
     Checked { verified: Option<VerifyReport>, sync: SyncReport },
     SettingsLoaded,
-    SourcePreview(String, SourcePreview),
-    SourceSaved(Result<(), String>),
+    SourcePreview(Arc<LocationPreview>),
+    SourceSaved { source: SourceConfig, approved: Result<(), String> },
     Resolved(ResolveReport),
     PluginResolved(RepoReport),
-    Removed(RemoveReport),
+    Removed { source: String, label: String, lanes: Vec<(String, SourceKind, RemoveReport)> },
     Diffed(DiffReport),
     Flushed,
     Planned,
@@ -378,22 +437,68 @@ pub struct Done {
     pub config_saves: Vec<ConfigSaveOutcome>,
     /// Whether this order checked for portable companions.
     pub settings_checked: bool,
+    /// The display cache, read when the app starts.
+    pub seen: Option<std::collections::BTreeMap<String, crate::seen::Seen>>,
     pub update: Option<UpdateState>,
 }
 
 /// Runs one order. Called on the worker thread, which owns the engine.
+/// Where the worker gave a lane a fresh ID while saving (`asked` became `saved`), give the same lane in `target` that
+/// ID too, as long as it still has the ID that was asked for.
+fn carry_lane_ids(asked: &Config, saved: &Config, target: &mut Config) {
+    let mut moves = Vec::new();
+    for source in saved.sources() {
+        let Some(old) = asked.sources().iter().find(|s| s.id == source.id) else { continue };
+        for kind in KINDS {
+            if let (Some(from), Some(to)) = (old.lanes.id(kind), source.lanes.id(kind))
+                && from != to
+                && target.sources().iter().any(|s| s.id == source.id && s.lanes.id(kind) == Some(from))
+            {
+                moves.push((source.id.clone(), kind, to.to_owned()));
+            }
+        }
+    }
+    if moves.is_empty() {
+        return;
+    }
+    target.edit(|list, _| {
+        for (id, kind, lane) in moves {
+            if let Some(s) = list.iter_mut().find(|s| s.id == id) {
+                s.lanes = std::mem::take(&mut s.lanes).with(kind, lane);
+            }
+        }
+    });
+}
+
 pub fn perform(engine: &mut Engine, order: &Order, cancel: &AtomicBool) -> Done {
     perform_with_updates(engine, order, cancel, None, crate::interval::now_secs())
 }
 
 pub(crate) fn perform_with_updates(engine: &mut Engine, order: &Order, cancel: &AtomicBool, mut updates: Option<&mut Updates>, now: UnixSecs) -> Done {
     let mut config_saves = Vec::with_capacity(order.config_saves.len());
+    let mut cfg = order.cfg.clone();
+    let mut renamed: Vec<(Config, Config)> = Vec::new();
     for save in &order.config_saves {
-        let result = order
-            .settings_source
-            .as_ref()
-            .map_or_else(|| Err("the settings folder is unavailable".to_string()), |source| source.save(&save.before, &save.after, save.portable));
-        config_saves.push(save.clone().outcome(result));
+        let mut save = save.clone();
+        let requested = save.after.clone();
+        for (asked, saved) in &renamed {
+            carry_lane_ids(asked, saved, &mut save.before);
+            carry_lane_ids(asked, saved, &mut save.after);
+        }
+        let carried = save.after.clone();
+        let result = engine.fresh_lane_ids(&save.before, &mut save.after).and_then(|()| {
+            order
+                .settings_source
+                .as_ref()
+                .map_or_else(|| Err("the settings folder is unavailable".to_string()), |source| source.save(&save.before, &save.after, save.portable))
+        });
+        if result.is_ok() && save.after != carried {
+            renamed.push((carried, save.after.clone()));
+        }
+        config_saves.push(save.outcome_of(requested, result));
+    }
+    for (requested, saved) in &renamed {
+        carry_lane_ids(requested, saved, &mut cfg);
     }
 
     let update_request = order.job.update_request();
@@ -409,7 +514,6 @@ pub(crate) fn perform_with_updates(engine: &mut Engine, order: &Order, cancel: &
         || order.reload_settings
         || update_request.is_some()
         || (!order.settings_initialized && matches!(order.job, Job::LoadSettings | Job::Startup));
-    let mut cfg = order.cfg.clone();
     let mut skills_dir = order.skills_dir.clone();
     let portable_mode = order.portable_mode;
     let mut settings = None;
@@ -503,7 +607,14 @@ pub(crate) fn perform_with_updates(engine: &mut Engine, order: &Order, cancel: &
             result
         };
         run().map(Answer::AppUpdate).map_err(EngineError::Failed)
-    } else if target.is_some_and(|id| moved || order.cfg.find(id).is_none() || cfg.find(id) != order.cfg.find(id)) {
+    } else if target.is_some_and(|id| {
+        moved
+            || if matches!(order.job, Job::Remove { .. }) {
+                order.cfg.find_source(id).is_none() || cfg.find_source(id) != order.cfg.find_source(id)
+            } else {
+                order.cfg.find(id).is_none() || cfg.find(id) != order.cfg.find(id)
+            }
+    }) {
         Err(EngineError::Failed("The source changed. Choose the source you want again.".into()))
     } else if reload_only || skip_for_folder_change {
         Ok(Answer::SettingsLoaded)
@@ -512,29 +623,8 @@ pub(crate) fn perform_with_updates(engine: &mut Engine, order: &Order, cancel: &
             Job::LoadSettings => Ok(Answer::SettingsLoaded),
             Job::Startup => engine.startup(&cfg).map(Answer::Started),
             Job::Look => engine.verify(&cfg, Access::ReadOnly).map(Answer::Looked),
-            Job::PreviewSource(input) => (|| {
-                let mut draft = input.source.clone();
-                assign_fresh_id(&engine.paths().state_file(), &cfg, &mut draft)?;
-                let preview = engine.preview_source(&cfg, &draft, cancel)?;
-                Ok(Answer::SourcePreview(draft.id, preview))
-            })(),
-            Job::SaveSource(input, reviewed) => (|| {
-                recheck_preview(engine, &cfg, &input.source, reviewed, cancel)?;
-                let store = source.ok_or_else(|| EngineError::Failed("The settings folder is unavailable.".into()))?;
-                let active = store.load(portable_mode, true, true).map_err(EngineError::Failed)?;
-                if !active.is_some_and(|s| s.config == cfg && s.portable == portable_mode && s.skills_dir == skills_dir) {
-                    return Err(EngineError::Failed("The settings changed. Preview the source again.".into()));
-                }
-                let mut after = cfg.clone();
-                after.repos.push(input.source.clone());
-                if cancel.load(Ordering::Acquire) {
-                    return Err(EngineError::Failed("Adding the source was cancelled.".into()));
-                }
-                store.save(&cfg, &after, portable_mode).map_err(EngineError::Failed)?;
-                let approved = approve_saved_plugins(engine, &after, &input.source.id, reviewed);
-                cfg = after;
-                Ok(Answer::SourceSaved(approved))
-            })(),
+            Job::PreviewSource(input) => engine.preview_location(&cfg, &input.text, false, cancel).map(|p| Answer::SourcePreview(Arc::new(p))),
+            Job::SaveSource(input, reviewed, approve) => save_source(engine, &mut cfg, source, (portable_mode, &skills_dir), input, reviewed, *approve, cancel),
             Job::Poll => {
                 engine.retain_plugin_attention_rows(&order.plugin_rows);
                 engine.sync(&cfg, &Which::Due, &SyncOptions::default(), cancel).map(|sync| Answer::Checked { verified: None, sync })
@@ -550,7 +640,19 @@ pub(crate) fn perform_with_updates(engine: &mut Engine, order: &Order, cancel: &
                 let opts = SyncOptions { ignore_etag: true, confirm_mass_delete: true, ..SyncOptions::default() };
                 engine.sync(&cfg, &Which::One(id.clone()), &opts, cancel).map(|sync| Answer::Checked { verified: None, sync })
             }
-            Job::Remove { repo, delete_skills } => remove_source(engine, &cfg, repo, *delete_skills).map(Answer::Removed),
+            Job::Remove { repo, delete_skills } => (|| {
+                let whole = cfg.find_source(repo).ok_or_else(|| EngineError::Failed("The source changed. Choose the source you want again.".into()))?;
+                let lanes = removal_lanes(engine, &cfg, whole).map_err(EngineError::Failed)?;
+                if *delete_skills && !lanes.iter().any(|(_, k)| *k == SourceKind::Skills) {
+                    return Err(EngineError::Failed(
+                        "Only a source with skills can delete them. Remove this source without deleting to keep its files.".into(),
+                    ));
+                }
+                let id = whole.id.clone();
+                let label = source_label(whole);
+                let lanes = remove_whole_source(engine, &cfg, &lanes, *delete_skills, false)?;
+                Ok(Answer::Removed { source: id, label, lanes })
+            })(),
             Job::Diff { repo, skill, preview: false } => engine.diff(&cfg, repo, skill, cancel).map(Answer::Diffed),
             Job::Diff { repo, skill, preview: true } => engine.preview(&cfg, repo, skill, cancel).map(Answer::Diffed),
             Job::Flush => engine.flush().map(|()| Answer::Flushed),
@@ -561,11 +663,11 @@ pub(crate) fn perform_with_updates(engine: &mut Engine, order: &Order, cancel: &
     Done {
         job: order.job.clone(),
         next_wake: engine.next_wake(&cfg),
-        last_checks: cfg.repos.iter().filter_map(|r| engine.last_check(&r.id).map(|at| (r.id.clone(), at))).collect(),
-        kept: cfg.repos.iter().map(|r| (r.id.clone(), engine.kept(&r.id))).collect(),
-        facts: cfg.repos.iter().filter(|r| r.kind != SourceKind::Plugins).map(|r| (r.id.clone(), engine.facts(&r.id))).collect(),
+        last_checks: cfg.repos().iter().filter_map(|r| engine.last_check(&r.id).map(|at| (r.id.clone(), at))).collect(),
+        kept: cfg.repos().iter().map(|r| (r.id.clone(), engine.kept(&r.id))).collect(),
+        facts: cfg.repos().iter().filter(|r| r.kind != SourceKind::Plugins).map(|r| (r.id.clone(), engine.facts(&r.id))).collect(),
         plugin_records: if matches!(result, Ok(Answer::Started(_) | Answer::Looked(_) | Answer::Checked { .. } | Answer::PluginResolved(_))) {
-            cfg.repos
+            cfg.repos()
                 .iter()
                 .filter(|r| r.kind == SourceKind::Plugins)
                 .map(|r| (r.id.clone(), engine.plugin_record(r).map(recorded_plugin_rows).unwrap_or_default()))
@@ -573,12 +675,13 @@ pub(crate) fn perform_with_updates(engine: &mut Engine, order: &Order, cancel: &
         } else {
             Vec::new()
         },
-        lists_nothing: cfg.repos.iter().map(|r| (r.id.clone(), engine.lists_nothing(&r.id))).collect(),
-        private: cfg.repos.iter().map(|r| (r.id.clone(), engine.needs_token(&r.id))).collect(),
+        lists_nothing: cfg.repos().iter().map(|r| (r.id.clone(), engine.lists_nothing(&r.id))).collect(),
+        private: cfg.repos().iter().map(|r| (r.id.clone(), engine.needs_token(&r.id))).collect(),
         stamp: engine.state_stamp(),
         settings,
         config_saves,
         settings_checked: loads_settings && probe_portable,
+        seen: (order.job == Job::Startup).then(|| crate::seen::load(&engine.paths().seen_file())),
         result,
         update: updates.map(|u| UpdateState { generation: order.update_generation, clock: u.clock, staged: u.staged(), status: update_status, disk, restart }),
     }
@@ -698,18 +801,24 @@ impl App {
         matches!(self.busy, Some(Job::SaveSource(..))) || self.draft.as_ref().is_some_and(|d| matches!(d.stage, DraftStage::Saving))
     }
 
-    /// A duplicate gets a draft for the refusal, but no worker job.
-    pub fn preview_source(&mut self, spec: &RepoSpec, kind: SourceKind, every: Option<Interval>) -> Result<u64, String> {
+    /// Preview a location the user typed. A malformed location is refused at once; a bare `owner/repo` that is already a
+    /// source gets a draft for the refusal, but no worker job.
+    pub fn preview_location(&mut self, text: &str, every: Option<Interval>) -> Result<u64, String> {
         if self.quitting || self.saving_source() {
             return Err("Cannot start another preview now.".into());
         }
-        let (source, stage) = match new_source(&self.cfg, spec, kind, every, false) {
-            Ok(source) => (source, DraftStage::Loading),
-            Err(old) => (old.clone(), DraftStage::AlreadySetUp),
+        let location = Location::parse(text)?;
+        let known = match location.target {
+            Target::Bare => same_location(&self.cfg, &format!("{}/{}", location.owner, location.name), "", "").map(|old| old.id.clone()),
+            _ => None,
         };
         self.dismiss_source();
         self.next_ticket += 1;
-        let input = Arc::new(DraftInput { ticket: self.next_ticket, source });
+        let input = Arc::new(DraftInput { ticket: self.next_ticket, text: text.trim().to_string(), every });
+        let stage = match known {
+            Some(id) => DraftStage::AlreadySetUp(id),
+            None => DraftStage::Loading,
+        };
         let read = matches!(stage, DraftStage::Loading);
         self.draft = Some(SourceDraft { input: input.clone(), stage });
         if read {
@@ -725,16 +834,60 @@ impl App {
         }
     }
 
-    pub fn confirm_source(&mut self, ticket: u64) -> Result<(), String> {
+    /// Save the reviewed preview. `approve_plugins` approves the plugins it showed, after the save, and only those.
+    pub fn confirm_source(&mut self, ticket: u64, approve_plugins: bool) -> Result<(), String> {
         let draft = self.draft.as_mut().filter(|d| !self.quitting && d.input.ticket == ticket).ok_or("This preview is no longer current.")?;
         let DraftStage::Reviewed(preview) = &draft.stage else { return Err("There is no finished preview to save.".into()) };
-        if let Some(why) = preview.blocker(&draft.input.source) {
-            return Err(why.into());
+        if !KINDS.iter().any(|&kind| preview_syncs(preview, kind)) {
+            return Err("Nothing here would sync. Check the branch and folder, or edit the location.".into());
         }
-        let job = Job::SaveSource(draft.input.clone(), preview.clone());
+        let job = Job::SaveSource(draft.input.clone(), preview.clone(), approve_plugins);
         draft.stage = DraftStage::Saving;
         self.want(job);
         Ok(())
+    }
+
+    /// Change one source's settings (by source ID or lane ID) and save them. False when nothing changed, so nothing is saved.
+    pub fn edit_source(&mut self, id: &str, change: impl FnOnce(&mut SourceConfig)) -> Result<bool, String> {
+        let before = self.cfg.clone();
+        let source = before.find_source(id).ok_or("The source changed. Choose the source you want again.")?;
+        let mut edited = source.clone();
+        change(&mut edited);
+        if edited == *source {
+            return Ok(false);
+        }
+        edited.effective_policy(before.global()).map_err(|why| capitalized(&why))?;
+        let sid = source.id.clone();
+        let mut after = before.clone();
+        after.edit(|sources, _| {
+            if let Some(s) = sources.iter_mut().find(|s| s.id == sid) {
+                *s = edited;
+            }
+        });
+        self.save_edit(before, after);
+        Ok(true)
+    }
+
+    /// Change the defaults every source follows, and save them. False when nothing changed, so nothing is saved.
+    pub fn edit_global(&mut self, change: impl FnOnce(&mut GlobalSettings)) -> Result<bool, String> {
+        let before = self.cfg.clone();
+        let mut global = before.global().clone();
+        change(&mut global);
+        if global == *before.global() {
+            return Ok(false);
+        }
+        for source in before.sources() {
+            source.effective_policy(&global).map_err(|why| capitalized(&why))?;
+        }
+        let mut after = before.clone();
+        after.edit(|_, g| *g = global);
+        self.save_edit(before, after);
+        Ok(true)
+    }
+
+    fn save_edit(&mut self, before: Config, after: Config) {
+        self.set_cfg(after.clone(), self.skills_dir.clone());
+        self.queue_config_save(before, after, self.portable_mode, true);
     }
 
     pub fn skills_dir(&self) -> &PathBuf {
@@ -824,13 +977,21 @@ impl App {
         if moved || self.cfg.app_update != cfg.app_update {
             self.revoke_update();
         }
-        for old in self.cfg.repos.iter().filter(|r| r.kind == SourceKind::Plugins) {
+        for old in self.cfg.repos().iter().filter(|r| r.kind == SourceKind::Plugins) {
             if cfg.find(&old.id).is_none_or(|new| old.kind != new.kind || old.repo != new.repo || old.branch != new.branch || old.path != new.path) {
                 self.board.forget_repo(&old.id);
             }
         }
         self.queue.retain(|job| {
             job.target().is_none_or(|repo| {
+                if matches!(job, Job::Remove { .. }) {
+                    return !moved
+                        && self
+                            .cfg
+                            .find_source(repo)
+                            .zip(cfg.find_source(repo))
+                            .is_some_and(|(old, new)| old.id == new.id && old.repo == new.repo && old.branch == new.branch && old.path == new.path);
+                }
                 !moved
                     && self
                         .cfg
@@ -964,7 +1125,7 @@ impl App {
         let reload_settings = std::mem::take(&mut self.reload_settings_pending);
         let config_saves = std::mem::take(&mut self.config_saves);
         let plugin_rows = if job == Job::Poll {
-            self.cfg.repos.iter().filter(|r| r.kind == SourceKind::Plugins && self.board.has_plugin_rows(&r.id)).map(|r| r.id.clone()).collect()
+            self.cfg.repos().iter().filter(|r| r.kind == SourceKind::Plugins && self.board.has_plugin_rows(&r.id)).map(|r| r.id.clone()).collect()
         } else {
             Vec::new()
         };
@@ -1003,6 +1164,9 @@ impl App {
             }
         }
         let job = done.job;
+        if let Some(seen) = done.seen {
+            self.board.set_seen(seen);
+        }
         let config_saves = done.config_saves;
         if done.settings_checked && !self.reload_settings_pending && !self.queue.iter().any(|job| matches!(job, Job::Check(_))) {
             self.portable_probe_pending = false;
@@ -1016,7 +1180,7 @@ impl App {
         match done.result {
             Err(e) if matches!(job, Job::PreviewSource(_) | Job::SaveSource(..)) => {
                 let input = match &job {
-                    Job::PreviewSource(i) | Job::SaveSource(i, _) => i,
+                    Job::PreviewSource(i) | Job::SaveSource(i, ..) => i,
                     _ => unreachable!(),
                 };
                 if let Some(draft) = self.draft.as_mut().filter(|d| d.input == *input) {
@@ -1066,29 +1230,43 @@ impl App {
                         | Answer::Diffed(_)
                         | Answer::AppUpdate(_)
                         | Answer::SourcePreview(..)
-                        | Answer::SourceSaved(_)
+                        | Answer::SourceSaved { .. }
                 ) {
                     self.failures = 0;
                     self.board.note_failure(now, None);
                 }
                 match answer {
-                    Answer::SourcePreview(id, preview) => {
+                    Answer::SourcePreview(preview) => {
                         if let Job::PreviewSource(input) = &job {
+                            let known = already_added(&self.cfg, &preview);
                             if let Some(d) = self.draft.as_mut().filter(|d| d.input == *input && matches!(d.stage, DraftStage::Loading)) {
-                                Arc::make_mut(&mut d.input).source.id = id;
-                                d.stage = DraftStage::Reviewed(Arc::new(preview));
+                                d.stage = match known {
+                                    Some(id) => DraftStage::AlreadySetUp(id),
+                                    None => DraftStage::Reviewed(preview),
+                                };
                             }
                         }
                     }
-                    Answer::SourceSaved(approved) => {
-                        if let Job::SaveSource(input, _) = &job {
+                    Answer::SourceSaved { source, approved } => {
+                        if let Job::SaveSource(input, ..) = &job {
                             if self.draft.as_ref().is_some_and(|d| d.input == *input && matches!(d.stage, DraftStage::Saving)) {
                                 self.draft = None;
-                                self.cfg.repos.push(input.source.clone());
+                                let label = source_label(&source);
+                                let id = source.id.clone();
+                                if let Err(why) = self.cfg.add_source_config(source) {
+                                    // The worker saved it, so the settings must be read again.
+                                    self.board.say(now, Level::Error, why);
+                                    self.reload_before_next_job();
+                                }
                                 match approved {
                                     Ok(()) => {
-                                        settled.feedback = Some(format!("Added {} [{}].", input.source.label(), input.source.id));
-                                        self.want(Job::Check(Some(input.source.id.clone())));
+                                        settled.feedback = Some(format!("Added {label} [{id}]."));
+                                        // Any lane but the plugins one checks the whole source.
+                                        let lanes = self.cfg.lanes_of(&id);
+                                        if let Some(lane) = lanes.iter().find(|r| r.kind != SourceKind::Plugins).or(lanes.first()) {
+                                            let lane = lane.id.clone();
+                                            self.want(Job::Check(Some(lane)));
+                                        }
                                     }
                                     Err(why) => {
                                         self.board.say(now, Level::Error, why.clone());
@@ -1149,14 +1327,14 @@ impl App {
                             settled.feedback = Some(text);
                         }
                     }
-                    Answer::Removed(report) => {
-                        if let Job::Remove { repo, .. } = &job {
-                            let text = self.removed_text(repo, &report);
-                            self.board.forget_repo(repo);
-                            self.board.say(now, if report.kept.is_empty() || report.message.is_some() { Level::Ok } else { Level::Attention }, text.clone());
-                            settled.feedback = Some(text);
-                            settled.removed = Some(repo.clone());
+                    Answer::Removed { source, label, lanes } => {
+                        let (text, attention) = removed_text(&label, &lanes);
+                        for (lane, ..) in &lanes {
+                            self.board.forget_repo(lane);
                         }
+                        self.board.say(now, if attention { Level::Attention } else { Level::Ok }, text.clone());
+                        settled.feedback = Some(text);
+                        settled.removed = Some(source);
                     }
                     Answer::Diffed(report) => settled.diff = shown(&job, Ok(report)),
                     Answer::SettingsLoaded => {}
@@ -1167,7 +1345,7 @@ impl App {
 
         for save in config_saves {
             if let Err(error) = save.result {
-                if save.revert_on_failure && self.cfg == save.after {
+                if save.revert_on_failure && self.cfg == save.requested {
                     self.cfg = save.before;
                     self.queue.retain(|queued| !matches!(queued, Job::Check(_)));
                 }
@@ -1177,10 +1355,21 @@ impl App {
             } else {
                 if self.cfg == save.before {
                     self.set_cfg(save.after.clone(), self.skills_dir.clone());
+                } else if save.requested != save.after {
+                    let mut cfg = self.cfg.clone();
+                    carry_lane_ids(&save.requested, &save.after, &mut cfg);
+                    for pending in &mut self.config_saves {
+                        carry_lane_ids(&save.requested, &save.after, &mut pending.before);
+                        carry_lane_ids(&save.requested, &save.after, &mut pending.after);
+                    }
+                    if cfg != self.cfg {
+                        self.set_cfg(cfg, self.skills_dir.clone());
+                    }
                 }
                 if self.cfg == save.after {
-                    for r in &save.after.repos {
-                        if r.enabled && save.before.find(&r.id).is_some_and(|old| !old.enabled) {
+                    // A lane that syncs again, because its source or its type was turned back on, is checked now.
+                    for r in save.after.repos() {
+                        if r.enabled && save.before.find(&r.id).is_none_or(|old| !old.enabled) {
                             self.want(Job::Check(Some(r.id.clone())));
                         }
                     }
@@ -1209,8 +1398,7 @@ impl App {
         }
         // Told once the board knows all the job brought back, so that it never says all is well when it is not.
         if let Some(sync) = checked {
-            let (_, items) = crate::board::item_nouns(sync.repos.iter().filter_map(|r| self.cfg.find(&r.repo_id).map(|s| s.kind)));
-            settled.feedback = Some(summary(&sync, self.health() == Health::Ok, items));
+            settled.feedback = Some(summary(&sync, self.health() == Health::Ok, &self.cfg));
         }
         settled.stale_feedback = settled.feedback.is_none() && self.health() != before;
         settled
@@ -1334,22 +1522,31 @@ impl App {
     fn hold(&mut self, until: UnixSecs) {
         self.not_before = self.not_before.max(until);
     }
+}
 
-    fn removed_text(&self, repo: &str, report: &RemoveReport) -> String {
-        let label = self.cfg.find(repo).map_or_else(|| repo.to_string(), |r| r.label());
-        let mut text = format!("Removed {label}.");
+/// What removing a whole source did, in one line, and whether something now needs the user's eye.
+fn removed_text(label: &str, lanes: &[(String, SourceKind, RemoveReport)]) -> (String, bool) {
+    let mut text = format!("Removed {label}.");
+    let mut deleted = Vec::new();
+    let mut kept = Vec::new();
+    let mut attention = false;
+    for (_, _, report) in lanes {
         if let Some(message) = report.message {
-            return format!("{text} {message}");
+            text.push(' ');
+            text.push_str(message);
+            continue;
         }
-        if !report.deleted.is_empty() {
-            text.push_str(&format!(" Deleted: {}.", report.deleted.join(", ")));
-        }
-        if !report.kept.is_empty() {
-            let kept: Vec<String> = report.kept.iter().map(|(name, why)| format!("{name} ({why})")).collect();
-            text.push_str(&format!(" Kept as yours: {}.", kept.join(", ")));
-        }
-        text
+        attention |= !report.kept.is_empty();
+        deleted.extend(report.deleted.iter().cloned());
+        kept.extend(report.kept.iter().map(|(name, why)| format!("{name} ({why})")));
     }
+    if !deleted.is_empty() {
+        text.push_str(&format!(" Deleted: {}.", deleted.join(", ")));
+    }
+    if !kept.is_empty() {
+        text.push_str(&format!(" Kept as yours: {}.", kept.join(", ")));
+    }
+    (text, attention)
 }
 
 fn backoff(failures: u32) -> UnixSecs {
@@ -1367,20 +1564,43 @@ fn shown(job: &Job, result: Result<DiffReport, String>) -> Option<Shown> {
 /// One line about a check the user asked for. The rows say the details. The line is cut at its end when it is too long,
 /// so the reason comes first and the repository after it. `all_well` is whether nothing needs the user once the check is
 /// taken in: a check that found nothing new does not mean an edit made earlier is settled.
-fn summary(report: &SyncReport, all_well: bool, items: &str) -> String {
-    let failed: Vec<_> = report.repos.iter().filter_map(|r| if let Outcome::Failed(f) = &r.outcome { Some((r, f)) } else { None }).collect();
-    // As the row's "No skills found": the listing was empty and nothing was left to do about it.
-    let empty: Vec<_> = report.repos.iter().filter(|r| r.lists_nothing && r.skills.is_empty() && r.plugins.is_empty()).collect();
+fn summary(report: &SyncReport, all_well: bool, cfg: &Config) -> String {
+    // The user sees one entry per source, so a source's types are told as one repository.
+    let source = |r: &RepoReport| cfg.find_source(&r.repo_id).map_or_else(|| (r.repo_id.clone(), r.label.clone()), |s| (s.id.clone(), source_label(s)));
+    let mut failed = Vec::new();
+    // As the entry's "Nothing found": every type the source was checked for listed nothing, and nothing was left to do.
+    let mut sources: Vec<(String, String, bool)> = Vec::new();
+    for r in &report.repos {
+        let (id, label) = source(r);
+        if let Outcome::Failed(f) = &r.outcome {
+            if !failed.iter().any(|(seen, ..): &(String, String, _)| *seen == id) {
+                failed.push((id.clone(), label.clone(), f));
+            }
+        }
+        let empty = r.lists_nothing && r.skills.is_empty() && r.plugins.is_empty();
+        match sources.iter_mut().find(|(seen, ..)| *seen == id) {
+            Some(entry) => entry.2 &= empty,
+            None => sources.push((id, label, empty)),
+        }
+    }
+    let empty: Vec<_> = sources.iter().filter(|(.., empty)| *empty).collect();
     let any = |f: fn(&Outcome) -> bool| report.repos.iter().any(|r| f(&r.outcome));
+    // Each sentence names the types of the lanes it is about, so a source that only changed skills says "skills".
+    let items = |about: &dyn Fn(&RepoReport) -> bool| {
+        crate::board::item_nouns(report.repos.iter().filter(|r| about(r)).filter_map(|r| cfg.find(&r.repo_id).map(|s| s.kind))).1
+    };
+    let emptied = || items(&|r| empty.iter().any(|(id, ..)| *id == source(r).0));
     match failed.as_slice() {
         _ if report.repos.is_empty() => "There is nothing to check: no repository is enabled".to_string(),
-        [(repo, failure)] => format!("{} ({})", capitalized(&failure.message), repo.label),
+        [(_, label, failure)] => format!("{} ({label})", capitalized(&failure.message)),
         [_, ..] => format!("{} repositories could not be checked", failed.len()),
         [] if any(|o| matches!(o, Outcome::Cancelled)) => "The check was stopped".to_string(),
-        [] if any(|o| matches!(o, Outcome::NeedsAttention)) => format!("Checked: some {items} need your attention"),
-        [] if empty.len() == 1 => format!("Checked: no {items} found ({})", empty[0].label),
-        [] if !empty.is_empty() => format!("Checked: no {items} found in {} repositories", empty.len()),
-        [] if any(|o| matches!(o, Outcome::Synced)) => format!("Checked: {items} were updated"),
+        [] if any(|o| matches!(o, Outcome::NeedsAttention)) => {
+            format!("Checked: some {} need your attention", items(&|r| matches!(r.outcome, Outcome::NeedsAttention)))
+        }
+        [] if empty.len() == 1 => format!("Checked: no {} found ({})", emptied(), empty[0].1),
+        [] if !empty.is_empty() => format!("Checked: no {} found in {} repositories", emptied(), empty.len()),
+        [] if any(|o| matches!(o, Outcome::Synced)) => format!("Checked: {} were updated", items(&|r| matches!(r.outcome, Outcome::Synced))),
         [] if all_well => "Checked: everything is up to date".to_string(),
         [] => "Checked: nothing new on GitHub".to_string(),
     }
@@ -1389,6 +1609,7 @@ fn summary(report: &SyncReport, all_well: bool, items: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::RepoSpec;
     use crate::engine::{Failure, RepoReport};
     use crate::github::FailureKind;
 
@@ -1408,7 +1629,7 @@ mod tests {
     }
 
     fn checked(repos: Vec<RepoReport>) -> SyncReport {
-        SyncReport { repos, notes: Vec::new(), warnings: Vec::new() }
+        SyncReport { repos, notes: Vec::new(), warnings: Vec::new(), seen: Vec::new() }
     }
 
     fn failed_check(label: &str, message: &str) -> SyncReport {
@@ -1418,21 +1639,66 @@ mod tests {
 
     #[test]
     fn a_failed_check_says_why_first_because_the_status_line_cuts_the_end() {
+        let none = Config::default();
         let lost = failed_check("owner/repo@main : skills", "the connection was lost");
-        assert_eq!(summary(&lost, false, "skills"), "The connection was lost (owner/repo@main : skills)");
+        assert_eq!(summary(&lost, false, &none), "The connection was lost (owner/repo@main : skills)");
         let refused = failed_check("owner/repo@main : skills", "GitHub refused access to owner/repo");
-        assert_eq!(summary(&refused, false, "skills"), "GitHub refused access to owner/repo (owner/repo@main : skills)");
+        assert_eq!(summary(&refused, false, &none), "GitHub refused access to owner/repo (owner/repo@main : skills)");
     }
 
     #[test]
     fn a_check_that_found_no_skills_does_not_say_everything_is_up_to_date() {
+        let none = Config::default();
         let empty = |label| RepoReport { lists_nothing: true, ..repo_report(label, Outcome::Unchanged) };
-        assert_eq!(summary(&checked(vec![empty("o/a"), repo_report("o/b", Outcome::Synced)]), false, "skills"), "Checked: no skills found (o/a)");
-        assert_eq!(summary(&checked(vec![empty("o/a"), empty("o/b")]), false, "skills"), "Checked: no skills found in 2 repositories");
+        assert_eq!(summary(&checked(vec![empty("o/a"), repo_report("o/b", Outcome::Synced)]), false, &none), "Checked: no skills found (o/a)");
+        assert_eq!(summary(&checked(vec![empty("o/a"), empty("o/b")]), false, &none), "Checked: no skills found in 2 repositories");
         // Skills that need the user come first.
         let attention = checked(vec![empty("o/a"), repo_report("o/b", Outcome::NeedsAttention)]);
-        assert_eq!(summary(&attention, false, "agents"), "Checked: some agents need your attention");
-        assert_eq!(summary(&checked(vec![repo_report("o/b", Outcome::Unchanged)]), true, "skills"), "Checked: everything is up to date");
+        assert_eq!(summary(&attention, false, &none), "Checked: some skills need your attention");
+        assert_eq!(summary(&checked(vec![repo_report("o/b", Outcome::Unchanged)]), true, &none), "Checked: everything is up to date");
+    }
+
+    #[test]
+    fn a_check_is_told_per_source_not_per_type() {
+        let mut cfg = Config::default();
+        let (id, lanes) = crate::sources::allocate_source_ids("kit", &mut cfg.taken_ids());
+        let source = crate::sources::SourceConfig { id, repo: "o/kit".into(), path: "skills".into(), lanes, ..Default::default() };
+        cfg.add_source_config(source.clone()).unwrap();
+        let label = crate::board::source_label(&source);
+        let kinds = [SourceKind::Skills, SourceKind::Agents, SourceKind::Instructions, SourceKind::Plugins];
+        let lanes = |outcome: fn(SourceKind) -> (Outcome, bool)| {
+            checked(
+                kinds
+                    .iter()
+                    .map(|&kind| {
+                        let (outcome, lists_nothing) = outcome(kind);
+                        RepoReport { repo_id: source.lanes.id(kind).unwrap().into(), lists_nothing, ..repo_report(&format!("{kind:?} lane"), outcome) }
+                    })
+                    .collect(),
+            )
+        };
+        let nothing = lanes(|_| (Outcome::Unchanged, true));
+        assert_eq!(summary(&nothing, false, &cfg), format!("Checked: no items found ({label})"));
+        // A type the source does not have is no news while another type of it was installed, and the line names only
+        // the type that changed, as the band above it does.
+        let only_skills = lanes(|kind| if kind == SourceKind::Skills { (Outcome::Synced, false) } else { (Outcome::Unchanged, true) });
+        assert_eq!(summary(&only_skills, false, &cfg), "Checked: skills were updated");
+        let both = lanes(|kind| match kind {
+            SourceKind::Skills | SourceKind::Agents => (Outcome::Synced, false),
+            _ => (Outcome::Unchanged, true),
+        });
+        assert_eq!(summary(&both, false, &cfg), "Checked: items were updated");
+        let agent_waits = lanes(|kind| match kind {
+            SourceKind::Skills => (Outcome::Synced, false),
+            SourceKind::Agents => (Outcome::NeedsAttention, false),
+            _ => (Outcome::Unchanged, true),
+        });
+        assert_eq!(summary(&agent_waits, false, &cfg), "Checked: some agents need your attention");
+        let lost = Failure { kind: FailureKind::Network, message: "the connection was lost".into(), retry_at: None };
+        let failed = checked(
+            kinds.iter().map(|&k| RepoReport { repo_id: source.lanes.id(k).unwrap().into(), ..repo_report("lane", Outcome::Failed(lost.clone())) }).collect(),
+        );
+        assert_eq!(summary(&failed, false, &cfg), format!("The connection was lost ({label})"));
     }
 
     #[test]
@@ -1512,6 +1778,7 @@ mod tests {
             job: Job::ScheduledUpdate,
             result: Ok(Answer::AppUpdate("staged before Off".into())),
             update: Some(UpdateState { generation, clock: app.update_clock, staged: Some("1.2.3".parse().unwrap()), status: None, disk: None, restart: None }),
+            seen: None,
             next_wake: None,
             last_checks: vec![],
             kept: vec![],
@@ -1535,26 +1802,30 @@ mod tests {
     fn plugin_app_does_not_queue_the_first_check_when_approval_fails_after_save() {
         let mut app = App::new(Config::default(), PathBuf::from("unused"));
         app.queue.clear();
-        let spec = RepoSpec::parse("https://github.com/o/r/tree/main").unwrap();
-        app.preview_source(&spec, SourceKind::Plugins, None).unwrap();
+        app.preview_location("https://github.com/o/r/tree/main", None).unwrap();
         app.queue.clear();
         let draft = app.draft.as_mut().unwrap();
         draft.stage = DraftStage::Saving;
-        let id = draft.input.source.id.clone();
-        let job = Job::SaveSource(
-            draft.input.clone(),
-            Arc::new(SourcePreview {
-                kind: SourceKind::Plugins,
-                names: vec![],
-                destination: crate::source::PreviewDestination::NotChecked,
-                errors: vec![],
-                plugins: None,
-            }),
-        );
+        let source = SourceConfig {
+            id: "o-r".into(),
+            repo: "o/r".into(),
+            branch: "main".into(),
+            lanes: crate::sources::Lanes::default().with(SourceKind::Plugins, "o-r".into()),
+            ..SourceConfig::default()
+        };
+        let preview = LocationPreview {
+            source: source.clone(),
+            branch: "main".into(),
+            follows_default: false,
+            types: crate::sources::Types::default(),
+            inventory: crate::inventory::Inventory::default(),
+            destinations: vec![],
+        };
+        let job = Job::SaveSource(draft.input.clone(), Arc::new(preview), true);
         let message = "The source was saved, but its plugins could not be approved.";
-        let done = app_update_done(job, app.update_generation, Ok(Answer::SourceSaved(Err(message.into()))));
+        let done = app_update_done(job, app.update_generation, Ok(Answer::SourceSaved { source, approved: Err(message.into()) }));
         assert_eq!(app.finish(done, 10).feedback.as_deref(), Some(message));
-        assert!(app.cfg.find(&id).is_some(), "the source was already saved");
+        assert!(app.cfg.find_source("o-r").is_some(), "the source was already saved");
         assert!(app.queue.is_empty(), "do not start the first check after this refusal");
     }
 
@@ -1594,11 +1865,35 @@ mod tests {
         assert_eq!(view.level, Level::Error);
     }
 
+    #[test]
+    fn turning_a_type_on_checks_its_lane_now() {
+        let mut before = Config::default();
+        let (id, lanes) = crate::sources::allocate_source_ids("s", &mut before.taken_ids());
+        let mut source = SourceConfig { id: id.clone(), repo: "o/s".into(), lanes, ..SourceConfig::default() };
+        source.set_type(SourceKind::Agents, Some(false));
+        before.add_source_config(source).unwrap();
+        let mut after = before.clone();
+        after.edit(|sources, _| sources[0].set_type(SourceKind::Agents, Some(true)));
+        let lane = |kind| after.find_source(&id).and_then(|s| s.lanes.id(kind)).unwrap().to_owned();
+        let (agents, skills) = (lane(SourceKind::Agents), lane(SourceKind::Skills));
+        assert!(before.find(&agents).is_none() && after.find(&agents).is_some_and(|r| r.enabled));
+
+        let mut app = App::new(before.clone(), PathBuf::from("unused"));
+        app.queue.clear();
+        let mut done = app_update_done(Job::Plan, app.update_generation, Ok(Answer::Planned));
+        done.config_saves = vec![ConfigSave { before, after: after.clone(), portable: false, revert_on_failure: false }.outcome(Ok(()))];
+        app.finish(done, 10);
+        assert_eq!(app.cfg, after);
+        assert!(app.queue.contains(&Job::Check(Some(agents))), "the lane turned on is checked: {:?}", app.queue);
+        assert!(!app.queue.contains(&Job::Check(Some(skills))), "a lane that was on already waits for its schedule");
+    }
+
     fn app_update_done(job: Job, generation: u64, result: Result<Answer, EngineError>) -> Done {
         Done {
             job,
             result,
             update: Some(UpdateState { generation, clock: None, staged: None, status: None, disk: None, restart: None }),
+            seen: None,
             next_wake: None,
             last_checks: vec![],
             kept: vec![],
@@ -1637,7 +1932,15 @@ mod tests {
     fn a_restarted_tray_says_so_when_its_first_look_is_done() {
         let started = || {
             let tracking = crate::engine::Tracking { check: crate::verify::Check::Full, volume_changed: false, journal: false, folder_missing: false };
-            let verify = crate::engine::VerifyReport { skills: vec![], orphans: vec![], stats: Default::default(), tracking, notes: vec![], warnings: vec![] };
+            let verify = crate::engine::VerifyReport {
+                skills: vec![],
+                lanes: vec![],
+                orphans: vec![],
+                stats: Default::default(),
+                tracking,
+                notes: vec![],
+                warnings: vec![],
+            };
             let report = crate::engine::StartupReport { verify, problem: None };
             Done { update: None, ..app_update_done(Job::Startup, 0, Ok(Answer::Started(report))) }
         };

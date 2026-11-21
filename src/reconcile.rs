@@ -77,6 +77,10 @@ pub struct OwnedView<'a> {
 pub struct Input<'a> {
     pub desired: &'a [Skill],
     pub rejected: &'a [Rejected],
+    /// Names the listing has, but which are not to be installed (filtered by a folder rule, or bundled). Positive
+    /// evidence: an owned one is kept as it is, never updated or removed. They do not count against the empty-listing
+    /// guard: only what the lane would install (`desired`) or rejects (`rejected`) makes a listing non-empty.
+    pub protected: &'a [Rejected],
     pub owned: &'a [OwnedView<'a>],
     /// Case-folded names owned by other repositories, with the owner's id.
     pub other_owners: &'a HashMap<String, String>,
@@ -106,8 +110,16 @@ pub enum Hold {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Skip {
     Ignored,
-    Collision { owner: String },
-    Rejected { reason: String },
+    Collision {
+        owner: String,
+    },
+    Rejected {
+        reason: String,
+    },
+    /// Listed, but not synced (a filter, a package or a type switch): kept as it is, with its files and ownership.
+    Protected {
+        reason: String,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -180,6 +192,7 @@ impl Verdict {
             Verdict::Skipped(Skip::Ignored) => "Kept as yours".to_string(),
             Verdict::Skipped(Skip::Collision { owner }) => format!("Skipped: another repository ({owner}) already provides this name"),
             Verdict::Skipped(Skip::Rejected { reason }) => format!("Skipped: not safe to install ({reason})"),
+            Verdict::Skipped(Skip::Protected { reason }) => format!("Kept as it is, not synced: {reason}"),
         }
     }
 }
@@ -224,11 +237,16 @@ fn remove_verdict(local: &LocalState, hold_empty: bool) -> Verdict {
     }
 }
 
+/// A rejected or protected name keeps an owned folder when Windows would treat the two as the same name.
+pub(crate) fn listed_as<'r>(list: &'r [Rejected], name: &str) -> Option<&'r Rejected> {
+    // Two ASCII names are the same to Windows exactly when their case folds are; only other names need to ask it.
+    list.iter().find(|r| fold(&r.name) == fold(name) || ((!r.name.is_ascii() || !name.is_ascii()) && crate::win::fs::same_win_name(&r.name, name)))
+}
+
 pub fn plan(input: &Input) -> Vec<Decision> {
     let mut out = Vec::new();
     let desired_keys: HashSet<String> = input.desired.iter().map(|s| fold(&s.name)).collect();
     let owned_by_key: HashMap<String, &OwnedView> = input.owned.iter().map(|o| (fold(&o.skill.name), o)).collect();
-    let rejected_by_key: HashMap<String, &Rejected> = input.rejected.iter().map(|r| (fold(&r.name), r)).collect();
     let interrupted_keys: HashSet<String> = input.interrupted.iter().map(|n| fold(n)).collect();
 
     for skill in input.desired {
@@ -257,8 +275,10 @@ pub fn plan(input: &Input) -> Vec<Decision> {
         if desired_keys.contains(&key) || input.unmanaged.get(&key) == Some(&UnmanagedState::Paused) {
             continue;
         }
-        let verdict = if let Some(r) = rejected_by_key.get(&key) {
+        let verdict = if let Some(r) = listed_as(input.rejected, &owned.skill.name) {
             Verdict::Skipped(Skip::Rejected { reason: r.reason.clone() })
+        } else if let Some(r) = listed_as(input.protected, &owned.skill.name) {
+            Verdict::Skipped(Skip::Protected { reason: r.reason.clone() })
         } else {
             remove_verdict(&owned.local, hold_all_deletions)
         };
@@ -300,6 +320,7 @@ pub struct LeafListing<'a> {
 enum LeafFact<'a> {
     Listed(&'a SkillFile),
     Rejected(&'a str),
+    Protected(&'a str),
     Absent { hold_empty: bool },
 }
 
@@ -329,10 +350,14 @@ impl<'a> LeafListing<'a> {
             } else {
                 LeafFact::Rejected("another spelling has the same folded name")
             }
-        } else if let Ok(i) = discovery.rejected().binary_search_by(|r| r.name.as_str().cmp(name)) {
-            LeafFact::Rejected(&discovery.rejected()[i].reason)
+        } else if let Some(r) = discovery.rejected().iter().find(|r| r.name == name || crate::win::fs::same_win_name(&r.name, name)) {
+            LeafFact::Rejected(&r.reason)
+        } else if let Some(r) = discovery.protected().iter().find(|r| r.name == name || crate::win::fs::same_win_name(&r.name, name)) {
+            LeafFact::Protected(&r.reason)
         } else if discovery.confirms_leaf_absent(recorded, name) {
-            LeafFact::Absent { hold_empty: files.is_empty() && !confirm_empty }
+            // The empty-listing guard counts only what this lane would install or rejects; items it never syncs
+            // (filtered or bundled) do not make the listing non-empty.
+            LeafFact::Absent { hold_empty: files.is_empty() && discovery.rejected().is_empty() && !confirm_empty }
         } else {
             return Err("the listing does not prove this file is absent from the recorded source".into());
         };
@@ -369,6 +394,7 @@ pub(crate) fn plan_leaf(listing: LeafListing, facts: LeafFacts) -> Verdict {
     }
     match (listing.fact, facts.owned) {
         (LeafFact::Rejected(reason), _) => Verdict::Skipped(Skip::Rejected { reason: reason.into() }),
+        (LeafFact::Protected(reason), _) => Verdict::Skipped(Skip::Protected { reason: reason.into() }),
         (LeafFact::Listed(f), Some((old, local))) => owned_verdict(&local, old.blob == f.blob, facts.matches_upstream),
         (LeafFact::Listed(_), None) => {
             unmanaged_verdict(facts.exists.then_some(if facts.matches_upstream { UnmanagedState::Identical } else { UnmanagedState::Different }))
@@ -416,6 +442,7 @@ mod tests {
     struct Case {
         desired: Vec<Skill>,
         rejected: Vec<Rejected>,
+        protected: Vec<Rejected>,
         owned: Vec<(OwnedSkill, LocalState)>,
         /// Case-folded names of owned skills whose folder was found to be what upstream has now.
         matching: HashSet<String>,
@@ -431,6 +458,7 @@ mod tests {
             Case {
                 desired: vec![],
                 rejected: vec![],
+                protected: vec![],
                 owned: vec![],
                 matching: HashSet::new(),
                 other: HashMap::new(),
@@ -447,6 +475,7 @@ mod tests {
             let input = Input {
                 desired: &self.desired,
                 rejected: &self.rejected,
+                protected: &self.protected,
                 owned: &views,
                 other_owners: &self.other,
                 unmanaged: &self.unmanaged,
@@ -462,6 +491,40 @@ mod tests {
             assert_eq!(r.len(), 1, "{r:?}");
             r.remove(0).1
         }
+    }
+
+    #[test]
+    fn a_listed_name_in_another_ascii_case_is_the_same_item() {
+        let list = [Rejected { name: "Alpha".into(), reason: "'examples' is an ignored folder".into() }];
+        assert_eq!(listed_as(&list, "alPHA").map(|r| r.name.as_str()), Some("Alpha"));
+        assert!(listed_as(&list, "alpha2").is_none());
+    }
+
+    #[test]
+    fn a_listed_item_that_is_not_synced_keeps_what_is_owned_but_does_not_count_against_the_empty_guard() {
+        let off = || Rejected { name: "alpha".into(), reason: "'examples' is an ignored folder".into() };
+        for local in [LocalState::Clean, dirty(), LocalState::FolderMissing] {
+            let mut c = Case::new();
+            c.owned = vec![(own("alpha", "v1"), local.clone())];
+            c.protected = vec![off()];
+            assert_eq!(c.only(), Verdict::Skipped(Skip::Protected { reason: off().reason }), "{local:?}");
+            c.confirm = true;
+            assert_eq!(c.only(), Verdict::Skipped(Skip::Protected { reason: off().reason }), "a confirmation removes nothing listed: {local:?}");
+        }
+        // Another owned item that is really gone is held: a listed item that is not synced (filtered, or bundled in a
+        // package) does not make the listing any less empty for this type.
+        let mut c = Case::new();
+        c.owned = vec![(own("alpha", "v1"), LocalState::Clean), (own("beta", "v1"), LocalState::Clean)];
+        c.protected = vec![off()];
+        let kept = ("alpha".to_string(), Verdict::Skipped(Skip::Protected { reason: off().reason }));
+        assert_eq!(c.run(), vec![kept.clone(), ("beta".into(), Verdict::Held(Hold::MassDeletion))]);
+        c.confirm = true;
+        assert_eq!(c.run(), vec![kept, ("beta".into(), Verdict::Delete)]);
+        // Nobody owns it: nothing happens and nothing needs attention.
+        let mut c = Case::new();
+        c.protected = vec![off()];
+        assert!(c.run().is_empty());
+        assert!(!Verdict::Skipped(Skip::Protected { reason: String::new() }).needs_attention());
     }
 
     #[test]

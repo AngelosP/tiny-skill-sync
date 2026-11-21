@@ -68,6 +68,29 @@
 - Bounds: `MAX_TREE_BYTES` is 16 MiB (github.rs:20), `MAX_MANIFEST_BYTES` 256 KiB, and `MAX_SETTINGS` 4 MiB. The
   plugin listing is always the whole branch root.
 
+### Mixed sources (issue #8, inspection of the uncommitted tree, 2026-11-21)
+
+- Smart App Control blocked every fresh build script in a new target dir (os error 4551 on proc-macro2, quote,
+  serde_core), even after retries and `CARGO_PROFILE_RELEASE_BUILD_OVERRIDE_DEBUG=1`. A new reviewer target dir may
+  therefore build nothing; plan on inspection or reuse an existing reviewer dir.
+- Bench copies `target\release\*.exe` (`common.ps1` `New-LiveRoot`); the exe row budget is 1.70 MiB (bench.ps1:433;
+  raised from 1.40 by the coordinator with the owner's delegated authority for issue #8, 2026-11-21).
+- One source = one conditional root listing (`engine/root.rs` `sync_source`/`root_listing`, always `path ""`,
+  recursive). `shared_etag` (root.rs:134) is conditional only if every on-lane holds the same `etag#rules` tag.
+  A 304 calls only `touch_check` (lazy time); `set_lane_poll` ignores time-only changes (state.rs:775).
+  Tests: `an_unchanged_source_costs_one_request_and_writes_nothing...` (tests/engine_lanes.rs:346).
+- Saved history searches: the mixed-source shortcut is fixed. When the commit is unchanged and every lane could
+  skip the listing (`shared_etag`), it costs 1 commit request and makes no state write (root.rs:267-277; test
+  `a_finished_history_search_keeps_an_unchanged_mixed_source_at_one_request`, engine_lanes.rs:400).
+- `confirm_source_at` (github.rs:230) fetches `historical_tree(.., "")`, i.e. a full recursive `COMMIT:` tree, only
+  to compare the root SHA for lane views. `RootListing::confirmed` dedups it across file lanes, not with skills.
+- `lane_files` (loose.rs:82-89) scans every entry under the lane path (whole repo for `""`) against every leaf with
+  `same_win_name` (2 UTF-16 allocs + FFI each); HEAD scanned only top-level entries.
+- `lane_discovery` (tree.rs:231) re-runs `entry_index` and clones every scoped entry per lane call; `sync_files_in`
+  calls it twice for a new file lane.
+- Splitter: drag saves `window.txt` once at the end (window.rs:547); each arrow key reads and writes it on the UI
+  thread (window.rs:566-571). Every drag move re-lays out hero, nav and page. A list timer was removed; no new timer.
+
 ## Baselines
 
 - `bench-20261119-225701.md`: tray 7.9 ms median; idle threads/handles 5/149; after poll 9/340; exe 1,168,384 bytes.
@@ -80,6 +103,15 @@
 - Plugins F4 (verified by a no-op release build on 2026-11-20): tray exe 1,415,680 bytes, 104,960 over the
   1,310,720 budget; tss.exe 1,204,224. Plugins add about 127 KB. The coordinator's linker map put about 116 KB
   in plugins.
+- Issue #8 (observed, not my build): `target\release` built 07:49 on 2026-11-21 from the feature tree (dep-info lists
+  sources.rs and location.rs; no newer source): tray 1,707,520 bytes, tss.exe 1,482,240. That is 291,840 more than
+    plugins F4. The coordinator's map: HEAD v0.8.0 1,434,112 bytes, +273,408, spread across modules
+    (`target\size-diff.txt`).
+  - `bench-20261121-082936.md` (issue #8, all rows within budget): tray 9.2 ms; startup job 8.54 ms for 5 files
+    (5.7 ms before, 1.1 ms on 2026-11-20 00:13); open to painted 55.4 ms median, max 63.1 (37-47 before); unchanged
+    poll 31.3 ms CPU, 0 I/O; idle 5/154; after a poll 9/345, 1.0/2.9 MiB; exe 1,707,520 against 1.70 MiB
+    (75,059 bytes headroom). Bench now adds with `--yes` (bench.ps1:252), so the fixture source has all detected types,
+    not skills only. Rows before and after are not like for like.
 - No measurement exists of a Copilot CLI launch (wall time, CPU, memory) or of a plugin poll.
 
 ## Open proposals

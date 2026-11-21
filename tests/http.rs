@@ -308,6 +308,19 @@ fn historical_absence_needs_a_complete_parent_and_404_is_never_absence() {
     }
 }
 
+#[test]
+fn a_historical_repository_root_is_its_tree_not_the_commit_github_echoes_back() {
+    // GitHub answers git/trees/COMMIT with the commit's own ID as "sha"; COMMIT: names the root tree itself.
+    const TREE: &str = "fedcba9876543210fedcba9876543210fedcba98";
+    let server = FakeServer::start(|req| {
+        let sha = if req.target.starts_with(&format!("/api/repos/o/n/git/trees/{SHA}%3A")) { TREE } else { SHA };
+        answer(200, json!({"sha": sha, "tree": [], "truncated": false}).to_string())
+    });
+    let root = server.remote().historical_tree(&at("main", ""), SHA, "", None, &go()).unwrap().unwrap();
+    assert_eq!(root.sha, TREE);
+    assert_eq!(server.seen()[0].target, format!("/api/repos/o/n/git/trees/{SHA}%3A?recursive=1"));
+}
+
 /// A small listing in GitHub's format: one skill folder with its `SKILL.md`.
 fn http_listing() -> String {
     json!({
@@ -443,6 +456,99 @@ fn the_commit_pin_is_read_from_the_bare_answer_and_anything_else_is_refused() {
         assert_eq!(s.header("accept"), Some("application/vnd.github.sha"));
         assert_eq!(s.header("x-github-api-version"), Some("2022-11-28"));
     }
+}
+
+#[test]
+fn matching_heads_follow_pages_on_the_configured_origin_only() {
+    let server = FakeServer::start(|req| match req.target.as_str() {
+        "/api/repos/o/n/git/matching-refs/heads/team%2Bx?per_page=100&page=1" => {
+            answer(200, r#"[{"ref":"refs/heads/team+x"},{"ref":"refs/heads/team+x-other"}]"#)
+                .header("Link", r#"<http://127.0.0.1:9/never-request-this?page=2>; rel="next", <http://127.0.0.1:9/ignored?page=2>; rel="last""#)
+        }
+        "/api/repos/o/n/git/matching-refs/heads/team%2Bx?per_page=100&page=2" => {
+            answer(200, r#"[{"ref":"refs/heads/team+x/feature"}]"#).header("Link", r#"</irrelevant?page=1>; rel="prev""#)
+        }
+        _ => answer(404, ""),
+    });
+    let token = Secret::new("tss-test-token".to_owned());
+    let names = server.remote().matching_heads(&at("ignored", "also/ignored"), "team+x", Some(&token), &go()).unwrap();
+    assert_eq!(names, ["team+x", "team+x-other", "team+x/feature"]);
+    let seen = server.seen();
+    assert_eq!(seen.len(), 2);
+    for req in seen {
+        assert_eq!(req.method, "GET");
+        assert_eq!(req.header("accept"), Some("application/vnd.github+json"));
+        assert_eq!(req.header("authorization"), Some("Bearer tss-test-token"));
+    }
+}
+
+#[test]
+fn matching_heads_reject_invalid_incomplete_and_unbounded_answers() {
+    let server = FakeServer::start(|req| {
+        let page = req.target.rsplit('=').next().unwrap();
+        if req.target.contains("/loop?") {
+            answer(200, format!(r#"[{{"ref":"refs/heads/loop/{page}"}}]"#)).header("Link", r#"</unused>; rel="next""#)
+        } else if req.target.contains("/tag?") {
+            answer(200, r#"[{"ref":"refs/tags/tag"}]"#)
+        } else if req.target.contains("/broken?") {
+            answer(200, r#"[{"ref":"refs/heads/broken"}]"#).header("Link", "not a link")
+        } else if req.target.contains("/invalid-link?") {
+            answer(200, r#"[{"ref":"refs/heads/invalid-link"}]"#).header("Link", "</unused>; rel=next;type=foo")
+        } else if req.target.contains("/empty-page?") && page == "1" {
+            answer(200, r#"[{"ref":"refs/heads/empty-page"}]"#).header("Link", r#"</unused>; rel="next""#)
+        } else if req.target.contains("/big?") {
+            answer(200, " ".repeat(513 * 1024))
+        } else if req.target.contains("/limited?") {
+            if page == "1" {
+                answer(200, r#"[{"ref":"refs/heads/limited"}]"#).header("Link", r#"</unused>; rel="next""#)
+            } else {
+                answer(429, "{}").header("Retry-After", "123")
+            }
+        } else {
+            answer(200, "[]")
+        }
+    });
+    let remote = server.remote();
+    let repo = at("", "");
+    for (prefix, kind) in [
+        ("tag", FailureKind::Protocol),
+        ("broken", FailureKind::Protocol),
+        ("invalid-link", FailureKind::Protocol),
+        ("empty-page", FailureKind::Protocol),
+        ("big", FailureKind::TooLarge),
+        ("loop", FailureKind::TooLarge),
+    ] {
+        assert_eq!(remote.matching_heads(&repo, prefix, None, &go()).unwrap_err().kind, kind);
+    }
+    let now = now_epoch();
+    let e = remote.matching_heads(&repo, "limited", None, &go()).unwrap_err();
+    assert_eq!(e.kind, FailureKind::RateLimited);
+    assert!((now + 123..=now_epoch() + 123).contains(&e.retry_at.unwrap()));
+    assert!(remote.matching_heads(&repo, "absent", None, &go()).unwrap().is_empty());
+    assert_eq!(server.seen().iter().filter(|req| req.target.contains("/loop?")).count(), 20);
+}
+
+#[test]
+fn default_branch_reads_repo_metadata_and_reports_normal_failures() {
+    let server = FakeServer::start(|req| match req.target.as_str() {
+        "/api/repos/o/n" => answer(200, r#"{"default_branch":"feature/default"}"#),
+        "/api/repos/o/invalid" => answer(200, r#"{"default_branch":"not a branch"}"#),
+        "/api/repos/o/shape" => answer(200, r#"["main"]"#),
+        "/api/repos/o/big" => answer(200, " ".repeat(65 * 1024)),
+        _ => answer(404, "{}"),
+    });
+    let remote = server.remote();
+    assert_eq!(remote.default_branch(&at("main", "some/folder"), None, &go()).unwrap(), "feature/default");
+    for (name, kind) in
+        [("invalid", FailureKind::Protocol), ("shape", FailureKind::Protocol), ("big", FailureKind::TooLarge), ("private", FailureKind::NotFound)]
+    {
+        let repo = RepoRef { name, ..at("", "") };
+        assert_eq!(remote.default_branch(&repo, None, &go()).unwrap_err().kind, kind);
+    }
+    let count = server.seen().len();
+    assert_eq!(remote.default_branch(&at("", ""), None, &AtomicBool::new(true)).unwrap_err().kind, FailureKind::Cancelled);
+    assert_eq!(server.seen().len(), count);
+    assert!(server.seen().iter().all(|req| req.header("authorization").is_none()));
 }
 
 #[test]
@@ -658,7 +764,7 @@ fn a_cancel_is_honoured_before_sending_and_between_reads() {
 // Whole checks over a socket: a fake GitHub that serves one repository, `o/fixtures`, from a map of files
 // ---------------------------------------------------------------------------------------------------------------------
 
-const TREE: &str = "/api/repos/o/fixtures/git/trees/HEAD%3Askills?recursive=1";
+const TREE: &str = "/api/repos/o/fixtures/git/trees/HEAD%3A?recursive=1";
 const COMMIT: &str = "/api/repos/o/fixtures/commits/HEAD";
 
 struct Upstream {
@@ -689,23 +795,29 @@ fn fixture_files() -> BTreeMap<String, Vec<u8>> {
 
 /// The listing of `skills/` in GitHub's format, its ETag and the commit it belongs to.
 fn listing(files: &BTreeMap<String, Vec<u8>>) -> (String, String, String) {
+    let (body, sha) = subtree(files, "");
+    let etag = format!("\"{}\"", &sha[..20]);
+    let commit = blob_hex(format!("commit {sha}").as_bytes());
+    (body, etag, commit)
+}
+
+/// The recursive listing of one folder (`""` = the branch root); each folder's SHA is that of its own listing.
+fn subtree(files: &BTreeMap<String, Vec<u8>>, folder: &str) -> (String, String) {
+    let prefix = if folder.is_empty() { String::new() } else { format!("{folder}/") };
     let mut entries = Vec::new();
     let mut folders = BTreeSet::new();
     for (path, content) in files {
-        let Some(rel) = path.strip_prefix("skills/") else { continue };
+        let Some(rel) = path.strip_prefix(prefix.as_str()) else { continue };
         for (i, _) in rel.match_indices('/') {
             folders.insert(&rel[..i]);
         }
         entries.push(json!({"path": rel, "mode": "100644", "type": "blob", "sha": blob_hex(content), "size": content.len()}));
     }
-    for folder in folders {
-        entries.push(json!({"path": folder, "mode": "040000", "type": "tree", "sha": blob_hex(folder.as_bytes())}));
+    for sub in folders {
+        entries.push(json!({"path": sub, "mode": "040000", "type": "tree", "sha": subtree(files, &format!("{prefix}{sub}")).1}));
     }
     let tree_sha = blob_hex(serde_json::to_string(&entries).unwrap().as_bytes());
-    let body = json!({"sha": tree_sha, "url": "u", "tree": entries, "truncated": false}).to_string();
-    let etag = format!("\"{}\"", &tree_sha[..20]);
-    let commit = blob_hex(format!("commit {tree_sha}").as_bytes());
-    (body, etag, commit)
+    (json!({"sha": tree_sha, "url": "u", "tree": entries, "truncated": false}).to_string(), tree_sha)
 }
 
 fn decode(s: &str) -> String {
@@ -734,7 +846,7 @@ fn fake_github(upstream: Arc<Mutex<Upstream>>) -> impl Fn(&Seen) -> Reply + Send
             }
         }
         let (body, etag, commit) = listing(&up.files);
-        let tree_sha = serde_json::from_str::<serde_json::Value>(&body).unwrap()["sha"].as_str().unwrap().to_string();
+        let (skills_body, tree_sha) = subtree(&up.files, "skills");
         if req.target == TREE {
             return if req.header("if-none-match") == Some(etag.as_str()) {
                 answer(304, "").header("ETag", &etag)
@@ -746,7 +858,7 @@ fn fake_github(upstream: Arc<Mutex<Upstream>>) -> impl Fn(&Seen) -> Reply + Send
             return answer(200, commit);
         }
         if let Some(tree) = req.target.strip_prefix("/api/repos/o/fixtures/git/trees/") {
-            if tree == commit {
+            if tree == format!("{commit}%3A") {
                 return answer(
                     200,
                     json!({
@@ -758,7 +870,7 @@ fn fake_github(upstream: Arc<Mutex<Upstream>>) -> impl Fn(&Seen) -> Reply + Send
                 );
             }
             if tree == format!("{tree_sha}?recursive=1") {
-                return answer(200, body).header("Content-Type", "application/json; charset=utf-8");
+                return answer(200, skills_body).header("Content-Type", "application/json; charset=utf-8");
             }
         }
         let file = req.target.strip_prefix(&format!("/raw/o/fixtures/{commit}/")).map(decode).and_then(|path| up.files.get(&path));

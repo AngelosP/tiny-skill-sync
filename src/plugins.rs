@@ -11,7 +11,7 @@ mod name_map;
 pub use name_map::NameMap;
 pub mod native;
 mod plan;
-pub use plan::{Action, Blocker, Choice, Operation, Plan, Status, plan, plan_source_removal};
+pub use plan::{Action, Blocker, Choice, Operation, Plan, Status, plan, plan_source_removal, plan_unapproved};
 
 /// The identity must already be in Copilot's normal form. Never normalise an argument to the CLI.
 pub(crate) fn normal_name(name: &str) -> bool {

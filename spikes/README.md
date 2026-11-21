@@ -7,8 +7,8 @@ They are kept so the measurements can be repeated, for example on another machin
 None of this is part of the app. The Rust spikes are in `examples\` and build only with `--features spikes`. Raw results
 go to `spikes\out\`, which git ignores.
 
-All of them work in their own folders under `%TEMP%` and only read from GitHub. Run them from a normal (not elevated)
-PowerShell.
+The spikes use throwaway folders under `%TEMP%`. S1-S3 only read from GitHub; S4 creates and removes two `e2e-*`
+branches of the public fixture repository. Run them from a normal (not elevated) PowerShell.
 
 | Spike | Question | Files |
 | --- | --- | --- |
@@ -16,6 +16,7 @@ PowerShell.
 | S1b | What does a per-file fingerprint cost in Rust, and when does it miss a change? | `..\examples\s1b_fingerprint.rs` |
 | S2 | How does GitHub answer conditional polls, with and without a token? | `s2-github-probe.ps1`, `s2b-304-cost.ps1`, `s2c-observe.ps1` |
 | S3 | What does a native Rust tray app cost to start, keep idle and poll? | `..\examples\s3_tray.rs`, `..\examples\s3_floor.rs`, `s3-build-variants.ps1`, `s3-measure.ps1` |
+| S4 | Can Copilot CLI install and verify a standalone plugin from a named branch and folder? | `s4-standalone-plugin.ps1` |
 
 ## Running them
 
@@ -35,6 +36,9 @@ cargo run --release --features spikes --example s1b_fingerprint -- cleanup
 # S3: build the tray spike in each variant, then measure it
 .\spikes\s3-build-variants.ps1
 .\spikes\s3-measure.ps1
+
+# S4: real Copilot CLI, isolated home/cache, gh with write access to the public fixture
+.\spikes\s4-standalone-plugin.ps1
 ```
 
 Each script's header lists its options. `s2-github-probe.ps1 -Auth token`, `s2b-304-cost.ps1` and `s2c-observe.ps1` use
@@ -84,3 +88,26 @@ the token from `gh auth token` and keep it in memory only.
 These numbers became the budgets the real app is measured against (see
 [CONTRIBUTING.md](../CONTRIBUTING.md#measuring)); the real app's results are in
 [the user guide](../docs/GUIDE.md#measured-cost).
+
+### S4: standalone Copilot CLI plugins (2026-11-21)
+
+Copilot CLI 1.0.112, isolated home and cache, no GitHub sign-in. The probe pushes a plugin with a skill to
+`tools/spike-plugin` on two throwaway branches of the public fixture (whose `main` has no plugin), then tries 12
+install forms. It checks each one against `plugin list --json` and against the manifest and skill on disk.
+
+- **No direct form installs from a named branch.** `OWNER/REPO:PATH`, `#ref` or `@ref` before or after the path,
+  Git URLs with `#ref`, `?ref=&path=` and `/tree/BRANCH/PATH` all exit 1 and install nothing.
+- **Direct installs use the default branch only.** A positive control on another public repository,
+  `github/awesome-copilot:plugins/arch`, installs from `main` into `installed-plugins\_direct\...`. `config.json` (a
+  JSON file with comments, managed by the CLI) records `{"source":"github","repo":...,"path":...}` and no ref. The
+  list row has `marketplace` set to `""`. Adding `#main` to the path fails ("Plugin path does not exist"). The CLI
+  warns: "Direct plugin installs (repos, URLs, local paths) are deprecated. Only plugin@marketplace installs will be
+  supported in a future release."
+- **A marketplace pins the branch.** `plugin marketplace add OWNER/REPO#BRANCH` followed by `install NAME@MARKET`
+  installs the branch's exact files. `settings.json` records the repo and ref under `extraKnownMarketplaces`.
+- **The same name can be installed twice.** A local-path control (not a GitHub result) installs into `_direct`.
+  The marketplace copy of the same plugin then appears as a second row; the rows are told apart by `marketplace`.
+- Update was not measured because no direct GitHub install from the branch succeeded.
+
+Decision: the app installs a plugin only through a marketplace on the exact branch. A standalone plugin that no
+branch-root marketplace lists is shown once, with the reason, and never installed directly.

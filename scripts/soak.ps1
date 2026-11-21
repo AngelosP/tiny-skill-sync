@@ -98,7 +98,7 @@ try {
 
     New-RunBranch $Repo 'main' $branch
     $branchMade = $true
-    $added = Invoke-LiveTss $root @('add', $folderAddress, '--every', $Every)
+    $added = Invoke-LiveTss $root @('add', $folderAddress, '--every', $Every, '--yes')
     if ($added.Code -ne 0) { throw "tss add failed: $($added.Text)" }
 
     $clock = [Diagnostics.Stopwatch]::StartNew()

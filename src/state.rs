@@ -16,7 +16,7 @@ use crate::plugins::{NameMap, normal_name};
 use crate::source::{DestinationBinding, SourceKind};
 use crate::tree::SkillFile;
 
-pub const STATE_VERSION: u32 = 2;
+pub const STATE_VERSION: u32 = 3;
 
 /// What Windows reported about a file when its content was last known to match the manifest.
 /// Stored as `[file id (2 numbers), size, last write, change time, USN]`.
@@ -207,6 +207,9 @@ pub struct State {
     loose_sources: BTreeMap<String, LooseSourceState>,
     #[serde(skip_serializing_if = "NameMap::is_empty")]
     plugin_sources: NameMap<PluginSourceState>,
+    /// Scheduling data of lanes without a record, by lane ID (see `LanePoll`). Format 3 only.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    lane_polls: BTreeMap<String, LanePoll>,
 }
 
 impl Default for State {
@@ -219,6 +222,7 @@ impl Default for State {
             set_aside: Vec::new(),
             loose_sources: BTreeMap::new(),
             plugin_sources: NameMap::new(),
+            lane_polls: BTreeMap::new(),
         }
     }
 }
@@ -434,6 +438,12 @@ impl PluginOrigin {
     pub fn matches(&self, source: &RepoConfig) -> bool {
         source.kind == SourceKind::Plugins && self.repo == source.repo && self.branch == source.branch && self.path == source.path
     }
+
+    /// The record of a plugins lane, before the lane's branch is resolved: a lane that follows the default branch
+    /// (empty branch) keeps the record made for the branch it resolved to. The exact branch is compared at check time.
+    pub fn matches_lane(&self, lane: &RepoConfig) -> bool {
+        lane.kind == SourceKind::Plugins && self.repo == lane.repo && self.path == lane.path && (lane.branch.is_empty() || self.branch == lane.branch)
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -467,6 +477,10 @@ pub struct PluginSourceState {
     /// A null publisher is an explicit approval of an unnamed publisher, not a missing approval.
     pub approved: NameMap<Option<String>>,
     pub plugins: NameMap<OwnedPlugin>,
+    /// The plugin root (branch-root path) each approval was given for. A name without one was approved before roots
+    /// were recorded and stays approved wherever its root is.
+    #[serde(default, skip_serializing_if = "NameMap::is_empty")]
+    pub roots: NameMap<String>,
 }
 
 impl PluginSourceState {
@@ -479,6 +493,7 @@ impl PluginSourceState {
             poll: PluginPoll::default(),
             approved: NameMap::new(),
             plugins: NameMap::new(),
+            roots: NameMap::new(),
         }
     }
 
@@ -497,12 +512,52 @@ impl PluginSourceState {
         if !self.recorded_source("").problems().is_empty() || !normal_name(&self.market) || crate::source::check_root(&self.copilot_home).is_err() {
             return Err("invalid plugin source identity in state.json".into());
         }
-        if self.approved.keys().chain(self.plugins.keys()).any(|name| !normal_name(name))
+        if self.approved.keys().chain(self.plugins.keys()).chain(self.roots.keys()).any(|name| !normal_name(name))
             || self.plugins.values().any(|plugin| !crate::hash::is_sha1_hex(&plugin.fingerprint))
+            || self.roots.values().any(|root| !root.is_empty() && crate::pathsafe::check_rel_path(root).is_err())
         {
             return Err("invalid plugin record in state.json".into());
         }
         Ok(())
+    }
+}
+
+/// When a lane that has no record yet (it found nothing of its type to place, or its plugins are not approved) was
+/// last checked, and at which tagged ETag, for the location it was checked at. Scheduling only: it owns nothing and
+/// is never used for ownership, adoption or deletion. It goes as soon as the lane gets a real record.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LanePoll {
+    pub kind: SourceKind,
+    pub repo: String,
+    pub branch: String,
+    pub path: String,
+    pub etag: Option<String>,
+    pub last_check: Option<i64>,
+    #[serde(default)]
+    pub lists_nothing: bool,
+    /// A plugins lane whose last full check left plugins for the user to approve or look at.
+    #[serde(default)]
+    pub attention: bool,
+}
+
+impl LanePoll {
+    pub fn new(lane: &RepoConfig, etag: Option<String>, last_check: i64, lists_nothing: bool, attention: bool) -> Self {
+        Self {
+            kind: lane.kind,
+            repo: lane.repo.clone(),
+            branch: lane.branch.clone(),
+            path: lane.path.clone(),
+            etag,
+            last_check: Some(last_check),
+            lists_nothing,
+            attention,
+        }
+    }
+
+    /// Whether this was recorded for `lane` as it is configured now.
+    pub fn matches(&self, lane: &RepoConfig) -> bool {
+        self.kind == lane.kind && self.repo == lane.repo && self.branch == lane.branch && self.path == lane.path
     }
 }
 
@@ -514,6 +569,8 @@ struct StateFormat {
     loose_sources: bool,
     #[serde(default, deserialize_with = "present")]
     plugin_sources: bool,
+    #[serde(default, deserialize_with = "present")]
+    lane_polls: bool,
 }
 
 // Inspect only the field names, without building any of the records. Keep the legacy
@@ -535,6 +592,8 @@ struct StateKeys {
     _loose_sources: Option<serde::de::IgnoredAny>,
     #[serde(rename = "plugin_sources")]
     _plugin_sources: Option<serde::de::IgnoredAny>,
+    #[serde(rename = "lane_polls")]
+    _lane_polls: Option<serde::de::IgnoredAny>,
 }
 
 fn present<'de, D: Deserializer<'de>>(d: D) -> Result<bool, D::Error> {
@@ -613,12 +672,19 @@ impl State {
                 if format.plugin_sources && format.version < 2 {
                     return Err(io::Error::other("plugin state requires state.json format 2"));
                 }
+                if format.lane_polls && format.version < 3 {
+                    return Err(io::Error::other("lane check times require state.json format 3"));
+                }
                 if format.version >= 2 {
                     serde_json::from_slice::<StateKeys>(&bytes).map_err(io::Error::other)?;
                 }
                 match serde_json::from_slice::<State>(&bytes) {
                     Ok(mut state) => {
                         state.check_bindings().map_err(io::Error::other)?;
+                        if state.needs_format_3() && format.version < 3 {
+                            return Err(io::Error::other("plugin approval roots require state.json format 3"));
+                        }
+                        state.drop_conflicting_lane_polls();
                         state.version = state.wire_version();
                         Ok(state)
                     }
@@ -659,8 +725,70 @@ impl State {
         fsx::write_atomic(path, &json)
     }
 
+    /// The oldest format that holds everything recorded, so an older app reads a file it fully understands and
+    /// refuses any other as newer. Add each new format 3 field to `needs_format_3`.
     fn wire_version(&self) -> u32 {
-        if self.loose_sources.is_empty() && self.plugin_sources.is_empty() { 1 } else { 2 }
+        if self.needs_format_3() {
+            3
+        } else if self.loose_sources.is_empty() && self.plugin_sources.is_empty() {
+            1
+        } else {
+            2
+        }
+    }
+
+    /// Fields format 2 readers (v0.8.0) do not know: plugin approval roots and the check times of lanes without a
+    /// record.
+    fn needs_format_3(&self) -> bool {
+        !self.lane_polls.is_empty() || self.plugin_sources.values().any(|record| !record.roots.is_empty())
+    }
+
+    /// A lane's check time never stands beside a real record of the same ID, and a damaged one is just forgotten:
+    /// it is scheduling data only, so dropping it costs at most one listing.
+    fn drop_conflicting_lane_polls(&mut self) {
+        let bad: Vec<String> = self
+            .lane_polls
+            .iter()
+            .filter(|(id, poll)| id.trim().is_empty() || poll.kind.is_skills() || self.has_source_id(id))
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in bad {
+            self.lane_polls.remove(&id);
+        }
+    }
+
+    /// The check data of a lane that has no record, when it was recorded for the lane as configured now.
+    pub(crate) fn lane_poll(&self, lane: &RepoConfig) -> Option<&LanePoll> {
+        self.lane_polls.get(&lane.id).filter(|p| p.matches(lane) && !self.has_source_id(&lane.id))
+    }
+
+    pub(crate) fn lane_polls(&self) -> &BTreeMap<String, LanePoll> {
+        &self.lane_polls
+    }
+
+    /// Records the check of a lane that has no record. Says whether anything but the check time changed, which is
+    /// worth a write; a lane with a real record gets none.
+    pub(crate) fn set_lane_poll(&mut self, id: &str, poll: LanePoll) -> bool {
+        if id.trim().is_empty() || poll.kind.is_skills() || self.has_source_id(id) {
+            return false;
+        }
+        let changed = self.lane_polls.get(id).is_none_or(|old| LanePoll { last_check: poll.last_check, ..old.clone() } != poll);
+        self.lane_polls.insert(id.into(), poll);
+        self.version = self.wire_version();
+        changed
+    }
+
+    pub(crate) fn forget_lane_poll(&mut self, id: &str) -> bool {
+        let removed = self.lane_polls.remove(id).is_some();
+        self.version = self.wire_version();
+        removed
+    }
+
+    /// Forgets the check data of lanes `keep` rejects (unknown, or recorded for another location). Not worth a write
+    /// by itself: it goes with the next save.
+    pub(crate) fn retain_lane_polls(&mut self, keep: impl Fn(&str, &LanePoll) -> bool) {
+        self.lane_polls.retain(|id, poll| keep(id, poll));
+        self.version = self.wire_version();
     }
 
     fn has_skills_record(&self, id: &str) -> bool {
@@ -719,6 +847,7 @@ impl State {
             source.id.clone(),
             LooseSourceState { binding, origin: Some(source.into()), poll: LeafPoll::default(), directory_id: None, leaves: Vec::new() },
         );
+        self.lane_polls.remove(&source.id);
         self.version = self.wire_version();
         Ok(())
     }
@@ -766,6 +895,7 @@ impl State {
             }
         }
         self.plugin_sources.insert(id.into(), record);
+        self.lane_polls.remove(id);
         self.version = self.wire_version();
         Ok(())
     }
@@ -790,8 +920,10 @@ impl State {
             Some(&mut r.poll.last_check)
         } else if let Some(r) = self.loose_sources.get_mut(id) {
             Some(&mut r.poll.last_check)
+        } else if let Some(r) = self.repos.get_mut(id) {
+            Some(&mut r.last_check)
         } else {
-            self.repos.get_mut(id).map(|r| &mut r.last_check)
+            self.lane_polls.get_mut(id).map(|p| &mut p.last_check)
         }
     }
 
@@ -1307,7 +1439,9 @@ mod tests {
         old_folder["set_aside"] = serde_json::json!([{"repos":{"id":{}}}]);
         let mut loose = base.clone();
         loose["loose_sources"] = serde_json::json!({"id":{"binding":{"kind":"agents", "root":dir.join("agents")}}});
-        for bad in [old, current, old_folder, loose] {
+        let mut roots_at_2 = base.clone();
+        roots_at_2["plugin_sources"]["id"]["roots"] = serde_json::json!({"one":"tools/one"});
+        for bad in [old, current, old_folder, loose, roots_at_2] {
             let bytes = serde_json::to_vec(&bad).unwrap();
             std::fs::write(&path, &bytes).unwrap();
             let refused = State::load_sources_with(&path, true).is_err();
@@ -1351,6 +1485,103 @@ mod tests {
         state.save(&path).unwrap();
         assert_eq!(v1_reader::load(&path), "usable");
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn plugin_approval_roots_raise_the_state_format_so_v0_8_0_refuses_it_as_newer() {
+        let dir = temp("plugin-roots-format");
+        let path = dir.join("state.json");
+        let source = RepoConfig { id: "kit-plugins".into(), kind: SourceKind::Plugins, repo: "owner/repo".into(), branch: "main".into(), ..Default::default() };
+        let mut record = PluginSourceState::new(&source, &dir.join("copilot"), "market");
+        record.approved.insert("tool".into(), None);
+        let written = |state: &State| {
+            state.save(&path).unwrap();
+            serde_json::from_slice::<serde_json::Value>(&std::fs::read(&path).unwrap()).unwrap()["version"].clone()
+        };
+        let mut state = State::default();
+        state.set_plugin_source(&source.id, record.clone()).unwrap();
+        assert_eq!(written(&state), 2, "a plugin source without roots keeps format 2");
+
+        record.roots.insert("tool".into(), "plugins/tool".into());
+        state.set_plugin_source(&source.id, record).unwrap();
+        let version = written(&state);
+        let back = State::load_sources_with(&path, false).map(|l| l.state);
+        std::fs::remove_dir_all(dir).unwrap();
+        assert_eq!(version, 3, "plugin approval roots are new in state.json but the file still says format {version}, which v0.8.0 decodes and fails on");
+        assert_eq!(back.unwrap(), state);
+    }
+
+    fn agents_lane() -> RepoConfig {
+        RepoConfig { id: "kit-agents".into(), kind: SourceKind::Agents, repo: "owner/kit".into(), ..Default::default() }
+    }
+
+    #[test]
+    fn lane_check_times_round_trip_at_format_3_and_only_for_the_location_they_were_taken_at() {
+        let dir = temp("lane-polls-format");
+        let path = dir.join("state.json");
+        let lane = agents_lane();
+        let mut state = State::default();
+        assert!(state.set_lane_poll(&lane.id, LanePoll::new(&lane, Some("W/\"e\"".into()), 100, true, false)));
+        assert!(!state.set_lane_poll(&lane.id, LanePoll::new(&lane, Some("W/\"e\"".into()), 200, true, false)), "a new time alone is not worth a write");
+        state.save(&path).unwrap();
+        let written: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let back = State::load_sources_with(&path, false).unwrap().state;
+        std::fs::remove_dir_all(dir).unwrap();
+        assert_eq!(written["version"], 3, "v0.8.0 must refuse a file with lane check times as newer");
+        assert_eq!(back, state);
+        assert_eq!(back.lane_poll(&lane).and_then(|p| p.last_check), Some(200));
+        let moved = RepoConfig { branch: "dev".into(), ..lane.clone() };
+        assert!(back.lane_poll(&moved).is_none(), "a check of another branch says nothing about this one");
+
+        let mut state = back;
+        assert!(state.forget_lane_poll(&lane.id));
+        assert_eq!(state.wire_version(), 1);
+    }
+
+    #[test]
+    fn lane_check_times_below_format_3_are_refused_and_never_overwritten() {
+        let dir = temp("lane-polls-old");
+        let path = dir.join("state.json");
+        let polls = r#""lane_polls":{"kit-agents":{"kind":"agents","repo":"owner/kit","branch":"","path":"","etag":null,"last_check":1}}"#;
+        for version in [1, 2] {
+            let bad = format!("{{\"version\":{version},{polls}}}");
+            std::fs::write(&path, &bad).unwrap();
+            for quarantine in [false, true] {
+                assert!(State::load_sources_with(&path, quarantine).is_err(), "{bad}");
+                assert_eq!(std::fs::read(&path).unwrap(), bad.as_bytes());
+            }
+        }
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_stale_or_conflicting_lane_check_time_is_dropped_not_fatal() {
+        let dir = temp("lane-polls-conflict");
+        let path = dir.join("state.json");
+        let poll = |kind: &str| format!(r#"{{"kind":"{kind}","repo":"owner/kit","branch":"","path":"","etag":"e","last_check":1}}"#);
+        let text = format!(
+            r#"{{"version":3,"repos":{{"skills-id":{{}}}},"lane_polls":{{"skills-id":{},"":{},"kit-skills":{},"kit-agents":{}}}}}"#,
+            poll("agents"),
+            poll("agents"),
+            poll("skills"),
+            poll("agents")
+        );
+        std::fs::write(&path, &text).unwrap();
+        let state = State::load_sources_with(&path, false).unwrap().state;
+        assert_eq!(state.lane_polls().keys().collect::<Vec<_>>(), ["kit-agents"], "only the entry nothing else claims stays");
+        assert_eq!(state.version, 3);
+
+        let only_conflict = format!(r#"{{"version":3,"repos":{{"skills-id":{{}}}},"lane_polls":{{"skills-id":{}}}}}"#, poll("agents"));
+        std::fs::write(&path, &only_conflict).unwrap();
+        let mut state = State::load_sources_with(&path, false).unwrap().state;
+        assert!(state.lane_polls().is_empty());
+        assert_eq!(state.version, 1, "with the entry gone the file goes back to the oldest format that holds it");
+        assert!(!state.set_lane_poll("skills-id", LanePoll::new(&agents_lane(), None, 2, true, false)), "a real record wins");
+        state.save(&path).unwrap();
+        let back = State::load_sources_with(&path, false).unwrap().state;
+        std::fs::remove_dir_all(dir).unwrap();
+        assert!(back.lane_polls().is_empty());
     }
 
     #[test]
@@ -1480,7 +1711,7 @@ mod tests {
         std::fs::write(&path, bytes).unwrap();
         let cfg = Config::load(&config_path).unwrap();
         let st = State::load(&path).unwrap().state;
-        let source = &cfg.repos[1];
+        let source = &cfg.repos()[1];
         assert_eq!((&source.kind, source.id.as_str()), (&SourceKind::Skills, "o-r-2"));
         let record = st.repo(&source.id).unwrap();
         assert!(record.is_ignored("mine"));
@@ -1493,6 +1724,7 @@ mod tests {
         let changes = reconcile::plan(&reconcile::Input {
             desired: &[],
             rejected: &[],
+            protected: &[],
             owned: &[reconcile::OwnedView { skill: owned, local, matches_upstream: false }],
             other_owners: &Default::default(),
             unmanaged: &Default::default(),

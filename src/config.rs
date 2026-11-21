@@ -1,10 +1,12 @@
 //! What the user configures: repositories, where skills are installed, and app update preferences.
 //! `config.json` is meant to be readable and hand-editable.
 
+use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::os::windows::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use windows_sys::Win32::Foundation::GENERIC_WRITE;
@@ -14,25 +16,43 @@ use crate::fsx;
 use crate::interval::{Interval, Unit};
 use crate::pathsafe;
 use crate::source::SourceKind;
+use crate::sources::{GlobalSettings, SourceConfig};
 
 pub const CONFIG_FILE: &str = "config.json";
-pub const CONFIG_VERSION: u32 = 2;
+pub const CONFIG_VERSION: u32 = crate::sources::CONFIG_VERSION;
 pub const DEFAULT_INTERVAL: Interval = Interval::new(1, Unit::Day);
 
 /// Hold through re-read, decision, and replacement. The directory must exist. Cooperating writers must see the
 /// *same filesystem directory*; independently synchronized cloud replicas do not share a lock. Readers need no lock.
 pub(crate) fn settings_write_lock(directory: &Path) -> Result<File, String> {
+    settings_write_lock_within(directory, Duration::ZERO)
+}
+
+/// `settings_write_lock`, trying again while another writer holds the lock until `wait` has passed. Waiting changes
+/// nothing, so it may be stopped at any point.
+pub(crate) fn settings_write_lock_within(directory: &Path, wait: Duration) -> Result<File, String> {
     let path = directory.join(".tss-settings.lock");
-    // CREATE_NEW never takes over an existing entry. Delete-on-close removes only the file this handle created,
-    // including on process exit; unlinking a lock by name could remove somebody else's lock.
-    OpenOptions::new()
-        .write(true)
-        .access_mode(GENERIC_WRITE | DELETE)
-        .create_new(true)
-        .share_mode(0)
-        .custom_flags(FILE_FLAG_DELETE_ON_CLOSE | FILE_FLAG_OPEN_REPARSE_POINT)
-        .open(&path)
-        .map_err(|e| format!("cannot lock settings at {} (another writer may be busy); try again: {e}", path.display()))
+    let deadline = Instant::now() + wait;
+    loop {
+        // CREATE_NEW never takes over an existing entry. Delete-on-close removes only the file this handle created,
+        // including on process exit; unlinking a lock by name could remove somebody else's lock.
+        let opened = OpenOptions::new()
+            .write(true)
+            .access_mode(GENERIC_WRITE | DELETE)
+            .create_new(true)
+            .share_mode(0)
+            .custom_flags(FILE_FLAG_DELETE_ON_CLOSE | FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(&path);
+        match opened {
+            Err(e) if held_by_another(&e) && Instant::now() < deadline => std::thread::sleep(Duration::from_millis(25)),
+            done => return done.map_err(|e| format!("cannot lock settings at {} (another writer may be busy); try again: {e}", path.display())),
+        }
+    }
+}
+
+/// The lock file exists, is being deleted by a writer that just let it go (access denied), or is open (sharing).
+fn held_by_another(e: &io::Error) -> bool {
+    e.kind() == io::ErrorKind::AlreadyExists || matches!(e.raw_os_error(), Some(5 | 32))
 }
 
 fn local_settings_lock(path: &Path) -> Result<File, String> {
@@ -176,40 +196,78 @@ pub enum UpdateTiming {
     OnQuit,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(default, remote = "Self")]
+/// The settings. Sources and the global type and filter settings are the single source of truth; the lane views the
+/// engine runs (`repos`) and the set of every persisted lane ID are derived from them after every change, so they
+/// can never drift.
+#[derive(Clone, Debug, PartialEq)]
 pub struct Config {
     /// Where skills are installed. Empty means `%USERPROFILE%\.copilot\skills`.
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub skills_dir: Option<String>,
     pub default_interval: Interval,
-    #[serde(deserialize_with = "UpdatePrefs::read_object", skip_serializing_if = "UpdatePrefs::is_default")]
+    pub app_update: UpdatePrefs,
+    /// Private inside, so it can only change through the methods that rebuild the lane views.
+    pub source_set: SourceSet,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct SourceSet {
+    sources: Vec<SourceConfig>,
+    global: GlobalSettings,
+    lanes: Vec<RepoConfig>,
+    known: Vec<(String, SourceKind)>,
+}
+
+/// Format 1 and 2: one entry per typed source. Read only, to migrate.
+#[derive(Deserialize)]
+#[serde(default)]
+pub(crate) struct LegacyConfig {
+    pub skills_dir: Option<String>,
+    pub default_interval: Interval,
+    #[serde(deserialize_with = "UpdatePrefs::read_object")]
     pub app_update: UpdatePrefs,
     pub repos: Vec<RepoConfig>,
+    /// Format 3 fields. Present in an older-format file, they mean a missing or wrong `version`, not data to drop.
+    sources: Option<serde::de::IgnoredAny>,
+    global: Option<serde::de::IgnoredAny>,
 }
 
-impl Serialize for Config {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        // The format is a property of the payload, not a mutable setting that can get out of sync.
-        #[derive(Serialize)]
-        struct Wire<'a> {
-            version: u32,
-            #[serde(flatten, serialize_with = "Config::serialize")]
-            settings: &'a Config,
-        }
-        Wire { version: self.wire_version(), settings: self }.serialize(serializer)
+impl Default for LegacyConfig {
+    fn default() -> Self {
+        let Config { skills_dir, default_interval, app_update, .. } = Config::default();
+        LegacyConfig { skills_dir, default_interval, app_update, repos: Vec::new(), sources: None, global: None }
     }
 }
 
-impl<'de> Deserialize<'de> for Config {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        Config::deserialize(deserializer)
+#[derive(Serialize, Deserialize)]
+#[serde(default)]
+struct Wire {
+    version: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    skills_dir: Option<String>,
+    default_interval: Interval,
+    #[serde(deserialize_with = "UpdatePrefs::read_object", skip_serializing_if = "UpdatePrefs::is_default")]
+    app_update: UpdatePrefs,
+    #[serde(skip_serializing_if = "is_default_global")]
+    global: GlobalSettings,
+    sources: Vec<SourceConfig>,
+    #[serde(skip_serializing)]
+    repos: Option<serde::de::IgnoredAny>,
+}
+
+impl Default for Wire {
+    fn default() -> Self {
+        let Config { skills_dir, default_interval, app_update, .. } = Config::default();
+        Wire { version: CONFIG_VERSION, skills_dir, default_interval, app_update, global: GlobalSettings::default(), sources: Vec::new(), repos: None }
     }
+}
+
+fn is_default_global(g: &GlobalSettings) -> bool {
+    *g == GlobalSettings::default()
 }
 
 impl Default for Config {
     fn default() -> Self {
-        Config { skills_dir: None, default_interval: DEFAULT_INTERVAL, app_update: UpdatePrefs::default(), repos: Vec::new() }
+        Config { skills_dir: None, default_interval: DEFAULT_INTERVAL, app_update: UpdatePrefs::default(), source_set: SourceSet::default() }
     }
 }
 
@@ -232,6 +290,9 @@ pub struct RepoConfig {
     pub enabled: bool,
     #[serde(skip_serializing_if = "SourceKind::is_skills")]
     pub kind: SourceKind,
+    /// The ID of the source this lane belongs to (not persisted on a lane).
+    #[serde(skip)]
+    pub source: String,
 }
 
 impl Default for RepoConfig {
@@ -245,6 +306,7 @@ impl Default for RepoConfig {
             use_token: false,
             enabled: true,
             kind: SourceKind::Skills,
+            source: String::new(),
         }
     }
 }
@@ -287,9 +349,10 @@ impl RepoConfig {
             Ok(spec) if spec.branch.is_empty() && spec.path.is_empty() && spec.full_name() == self.repo => {}
             Ok(_) | Err(_) => out.push(format!("'{}' is not a repository name like owner/name", self.repo)),
         }
-        let plugin_branch_problem = if self.kind != SourceKind::Plugins {
+        // An empty branch follows the default branch; a full plugin check resolves its name first.
+        let plugin_branch_problem = if self.kind != SourceKind::Plugins || self.branch.is_empty() {
             None
-        } else if self.branch.is_empty() || self.branch == "HEAD" {
+        } else if self.branch == "HEAD" {
             Some("Plugins need a named branch, for example https://github.com/OWNER/NAME/tree/main.")
         } else {
             check_plugin_branch_chars(&self.branch).err()
@@ -315,57 +378,147 @@ impl RepoConfig {
     }
 }
 
+/// Give hand-written legacy entries without an ID one derived from the repository name, the same on every load.
+pub(crate) fn assign_legacy_ids(repos: &mut [RepoConfig]) {
+    for i in 0..repos.len() {
+        if repos[i].id.trim().is_empty() {
+            let taken: HashSet<String> = repos.iter().map(|r| r.id.clone()).collect();
+            repos[i].id = unique_id(&repos[i].repo, &taken);
+        }
+    }
+}
+
+pub(crate) fn id_base(repo: &str) -> String {
+    let base: String = repo.to_lowercase().chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' { c } else { '-' }).collect();
+    if base.is_empty() { "repo".to_string() } else { base }
+}
+
+fn unique_id(repo: &str, taken: &HashSet<String>) -> String {
+    let base = id_base(repo);
+    let mut candidate = base.clone();
+    let mut n = 2;
+    while taken.contains(&candidate) {
+        candidate = format!("{base}-{n}");
+        n += 1;
+    }
+    candidate
+}
+
+pub const KINDS: [SourceKind; 4] = [SourceKind::Skills, SourceKind::Agents, SourceKind::Instructions, SourceKind::Plugins];
+
 impl Config {
     pub fn wire_version(&self) -> u32 {
-        source_version(&self.repos)
+        CONFIG_VERSION
     }
 
+    /// A missing source or lane ID (a legacy file being migrated, or a hand-written source) is derived from the file
+    /// alone, the same on every load, so that records saved under it keep matching.
     pub fn parse(bytes: &[u8]) -> Result<Config, String> {
         let invalid = |e| format!("config.json is not valid: {e}");
         let Format { version } = parse_json_object(bytes).map_err(invalid)?;
         if version > CONFIG_VERSION {
             return Err(format!("config.json was written by a newer version (format {version}, this app understands {CONFIG_VERSION})"));
         }
-        let mut cfg: Config = parse_json_object(bytes).map_err(invalid)?;
-        if version < 2 && cfg.wire_version() == 2 {
-            return Err("typed sources require config.json format 2".into());
-        }
+        let cfg = if version >= 3 {
+            let wire: Wire = parse_json_object(bytes).map_err(invalid)?;
+            if wire.repos.is_some() {
+                return Err(invalid("format 3 lists its repositories under \"sources\", not \"repos\"".into()));
+            }
+            Config::from_parts(wire.skills_dir, wire.default_interval, wire.app_update, wire.global, wire.sources)?
+        } else {
+            let legacy: LegacyConfig = parse_json_object(bytes).map_err(invalid)?;
+            if legacy.sources.is_some() || legacy.global.is_some() {
+                return Err(invalid("\"sources\" and \"global\" are format 3 settings, but the file does not say \"version\": 3".into()));
+            }
+            let sources = migrate_file(version, legacy.repos)?;
+            Config::from_parts(legacy.skills_dir, legacy.default_interval, legacy.app_update, GlobalSettings::default(), sources)?
+        };
         // A relative folder would depend on the folder the app is started in, which at sign-in is Windows' own.
         if let Some(dir) = cfg.skills_dir.as_deref().map(str::trim).filter(|d| !d.is_empty() && !Path::new(d).is_absolute()) {
             return Err(format!("the skills folder in {CONFIG_FILE} must be a full path, such as D:\\skills; '{dir}' is not one"));
         }
-        cfg.assign_missing_ids();
-        cfg.check_typed_ids()?;
         Ok(cfg)
     }
 
+    pub(crate) fn from_parts(
+        skills_dir: Option<String>,
+        default_interval: Interval,
+        app_update: UpdatePrefs,
+        global: GlobalSettings,
+        mut sources: Vec<SourceConfig>,
+    ) -> Result<Config, String> {
+        let missing = sources.iter().any(|s| s.id.trim().is_empty() || KINDS.iter().any(|&k| s.lanes.id(k).is_none()));
+        if missing {
+            // Only the IDs in the settings themselves count, never state records: anything else could give a lane a
+            // different ID on the next load and detach what it installed.
+            let mut taken = HashSet::new();
+            for s in &sources {
+                taken.extend(std::iter::once(s.id.clone()).chain(KINDS.iter().filter_map(|&k| s.lanes.id(k).map(str::to_owned))));
+            }
+            taken.remove("");
+            for s in &mut sources {
+                if s.id.trim().is_empty() {
+                    s.id = unique_id(&s.repo, &taken);
+                    taken.insert(s.id.clone());
+                }
+            }
+            crate::sources::complete_lanes(&mut sources, &mut taken);
+        }
+        check_ids(&sources)?;
+        let mut cfg = Config { skills_dir, default_interval, app_update, source_set: SourceSet { sources, global, ..SourceSet::default() } };
+        cfg.rebuild();
+        Ok(cfg)
+    }
+
+    fn rebuild(&mut self) {
+        self.source_set.lanes.clear();
+        self.source_set.known.clear();
+        for s in &self.source_set.sources {
+            let types = s.effective_types(&self.source_set.global);
+            for kind in KINDS {
+                let Some(id) = s.lanes.id(kind) else { continue };
+                self.source_set.known.push((id.to_owned(), kind));
+                if types.enabled(kind) {
+                    self.source_set.lanes.push(RepoConfig {
+                        id: id.to_owned(),
+                        repo: s.repo.clone(),
+                        branch: s.branch.clone(),
+                        path: s.path.clone(),
+                        interval: s.interval,
+                        use_token: s.use_token,
+                        enabled: s.enabled,
+                        kind,
+                        source: s.id.clone(),
+                    });
+                }
+            }
+        }
+    }
+
     pub fn to_json(&self) -> String {
-        serde_json::to_string_pretty(self).expect("config serializes") + "\n"
+        let wire = Wire {
+            version: CONFIG_VERSION,
+            skills_dir: self.skills_dir.clone(),
+            default_interval: self.default_interval,
+            app_update: self.app_update,
+            global: self.source_set.global.clone(),
+            sources: self.source_set.sources.clone(),
+            repos: None,
+        };
+        serde_json::to_string_pretty(&wire).expect("config serializes") + "\n"
     }
 
     /// A missing file is an empty configuration; a file that cannot be read or understood is an error, so it is never
     /// overwritten by mistake.
     pub fn load(path: &Path) -> Result<Config, String> {
-        Self::load_sources(path)?.skills_only()
+        Self::load_sources(path)
     }
 
-    /// Settings model for typed callers. The existing app/CLI must not dispatch these IDs as skills.
+    /// A legacy file is migrated in memory, and missing IDs are derived from the file alone (see `parse`).
     pub fn load_sources(path: &Path) -> Result<Config, String> {
         match read_optional(path)? {
             Some(bytes) => Config::parse(&bytes).map_err(|e| format!("{e} ({})", path.display())),
             None => Ok(Config::default()),
-        }
-    }
-
-    pub(crate) fn skills_only(self) -> Result<Self, String> {
-        self.require_skills()?;
-        Ok(self)
-    }
-
-    pub(crate) fn require_skills(&self) -> Result<(), String> {
-        match self.repos.iter().find(|r| !r.kind.is_skills()) {
-            Some(r) => Err(format!("source '{}' is not a skills source; this version cannot sync its kind", r.id)),
-            None => Ok(()),
         }
     }
 
@@ -392,49 +545,176 @@ impl Config {
     }
 
     pub(crate) fn check_typed_ids(&self) -> Result<(), String> {
-        // Legacy settings still report duplicates through `problems`. Typed ownership cannot be
-        // keyed by an ambiguous ID. Missing IDs are assigned by the unchanged legacy algorithm.
-        if self.wire_version() > 1 {
-            let mut ids = std::collections::HashSet::new();
-            for r in &self.repos {
-                if !r.id.trim().is_empty() && !ids.insert(&r.id) {
-                    return Err(format!("two sources share the id '{}'", r.id));
+        check_ids(&self.source_set.sources)
+    }
+
+    /// The lanes to run: every lane whose type is on, in source order, then skills, agents, instructions, plugins.
+    pub fn repos(&self) -> &[RepoConfig] {
+        &self.source_set.lanes
+    }
+
+    pub fn sources(&self) -> &[SourceConfig] {
+        &self.source_set.sources
+    }
+
+    pub fn global(&self) -> &GlobalSettings {
+        &self.source_set.global
+    }
+
+    /// Every persisted lane ID, on or off. A state record under one of these is still configured.
+    pub fn known_lanes(&self) -> &[(String, SourceKind)] {
+        &self.source_set.known
+    }
+
+    pub fn is_known_lane(&self, id: &str) -> bool {
+        self.source_set.known.iter().any(|(k, _)| k == id)
+    }
+
+    /// Every source ID and lane ID in use, for allocating new ones.
+    pub fn taken_ids(&self) -> HashSet<String> {
+        self.source_set.sources.iter().map(|s| s.id.clone()).chain(self.source_set.known.iter().map(|(id, _)| id.clone())).collect()
+    }
+
+    /// The lane view of an on lane.
+    pub fn find(&self, id: &str) -> Option<&RepoConfig> {
+        self.source_set.lanes.iter().find(|r| r.id == id)
+    }
+
+    /// The source with this source ID or lane ID.
+    pub fn find_source(&self, id: &str) -> Option<&SourceConfig> {
+        self.source_set
+            .sources
+            .iter()
+            .find(|s| s.id == id)
+            .or_else(|| self.source_set.sources.iter().find(|s| KINDS.iter().any(|&k| s.lanes.id(k) == Some(id))))
+    }
+
+    /// Every lane ID of the source that has `id` (its own ID or any lane's), whether its type is on or off.
+    pub fn lane_ids(&self, id: &str) -> Vec<&str> {
+        self.find_source(id).map(|s| KINDS.iter().filter_map(|&k| s.lanes.id(k)).collect()).unwrap_or_default()
+    }
+
+    /// The on lanes of the source with this source ID or lane ID.
+    pub fn lanes_of(&self, id: &str) -> Vec<&RepoConfig> {
+        match self.find_source(id) {
+            Some(s) => self.source_set.lanes.iter().filter(|r| r.source == s.id).collect(),
+            None => Vec::new(),
+        }
+    }
+
+    /// Change sources or global settings; the lane views are rebuilt afterwards.
+    pub fn edit<R>(&mut self, f: impl FnOnce(&mut Vec<SourceConfig>, &mut GlobalSettings) -> R) -> R {
+        let out = f(&mut self.source_set.sources, &mut self.source_set.global);
+        self.rebuild();
+        out
+    }
+
+    fn edit_source(&mut self, id: &str, f: impl FnOnce(&mut SourceConfig)) -> bool {
+        let Some(index) = self.find_source(id).and_then(|s| self.source_set.sources.iter().position(|o| o.id == s.id)) else { return false };
+        self.edit(|sources, _| f(&mut sources[index]));
+        true
+    }
+
+    pub fn set_enabled(&mut self, id: &str, enabled: bool) -> bool {
+        self.edit_source(id, |s| s.enabled = enabled)
+    }
+
+    pub fn set_interval(&mut self, id: &str, interval: Option<Interval>) -> bool {
+        self.edit_source(id, |s| s.interval = interval)
+    }
+
+    pub fn set_use_token(&mut self, id: &str, use_token: bool) -> bool {
+        self.edit_source(id, |s| s.use_token = use_token)
+    }
+
+    /// Remove the whole source with this source ID or lane ID.
+    pub fn remove(&mut self, id: &str) -> bool {
+        let Some(sid) = self.find_source(id).map(|s| s.id.clone()) else { return false };
+        self.edit(|sources, _| sources.retain(|s| s.id != sid));
+        true
+    }
+
+    /// Stop syncing one lane: its type is turned off for its source, or the whole source goes when no other lane of it
+    /// is on. Returns false when no source has this ID.
+    pub fn remove_lane(&mut self, id: &str) -> bool {
+        let Some(source) = self.find_source(id) else { return false };
+        let sid = source.id.clone();
+        let kind = KINDS.into_iter().find(|&k| source.lanes.id(k) == Some(id));
+        let others = self.source_set.lanes.iter().any(|r| r.source == sid && r.id != id);
+        match kind {
+            Some(kind) if others => self.edit(|sources, _| {
+                if let Some(s) = sources.iter_mut().find(|s| s.id == sid) {
+                    s.types.set(kind, false);
                 }
-            }
+            }),
+            _ => self.edit(|sources, _| sources.retain(|s| s.id != sid)),
         }
-        Ok(())
+        true
     }
 
-    /// Entries written by hand may lack an id. The id is derived from the repository name, so it is the same on every load.
-    pub fn assign_missing_ids(&mut self) {
-        for i in 0..self.repos.len() {
-            if self.repos[i].id.trim().is_empty() {
-                let id = self.unique_id(&self.repos[i].repo.clone());
-                self.repos[i].id = id;
-            }
-        }
+    /// A projection that holds one lane and no sources, for timing calculations only. Never save it.
+    pub(crate) fn lane_only(lane: RepoConfig, default_interval: Interval) -> Config {
+        Config { default_interval, source_set: SourceSet { lanes: vec![lane], ..SourceSet::default() }, ..Config::default() }
     }
 
-    fn unique_id(&self, repo: &str) -> String {
-        let base: String = repo.to_lowercase().chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' { c } else { '-' }).collect();
-        let base = if base.is_empty() { "repo".to_string() } else { base };
-        let mut candidate = base.clone();
-        let mut n = 2;
-        while self.repos.iter().any(|r| r.id == candidate) {
-            candidate = format!("{base}-{n}");
-            n += 1;
+    /// Build settings from typed entries the way migration does (entries at the same location with distinct kinds
+    /// share a source; every entry keeps its ID). For tests and fixtures.
+    pub fn from_lanes(lanes: Vec<RepoConfig>) -> Config {
+        let mut lanes = lanes;
+        assign_legacy_ids(&mut lanes);
+        let sources = crate::sources::migrate_legacy(&lanes, &HashSet::new()).expect("unique IDs");
+        Config::from_parts(None, DEFAULT_INTERVAL, UpdatePrefs::default(), GlobalSettings::default(), sources).expect("valid IDs")
+    }
+
+    /// Change one on lane as if it were a typed entry. Location, schedule and token changes apply to its whole source;
+    /// a changed `id` renames this lane only. Returns false when no on lane has this ID.
+    pub fn update_lane(&mut self, id: &str, f: impl FnOnce(&mut RepoConfig)) -> bool {
+        let Some(old) = self.find(id).cloned() else { return false };
+        let mut new = old.clone();
+        f(&mut new);
+        assert_eq!(new.kind, old.kind, "a lane cannot change its type");
+        self.edit(|sources, _| {
+            let Some(s) = sources.iter_mut().find(|s| s.id == old.source) else { return };
+            s.repo = new.repo;
+            s.branch = new.branch;
+            s.path = new.path;
+            s.interval = new.interval;
+            s.use_token = new.use_token;
+            s.enabled = new.enabled;
+            if new.id != old.id {
+                s.lanes = s.lanes.clone().with(old.kind, new.id);
+            }
+        });
+        true
+    }
+
+    /// `update_lane` by position in `repos()`.
+    pub fn update_lane_at(&mut self, index: usize, f: impl FnOnce(&mut RepoConfig)) -> bool {
+        let id = self.source_set.lanes[index].id.clone();
+        self.update_lane(&id, f)
+    }
+
+    /// Remove every source.
+    pub fn clear_sources(&mut self) {
+        self.edit(|sources, _| sources.clear());
+    }
+
+    /// Keep only the sources whose on lanes all pass `keep` (a source without on lanes is kept).
+    pub fn retain_lanes(&mut self, mut keep: impl FnMut(&RepoConfig) -> bool) {
+        let drop: HashSet<String> = self.source_set.lanes.iter().filter(|r| !keep(r)).map(|r| r.source.clone()).collect();
+        if !drop.is_empty() {
+            self.edit(|sources, _| sources.retain(|s| !drop.contains(&s.id)));
         }
-        candidate
     }
 
     pub fn add_repo(&mut self, spec: &RepoSpec, interval: Option<Interval>, use_token: bool) -> &RepoConfig {
         self.add_source(SourceKind::Skills, spec, interval, use_token)
     }
 
+    /// Interim typed add: a new source with only `kind` on (the other three types explicitly off).
     pub fn add_source(&mut self, kind: SourceKind, spec: &RepoSpec, interval: Option<Interval>, use_token: bool) -> &RepoConfig {
-        let id = self.unique_id(&spec.full_name());
-        self.repos.push(RepoConfig {
-            id,
+        self.push_lane(RepoConfig {
+            id: String::new(),
             kind,
             repo: spec.full_name(),
             branch: spec.branch.clone(),
@@ -442,12 +722,32 @@ impl Config {
             interval,
             use_token,
             enabled: true,
-        });
-        self.repos.last().expect("just pushed")
+            source: String::new(),
+        })
     }
 
-    pub fn find(&self, id: &str) -> Option<&RepoConfig> {
-        self.repos.iter().find(|r| r.id == id)
+    /// Add one typed entry the way migration does: a new source with only its kind on, the lane keeping the entry's ID
+    /// (an empty ID gets a fresh one). Panics if the ID is already in use.
+    pub fn push_lane(&mut self, mut lane: RepoConfig) -> &RepoConfig {
+        let mut taken = self.taken_ids();
+        if lane.id.trim().is_empty() {
+            lane.id = unique_id(&lane.repo, &taken);
+        }
+        assert!(!taken.contains(&lane.id), "the ID '{}' is already in use", lane.id);
+        taken.insert(lane.id.clone());
+        let id = lane.id.clone();
+        let mut new = crate::sources::migrate_legacy(std::slice::from_ref(&lane), &taken).expect("one entry");
+        self.edit(|sources, _| sources.append(&mut new));
+        self.find(&id).expect("its type is on")
+    }
+
+    /// Add a source built elsewhere (for example from a preview). Its IDs must be unique.
+    pub fn add_source_config(&mut self, source: SourceConfig) -> Result<(), String> {
+        let mut all = self.source_set.sources.clone();
+        all.push(source);
+        check_ids(&all)?;
+        self.edit(|sources, _| *sources = all);
+        Ok(())
     }
 
     pub fn problems(&self) -> Vec<String> {
@@ -455,14 +755,53 @@ impl Config {
         if let Err(e) = self.default_interval.validate_poll() {
             out.push(format!("default interval: {e}"));
         }
-        for (i, r) in self.repos.iter().enumerate() {
-            if self.repos[..i].iter().any(|o| o.id == r.id) {
-                out.push(format!("two repositories share the id '{}'", r.id));
+        if let Err(e) = check_ids(&self.source_set.sources) {
+            out.push(e);
+        }
+        if let Err(e) = crate::sources::validate_ignore_names(&self.source_set.global.ignore_folders) {
+            out.push(format!("ignore_folders: {e}"));
+        }
+        for s in &self.source_set.sources {
+            if let Err(e) = s.effective_policy(&self.source_set.global) {
+                out.push(format!("{}: {e}", s.id));
             }
+        }
+        for r in &self.source_set.lanes {
             out.extend(r.problems().into_iter().map(|p| format!("{}: {p}", r.id)));
         }
         out
     }
+}
+
+fn migrate_file(version: u32, mut repos: Vec<RepoConfig>) -> Result<Vec<SourceConfig>, String> {
+    if version < 2 && source_version(&repos) == 2 {
+        return Err("typed sources require config.json format 2".into());
+    }
+    assign_legacy_ids(&mut repos);
+    crate::sources::migrate_legacy(&repos, &HashSet::new())
+}
+
+/// Source IDs are unique; lane IDs are unique across all sources. A source's skills lane may share its source's ID.
+fn check_ids(sources: &[SourceConfig]) -> Result<(), String> {
+    let mut owner: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for (i, s) in sources.iter().enumerate() {
+        if s.id.trim().is_empty() {
+            return Err(format!("a source for '{}' has no id", s.repo));
+        }
+        if owner.insert(&s.id, i).is_some() {
+            return Err(format!("two sources share the id '{}'", s.id));
+        }
+    }
+    let mut lanes = HashSet::new();
+    for (i, s) in sources.iter().enumerate() {
+        for kind in KINDS {
+            let Some(id) = s.lanes.id(kind) else { continue };
+            if id.trim().is_empty() || !lanes.insert(id) || owner.get(id).is_some_and(|&o| o != i) {
+                return Err(format!("two sources share the id '{id}'"));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// A repository as a person types it: `owner/name`, or a pasted GitHub address that may name a branch and folder.
@@ -533,12 +872,12 @@ impl RepoSpec {
     }
 }
 
-fn check_owner(owner: &str) -> Result<(), String> {
+pub(crate) fn check_owner(owner: &str) -> Result<(), String> {
     let ok = !owner.is_empty() && owner.len() <= 39 && owner.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-');
     if ok { Ok(()) } else { Err(format!("'{owner}' is not a valid GitHub user or organization name")) }
 }
 
-fn check_repo_name(name: &str) -> Result<(), String> {
+pub(crate) fn check_repo_name(name: &str) -> Result<(), String> {
     let ok = !name.is_empty()
         && name.len() <= 100
         && name != "."
@@ -639,6 +978,11 @@ impl Paths {
         self.home.join("state.json")
     }
 
+    /// The display-only cache of what each source's last complete listing held (`crate::seen`).
+    pub fn seen_file(&self) -> PathBuf {
+        self.home.join(crate::seen::SEEN_FILE)
+    }
+
     /// Scratch space for downloads and replaced folders. It sits beside the skills folder rather than inside it,
     /// so Copilot never sees half-installed skills, and it is on the same volume so renames are instant and atomic.
     pub fn work_dir(&self) -> PathBuf {
@@ -714,7 +1058,7 @@ pub(crate) mod v1_reader {
     }
 
     pub fn accepts_sources(bytes: &[u8]) -> bool {
-        parse_json_object::<Sources>(bytes).unwrap().version == 1
+        parse_json_object::<Sources>(bytes).is_ok_and(|s| s.version == 1)
     }
 }
 
@@ -727,13 +1071,16 @@ mod tests {
         let bytes = br#"{"version":2,"repos":[{"repo":"owner/tools","branch":"main","path":"tools","kind":"plugins"}]}"#;
         let cfg = Config::parse(bytes).unwrap();
         assert!(cfg.problems().is_empty());
-        assert_eq!(cfg.wire_version(), 2);
+        assert_eq!(cfg.wire_version(), 3);
         assert!(!v1_reader::accepts_local(cfg.to_json().as_bytes()));
+        assert!(!cfg.to_json().contains("\"kind\""), "format 3 writes types, not kind");
         assert_eq!(Config::parse(cfg.to_json().as_bytes()).unwrap(), cfg);
-        for branch in ["", "HEAD", "unusable#ref"] {
-            let source = RepoConfig { branch: branch.into(), ..cfg.repos[0].clone() };
+        for branch in ["HEAD", "unusable#ref"] {
+            let source = RepoConfig { branch: branch.into(), ..cfg.repos()[0].clone() };
             assert!(!source.problems().is_empty(), "{branch}");
         }
+        // No branch follows the default branch; the check names it before using Copilot CLI.
+        assert!(RepoConfig { branch: String::new(), ..cfg.repos()[0].clone() }.problems().is_empty());
         let mut no_version = serde_json::from_slice::<serde_json::Value>(bytes).unwrap();
         no_version.as_object_mut().unwrap().remove("version");
         assert!(Config::parse(&serde_json::to_vec(&no_version).unwrap()).is_err());
@@ -813,11 +1160,31 @@ mod tests {
         let spec = RepoSpec::parse("o/r").unwrap();
         cfg.add_repo(&spec, Some(Interval::new(6, Unit::Hour)), true);
         cfg.add_repo(&spec, None, false);
-        assert_eq!(cfg.repos[0].id, "o/r".replace('/', "-"));
-        assert_eq!(cfg.repos[1].id, "o-r-2");
+        assert_eq!(cfg.repos()[0].id, "o/r".replace('/', "-"));
+        assert_eq!(cfg.repos()[1].id, "o-r-2");
         let back = Config::parse(cfg.to_json().as_bytes()).unwrap();
         assert_eq!(back, cfg);
         assert!(cfg.problems().is_empty(), "{:?}", cfg.problems());
+    }
+
+    #[test]
+    fn format_3_keeps_global_rules_and_source_overrides_and_writes_no_kind() {
+        let text = br#"{"version":3,"global":{"types":{"plugins":false},"include_repo_items":true,"ignore_folders":["demo"]},
+            "sources":[{"id":"kit","repo":"o/kit","path":"tools","types":{"agents":false,"skills":true},"include_repo_items":false,
+            "ignore_add":["drafts"],"ignore_allow":["demo"],"lanes":{"skills":"kit","agents":"kit-agents"}}]}"#;
+        let cfg = Config::parse(text).unwrap();
+        assert_eq!(cfg.global().ignore_folders, ["demo"]);
+        let source = &cfg.sources()[0];
+        assert_eq!((source.types.agents, source.types.instructions, source.include_repo_items), (Some(false), None, Some(false)));
+        assert_eq!(
+            cfg.repos().iter().map(|r| (r.id.as_str(), r.kind)).collect::<Vec<_>>(),
+            [("kit", SourceKind::Skills), ("kit-instructions", SourceKind::Instructions)],
+            "agents off here, plugins off globally, and a missing lane ID is given on load"
+        );
+        assert!(cfg.is_known_lane("kit-agents"), "an off lane is still configured");
+        let json = cfg.to_json();
+        assert!(!json.contains("\"kind\""), "{json}");
+        assert_eq!(Config::parse(json.as_bytes()).unwrap(), cfg);
     }
 
     #[test]
@@ -825,7 +1192,7 @@ mod tests {
         let legacy = Config::parse(br#"{"version":1,"repos":[{"repo":"o/r"}]}"#).unwrap();
         assert_eq!(legacy.app_update, UpdatePrefs { enabled: true, interval: UpdateInterval::Daily, timing: UpdateTiming::Immediate });
         let json: serde_json::Value = serde_json::from_str(&legacy.to_json()).unwrap();
-        assert_eq!(json["version"], 1);
+        assert_eq!(json["version"], 3, "every save writes format 3");
         assert!(json.get("app_update").is_none());
 
         let off = Config::parse(br#"{"app_update":{"enabled":false}}"#).unwrap();
@@ -873,9 +1240,9 @@ mod tests {
     fn minimal_hand_written_config_works() {
         let cfg = Config::parse(br#"{ "default_interval": "12h", "repos": [ { "repo": "a/b" }, { "repo": "a/b", "path": "skills" } ] }"#).unwrap();
         assert_eq!(cfg.default_interval, Interval::new(12, Unit::Hour));
-        assert!(cfg.repos[0].enabled && !cfg.repos[0].use_token);
-        assert_eq!(cfg.repos[0].id, "a-b");
-        assert_eq!(cfg.repos[1].id, "a-b-2");
+        assert!(cfg.repos()[0].enabled && !cfg.repos()[0].use_token);
+        assert_eq!(cfg.repos()[0].id, "a-b");
+        assert_eq!(cfg.repos()[1].id, "a-b-2");
         // Ids are derived, so loading the same file twice assigns the same ids.
         let again = Config::parse(br#"{ "default_interval": "12h", "repos": [ { "repo": "a/b" }, { "repo": "a/b", "path": "skills" } ] }"#).unwrap();
         assert_eq!(cfg, again);
@@ -896,29 +1263,63 @@ mod tests {
     }
 
     #[test]
-    fn only_a_loose_source_gates_the_local_writer_and_skills_dispatch() {
+    fn legacy_typed_entries_migrate_to_sources_that_keep_every_lane_id() {
         let dir = temp_dir("typed");
         let path = dir.join(CONFIG_FILE);
-        let mut cfg = Config::parse(br#"{"repos":[{"repo":"o/r"},{"repo":"o/r","kind":"skills","id":"o-r-2","path":"skills"}]}"#).unwrap();
-        let legacy = cfg.to_json();
-        assert!(v1_reader::accepts_local(legacy.as_bytes()));
-        assert!(!legacy.contains("\"kind\""));
-        let spec = RepoSpec::parse("https://github.com/o/r/tree/main/more").unwrap();
-        for kind in [SourceKind::Agents, SourceKind::Instructions] {
-            cfg.add_source(kind, &spec, None, false);
-        }
-        assert_eq!(cfg.repos.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(), ["o-r", "o-r-2", "o-r-3", "o-r-4"]);
+        let v2 = br#"{"version":2,"repos":[
+            {"id":"tools","repo":"o/r","branch":"main","path":"x"},
+            {"id":"tools-ag","repo":"o/r","branch":"main","path":"x","kind":"agents"},
+            {"id":"again","repo":"o/r","branch":"main","path":"x","kind":"agents"},
+            {"id":"other","repo":"o/r","branch":"main","path":"x","kind":"instructions","use_token":true}]}"#;
+        let cfg = Config::parse(v2).unwrap();
+        let ids = |c: &Config| c.sources().iter().map(|s| s.id.clone()).collect::<Vec<_>>();
+        assert_eq!(ids(&cfg), ["tools", "again", "other"], "same location merges; the same kind twice and a different token stay apart");
+        let tools = &cfg.sources()[0];
+        assert_eq!((tools.lanes.id(SourceKind::Skills), tools.lanes.id(SourceKind::Agents)), (Some("tools"), Some("tools-ag")));
+        assert_eq!((tools.types.instructions, tools.types.plugins), (Some(false), Some(false)), "other types are off explicitly");
+        let lanes = cfg.repos().iter().map(|r| (r.id.as_str(), r.kind, r.source.as_str())).collect::<Vec<_>>();
+        assert_eq!(
+            lanes,
+            [
+                ("tools", SourceKind::Skills, "tools"),
+                ("tools-ag", SourceKind::Agents, "tools"),
+                ("again", SourceKind::Agents, "again"),
+                ("other", SourceKind::Instructions, "other")
+            ]
+        );
+        let off = tools.lanes.id(SourceKind::Instructions).unwrap().to_owned();
+        assert!(cfg.is_known_lane(&off) && cfg.find(&off).is_none(), "an off lane is known, never run");
+
         cfg.save(&path).unwrap();
         let bytes = fs::read(&path).unwrap();
-        assert!(!v1_reader::accepts_local(&bytes), "the old payload decoded, but its version gate refused");
-        assert_eq!(Config::load_sources(&path).unwrap(), cfg);
-        assert!(Config::load(&path).is_err(), "never give mixed settings to the skills worker");
-        assert_eq!(fs::read(&path).unwrap(), bytes);
-        let before = cfg.clone();
-        cfg.repos.truncate(2);
-        cfg.save_if_unchanged(&path, &before).unwrap();
-        assert_eq!(fs::read(&path).unwrap(), legacy.as_bytes());
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["version"], 3);
+        assert!(json.get("repos").is_none() && !String::from_utf8_lossy(&bytes).contains("\"kind\""));
+        assert!(!v1_reader::accepts_local(&bytes), "an older app refuses format 3");
+        assert_eq!(Config::load(&path).unwrap(), cfg, "mixed types load normally now");
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn lanes_follow_every_change_to_their_source() {
+        let mut cfg = Config::parse(br#"{"version":2,"repos":[{"id":"s","repo":"o/r"},{"id":"s-ag","repo":"o/r","kind":"agents"}]}"#).unwrap();
+        let run = |c: &Config| c.repos().iter().map(|r| (r.id.clone(), r.enabled, r.use_token, r.interval)).collect::<Vec<_>>();
+        cfg.set_enabled("s-ag", false);
+        cfg.set_use_token("s", true);
+        cfg.set_interval("s", Some(Interval::new(6, Unit::Hour)));
+        let six = Some(Interval::new(6, Unit::Hour));
+        assert_eq!(run(&cfg), [("s".to_owned(), false, true, six), ("s-ag".to_owned(), false, true, six)], "one source, one schedule");
+        cfg.edit(|sources, _| sources[0].types.set(SourceKind::Skills, false));
+        assert_eq!(run(&cfg).len(), 1, "a type turned off leaves the run list at once");
+        assert!(cfg.is_known_lane("s"));
+        cfg.edit(|sources, global| {
+            sources[0].types.agents = None;
+            global.types.agents = false;
+        });
+        assert!(cfg.repos().is_empty() && cfg.is_known_lane("s-ag"), "an inherited global switch also applies");
+        assert_eq!(Config::parse(cfg.to_json().as_bytes()).unwrap(), cfg);
+        cfg.remove("s-ag");
+        assert!(cfg.sources().is_empty() && !cfg.is_known_lane("s"));
     }
 
     #[test]
@@ -946,6 +1347,27 @@ mod tests {
     }
 
     #[test]
+    fn a_versionless_file_with_format_3_fields_is_refused_and_never_overwritten() {
+        let dir = temp_dir("versionless-v3");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(CONFIG_FILE);
+        let mut problems = Vec::new();
+        for v3 in [r#"{"sources":[{"id":"kit","repo":"o/kit"}]}"#, r#"{"global":{"include_repo_items":true}}"#] {
+            fs::write(&path, v3).unwrap();
+            match Config::load_sources(&path) {
+                Ok(cfg) => problems.push(format!("{v3} loaded with {} sources instead of being refused", cfg.sources().len())),
+                Err(e) if !e.contains("version") => problems.push(format!("{v3}: the error does not say the file needs a \"version\": {e}")),
+                Err(_) => {}
+            }
+            if Config::default().save(&path).is_ok() || fs::read(&path).unwrap() != v3.as_bytes() {
+                problems.push(format!("{v3} was overwritten by a save"));
+            }
+        }
+        fs::remove_dir_all(dir).unwrap();
+        assert!(problems.is_empty(), "a versionless file with format 3 fields must be refused, not read as an empty format 1 file:\n{}", problems.join("\n"));
+    }
+
+    #[test]
     fn a_missing_file_is_an_empty_config_and_a_saved_one_loads_back() {
         let dir = temp_dir("load");
         let file = dir.join(CONFIG_FILE);
@@ -959,7 +1381,7 @@ mod tests {
         let mut with_bom = b"\xEF\xBB\xBF".to_vec();
         with_bom.extend_from_slice(br#"{ "repos": [ { "repo": "a/b" } ] }"#);
         fs::write(&file, with_bom).unwrap();
-        assert_eq!(Config::load(&file).unwrap().repos[0].id, "a-b", "a hand-edited file with a byte order mark");
+        assert_eq!(Config::load(&file).unwrap().repos()[0].id, "a-b", "a hand-edited file with a byte order mark");
 
         fs::write(&file, b"{ broken").unwrap();
         let e = Config::load(&file).unwrap_err();
@@ -1031,10 +1453,11 @@ mod tests {
 
     #[test]
     fn problems_are_reported_in_plain_words() {
-        let cfg = Config::parse(br#"{ "default_interval": "1m", "repos": [ { "id": "x", "repo": "nope" }, { "id": "x", "repo": "a/b", "interval": "2m", "path": "../x", "branch": "a b" } ] }"#).unwrap();
+        let shared = Config::parse(br#"{ "repos": [ { "id": "x", "repo": "a/b" }, { "id": "x", "repo": "c/d" } ] }"#).unwrap_err();
+        assert!(shared.contains("share the ID"), "{shared}");
+        let cfg = Config::parse(br#"{ "default_interval": "1m", "repos": [ { "id": "x", "repo": "nope" }, { "id": "y", "repo": "a/b", "interval": "2m", "path": "../x", "branch": "a b" } ] }"#).unwrap();
         let problems = cfg.problems();
         assert!(problems.iter().any(|p| p.contains("default interval")), "{problems:?}");
-        assert!(problems.iter().any(|p| p.contains("share the id")), "{problems:?}");
         assert!(problems.iter().any(|p| p.contains("owner/name")), "{problems:?}");
         assert!(problems.iter().any(|p| p.contains("folder")), "{problems:?}");
         assert!(problems.iter().any(|p| p.contains("branch")), "{problems:?}");

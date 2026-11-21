@@ -158,7 +158,7 @@ fn historical_source_root_and_local_changes_invalidate_saved_progress() {
     sync_all(&mut engine, &cfg);
     assert!(!w.state().repo("fx").unwrap().searches.is_empty());
     let mut other = cfg.clone();
-    other.repos[0].path = "other".into();
+    other.update_lane_at(0, |r| r.path = "other".into());
     remote.put(REPO, "other/alpha/SKILL.md", "unrelated");
     sync_all(&mut engine, &other);
     assert_eq!(fs::read_to_string(second.join("alpha\\SKILL.md")).unwrap(), "old");
@@ -433,11 +433,19 @@ fn pending_skill_transaction_recovers_after_its_source_is_removed_or_rebound() {
         assert!(matches!(&skill(only(&interrupted), "alpha").result, ApplyResult::Failed(_)));
         let mut cfg = s.cfg.clone();
         match change {
-            0 => cfg.repos.clear(),
-            1 => cfg.repos[0].id = "renamed".into(),
-            2 => cfg.repos[0].repo = "o/another".into(),
-            3 => cfg.repos[0].path = "elsewhere".into(),
-            4 => cfg.repos[0].branch = "other".into(),
+            0 => cfg.clear_sources(),
+            1 => {
+                cfg.update_lane_at(0, |r| r.id = "renamed".into());
+            }
+            2 => {
+                cfg.update_lane_at(0, |r| r.repo = "o/another".into());
+            }
+            3 => {
+                cfg.update_lane_at(0, |r| r.path = "elsewhere".into());
+            }
+            4 => {
+                cfg.update_lane_at(0, |r| r.branch = "other".into());
+            }
             _ => unreachable!(),
         }
 

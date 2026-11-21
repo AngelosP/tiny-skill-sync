@@ -38,9 +38,10 @@
   <main id="main" tabindex="-1">
     <section class="wrap hero" aria-labelledby="title">
       <h1 id="title">Keep your Copilot skills in sync with GitHub</h1>
-      <p class="lead">Tiny Skill Sync is a tiny Windows tray app. Tell it which GitHub repositories, or which folder of
-        one, hold skills. It installs them into your Copilot skills folder, checks GitHub on a schedule, and installs,
-        updates and removes skills as they change there.</p>
+      <p class="lead">Tiny Skill Sync is a tiny Windows tray app. Give it one GitHub location: a repository, a branch
+        or a folder in it. It finds the skills, agents, instructions and plugins there, installs them into your
+        Copilot folders, checks GitHub on a schedule, and installs, updates and removes them as they change there.
+        Plugins are installed by GitHub Copilot CLI, and only after you approve them.</p>
       <p>It never touches a skill it did not install, and it never overwrites or deletes a skill you edited. It removes
         from your PC only what came from GitHub and was later removed there.</p>
       <p class="actions">
@@ -156,13 +157,14 @@
             anyway</strong>.</p>
         </li>
         <li>
-          <p>Click the icon to open the window. Click <strong>Add repository</strong>, paste the address of a GitHub
-            folder that holds skills, and click <strong>Add</strong>. For example:</p>
+          <p>Click the icon to open the window. Click <strong>Add source</strong>, paste <code>owner/name</code> or the
+            address of a GitHub repository, branch or folder, and click <strong>Preview</strong>. The preview shows
+            what was found and saves nothing. For example:</p>
           <pre><code>https://github.com/anthropics/skills/tree/main/skills</code></pre>
         </li>
         <li>
-          <p>The app installs the skills at once, then checks once a day. It also asks whether to start with
-            Windows.</p>
+          <p>Click <strong>Add and check</strong>. The app installs what it found at once, then checks once a day. It
+            also asks whether to start with Windows.</p>
         </li>
       </ol>
       <p>Copies with <strong>App updates</strong> in Settings can check the official stable release and replace

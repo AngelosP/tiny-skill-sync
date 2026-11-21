@@ -63,7 +63,7 @@ function New-LiveRoot([string]$Prefix, [string]$Build = 'release') {
     $root = Join-Path $TempRoot ("tss-$Prefix-" + [guid]::NewGuid().ToString('N').Substring(0, 8))
     New-Item -ItemType Directory -Path $root -ErrorAction Stop | Out-Null
     try {
-        foreach ($d in 'home', 'skills', 'bin', 'out') { New-Item -ItemType Directory -Path (Join-Path $root $d) | Out-Null }
+        foreach ($d in 'home', 'skills', 'agents', 'instructions', 'bin', 'out') { New-Item -ItemType Directory -Path (Join-Path $root $d) | Out-Null }
         $from = Get-ExeDir $Build
         foreach ($exe in 'tiny-skill-sync.exe', 'tss.exe') {
             $built = Join-Path $from $exe
@@ -104,6 +104,8 @@ function New-LiveStartInfo($Root, [string]$Exe, [string[]]$AppArgs, [hashtable]$
     $psi.UseShellExecute = $false
     $psi.EnvironmentVariables['TSS_HOME'] = Join-Path $Root 'home'
     $psi.EnvironmentVariables['TSS_SKILLS_DIR'] = Join-Path $Root 'skills'
+    $psi.EnvironmentVariables['TSS_AGENTS_DIR'] = Join-Path $Root 'agents'
+    $psi.EnvironmentVariables['TSS_INSTRUCTIONS_DIR'] = Join-Path $Root 'instructions'
     foreach ($key in @($Env.Keys)) {
         if ($null -eq $Env[$key]) { $psi.EnvironmentVariables.Remove($key) } else { $psi.EnvironmentVariables[$key] = [string]$Env[$key] }
     }
@@ -141,18 +143,21 @@ function Invoke-LiveConsole($psi, [string]$Label, [int]$TimeoutSec, [string]$Inp
     $p.Dispose()
 }
 
-# Runs $Body with TSS_HOME and TSS_SKILLS_DIR pointing at the sandbox, so it and every program it starts use the
-# sandbox folders. Dev runs must not update the build in target\. The caller's values are put back afterwards.
+# Runs $Body with TSS_HOME and the skills, agents and instructions folders pointing at the sandbox, so it and every
+# program it starts use the sandbox folders. Dev runs must not update the build in target\. The caller's values are put
+# back afterwards.
 function Invoke-InSandbox {
     param([scriptblock]$Body, [string]$Root = $Sandbox)
-    $saved = $env:TSS_HOME, $env:TSS_SKILLS_DIR, $env:TSS_NO_APP_UPDATES
+    $saved = $env:TSS_HOME, $env:TSS_SKILLS_DIR, $env:TSS_AGENTS_DIR, $env:TSS_INSTRUCTIONS_DIR, $env:TSS_NO_APP_UPDATES
     $env:TSS_HOME = Join-Path $Root 'home'
     $env:TSS_SKILLS_DIR = Join-Path $Root 'skills'
+    $env:TSS_AGENTS_DIR = Join-Path $Root 'agents'
+    $env:TSS_INSTRUCTIONS_DIR = Join-Path $Root 'instructions'
     $env:TSS_NO_APP_UPDATES = '1'
     try {
         New-Item -ItemType Directory -Force $env:TSS_HOME | Out-Null
         & $Body
-    } finally { $env:TSS_HOME, $env:TSS_SKILLS_DIR, $env:TSS_NO_APP_UPDATES = $saved }
+    } finally { $env:TSS_HOME, $env:TSS_SKILLS_DIR, $env:TSS_AGENTS_DIR, $env:TSS_INSTRUCTIONS_DIR, $env:TSS_NO_APP_UPDATES = $saved }
 }
 
 # The GitHub token in Windows Credential Manager is shared by every copy of the app, sandbox or not.

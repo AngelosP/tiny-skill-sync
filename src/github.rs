@@ -4,6 +4,7 @@
 //! any `RemoteError` as "the answer is unknown": a missing network, a bad token, a rate limit, a 404 or a redirect
 //! is never read as "the skill was removed upstream".
 
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -19,6 +20,10 @@ pub const DEFAULT_RAW_BASE: &str = "https://raw.githubusercontent.com";
 /// Largest tree listing accepted. GitHub itself stops at about 7 MB and marks the result truncated.
 const MAX_TREE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_COMMIT_BYTES: usize = 4 * 1024;
+const MAX_REPO_BYTES: usize = 64 * 1024;
+const MAX_HEAD_PAGE_BYTES: usize = 512 * 1024;
+const MAX_HEAD_PAGES: u32 = 20;
+const MAX_HEADS: usize = 2000;
 /// Room for transfer overhead on top of a file's declared size; the exact size is verified by the caller.
 const FILE_SLACK_BYTES: usize = 64 * 1024;
 const DEFAULT_RATE_LIMIT_WAIT_SECS: i64 = 60;
@@ -138,6 +143,15 @@ impl std::fmt::Display for RemoteError {
 impl std::error::Error for RemoteError {}
 
 pub trait Remote: Send + Sync {
+    /// All heads matching this first-segment prefix, without `refs/heads/`. Incomplete answers fail.
+    fn matching_heads(&self, _repo: &RepoRef, _prefix: &str, _token: Option<&Secret>, _cancel: &AtomicBool) -> Result<Vec<String>, RemoteError> {
+        Err(RemoteError::new(FailureKind::Local, "This GitHub client cannot list branch names."))
+    }
+
+    /// The repository's current default branch name, not a commit or a fallback to `main`.
+    fn default_branch(&self, _repo: &RepoRef, _token: Option<&Secret>, _cancel: &AtomicBool) -> Result<String, RemoteError> {
+        Err(RemoteError::new(FailureKind::Local, "This GitHub client cannot read the default branch."))
+    }
     /// Lists the folder's whole tree. `etag` is the one stored with the last listing that was fully applied.
     fn tree(&self, repo: &RepoRef, etag: Option<&str>, token: Option<&Secret>, cancel: &AtomicBool) -> Result<TreeReply, RemoteError>;
 
@@ -216,6 +230,10 @@ pub fn confirm_source_at(
     let snapshot = remote.historical_tree(&reference, pin, "", token, cancel)?.ok_or_else(changed)?;
     if snapshot.sha != listing.tree_id() {
         return Err(changed());
+    }
+    if listing.is_lane_view() {
+        // The lane came from the pinned branch-root listing; the same Git tree ID at the pin means the same content.
+        return if cancel.load(Ordering::Relaxed) { Err(stopped()) } else { Ok(()) };
     }
     // Lengths were checked at discovery. Here we compare the pinned Git entries, not a local destination.
     let pinned = tree::discover_source(recorded, snapshot, 0).map_err(|why| RemoteError::new(FailureKind::Protocol, why))?;
@@ -341,7 +359,8 @@ impl GitHubRemote {
     }
 
     fn api_url(&self, repo: &RepoRef, tail: &str) -> Result<Url, RemoteError> {
-        let text = format!("{}/repos/{}/{}/{tail}", self.api, percent_encode(repo.owner), percent_encode(repo.name));
+        let slash = if tail.is_empty() { "" } else { "/" };
+        let text = format!("{}/repos/{}/{}{slash}{tail}", self.api, percent_encode(repo.owner), percent_encode(repo.name));
         Url::parse(&text).map_err(from_http)
     }
 
@@ -374,7 +393,89 @@ fn api_headers(accept: &str) -> Vec<(&'static str, String)> {
     vec![("Accept", accept.to_string()), ("X-GitHub-Api-Version", "2022-11-28".to_string())]
 }
 
+// A GitHub Link header tells us whether there is another page, never where to send credentials.
+// Fetch the next numeric page at the already configured API origin. The matching-refs endpoint
+// can also return one unpaged answer, which is still subject to the body and total-count limits.
+fn has_next_head_page(response: &Response) -> Result<bool, RemoteError> {
+    let bad_link = || RemoteError::new(FailureKind::Protocol, "GitHub returned invalid branch pagination.");
+    let mut next = false;
+    for (_, header) in response.headers.iter().filter(|(name, _)| name == "link") {
+        let mut link = header.as_str();
+        loop {
+            let (href, params) = link.trim_start().strip_prefix('<').and_then(|s| s.split_once('>')).ok_or_else(bad_link)?;
+            let (params, rest) = params.split_once(',').map_or((params, None), |(params, rest)| (params, Some(rest)));
+            let rel = params.trim().strip_prefix(';').and_then(|s| s.trim().strip_prefix("rel=")).ok_or_else(bad_link)?;
+            let rel = rel.trim();
+            let rel = rel.strip_prefix('"').and_then(|s| s.strip_suffix('"')).unwrap_or(rel);
+            // Accept GitHub's simple rel tokens; reject unexpected syntax rather than mistaking it for the last page.
+            if href.is_empty() || rel.trim().is_empty() || !rel.bytes().all(|b| b.is_ascii_alphanumeric() || b.is_ascii_whitespace() || b == b'-') {
+                return Err(bad_link());
+            }
+            if rel.split_ascii_whitespace().any(|r| r.eq_ignore_ascii_case("next")) {
+                if next {
+                    return Err(bad_link());
+                }
+                next = true;
+            }
+            let Some(rest) = rest else { break };
+            link = rest;
+        }
+    }
+    Ok(next)
+}
+
 impl Remote for GitHubRemote {
+    fn matching_heads(&self, repo: &RepoRef, prefix: &str, token: Option<&Secret>, cancel: &AtomicBool) -> Result<Vec<String>, RemoteError> {
+        crate::location::check_segment(prefix).map_err(|why| RemoteError::new(FailureKind::Local, why))?;
+        let prefix_url = percent_encode(prefix);
+        let invalid = || RemoteError::new(FailureKind::Protocol, "GitHub returned an invalid list of branch names.");
+        let too_many = || RemoteError::new(FailureKind::TooLarge, "GitHub listed too many matching branches.");
+        let mut heads = Vec::new();
+        let mut seen = HashSet::new();
+        for page in 1..=MAX_HEAD_PAGES {
+            let url = self.api_url(repo, &format!("git/matching-refs/heads/{prefix_url}?per_page=100&page={page}"))?;
+            let request = Request { url, headers: api_headers("application/vnd.github+json"), bearer: token, max_body: MAX_HEAD_PAGE_BYTES };
+            let (resp, body) = self.client.get_bytes(&request, cancel).map_err(from_http)?;
+            if resp.status != 200 {
+                return Err(failure(&resp, &repo.label(), token.is_some(), now_epoch()));
+            }
+            let rows: Vec<serde_json::Value> = serde_json::from_slice(&body).map_err(|_| invalid())?;
+            let more = has_next_head_page(&resp)?;
+            if rows.is_empty() && (page != 1 || more) {
+                return Err(invalid());
+            }
+            if heads.len() + rows.len() > MAX_HEADS {
+                return Err(too_many());
+            }
+            for row in rows {
+                let branch = row.get("ref").and_then(|v| v.as_str()).and_then(|s| s.strip_prefix("refs/heads/")).ok_or_else(invalid)?;
+                if !branch.starts_with(prefix) || crate::config::check_branch(branch).is_err() || !seen.insert(branch.to_owned()) {
+                    return Err(invalid());
+                }
+                heads.push(branch.to_owned());
+            }
+            if !more {
+                return Ok(heads);
+            }
+        }
+        Err(too_many())
+    }
+
+    fn default_branch(&self, repo: &RepoRef, token: Option<&Secret>, cancel: &AtomicBool) -> Result<String, RemoteError> {
+        #[derive(serde::Deserialize)]
+        struct Repository {
+            default_branch: String,
+        }
+        let request = Request { url: self.api_url(repo, "")?, headers: api_headers("application/vnd.github+json"), bearer: token, max_body: MAX_REPO_BYTES };
+        let (resp, body) = self.client.get_bytes(&request, cancel).map_err(from_http)?;
+        if resp.status != 200 {
+            return Err(failure(&resp, &repo.label(), token.is_some(), now_epoch()));
+        }
+        let invalid = || RemoteError::new(FailureKind::Protocol, "GitHub did not return a valid default branch name.");
+        let repo: Repository = crate::config::parse_json_object(&body).map_err(|_| invalid())?;
+        crate::config::check_branch(&repo.default_branch).map_err(|_| invalid())?;
+        Ok(repo.default_branch)
+    }
     fn history(&self, repo: &RepoRef, pin: &str, rel: &str, page: u32, token: Option<&Secret>, cancel: &AtomicBool) -> Result<Vec<String>, RemoteError> {
         if !is_commit_sha(pin) || page == 0 {
             return Err(RemoteError::new(FailureKind::Protocol, "history was requested without a pinned commit or page"));
@@ -404,7 +505,8 @@ impl Remote for GitHubRemote {
             return Err(RemoteError::new(FailureKind::Protocol, "a historical listing was requested without a pinned commit"));
         }
         let path = if rel.is_empty() { repo.path.to_string() } else { join_repo_path(repo.path, rel) };
-        let mut reference = commit.to_string();
+        // "COMMIT:" names the root tree. GitHub answers a bare commit ID with that commit's ID as the tree's "sha".
+        let mut reference = format!("{commit}:");
         for component in path.split('/').filter(|p| !p.is_empty()) {
             let parent = self.tree_at(repo, &reference, false, token, cancel)?;
             let mut seen = std::collections::HashSet::new();

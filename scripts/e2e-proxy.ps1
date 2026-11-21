@@ -46,7 +46,7 @@ public sealed class TssProxy {
     }
 
     // route: "api", "raw" or "both". mode: pass | close | hang[:MS] | slow:MS | 401 | 403 | limit | 429 | 404 | 500 | 503
-    // | garbage | redirect | empty-tree | truncated | corrupt | badauth | freeze[:TEXT]
+    // | garbage | redirect | empty-tree[:FOLDER] | truncated | corrupt | badauth | freeze[:TEXT]
     public void SetMode(string route, string mode) {
         lock (gate) {
             if (route == "both" || route == "api") modes["api"] = mode;
@@ -130,9 +130,18 @@ public sealed class TssProxy {
             case "garbage": return Reply(ctx, 200, "<html><body>This is not what an API says.</body></html>", null, "text/html");
             case "redirect": return Reply(ctx, 301, "{}", new string[] { "Location: https://api.github.com/repositories/1/git/trees/x" }, "application/json");
             case "empty-tree":
-                if (rest.Contains("/git/trees/"))
-                    return Reply(ctx, 200, "{\"sha\":\"4b825dc642cb6eb9a060e54bf8d69288fbee4904\",\"url\":\"\",\"tree\":[],\"truncated\":false}",
-                        new string[] { "ETag: W/\"tss-empty\"" }, "application/json");
+                // empty-tree:FOLDER keeps FOLDER (and the folders above it), with nothing in it.
+                if (rest.Contains("/git/trees/")) {
+                    StringBuilder entries = new StringBuilder();
+                    string path = "";
+                    foreach (string part in arg.Split(new char[] { '/' }, StringSplitOptions.RemoveEmptyEntries)) {
+                        path = path.Length == 0 ? part : path + "/" + part;
+                        if (entries.Length > 0) entries.Append(',');
+                        entries.Append("{\"path\":\"" + path + "\",\"mode\":\"040000\",\"type\":\"tree\",\"sha\":\"4b825dc642cb6eb9a060e54bf8d69288fbee4904\",\"url\":\"\"}");
+                    }
+                    return Reply(ctx, 200, "{\"sha\":\"4b825dc642cb6eb9a060e54bf8d69288fbee4904\",\"url\":\"\",\"tree\":[" + entries + "],\"truncated\":false}",
+                        new string[] { "ETag: W/\"tss-empty" + (arg.Length > 0 ? "-" + arg.Replace('"', '_') : "") + "\"" }, "application/json");
+                }
                 break;
         }
         return Forward(ctx, target, rest, name);

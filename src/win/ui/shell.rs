@@ -42,13 +42,13 @@ use super::page::{self, Note};
 use super::{bench, dialogs, register_class, sentence, tray, trim_memory, window};
 use crate::app::{App, Done, Job, Order, SettingsSource, Shown, SourceDraft, UpdateState, perform_with_updates};
 use crate::autostart::BACKGROUND;
-use crate::board::{APP_NAME, Level, RepoView, span};
+use crate::board::{APP_NAME, Level, SourceView, span};
 use crate::cli::{Host, SystemHost};
-use crate::config::{CONFIG_FILE, Config, Paths, RepoSpec, instance_tag};
+use crate::config::{CONFIG_FILE, Config, Paths, instance_tag};
 use crate::engine::{Engine, EngineError, Stamp, stamp_of};
 use crate::interval::{Interval, UnixSecs, now_secs};
 use crate::replacement::VerifiedTray;
-use crate::source::SourceKind;
+use crate::sources::{GlobalSettings, SourceConfig};
 use crate::win::{proc, wide, wide_os};
 
 /// Tray menu and remote-control commands, sent as `WM_COMMAND`.
@@ -436,6 +436,7 @@ impl Shell {
                     config_saves: order.config_saves.into_iter().map(|save| save.outcome(Err(why.clone()))).collect(),
                     settings_checked: false,
                     update: None,
+                    seen: None,
                 };
                 self.on_done(failed);
             }
@@ -553,11 +554,11 @@ impl Shell {
         config_saves.iter().all(|s| s.result.is_ok())
     }
 
-    /// The engine let go of a repository; it leaves the settings too.
+    /// The engine let go of a source; it leaves the settings too, with all its types.
     fn drop_from_config(&mut self, id: &str) {
         let before = self.app.cfg().clone();
         let mut after = before.clone();
-        after.repos.retain(|r| r.id != id);
+        after.remove(id);
         if before != after {
             // Stop scheduling it immediately even if the worker cannot update the settings.
             self.app.set_cfg(after.clone(), self.app.skills_dir().clone());
@@ -610,7 +611,7 @@ impl Shell {
         if !self.app.settings_initialized() {
             return "Loading settings…".to_string();
         }
-        if !self.app.cfg().repos.iter().any(|r| r.enabled) {
+        if !self.app.cfg().repos().iter().any(|r| r.enabled) {
             return "Add a source to start".to_string();
         }
         match self.app.next_wake() {
@@ -640,7 +641,8 @@ const CFG_UNREADABLE: &str = "Settings cannot be read; see Activity";
 pub struct Snapshot {
     pub now: UnixSecs,
     pub cfg: Config,
-    pub views: Vec<RepoView>,
+    /// One per source, as the list and a source's page show it.
+    pub sources: Vec<SourceView>,
     pub draft: Option<SourceDraft>,
     pub skills_dir: PathBuf,
     pub work_dir: PathBuf,
@@ -657,7 +659,7 @@ pub fn snapshot() -> Option<Snapshot> {
         Snapshot {
             now,
             cfg: s.app.cfg().clone(),
-            views: s.app.board.views(s.app.cfg(), now),
+            sources: s.app.board.source_views(s.app.cfg(), now),
             draft: s.app.draft().cloned(),
             skills_dir: s.app.skills_dir().clone(),
             work_dir: s.paths().work_dir(),
@@ -685,12 +687,45 @@ fn with_source_edit<T>(edit: impl FnOnce(&mut App) -> Result<T, String>) -> Resu
     result
 }
 
-pub fn preview_source(spec: &RepoSpec, kind: SourceKind, every: Option<Interval>) -> Result<u64, String> {
-    with_source_edit(|app| app.preview_source(spec, kind, every))
+pub fn preview_location(text: &str, every: Option<Interval>) -> Result<u64, String> {
+    with_source_edit(|app| app.preview_location(text, every))
 }
 
-pub fn confirm_source(ticket: u64) {
-    let _ = with_source_edit(|app| app.confirm_source(ticket));
+pub fn confirm_source(ticket: u64, approve_plugins: bool) {
+    let _ = with_source_edit(|app| app.confirm_source(ticket, approve_plugins));
+}
+
+/// Changes one source's settings (its types, folder rules and repository items). Returns whether anything changed.
+pub fn edit_source(id: &str, change: impl FnOnce(&mut SourceConfig)) -> Result<bool, String> {
+    settings_edit(|s| s.app.edit_source(id, change))
+}
+
+/// Changes the settings every source inherits. Returns whether anything changed.
+pub fn edit_global(change: impl FnOnce(&mut GlobalSettings)) -> Result<bool, String> {
+    settings_edit(|s| s.app.edit_global(change))
+}
+
+fn settings_edit(edit: impl FnOnce(&mut Shell) -> Result<bool, String>) -> Result<bool, String> {
+    let result = with_shell(|s| {
+        if s.cfg_error || !s.app.settings_initialized() || s.app.portable_probe_pending() {
+            return Err("Settings are unavailable or still being checked. Try again after they load.".to_string());
+        }
+        if s.saving_settings || s.app.saving_source() {
+            return Err("Settings are still being saved. Try again in a moment.".to_string());
+        }
+        let changed = edit(s)?;
+        if changed {
+            s.saving_settings = true;
+            s.feedback = Some("Saving settings…".into());
+        }
+        Ok(changed)
+    })
+    .unwrap_or_else(|| Err("The app is busy. Try again.".into()));
+    match &result {
+        Err(why) => tell(sentence(why)),
+        Ok(_) => kick(),
+    }
+    result
 }
 
 pub fn saving_source() -> bool {

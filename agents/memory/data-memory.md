@@ -29,6 +29,18 @@
   only config IDs, never state.
 - Portable `export`/`save_changes` write only Config (settings and sources). Plugin consent stays in local state.
 
+- Issue #8 (config v3, round 2): `Config::parse`/`from_parts` fill missing source/lane IDs from the config alone
+  (deterministic, never state); only a brand-new source (`allocate_source_ids` + `check_fresh_id`) avoids state
+  IDs. Turning a type on runs `source_preview::fresh_lane_ids` (renames a lane whose ID has foreign records).
+  Lanes already on in a hand-written/imported file get no such check (cross-kind collisions fail closed in
+  `validate_state`). `LegacyConfig` refuses `sources`/`global` without `"version": 3`.
+- `state.json` `STATE_VERSION` = 3; `wire_version` picks 3 only when `needs_format_3()` (plugin `roots` or
+  `lane_polls`). Below format 3 those fields are refused untouched (no quarantine). `lane_polls` (per lane ID,
+  scheduling only, kind + location + tagged ETag) are dropped on a real record, a conflict at load, or by
+  `prune_lane_polls` at startup/sync; `has_source_id`/`check_fresh_id` ignore them.
+- `seen.json` (`src/seen.rs`): version 1, no lock; `seen::update` re-reads, merges, atomically replaces only on change,
+  and never overwrites a newer version (`Ok(None)`).
+
 ## Baselines
 
 - Issue #7 item F (plugins) review, after the change, on uncommitted work over 893cebe: `scripts\dev.ps1 test -Quick -Filter`

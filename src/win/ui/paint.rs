@@ -111,6 +111,11 @@ pub mod glyph {
     pub const VIEW: char = '\u{E890}';
     pub const COPY: char = '\u{E8C8}';
     pub const LINK: char = '\u{E71B}';
+    /// The four types a source can hold: a light bulb, a person, a bulleted list and a puzzle piece.
+    pub const SKILL: char = '\u{E82F}';
+    pub const AGENT: char = '\u{E77B}';
+    pub const INSTRUCTION: char = '\u{E8FD}';
+    pub const PLUGIN: char = '\u{EA86}';
 }
 
 struct Canvas {

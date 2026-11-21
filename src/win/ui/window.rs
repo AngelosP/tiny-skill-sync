@@ -20,30 +20,31 @@ use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::HiDpi::{AdjustWindowRectExForDpi, GetDpiForSystem, GetDpiForWindow, GetSystemMetricsForDpi};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetFocus, SetFocus};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    BM_GETCHECK, CreateWindowExW, DefWindowProcW, DestroyIcon, DestroyWindow, GetClientRect, GetCursorPos, GetDlgCtrlID, HICON, ICON_BIG, ICON_SMALL, IDCANCEL,
-    IsChild, IsIconic, IsWindow, IsWindowVisible, IsZoomed, KillTimer, MINMAXINFO, PostMessageW, SIZE_MINIMIZED, SM_CXICON, SM_CXSMICON, SM_CXVSCROLL,
-    SPI_GETWORKAREA, SW_HIDE, SW_RESTORE, SW_SHOWNORMAL, SWP_NOACTIVATE, SWP_NOZORDER, SWP_SHOWWINDOW, SendMessageW, SetForegroundWindow, SetTimer,
-    SetWindowPos, ShowWindow, SystemParametersInfoW, WA_INACTIVE, WM_ACTIVATE, WM_APP, WM_CLOSE, WM_COMMAND, WM_DPICHANGED, WM_ERASEBKGND, WM_EXITSIZEMOVE,
-    WM_GETMINMAXINFO, WM_NCDESTROY, WM_PAINT, WM_SETICON, WM_SETTINGCHANGE, WM_SIZE, WM_SYSCOLORCHANGE, WM_THEMECHANGED, WM_TIMER, WS_CLIPCHILDREN,
-    WS_EX_CONTROLPARENT, WS_OVERLAPPEDWINDOW, WindowFromPoint,
+    BM_GETCHECK, CreateWindowExW, DefWindowProcW, DestroyIcon, DestroyWindow, GetClientRect, GetDlgCtrlID, HICON, ICON_BIG, ICON_SMALL, IDCANCEL, IsChild,
+    IsIconic, IsWindow, IsWindowVisible, IsZoomed, KillTimer, MINMAXINFO, PostMessageW, SIZE_MINIMIZED, SM_CXICON, SM_CXSMICON, SM_CXVSCROLL, SPI_GETWORKAREA,
+    SW_HIDE, SW_RESTORE, SW_SHOWNORMAL, SWP_NOACTIVATE, SWP_NOZORDER, SWP_SHOWWINDOW, SendMessageW, SetForegroundWindow, SetTimer, SetWindowPos, ShowWindow,
+    SystemParametersInfoW, WA_INACTIVE, WM_ACTIVATE, WM_APP, WM_CLOSE, WM_COMMAND, WM_DPICHANGED, WM_ERASEBKGND, WM_EXITSIZEMOVE, WM_GETMINMAXINFO,
+    WM_NCDESTROY, WM_PAINT, WM_SETICON, WM_SETTINGCHANGE, WM_SIZE, WM_SYSCOLORCHANGE, WM_THEMECHANGED, WM_TIMER, WS_CLIPCHILDREN, WS_EX_CONTROLPARENT,
+    WS_OVERLAPPEDWINDOW,
 };
 
 use super::control::{self, BN_CLICKED, CBN_SELENDOK, RowCmd, Surface};
 use super::dialogs::{self, Ask, Check, Field};
-use super::page::{self, CUSTOM, DIFF_FILES_W, DiffView, Fit, HERO_H, Hit, NAV_W, Page, Part, RepoPage, Report, SYNC_TIP, SettingsPage, id};
+use super::page::{self, CUSTOM, DiffView, Fit, HERO_H, Hit, MIN_LIST_W, NAV_W, Page, Part, Report, SYNC_TIP, SettingsPage, SourcePage, SplitKey, id};
 use super::paint::{self, Font, Rect, glyph};
 use super::shell::{self, Snapshot};
 use super::theme::{self, Role};
 use super::{bench, local_time, open_folder, place, register_class, scale, sentence, text_of, tray, trim_memory};
-use crate::app::Job;
+use crate::app::{DraftStage, Job};
 use crate::autostart::{Keys, Startup};
-use crate::board::{APP_NAME, Action, RepoView, Row};
-use crate::config::{Config, Paths, RepoConfig, RepoSpec, UpdatePrefs};
+use crate::board::{APP_NAME, Action, Row, SourceView, source_label};
+use crate::config::{Config, Paths, RepoConfig, UpdatePrefs};
 use crate::github::web_url;
 use crate::interval::{Interval, MIN_POLL_MINUTES};
 use crate::logo;
 use crate::pathsafe::printable;
 use crate::source::SourceKind;
+use crate::sources::SourceConfig;
 use crate::win::{autorun, clip, cred, proc, wide};
 
 const CLASS: &str = "TinySkillSyncWindow";
@@ -52,16 +53,13 @@ const EX_STYLE: u32 = WS_EX_CONTROLPARENT;
 /// The client size the first time it opens, and the smallest it can be made, in DIPs.
 const SIZE: (i32, i32) = (980, 680);
 const MIN_SIZE: (i32, i32) = (640, 480);
-/// Where the size the user last gave the window is kept, in the app's folder.
+/// Where the window size and preferred list width are kept, in the app's folder.
 const SIZE_FILE: &str = "window.txt";
 /// Show what the snapshot says now.
 const WM_REFRESH: u32 = WM_APP + 10;
 /// "5 minutes ago" goes stale; this keeps it roughly right.
 const TIMER_REFRESH: usize = 1;
 const REFRESH_MS: u32 = 60_000;
-/// The list on the left widens once the mouse has rested on it this long, so passing over it does nothing.
-const TIMER_LIST: usize = 2;
-const LIST_REST_MS: u32 = 250;
 /// The panels' ids. Not 1 or 2: Enter and Escape make the dialog manager look for a child with those.
 const HERO: i32 = 101;
 const NAV: i32 = 102;
@@ -69,11 +67,12 @@ const PAGE: i32 = 103;
 const HEAD: i32 = 104;
 const FILES: i32 = 105;
 const CODE: i32 = 106;
+const SPLITTER: i32 = 107;
 /// The entries of a repository's More menu.
-const SYNC_ONE: &str = "Sync this repository";
+const SYNC_ONE: &str = "Check now";
 const ON_GITHUB: &str = "Open on GitHub";
 const SKILLS_FOLDER: &str = "Open skills folder";
-const REMOVE: &str = "Remove repository…";
+const REMOVE: &str = "Remove source…";
 
 #[derive(Clone, Copy)]
 struct Panels {
@@ -84,11 +83,12 @@ struct Panels {
     head: HWND,
     files: HWND,
     code: HWND,
+    splitter: HWND,
 }
 
 impl Panels {
-    fn all(self) -> [HWND; 6] {
-        [self.hero, self.nav, self.page, self.head, self.files, self.code]
+    fn all(self) -> [HWND; 7] {
+        [self.hero, self.nav, self.page, self.head, self.files, self.code, self.splitter]
     }
 }
 
@@ -99,6 +99,8 @@ struct Win {
     /// The page on the right; `None` is the welcome page.
     page: Option<Page>,
     add_form: Option<(u64, AddForm)>,
+    /// The lane to show once the source being saved is in the settings.
+    adding: Option<String>,
     /// Keep a rejected source's details for the next Add Source attempt.
     retry_add_form: Option<AddForm>,
     /// The skills of the repository shown that the user opened or closed, by name.
@@ -122,12 +124,9 @@ thread_local! {
     static REFRESH_POSTED: Cell<bool> = const { Cell::new(false) };
     /// What the window draws behind the panels; kept apart from the state, so painting never needs to borrow it.
     static DIFF_MODE: Cell<bool> = const { Cell::new(false) };
-    /// How wide the list on the left is laid out, in DIPs; also for painting.
-    static LIST_SHOWN: Cell<i32> = const { Cell::new(NAV_W) };
-    /// The mouse is on the list on the left and the rest timer runs.
-    static LIST_RESTING: Cell<bool> = const { Cell::new(false) };
-    /// The mouse rested on the list, so it is as wide as its names need.
-    static LIST_WIDE: Cell<bool> = const { Cell::new(false) };
+    static SAVED_SIZE: Cell<WindowSize> = const { Cell::new(WindowSize::DEFAULT) };
+    /// A preview of the new width while the mouse is held; never written until capture ends.
+    static DRAG_WIDTH: Cell<Option<i32>> = const { Cell::new(None) };
 }
 
 pub fn window() -> HWND {
@@ -140,7 +139,7 @@ pub fn is_open() -> bool {
 
 pub fn offer_startup_once() {
     let hwnd = window();
-    if hwnd.is_null() || !shell::snapshot().is_some_and(|snapshot| !snapshot.cfg.repos.is_empty()) {
+    if hwnd.is_null() || !shell::snapshot().is_some_and(|snapshot| !snapshot.cfg.repos().is_empty()) {
         return;
     }
     offer_startup(hwnd);
@@ -188,14 +187,26 @@ fn size_file() -> PathBuf {
     Paths::home_dir().join(SIZE_FILE)
 }
 
-/// What [`save_size`] wrote: the client width and height in DIPs, made at least the smallest.
-fn parse_size(text: &str) -> Option<(i32, i32)> {
-    let mut parts = text.split_whitespace().map(|p| p.parse::<i32>().ok());
-    let (w, h) = (parts.next()??, parts.next()??);
-    if parts.next().is_some() {
-        return None;
-    }
-    Some((w.clamp(MIN_SIZE.0, 10_000), h.clamp(MIN_SIZE.1, 10_000)))
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct WindowSize {
+    client: (i32, i32),
+    list: i32,
+}
+
+impl WindowSize {
+    const DEFAULT: Self = Self { client: SIZE, list: NAV_W };
+}
+
+fn parse_size(text: &str) -> Option<WindowSize> {
+    let mut parts = text.split_whitespace();
+    let w = parts.next()?.parse::<i32>().ok()?.clamp(MIN_SIZE.0, 10_000);
+    let h = parts.next()?.parse::<i32>().ok()?.clamp(MIN_SIZE.1, 10_000);
+    let list = parts.next().and_then(|n| n.parse().ok()).filter(|&n| n >= MIN_LIST_W && parts.next().is_none()).unwrap_or(NAV_W);
+    Some(WindowSize { client: (w, h), list })
+}
+
+fn format_size(WindowSize { client: (w, h), list }: WindowSize) -> String {
+    format!("{w} {h} {list}\n")
 }
 
 /// A client size that fits on the work area, frame and all.
@@ -211,17 +222,28 @@ fn within_work_area((w, h): (i32, i32), dpi: u32) -> (i32, i32) {
     (w.min(room_w.max(MIN_SIZE.0)), h.min(room_h.max(MIN_SIZE.1)))
 }
 
-/// Remembers the size the user gave the window, unless it is maximized or minimized. Written only when it changed.
-fn save_size(hwnd: HWND) {
-    if unsafe { IsZoomed(hwnd) != 0 || IsIconic(hwnd) != 0 } {
-        return;
-    }
-    let (w, h) = client(hwnd);
+fn save_size(size: WindowSize) {
+    SAVED_SIZE.with(|s| s.set(size));
     let file = size_file();
-    let text = format!("{w} {h}\n");
+    let text = format_size(size);
     if fs::read_to_string(&file).ok().as_deref() != Some(text.as_str()) {
         let _ = fs::write(&file, text);
     }
+}
+
+/// Don't replace the normal size with the maximized or minimized size.
+fn remember_window_size(hwnd: HWND) {
+    if unsafe { IsZoomed(hwnd) == 0 && IsIconic(hwnd) == 0 } {
+        save_size(WindowSize { client: client(hwnd), ..SAVED_SIZE.with(Cell::get) });
+    }
+}
+
+fn requested_list_width() -> i32 {
+    DRAG_WIDTH.with(Cell::get).unwrap_or_else(|| SAVED_SIZE.with(Cell::get).list)
+}
+
+fn remember_list_width(list: i32) {
+    save_size(WindowSize { list, ..SAVED_SIZE.with(Cell::get) });
 }
 
 /// Opens the window, or brings it to the front.
@@ -241,9 +263,9 @@ pub fn open() {
     }
     let opened = Instant::now();
     theme::refresh();
-    let wanted = fs::read_to_string(size_file()).ok().and_then(|t| parse_size(&t)).unwrap_or(SIZE);
+    let wanted = fs::read_to_string(size_file()).ok().and_then(|t| parse_size(&t)).unwrap_or(WindowSize::DEFAULT);
     let system = unsafe { GetDpiForSystem() };
-    let [x, y, w, h] = place(STYLE, EX_STYLE, within_work_area(wanted, system), system, null_mut());
+    let [x, y, w, h] = place(STYLE, EX_STYLE, within_work_area(wanted.client, system), system, null_mut());
     let hwnd = unsafe {
         CreateWindowExW(EX_STYLE, wide(CLASS).as_ptr(), wide(APP_NAME).as_ptr(), STYLE, x, y, w, h, null_mut(), null_mut(), GetModuleHandleW(null()), null())
     };
@@ -256,9 +278,10 @@ pub fn open() {
     let p = Panels {
         hero: control::panel(hwnd, HERO, Role::None),
         nav: control::panel(hwnd, NAV, Role::None),
-        page: control::panel(hwnd, PAGE, Role::None),
         head: control::panel(hwnd, HEAD, Role::None),
         files: control::panel(hwnd, FILES, Role::None),
+        splitter: control::panel(hwnd, SPLITTER, Role::None),
+        page: control::panel(hwnd, PAGE, Role::None),
         code: control::panel(hwnd, CODE, Role::None),
     };
     for panel in [p.head, p.files, p.code] {
@@ -271,6 +294,7 @@ pub fn open() {
         snap: None,
         page: None,
         add_form: None,
+        adding: None,
         retry_add_form: None,
         toggled: HashSet::new(),
         diff: None,
@@ -284,16 +308,17 @@ pub fn open() {
     WINDOW.with(|w| w.set(hwnd));
     REFRESH_POSTED.with(|p| p.set(false));
     DIFF_MODE.with(|d| d.set(false));
+    SAVED_SIZE.with(|s| s.set(wanted));
     shell::reload_settings();
     // Now that the window knows its monitor's DPI.
-    let [x, y, w, h] = place(STYLE, EX_STYLE, within_work_area(wanted, dpi), dpi, null_mut());
+    let [x, y, w, h] = place(STYLE, EX_STYLE, within_work_area(wanted.client, dpi), dpi, null_mut());
     unsafe { SetWindowPos(hwnd, null_mut(), x, y, w, h, SWP_NOZORDER | SWP_NOACTIVATE) };
     update(hwnd);
     control::hide_cues(hwnd);
     // The repository shown, in the list, or Add repository when there is none.
     let first = with_state(|st| {
         let index = match &st.page {
-            Some(Page::Repo(shown)) => st.snap.as_ref().and_then(|s| s.views.iter().position(|v| v.id == *shown)),
+            Some(Page::Repo(shown)) => st.snap.as_ref().and_then(|s| s.sources.iter().position(|v| v.id == *shown)),
             _ => None,
         };
         control::child(st.p.nav, index.map_or(id::NAV_ADD, |i| id::NAV_REPO + i as i32))
@@ -356,11 +381,11 @@ fn update(hwnd: HWND) {
             st.diff = None;
         }
         let wanted = if st.page == Some(Page::Add) && snap.draft.is_none() {
-            st.snap.as_ref().and_then(|s| s.draft.as_ref()).map(|d| Page::Repo(d.input.source.id.clone()))
+            st.snap.as_ref().and_then(|s| s.draft.as_ref()).and(st.adding.take()).map(Page::Repo)
         } else {
             st.page.clone()
         };
-        let page = page::settle(wanted, &snap.views);
+        let page = page::settle(wanted, &snap.sources, &snap.cfg);
         let moved = page != st.page;
         if moved {
             st.page = page;
@@ -368,8 +393,9 @@ fn update(hwnd: HWND) {
         } else if let Some(Page::Repo(id)) = &page {
             if !st.toggled.is_empty() {
                 let mut previous = std::mem::take(&mut st.toggled);
-                if let Some(view) = snap.views.iter().find(|view| view.id == *id) {
-                    st.toggled.extend(view.skills.iter().filter(|r| page::expandable(r)).filter_map(|r| previous.take(&r.name)));
+                if let Some(view) = snap.sources.iter().find(|view| view.id == *id) {
+                    let rows = view.kinds.iter().flat_map(|k| k.rows.iter().map(move |r| (k, r)));
+                    st.toggled.extend(rows.filter(|(_, r)| page::expandable(r)).filter_map(|(k, r)| previous.take(&page::toggle_key(&k.lane, &r.name))));
                 }
             }
         }
@@ -386,68 +412,60 @@ fn update(hwnd: HWND) {
 /// What each panel shows and where, or `None` to hide it.
 type Plan = Vec<(HWND, Option<(Rect, Surface)>)>;
 
-fn lay_out(st: &Win, list_w: i32, w: i32, h: i32, bar: i32, fit: Fit) -> Plan {
+fn lay_out(st: &Win, preferred: i32, w: i32, h: i32, bar: i32, fit: Fit) -> Plan {
     let p = st.p;
     let Some(snap) = &st.snap else { return Vec::new() };
     // Laid out again without the scroll bar's width when it does not fit.
     let fitted = |at: Rect, make: &dyn Fn(i32) -> Surface| {
+        if at[2] == 0 || at[3] == 0 {
+            return None;
+        }
         let surface = make(at[2]);
         let surface = if surface.height > at[3] { make((at[2] - bar).max(0)) } else { surface };
         Some((at, surface))
     };
+    let splitter = |at: Rect| (at[2] > 0 && at[3] > 0).then(|| (at, page::splitter(at[2], at[3])));
     if let Some(d) = &st.diff {
-        let l = page::diff_layout(w, h, list_w);
+        let l = page::diff_layout(w, h, preferred);
         return vec![
             (p.hero, None),
             (p.nav, None),
             (p.page, None),
             (p.head, Some((l.head, page::diff_head(d, &l, fit)))),
-            (p.files, fitted(l.files, &|w| page::diff_files(d, w, fit))),
-            (p.code, fitted(l.code, &|w| page::diff_code(d, w, fit))),
+            (p.files, fitted(l.split.list, &|w| page::diff_files(d, w, fit))),
+            (p.splitter, splitter(l.split.splitter)),
+            (p.code, fitted(l.split.page, &|w| page::diff_code(d, w, fit))),
         ];
     }
     let body = (h - HERO_H).max(0);
-    let hero = page::hero_of(&snap.views, snap.problem.as_deref(), &snap.status, snap.news, snap.now);
-    let can_sync = snap.cfg.repos.iter().any(|r| r.enabled);
+    let l = page::split_layout(w, HERO_H, body, preferred);
+    let hero = page::hero_of(&snap.sources, snap.problem.as_deref(), &snap.status, snap.news, snap.now);
+    let can_sync = snap.cfg.repos().iter().any(|r| r.enabled);
     let welcome = Page::Repo(String::new());
     let shown = st.page.as_ref().unwrap_or(&welcome);
     vec![
         (p.hero, Some(([0, 0, w, HERO_H], page::hero(&hero, can_sync, w, fit)))),
-        (p.nav, fitted([0, HERO_H, list_w, body], &|w| page::nav(&snap.views, shown, w, body, fit))),
-        (p.page, fitted([list_w, HERO_H, (w - list_w).max(0), body], &|w| page_of(st, snap, w, fit))),
+        (p.nav, fitted(l.list, &|w| page::nav(&snap.sources, shown, w, body, fit))),
+        (p.splitter, splitter(l.splitter)),
+        (p.page, fitted(l.page, &|w| page_of(st, snap, w, fit))),
         (p.head, None),
         (p.files, None),
         (p.code, None),
     ]
 }
 
-/// How wide the active list on the left is, including the card borders in the diff view.
-fn list_width(st: &Win, w: i32, h: i32, bar: i32, fit: Fit) -> i32 {
-    let wide = LIST_WIDE.with(Cell::get);
-    if let Some(d) = &st.diff {
-        if !wide {
-            return DIFF_FILES_W;
-        }
-        let l = page::diff_layout(w, h, DIFF_FILES_W);
-        let scrolls = page::diff_files(d, l.files[2], fit).height > l.files[3];
-        return page::diff_files_width(d, w, if scrolls { bar } else { 0 }, fit);
-    }
-    let Some(snap) = st.snap.as_ref().filter(|_| wide) else { return NAV_W };
-    let body = (h - HERO_H).max(0);
-    let shown = st.page.clone().unwrap_or(Page::Repo(String::new()));
-    let scrolls = page::nav(&snap.views, &shown, NAV_W, body, fit).height > body;
-    page::nav_width(&snap.views, w, if scrolls { bar } else { 0 }, fit)
-}
-
 fn page_of(st: &Win, snap: &Snapshot, w: i32, fit: Fit) -> Surface {
     let default = snap.cfg.default_interval;
     match &st.page {
-        Some(Page::Repo(shown)) => match (snap.views.iter().find(|v| v.id == *shown), snap.cfg.find(shown)) {
-            (Some(view), Some(repo)) => page::repo_page(&RepoPage { view, repo, default, now: snap.now, toggled: &st.toggled }, w, fit),
+        Some(Page::Repo(shown)) => match (snap.sources.iter().find(|v| v.id == *shown), snap.cfg.find_source(shown)) {
+            (Some(view), Some(source)) => {
+                let p = SourcePage { view, source, global: snap.cfg.global(), default, now: snap.now, toggled: &st.toggled };
+                page::source_page(&p, w, fit)
+            }
             _ => page::welcome(w, fit),
         },
         Some(Page::Activity) => page::activity_page(&snap.notes, &local_time, w, fit),
-        Some(Page::Add) => snap.draft.as_ref().map_or_else(|| page::welcome(w, fit), |draft| page::source_preview(draft, w, fit)),
+        Some(Page::Add) => snap.draft.as_ref().map_or_else(|| page::welcome(w, fit), |draft| page::source_preview(draft, &snap.skills_dir, w, fit)),
         Some(Page::Settings) => {
             let skills_dir = snap.skills_dir.display().to_string();
             let startup = match &st.startup {
@@ -463,6 +481,7 @@ fn page_of(st: &Win, snap: &Snapshot, w: i32, fit: Fit) -> Surface {
                 running_version: env!("CARGO_PKG_VERSION"),
                 app_update: snap.cfg.app_update,
                 app_update_status: &snap.app_update_status,
+                global: snap.cfg.global(),
             };
             page::settings_page(&settings, w, fit)
         }
@@ -472,12 +491,6 @@ fn page_of(st: &Win, snap: &Snapshot, w: i32, fit: Fit) -> Surface {
 
 /// Lays everything out again for the window as it is now.
 fn render(hwnd: HWND) {
-    lay_out_again(hwnd, false);
-}
-
-/// Lays everything out again; with `if_list_moves`, only when the list on the left is to change width.
-fn lay_out_again(hwnd: HWND, if_list_moves: bool) {
-    let started = Instant::now();
     let dpi = dpi_of(hwnd);
     let (w, h) = client(hwnd);
     if w <= 0 || h <= 0 {
@@ -488,20 +501,8 @@ fn lay_out_again(hwnd: HWND, if_list_moves: bool) {
         let px = unsafe { GetSystemMetricsForDpi(SM_CXVSCROLL, dpi) };
         (px * 96 + dpi as i32 - 1) / dpi as i32
     };
-    let laid = with_state(|st| {
-        let diff = st.diff.is_some();
-        if diff != DIFF_MODE.with(Cell::get) {
-            unsafe { KillTimer(hwnd, TIMER_LIST) };
-            LIST_RESTING.with(|r| r.set(false));
-            LIST_WIDE.with(|w| w.set(false));
-        }
-        let list_w = list_width(st, w, h, bar, &fit);
-        let moves = list_w != LIST_SHOWN.with(Cell::get);
-        (moves || !if_list_moves).then(|| (lay_out(st, list_w, w, h, bar, &fit), diff, st.p.hero, list_w))
-    });
-    let Some((plan, diff, hero, list_w)) = laid.flatten() else { return };
+    let Some((plan, diff, hero)) = with_state(|st| (lay_out(st, requested_list_width(), w, h, bar, &fit), st.diff.is_some(), st.p.hero)) else { return };
     let switched = DIFF_MODE.with(|d| d.replace(diff)) != diff;
-    let widened = LIST_SHOWN.with(|n| n.replace(list_w)) != list_w;
     for (panel, part) in plan {
         match part {
             None => unsafe {
@@ -517,68 +518,60 @@ fn lay_out_again(hwnd: HWND, if_list_moves: bool) {
             }
         }
     }
-    if switched || widened {
-        unsafe { RedrawWindow(hwnd, null(), null_mut(), RDW_INVALIDATE | RDW_ALLCHILDREN) };
-    }
-    if if_list_moves && bench::on() {
-        // As for "settings": paint now, so that the mark includes drawing the panels at their new widths.
-        unsafe { RedrawWindow(hwnd, null(), null_mut(), RDW_UPDATENOW | RDW_ALLCHILDREN) };
-        bench::mark(if diff { "files" } else { "nav" }, Some(started.elapsed()));
+    if switched {
+        invalidate_layout(hwnd);
     }
     let sync = control::child(hero, id::SYNC);
     if !sync.is_null() && with_state(|st| std::mem::replace(&mut st.tipped, sync)).is_some_and(|before| before != sync) {
         control::tip(sync, SYNC_TIP);
     }
-    if switched {
-        on_hover(hwnd);
-    }
+}
+
+fn invalidate_layout(hwnd: HWND) {
+    unsafe { RedrawWindow(hwnd, null(), null_mut(), RDW_INVALIDATE | RDW_ALLCHILDREN) };
 }
 
 /// What the window draws behind its panels, into the canvas at its origin.
 fn draw_bg(hwnd: HWND) {
     let (w, h) = client(hwnd);
     paint::fill([0, 0, w, h], 0, Role::Bg, Role::None);
+    let preferred = requested_list_width();
     if DIFF_MODE.with(Cell::get) {
-        control::draw(&page::diff_backdrop(&page::diff_layout(w, h, LIST_SHOWN.with(Cell::get)), w, h));
+        control::draw(&page::diff_backdrop(&page::diff_layout(w, h, preferred), w, h));
     } else {
-        control::draw(&page::backdrop(LIST_SHOWN.with(Cell::get), w, h));
+        let l = page::split_layout(w, HERO_H, (h - HERO_H).max(0), preferred);
+        control::draw(&page::backdrop(l.page[0], w, h));
     }
 }
 
-/// Is the mouse on `panel` or one of its controls, with nothing over them?
-fn pointer_on(panel: HWND) -> bool {
-    let mut pt = POINT { x: 0, y: 0 };
-    if unsafe { GetCursorPos(&mut pt) } == 0 {
-        return false;
-    }
-    let under = unsafe { WindowFromPoint(pt) };
-    !under.is_null() && (under == panel || unsafe { IsChild(panel, under) } != 0)
-}
-
-/// The mouse came onto or left a part of the window. The list on the left widens once the mouse has rested on it for
-/// [`LIST_REST_MS`], and narrows as soon as the mouse is anywhere else.
-fn on_hover(hwnd: HWND) {
-    let Some(list) = with_state(|st| if st.diff.is_some() { st.p.files } else { st.p.nav }) else { return };
-    if pointer_on(list) {
-        if !LIST_WIDE.with(Cell::get) && !LIST_RESTING.with(|r| r.replace(true)) {
-            unsafe { SetTimer(hwnd, TIMER_LIST, LIST_REST_MS, None) };
-        }
-        return;
-    }
-    if LIST_RESTING.with(|r| r.replace(false)) {
-        unsafe { KillTimer(hwnd, TIMER_LIST) };
-    }
-    if LIST_WIDE.with(|w| w.replace(false)) {
-        lay_out_again(hwnd, true);
+fn finish_split_drag() {
+    if let Some(list) = DRAG_WIDTH.with(Cell::take) {
+        remember_list_width(list);
     }
 }
 
-fn on_rested(hwnd: HWND) {
-    unsafe { KillTimer(hwnd, TIMER_LIST) };
-    LIST_RESTING.with(|r| r.set(false));
-    let Some(list) = with_state(|st| if st.diff.is_some() { st.p.files } else { st.p.nav }) else { return };
-    if pointer_on(list) && !LIST_WIDE.with(|w| w.replace(true)) {
-        lay_out_again(hwnd, true);
+fn move_split(hwnd: HWND, x: i32) {
+    let (w, _) = client(hwnd);
+    let dpi = dpi_of(hwnd) as i32;
+    // Round to the nearest DIP, so grabbing a splitter on a scaled display does not jump by a DIP.
+    let wanted = (x.max(0).saturating_mul(96).saturating_add(dpi / 2)) / dpi;
+    let list = page::list_width(w, wanted);
+    if list != page::list_width(w, requested_list_width()) {
+        DRAG_WIDTH.with(|n| n.set(Some(list)));
+        render(hwnd);
+        invalidate_layout(hwnd);
+    }
+}
+
+fn key_split(hwnd: HWND, key: SplitKey, shift: bool) {
+    let (w, _) = client(hwnd);
+    let preferred = requested_list_width();
+    let list = page::width_after_key(w, preferred, key, shift);
+    DRAG_WIDTH.with(Cell::take);
+    remember_list_width(list);
+    if list != page::list_width(w, preferred) {
+        render(hwnd);
+        invalidate_layout(hwnd);
     }
 }
 
@@ -619,46 +612,56 @@ fn startup_now() -> Result<Startup, String> {
     autorun::this_exe().and_then(|exe| autorun::state(&Keys::current(), &exe)).map_err(|e| e.to_string())
 }
 
-/// Runs `f` on the repository whose page is shown: its settings and how it is.
-fn shown_repo<R>(f: impl FnOnce(&RepoConfig, &RepoView) -> R) -> Option<R> {
+/// Runs `f` on the source whose page is shown: its settings and how it is.
+fn shown_source<R>(f: impl FnOnce(&SourceConfig, &SourceView) -> R) -> Option<R> {
     with_state(|st| {
         let Some(Page::Repo(shown)) = &st.page else { return None };
         let snap = st.snap.as_ref()?;
-        Some(f(snap.cfg.find(shown)?, snap.views.iter().find(|v| v.id == *shown)?))
+        Some(f(snap.cfg.find_source(shown)?, snap.sources.iter().find(|v| v.id == *shown)?))
     })
     .flatten()
 }
 
-fn repo_mut<'a>(cfg: &'a mut Config, shown: &RepoConfig) -> Result<&'a mut RepoConfig, String> {
-    cfg.repos.iter_mut().find(|r| *r == shown).ok_or_else(|| "The source changed. Choose it again.".to_string())
+/// The row at `index` on the source's page: the lane it belongs to, whether its type syncs, and the row.
+fn shown_row(index: usize) -> Option<(RepoConfig, bool, Row)> {
+    shown_source(|s, v| page::row_at(v, index).map(|(k, row)| (page::lane_config(s, k.kind, &k.lane), k.on, row.clone()))).flatten()
+}
+
+/// Whether `lane` is still shown with the same settings, and `check` holds for its rows now.
+fn lane_shown(lane: &RepoConfig, check: impl FnOnce(&[Row]) -> bool) -> bool {
+    shown_source(|s, v| v.kinds.iter().find(|k| k.lane == lane.id).is_some_and(|k| page::lane_config(s, k.kind, &k.lane) == *lane && check(&k.rows)))
+        == Some(true)
+}
+
+/// Whether the row named `name` of `lane` still offers `action`.
+fn still_offers(lane: &RepoConfig, name: &str, action: Action) -> bool {
+    lane_shown(lane, |rows| rows.iter().any(|row| row.name == name && row.actions.contains(&action)))
+}
+
+fn source_mut<'a>(cfg: &'a Config, shown: &SourceConfig) -> Result<&'a SourceConfig, String> {
+    cfg.sources().iter().find(|s| *s == shown).ok_or_else(|| "The source changed. Choose it again.".to_string())
 }
 
 #[derive(Clone, Default)]
 struct AddForm {
     address: String,
-    kind: SourceKind,
     every: Option<Interval>,
-}
-
-fn add_choices(kind: SourceKind) -> impl Iterator<Item = SourceKind> {
-    std::iter::once(kind).chain(page::SOURCE_TYPES.iter().copied().filter(move |k| *k != kind))
 }
 
 fn add_question(default: Interval, form: &AddForm) -> Ask {
     let (mut items, shown) = page::every_choices(form.every, Some(default));
     items.retain(|item| item != CUSTOM);
-    let first = form.kind;
     Ask {
         heading: "Add source".to_string(),
-        text: "Choose one type to look for. Previewing a source does not install anything.".to_string(),
+        text: format!("{} Previewing a source does not save or install anything.", page::LOCATION_FORMS),
         field: Some(Field::Text {
-            label: "GitHub repository or folder".to_string(),
-            hint: "owner/name, or the address of a folder on GitHub".to_string(),
+            label: "GitHub repository, branch or folder".to_string(),
+            hint: "owner/name, or the address of a repository, branch or folder on GitHub".to_string(),
             initial: form.address.clone(),
-            check: Some(Box::new(move |text, choice| page::spec_hint(text, add_choices(first).nth(choice).unwrap_or(first)))),
+            check: Some(Box::new(|text, _| page::location_hint(text))),
+            empty_ok: false,
         }),
         combo: Some(("Check every".to_string(), items, shown)),
-        choices: add_choices(form.kind).map(|kind| kind.heading().into()).collect(),
         note: Some((
             glyph::LOCK,
             "Private repositories work automatically when you are signed in with the GitHub CLI or have saved a token in Settings.".to_string(),
@@ -681,22 +684,14 @@ fn add(hwnd: HWND, initial: AddForm) {
     if hwnd != window() {
         return;
     }
-    let Some(kind) = add_choices(initial.kind).nth(reply.choice) else { return };
     let Ok(every) = page::parse_every(&reply.combo) else { return };
-    preview_source(hwnd, AddForm { address: reply.text, kind, every });
+    preview_source(hwnd, AddForm { address: reply.text, every });
 }
 
 fn preview_source(hwnd: HWND, form: AddForm) {
     let retry_form = form.clone();
     with_state(|st| st.retry_add_form = Some(retry_form.clone()));
-    let spec = match RepoSpec::parse_for_kind(&form.address, form.kind) {
-        Ok(spec) => spec,
-        Err(e) => {
-            shell::tell(sentence(&e));
-            return;
-        }
-    };
-    match shell::preview_source(&spec, form.kind, form.every) {
+    match shell::preview_location(&form.address, form.every) {
         Ok(ticket) => {
             with_state(|st| st.add_form = Some((ticket, form)));
             go(hwnd, Some(Page::Add));
@@ -760,7 +755,7 @@ fn offer_startup(hwnd: HWND) {
 
 /// Check every, of the repository shown or (`default`) in Settings: an entry was chosen.
 fn every(hwnd: HWND, combo: HWND, default: bool) {
-    let source = shown_repo(|r, _| r.clone());
+    let source = shown_source(|s, _| s.clone());
     let mut text = text_of(combo);
     if text == CUSTOM {
         match custom_interval(hwnd, default) {
@@ -783,13 +778,12 @@ fn every(hwnd: HWND, combo: HWND, default: bool) {
             }
             Err(e) => shell::tell(format!("Default check interval: {e}")),
         }
-    } else if let Some(repo) = source.filter(|s| shown_repo(|r, _| r == s) == Some(true)) {
+    } else if let Some(source) = source.filter(|s| shown_source(|now, _| now == s) == Some(true)) {
         match page::parse_every(&text) {
             Ok(every) => {
                 let _ = shell::edit_config(|cfg| {
-                    let r = repo_mut(cfg, &repo)?;
-                    let changed = r.interval != every;
-                    r.interval = every;
+                    let changed = source_mut(cfg, &source)?.interval != every;
+                    cfg.set_interval(&source.id, every);
                     Ok(changed)
                 });
             }
@@ -817,6 +811,7 @@ fn custom_interval(hwnd: HWND, default: bool) -> Option<String> {
             hint: format!("At least {MIN_POLL_MINUTES} minutes"),
             initial: String::new(),
             check: Some(check),
+            empty_ok: false,
         }),
         ok: "Save".to_string(),
         ..Ask::default()
@@ -827,14 +822,89 @@ fn custom_interval(hwnd: HWND, default: bool) -> Option<String> {
 /// Keep in sync was switched.
 fn set_enabled(toggle: HWND) {
     let on = unsafe { SendMessageW(toggle, BM_GETCHECK, 0, 0) } != 0;
-    let Some(repo) = shown_repo(|r, _| r.clone()) else { return };
+    let Some(source) = shown_source(|s, _| s.clone()) else { return };
     let _ = shell::edit_config(|cfg| {
-        let r = repo_mut(cfg, &repo)?;
-        let changed = r.enabled != on;
-        r.enabled = on;
+        let changed = source_mut(cfg, &source)?.enabled != on;
+        cfg.set_enabled(&source.id, on);
         Ok(changed)
     });
     refresh();
+}
+
+/// A "What to sync" choice on a source's page: a type, or repository-specific items.
+fn source_choice(hwnd: HWND, n: i32, combo: HWND) {
+    let Some(source) = shown_source(|s, _| s.id.clone()) else { return };
+    if let Some(edit) = page::source_choice(n, control::combo_value(&text_of(combo))) {
+        let _ = shell::edit_source(&source, |s| edit.apply(s));
+    }
+    update(hwnd);
+}
+
+/// Asks for a list of folder names, separated by commas. `None` when the user cancelled; an empty answer means none.
+fn ask_folders(hwnd: HWND, heading: &str, text: &str, initial: &[String]) -> Option<String> {
+    dialogs::ask(hwnd, folders_question(heading, text, initial)).map(|reply| reply.text)
+}
+
+fn folders_question(heading: &str, text: &str, initial: &[String]) -> Ask {
+    let check: Check = Box::new(|text, _| match page::parse_folders(text) {
+        Ok(names) if names.is_empty() => Ok("No folder names".to_string()),
+        Ok(names) if names.len() == 1 => Ok("1 folder name".to_string()),
+        Ok(names) => Ok(format!("{} folder names", names.len())),
+        Err(why) => Err(why),
+    });
+    Ask {
+        heading: heading.to_string(),
+        text: text.to_string(),
+        field: Some(Field::Text {
+            label: "Folder names".to_string(),
+            hint: "Separate names with commas. Leave it empty for none.".to_string(),
+            initial: initial.join(", "),
+            check: Some(check),
+            empty_ok: true,
+        }),
+        ok: "Save".to_string(),
+        ..Ask::default()
+    }
+}
+
+/// Folder rules on a source's page: the folders it also skips and the ones it never skips.
+fn folder_rules(hwnd: HWND) {
+    let Some(source) = shown_source(|s, _| s.clone()) else { return };
+    let also = "Folders with these names are skipped in this source, as well as the ignored folders in Settings.";
+    let Some(add) = ask_folders(hwnd, "Also skip these folders", also, &source.ignore_add) else { return };
+    let never = "Folders with these names are searched in this source, even when Settings ignores them.";
+    let Some(allow) = ask_folders(hwnd, "Never skip these folders", never, &source.ignore_allow) else { return };
+    match page::folder_rules(&add, &allow) {
+        Ok(_) if shown_source(|s, _| *s == source) != Some(true) => shell::tell("The source changed. Choose it again.".to_string()),
+        Ok(edit) => {
+            let _ = shell::edit_source(&source.id, |s| edit.apply(s));
+        }
+        Err(why) => shell::tell(why),
+    }
+    update(hwnd);
+}
+
+/// A switch in the Sources group of Settings.
+fn global_switch(hwnd: HWND, n: i32, toggle: HWND) {
+    let on = unsafe { SendMessageW(toggle, BM_GETCHECK, 0, 0) } != 0;
+    if let Some(edit) = page::global_switch(n, on) {
+        let _ = shell::edit_global(|g| edit.apply(g));
+    }
+    update(hwnd);
+}
+
+/// Ignored folders, in Settings.
+fn edit_ignored(hwnd: HWND) {
+    let Some(names) = with_state(|st| st.snap.as_ref().map(|s| s.cfg.global().ignore_folders.clone())).flatten() else { return };
+    let text = "Folders with these names are skipped in every source, unless a source says otherwise.";
+    let Some(typed) = ask_folders(hwnd, "Ignored folders", text, &names) else { return };
+    match page::parse_folders(&typed) {
+        Ok(names) => {
+            let _ = shell::edit_global(|g| page::GlobalEdit::Ignore(names).apply(g));
+        }
+        Err(why) => shell::tell(why),
+    }
+    update(hwnd);
 }
 
 fn set_app_update(change: impl FnOnce(&mut UpdatePrefs)) {
@@ -865,27 +935,27 @@ fn switch_startup(on: bool) -> Result<Startup, String> {
 }
 
 fn more(hwnd: HWND, button: HWND) {
-    let Some(repo) = shown_repo(|r, _| r.clone()) else { return };
+    let Some(source) = shown_source(|s, _| s.clone()) else { return };
     let mut items = Vec::new();
-    if repo.enabled {
+    if source.enabled {
         items.push(SYNC_ONE);
     }
     items.push(ON_GITHUB);
-    if repo.kind == SourceKind::Skills {
+    if source.lanes.id(SourceKind::Skills).is_some() {
         items.push(SKILLS_FOLDER);
     }
     items.extend(["-", REMOVE]);
     let Some(chosen) = control::menu(button, &items, None, true) else { return };
-    if shown_repo(|r, _| r == &repo) != Some(true) {
+    if shown_source(|s, _| s == &source) != Some(true) {
         return;
     }
     match items[chosen] {
         SYNC_ONE => {
-            shell::want(Job::Check(Some(repo.id)));
+            shell::want(Job::Check(Some(source.id)));
         }
-        ON_GITHUB => open_on_github(&repo),
+        ON_GITHUB => open_on_github(&page::lane_config(&source, SourceKind::Skills, &source.id)),
         SKILLS_FOLDER => open_skills_folder(),
-        REMOVE => remove(hwnd, &repo),
+        REMOVE => remove(hwnd, &source),
         _ => {}
     }
 }
@@ -903,21 +973,20 @@ fn open_url(url: &str) {
     }
 }
 
-fn remove(hwnd: HWND, repo: &RepoConfig) {
-    let skills = repo.kind == SourceKind::Skills;
+fn remove(hwnd: HWND, source: &SourceConfig) {
+    // Deleting is offered only for a skills lane that syncs: the others keep their files.
+    let skills =
+        with_state(|st| st.snap.as_ref().is_some_and(|s| source.lanes.id(SourceKind::Skills).is_some_and(|id| s.cfg.find(id).is_some()))).unwrap_or(false);
+    let plugins = source.lanes.id(SourceKind::Plugins).is_some();
     let question = Ask {
-        heading: format!("Remove {}: {} [{}]?", repo.kind.heading(), printable(&repo.label()), printable(&repo.id)),
+        heading: format!("Remove {} [{}]?", printable(&source_label(source)), printable(&source.id)),
         text: format!(
-            "Its {} will no longer be kept up to date.{}",
-            repo.kind.nouns().1,
-            match repo.kind {
-                SourceKind::Skills => "",
-                SourceKind::Plugins => " They stay installed in Copilot.",
-                _ => " Its files stay installed.",
-            }
+            "Nothing from this source will be kept up to date any more.{}{}",
+            if skills { "" } else { " Its files stay installed." },
+            if plugins { " Its plugins stay installed in Copilot." } else { "" }
         ),
         choices: if skills {
-            vec!["Leave its skills installed; they become yours".into(), "Delete its skills too; skills you edited are kept".into()]
+            vec!["Leave its files installed; they become yours".into(), "Delete its skills too; skills you edited are kept".into()]
         } else {
             Vec::new()
         },
@@ -925,16 +994,18 @@ fn remove(hwnd: HWND, repo: &RepoConfig) {
         ..Ask::default()
     };
     if let Some(reply) = dialogs::ask(hwnd, question) {
-        if shown_repo(|r, _| r == repo) == Some(true) {
-            shell::want(Job::Remove { repo: repo.id.clone(), delete_skills: skills && reply.choice == 1 });
+        if shown_source(|s, _| s == source) == Some(true) {
+            shell::want(Job::Remove { repo: source.id.clone(), delete_skills: skills && reply.choice == 1 });
         }
     }
 }
 
 fn row_command(hwnd: HWND, button: HWND, index: usize, code: u32) {
-    let Some((repo, name, commands)) = shown_repo(|r, v| {
-        let row = v.skills.get(index)?;
-        Some((r.clone(), row.name.clone(), page::row_commands(row, r.kind, web_url(r, None).is_some())))
+    let Some((repo, name, commands)) = shown_source(|s, v| {
+        let (k, row) = page::row_at(v, index)?;
+        let lane = page::lane_config(s, k.kind, &k.lane);
+        let commands = page::kind_commands(row, k, web_url(&lane, None).is_some());
+        Some((lane, row.name.clone(), commands))
     })
     .flatten() else {
         return;
@@ -942,7 +1013,7 @@ fn row_command(hwnd: HWND, button: HWND, index: usize, code: u32) {
     let cmd = if code == control::ROW_MENU && !commands.is_empty() {
         let labels: Vec<_> = commands.iter().map(|cmd| cmd.label()).collect();
         let picked = control::menu(button, &labels, None, false).map(|i| commands[i]);
-        if unsafe { GetFocus() } == button && shown_repo(|r, _| r == &repo) == Some(true) {
+        if unsafe { GetFocus() } == button && lane_shown(&repo, |_| true) {
             focus_skill(hwnd, &repo.id, &name, false);
         }
         picked
@@ -951,18 +1022,21 @@ fn row_command(hwnd: HWND, button: HWND, index: usize, code: u32) {
     };
     let Some(cmd) = cmd else { return };
     // The popup runs a message loop: a refresh can remove, reorder, or resolve this skill.
-    let target = shown_repo(|r, v| command_target(r, &v.skills, &repo, &name, cmd)).flatten();
+    let target = shown_source(|s, v| command_target(s, v, &repo, &name, cmd)).flatten();
     if let Some((index, part)) = target {
         skill(hwnd, index, part);
     }
 }
 
-fn command_target(shown: &RepoConfig, rows: &[Row], repo: &RepoConfig, name: &str, cmd: RowCmd) -> Option<(usize, Part)> {
-    if shown != repo {
+/// The row, on the source's page as it is now, that a command chosen for the row `name` of `lane` goes to.
+fn command_target(source: &SourceConfig, view: &SourceView, lane: &RepoConfig, name: &str, cmd: RowCmd) -> Option<(usize, Part)> {
+    let k = view.kinds.iter().find(|k| k.lane == lane.id)?;
+    if page::lane_config(source, k.kind, &k.lane) != *lane {
         return None;
     }
-    let (index, row) = rows.iter().enumerate().find(|(_, row)| row.name == name)?;
-    if !page::row_commands(row, shown.kind, web_url(shown, None).is_some()).contains(&cmd) {
+    let index = page::row_index(view, &lane.id, name)?;
+    let row = k.rows.iter().find(|row| row.name == name)?;
+    if !page::kind_commands(row, k, web_url(lane, None).is_some()).contains(&cmd) {
         return None;
     }
     let part = match cmd {
@@ -979,20 +1053,23 @@ fn command_target(shown: &RepoConfig, rows: &[Row], repo: &RepoConfig, name: &st
 
 /// A part of a skill's row was clicked.
 fn skill(hwnd: HWND, index: usize, part: Part) {
-    let Some((repo, row)) = shown_repo(|r, v| Some((r.clone(), v.skills.get(index)?.clone()))).flatten() else { return };
+    let Some((repo, on, row)) = shown_row(index) else { return };
     let label = format!("{}: {} [{}]", repo.kind.heading(), repo.label(), repo.id);
     match part {
         Part::Row => {
             if !page::expandable(&row) {
                 return;
             }
+            let key = page::toggle_key(&repo.id, &row.name);
             with_state(|st| {
-                if !st.toggled.remove(&row.name) {
-                    st.toggled.insert(row.name.clone());
+                if !st.toggled.remove(&key) {
+                    st.toggled.insert(key);
                 }
             });
             render(hwnd);
         }
+        // A type that does not sync only offers what reads the files already there.
+        _ if !on && !matches!(part, Part::Open | Part::CopyPath | Part::CopyLink | Part::OnGitHub) => {}
         Part::Compare if repo.kind != SourceKind::Plugins => compare(hwnd, repo, row, false),
         Part::Open if repo.kind == SourceKind::Skills => open_skill(&row.name),
         Part::Action(k) => {
@@ -1006,10 +1083,7 @@ fn skill(hwnd: HWND, index: usize, part: Part) {
                             ..Ask::default()
                         };
                         // A check may finish while the question is open. Recheck the source and choice by name.
-                        if dialogs::ask(hwnd, question).is_none()
-                            || shown_repo(|r, v| r == &repo && v.skills.iter().any(|row_now| row_now.name == row.name && row_now.actions.contains(&action)))
-                                != Some(true)
-                        {
+                        if dialogs::ask(hwnd, question).is_none() || !still_offers(&repo, &row.name, action) {
                             return;
                         }
                     }
@@ -1055,9 +1129,7 @@ fn act(hwnd: HWND, repo: &RepoConfig, label: &str, skill: String, action: Action
                 ok: "Delete them".to_string(),
                 ..Ask::default()
             };
-            if dialogs::ask(hwnd, question).is_some()
-                && shown_repo(|r, v| r == repo && v.skills.iter().any(|row| row.name == skill && row.actions.contains(&action))) == Some(true)
-            {
+            if dialogs::ask(hwnd, question).is_some() && still_offers(repo, &skill, action) {
                 shell::want(Job::DeleteGone(repo.id.clone()));
             }
         }
@@ -1096,7 +1168,7 @@ fn leave_diff(hwnd: HWND) {
 
 fn focus_skill(hwnd: HWND, repo: &str, name: &str, from_card: bool) {
     let Some(p) = with_state(|st| st.diff.is_none().then_some(st.p)).flatten() else { return };
-    let index = shown_repo(|r, v| (r.id == repo).then(|| v.skills.iter().position(|row| row.name == name)).flatten()).flatten();
+    let index = shown_source(|_, v| page::row_index(v, repo, name)).flatten();
     let back = index
         .and_then(|i| [if from_card { 2 } else { 0 }, 0].into_iter().map(|k| control::child(p.page, page::skill_id(i, k))).find(|h| !h.is_null()))
         .unwrap_or_else(|| control::child(p.hero, id::SYNC));
@@ -1140,7 +1212,7 @@ fn diff_action(hwnd: HWND, index: usize) {
         return;
     };
     leave_diff(hwnd);
-    if shown_repo(|r, v| r == &repo && v.skills.iter().any(|row| row.name == skill && row.actions.contains(&action))) == Some(true) {
+    if still_offers(&repo, &skill, action) {
         if let Some(how) = action.resolution() {
             shell::want(Job::Resolve { repo: repo.id, skill, how });
         }
@@ -1279,10 +1351,11 @@ fn on_command(hwnd: HWND, wp: WPARAM, lp: LPARAM) {
                 set_app_update(|prefs| prefs.timing = when);
             }
         }
+        (Hit::Other(n), CBN_SELENDOK) if n == id::REPO_ITEMS || (id::SOURCE_TYPE..id::SOURCE_TYPE + 4).contains(&n) => source_choice(hwnd, n, ctl),
         (Hit::Skill(j, Part::Row), code) if code == control::ROW_MENU || RowCmd::from_code(code).is_some() => row_command(hwnd, ctl, j, code),
         (_, code) if code != BN_CLICKED => {}
         (Hit::Repo(i), _) => {
-            if let Some(page) = with_state(|st| st.snap.as_ref()?.views.get(i).map(|v| Page::Repo(v.id.clone()))).flatten() {
+            if let Some(page) = with_state(|st| st.snap.as_ref()?.sources.get(i).map(|v| Page::Repo(v.id.clone()))).flatten() {
                 go(hwnd, Some(page));
             }
         }
@@ -1307,11 +1380,18 @@ fn on_command(hwnd: HWND, wp: WPARAM, lp: LPARAM) {
                     }
                 }
             }
-            id::CONFIRM_SOURCE => {
-                let ticket =
-                    with_state(|st| (st.page == Some(Page::Add)).then(|| st.snap.as_ref()?.draft.as_ref().map(|d| d.input.ticket)).flatten()).flatten();
-                if let Some(ticket) = ticket {
-                    shell::confirm_source(ticket);
+            id::CONFIRM_SOURCE | id::APPROVE_SOURCE => {
+                let reviewed = with_state(|st| {
+                    let draft = st.snap.as_ref()?.draft.as_ref().filter(|_| st.page == Some(Page::Add))?;
+                    let DraftStage::Reviewed(preview) = &draft.stage else { return None };
+                    let lanes = &preview.source.lanes;
+                    let lane = [SourceKind::Skills, SourceKind::Agents, SourceKind::Instructions, SourceKind::Plugins].into_iter().find_map(|k| lanes.id(k));
+                    Some((draft.input.ticket, lane.unwrap_or(&preview.source.id).to_owned()))
+                })
+                .flatten();
+                if let Some((ticket, lane)) = reviewed {
+                    with_state(|st| st.adding = Some(lane));
+                    shell::confirm_source(ticket, n == id::APPROVE_SOURCE);
                     update(hwnd);
                 }
             }
@@ -1328,9 +1408,12 @@ fn on_command(hwnd: HWND, wp: WPARAM, lp: LPARAM) {
                 set_app_update(|prefs| prefs.enabled = on);
             }
             id::STARTUP => set_startup(ctl),
+            id::FOLDER_RULES => folder_rules(hwnd),
+            id::IGNORED_EDIT => edit_ignored(hwnd),
+            n if n == id::GLOBAL_REPO_ITEMS || (id::GLOBAL_TYPE..id::GLOBAL_TYPE + 4).contains(&n) => global_switch(hwnd, n, ctl),
             id::RETRY => {
-                if let Some(repo) = shown_repo(|r, _| r.id.clone()) {
-                    shell::want(Job::Check(Some(repo)));
+                if let Some(source) = shown_source(|s, _| s.id.clone()) {
+                    shell::want(Job::Check(Some(source)));
                 }
             }
             id::OPEN_SKILLS => open_skills_folder(),
@@ -1390,17 +1473,13 @@ fn on_theme(hwnd: HWND) {
 
 fn on_destroyed(hwnd: HWND) {
     shell::dismiss_source();
-    unsafe {
-        KillTimer(hwnd, TIMER_REFRESH);
-        KillTimer(hwnd, TIMER_LIST);
-    }
+    unsafe { KillTimer(hwnd, TIMER_REFRESH) };
+    finish_split_drag();
     let state = STATE.with(|s| s.try_borrow_mut().ok().and_then(|mut s| s.take()));
     WINDOW.with(|w| w.set(null_mut()));
     REFRESH_POSTED.with(|p| p.set(false));
     DIFF_MODE.with(|d| d.set(false));
-    LIST_SHOWN.with(|n| n.set(NAV_W));
-    LIST_RESTING.with(|r| r.set(false));
-    LIST_WIDE.with(|w| w.set(false));
+    SAVED_SIZE.with(|s| s.set(WindowSize::DEFAULT));
     if let Some(state) = state {
         for icon in state.icons {
             unsafe { DestroyIcon(icon) };
@@ -1420,14 +1499,19 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
         WM_REFRESH => update(hwnd),
         WM_COMMAND => on_command(hwnd, wp, lp),
         WM_TIMER if wp == TIMER_REFRESH => refresh(),
-        WM_TIMER if wp == TIMER_LIST => on_rested(hwnd),
-        control::WM_HOVER => on_hover(hwnd),
+        control::WM_SPLIT_DRAG if wp != 0 => finish_split_drag(),
+        control::WM_SPLIT_DRAG => move_split(hwnd, lp as i32),
+        control::WM_SPLIT_KEY => {
+            if let Some(key) = control::split_key(wp) {
+                key_split(hwnd, key, lp != 0);
+            }
+        }
         WM_SIZE => {
             if wp as u32 != SIZE_MINIMIZED {
                 render(hwnd);
             }
         }
-        WM_EXITSIZEMOVE => save_size(hwnd),
+        WM_EXITSIZEMOVE => remember_window_size(hwnd),
         WM_GETMINMAXINFO => {
             let dpi = dpi_of(hwnd);
             let mut rc = RECT { left: 0, top: 0, right: scale(MIN_SIZE.0, dpi), bottom: scale(MIN_SIZE.1, dpi) };
@@ -1475,10 +1559,25 @@ mod tests {
     use super::*;
 
     #[test]
+    fn an_empty_folder_list_is_taken_as_none_but_an_empty_location_is_refused() {
+        let taken = |a: Ask, text: &str| match a.field {
+            Some(Field::Text { check, empty_ok, .. }) => dialogs::accepts(text, empty_ok, check.as_deref(), 0),
+            _ => panic!("a text field"),
+        };
+        let folders = || folders_question("Ignored folders", "", &["node_modules".to_string()]);
+        assert!(taken(folders(), ""), "empty means no folders");
+        assert!(taken(folders(), "a, b"));
+        assert!(!taken(folders(), "a/b"), "a path is not a folder name");
+        assert!(!taken(add_question(crate::config::DEFAULT_INTERVAL, &AddForm::default()), ""));
+        let Some(Field::Text { check: Some(check), .. }) = folders().field else { panic!("the folder field checks names") };
+        assert_eq!(check(",", 0), Ok("No folder names".to_string()));
+    }
+
+    #[test]
     fn add_source_question_fits_a_small_work_area() {
         let a = add_question(crate::config::DEFAULT_INTERVAL, &AddForm::default());
         let Some(Field::Text { label, hint, .. }) = a.field else { panic!("the Add source question needs a field") };
-        assert_eq!(a.choices.len(), 4);
+        assert!(a.choices.is_empty());
         let q = page::Question {
             heading: a.heading,
             text: a.text,
@@ -1505,29 +1604,24 @@ mod tests {
     }
 
     #[test]
-    fn plugin_source_field_uses_the_selected_types_branch_rules() {
+    fn add_source_field_takes_a_location_without_a_type() {
         let q = add_question(crate::config::DEFAULT_INTERVAL, &AddForm::default());
         let Some(Field::Text { check: Some(check), .. }) = q.field else { panic!("the Add source field should validate addresses") };
-        let address = "https://github.com/o/r/tree/caf\u{e9}";
-        for file_kind in 0..3 {
-            assert!(check(address, file_kind).is_ok());
-        }
-        assert_eq!(
-            check(address, 3).unwrap_err(),
-            "This branch name has characters the app will not pass to Copilot CLI: use letters, digits, '.', '_', '/', '+' or '-'."
-        );
+        assert!(check("https://github.com/o/r/tree/caf\u{e9}/skills", 0).is_ok());
+        assert!(check("o/r", 0).is_ok());
+        assert!(check("https://github.com/o/r/blob/main/SKILL.md", 0).is_err(), "a file address is not a location");
+        assert!(check("https://gitlab.com/o/r", 0).is_err());
     }
 
     #[test]
-    fn continuation_edit_preselects_the_drafts_address_type_and_interval() {
+    fn continuation_edit_preselects_the_drafts_address_and_interval() {
         let address = "https://github.com/team/tools/tree/main/custom-agents?from=link";
-        let form = AddForm { address: address.into(), kind: SourceKind::Agents, every: Some(Interval::parse("6h").unwrap()) };
+        let form = AddForm { address: address.into(), every: Some(Interval::parse("6h").unwrap()) };
         let question = add_question(Interval::parse("1d").unwrap(), &form);
         assert!(matches!(question.field, Some(Field::Text { initial, .. }) if initial == form.address));
-        assert_eq!(question.choices.first().map(String::as_str), Some(form.kind.heading()));
+        assert!(question.choices.is_empty(), "the app finds every type itself");
         assert_eq!(page::parse_every(&question.combo.unwrap().2), Ok(form.every));
     }
-
     #[test]
     fn continuation_escape_leaves_an_in_progress_source_save_showing() {
         assert!(escape_cancels_source(false));
@@ -1536,29 +1630,51 @@ mod tests {
 
     #[test]
     fn row_menu_dispatch_follows_identity_and_rechecks_availability() {
-        let cfg = Config { repos: vec![RepoConfig { id: "one".into(), repo: "owner/repo".into(), ..Default::default() }], ..Default::default() };
+        let mut cfg = Config::default();
+        cfg.edit(|s, _| {
+            let lanes = crate::sources::Lanes::default().with(SourceKind::Skills, "one".into()).with(SourceKind::Agents, "one-agents".into());
+            s.push(SourceConfig { id: "one".into(), repo: "owner/repo".into(), lanes, ..Default::default() });
+        });
         let mut board = crate::board::Board::new();
         board.note_kept("one", &["alpha".into(), "beta".into()]);
-        let mut rows = board.views(&cfg, 0).remove(0).skills;
-        rows.swap(0, 1);
-        let repo = &cfg.repos[0];
-        let resolve = |shown: &str, rows: &[Row]| command_target(&RepoConfig { id: shown.into(), ..repo.clone() }, rows, repo, "alpha", RowCmd::ManageAgain);
-        assert_eq!(resolve("one", &rows), Some((1, Part::Action(0))));
-        assert_eq!(resolve("other", &rows), None);
-        let repurposed = RepoConfig { kind: SourceKind::Agents, ..repo.clone() };
-        assert_eq!(command_target(&repurposed, &rows, repo, "alpha", RowCmd::ManageAgain), None);
-        assert_eq!(resolve("one", &rows[..1]), None);
-        rows[1].actions.clear();
-        assert_eq!(resolve("one", &rows), None);
+        board.note_kept("one-agents", &["alpha".into()]);
+        let mut view = board.source_views(&cfg, 0).remove(0);
+        assert_eq!(view.kinds.iter().map(|k| k.kind).collect::<Vec<_>>(), [SourceKind::Skills, SourceKind::Agents]);
+        view.kinds[0].rows.swap(0, 1);
+        let source = cfg.find_source("one").unwrap().clone();
+        let skills = cfg.find("one").unwrap().clone();
+        let agents = cfg.find("one-agents").unwrap().clone();
+        let resolve = |view: &SourceView, lane: &RepoConfig| command_target(&source, view, lane, "alpha", RowCmd::ManageAgain);
+        assert_eq!(resolve(&view, &skills), Some((1, Part::Action(0))));
+        assert_eq!(resolve(&view, &agents), Some((2, Part::Action(0))), "an agent row is numbered after the skills");
+        assert_eq!(resolve(&view, &RepoConfig { id: "other".into(), ..skills.clone() }), None);
+        assert_eq!(resolve(&view, &RepoConfig { kind: SourceKind::Agents, ..skills.clone() }), None, "a repurposed lane");
+        let mut short = view.clone();
+        short.kinds[0].rows.truncate(1);
+        assert_eq!(resolve(&short, &skills), None);
+        view.kinds[0].rows[1].actions.clear();
+        assert_eq!(resolve(&view, &skills), None);
     }
 
     #[test]
-    fn the_saved_size_is_two_numbers_and_never_smaller_than_the_smallest() {
-        assert_eq!(parse_size("1200 800\n"), Some((1200, 800)));
-        assert_eq!(parse_size("100 50"), Some(MIN_SIZE));
-        assert_eq!(parse_size("1200"), None);
-        assert_eq!(parse_size("1200 800 3"), None);
-        assert_eq!(parse_size("wide tall"), None);
-        assert_eq!(parse_size(""), None);
+    fn window_txt_loads_legacy_and_splitter_widths() {
+        let client = (1200, 800);
+        assert_eq!(parse_size("1200 800\n"), Some(WindowSize { client, list: NAV_W }));
+        let size = WindowSize { client, list: 328 };
+        assert_eq!(parse_size(" 1200 800\t328\r\n"), Some(size));
+        assert_eq!(format_size(size), "1200 800 328\n");
+        assert_eq!(parse_size(&format_size(size)), Some(size));
+        assert_eq!(parse_size("100 50"), Some(WindowSize { client: MIN_SIZE, list: NAV_W }));
+        assert_eq!(parse_size("640 500 700"), Some(WindowSize { client: (640, 500), list: 700 }), "keep a preference larger than the current bounds");
+    }
+
+    #[test]
+    fn window_txt_defaults_a_bad_list_width_without_losing_the_window_size() {
+        for third in ["not-a-number", "0", "-160", "159", "2147483648", "250 trailing"] {
+            assert_eq!(parse_size(&format!("1200 800 {third}")), Some(WindowSize { client: (1200, 800), list: NAV_W }), "{third:?}");
+        }
+        for invalid in ["1200", "wide tall", "", "1200 tall 320"] {
+            assert_eq!(parse_size(invalid), None);
+        }
     }
 }

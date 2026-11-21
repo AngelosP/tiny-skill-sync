@@ -66,7 +66,7 @@ impl Roots {
     }
 
     pub(super) fn validate_state(&self, state: &State, cfg: &Config) -> Result<(), String> {
-        for s in &cfg.repos {
+        for s in cfg.repos() {
             if s.kind == SourceKind::Plugins {
                 state.check_plugin_id(&s.id)?;
                 continue;
@@ -106,7 +106,7 @@ pub(super) fn check(paths: &Paths, cfg: &Config, draft: Option<SourceKind>) -> R
     roots.add(paths.root(SourceKind::Skills)?, Role::Destination(SourceKind::Skills))?;
     roots.add(paths.work_dir(), Role::SkillWork)?;
     for kind in [SourceKind::Agents, SourceKind::Instructions] {
-        let required = paths.has_file_root(kind) || draft == Some(kind) || cfg.repos.iter().any(|r| r.kind == kind);
+        let required = paths.has_file_root(kind) || draft == Some(kind) || cfg.repos().iter().any(|r| r.kind == kind);
         let dir = match paths.root(kind) {
             Ok(dir) => dir,
             Err(_) if !required => continue, // isolated skills-only copy: never infer a real profile root

@@ -27,22 +27,22 @@ use windows_sys::Win32::UI::Controls::{
 use windows_sys::Win32::UI::HiDpi::GetDpiForWindow;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     EnableWindow, GetCapture, GetFocus, GetKeyState, IsWindowEnabled, ReleaseCapture, SetCapture, SetFocus, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent,
-    VK_APPS, VK_F10, VK_RETURN, VK_SHIFT, VK_SPACE,
+    VK_APPS, VK_END, VK_F10, VK_HOME, VK_LEFT, VK_RETURN, VK_RIGHT, VK_SHIFT, VK_SPACE,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, BM_CLICK, CREATESTRUCTW, CreatePopupMenu, CreateWindowExW, DLGC_WANTMESSAGE, DefWindowProcW, DestroyMenu, DestroyWindow, GA_ROOT,
     GWLP_USERDATA, GetAncestor, GetClientRect, GetCursorPos, GetDlgCtrlID, GetDlgItem, GetParent, GetScrollInfo, GetWindowLongPtrW, GetWindowRect, HMENU,
-    HTTRANSPARENT, HWND_TOP, IsChild, IsWindow, MF_CHECKED, MF_SEPARATOR, MF_STRING, MSG, PostMessageW, SB_BOTTOM, SB_LINEDOWN, SB_LINEUP, SB_PAGEDOWN,
-    SB_PAGEUP, SB_THUMBTRACK, SB_TOP, SB_VERT, SCROLLINFO, SIF_PAGE, SIF_POS, SIF_RANGE, SIF_TRACKPOS, SPI_GETWHEELSCROLLLINES, SW_INVALIDATE,
-    SW_SCROLLCHILDREN, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOREDRAW, SWP_NOSIZE, SWP_NOZORDER, ScrollWindowEx, SendMessageW, SetWindowLongPtrW, SetWindowPos,
-    SetWindowTextW, SystemParametersInfoW, TPM_RETURNCMD, TPM_RIGHTALIGN, TrackPopupMenuEx, UIS_INITIALIZE, UISF_HIDEACCEL, UISF_HIDEFOCUS, WM_APP,
-    WM_CAPTURECHANGED, WM_CHANGEUISTATE, WM_COMMAND, WM_CTLCOLOREDIT, WM_CTLCOLORSTATIC, WM_ENABLE, WM_ERASEBKGND, WM_GETDLGCODE, WM_KEYDOWN, WM_KILLFOCUS,
-    WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCREATE, WM_NCDESTROY, WM_NCHITTEST, WM_PAINT, WM_QUERYUISTATE,
-    WM_SETFOCUS, WM_SETTEXT, WM_SIZE, WM_SYSKEYDOWN, WM_UPDATEUISTATE, WM_VSCROLL, WS_CHILD, WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_DISABLED,
-    WS_EX_CONTROLPARENT, WS_EX_NOPARENTNOTIFY, WS_POPUP, WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
+    HTCLIENT, HTTRANSPARENT, HWND_TOP, IDC_SIZEWE, IsChild, IsWindow, LoadCursorW, MF_CHECKED, MF_SEPARATOR, MF_STRING, MSG, SB_BOTTOM, SB_LINEDOWN, SB_LINEUP,
+    SB_PAGEDOWN, SB_PAGEUP, SB_THUMBTRACK, SB_TOP, SB_VERT, SCROLLINFO, SIF_PAGE, SIF_POS, SIF_RANGE, SIF_TRACKPOS, SPI_GETWHEELSCROLLLINES, SW_INVALIDATE,
+    SW_SCROLLCHILDREN, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOREDRAW, SWP_NOSIZE, SWP_NOZORDER, ScrollWindowEx, SendMessageW, SetCursor, SetWindowLongPtrW,
+    SetWindowPos, SetWindowTextW, SystemParametersInfoW, TPM_RETURNCMD, TPM_RIGHTALIGN, TrackPopupMenuEx, UIS_INITIALIZE, UISF_HIDEACCEL, UISF_HIDEFOCUS,
+    WM_APP, WM_CAPTURECHANGED, WM_CHANGEUISTATE, WM_COMMAND, WM_CTLCOLOREDIT, WM_CTLCOLORSTATIC, WM_ENABLE, WM_ERASEBKGND, WM_GETDLGCODE, WM_KEYDOWN,
+    WM_KILLFOCUS, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCREATE, WM_NCDESTROY, WM_NCHITTEST, WM_PAINT,
+    WM_QUERYUISTATE, WM_SETCURSOR, WM_SETFOCUS, WM_SETTEXT, WM_SIZE, WM_SYSKEYDOWN, WM_UPDATEUISTATE, WM_VSCROLL, WS_CHILD, WS_CLIPCHILDREN, WS_CLIPSIBLINGS,
+    WS_DISABLED, WS_EX_CONTROLPARENT, WS_EX_NOPARENTNOTIFY, WS_POPUP, WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
 };
 
-use super::page::{self, Hit};
+use super::page::{self, Hit, SplitKey};
 use super::paint::{self, Font, Rect, Tone, glyph};
 use super::theme::{self, Role};
 use super::{register_class, scale, text_of};
@@ -54,9 +54,11 @@ pub const PANEL_CLASS: &str = "TinySkillSyncPanel";
 pub const WM_PAINTBG: u32 = WM_APP + 5;
 /// From a control that got the focus to its panel, which scrolls it into view.
 const WM_REVEAL: u32 = WM_APP + 6;
-/// Posted to the top-level window when the mouse comes onto or leaves a control or a panel, so that it can follow where
-/// the mouse is without asking all the time.
-pub const WM_HOVER: u32 = WM_APP + 7;
+/// To the top-level window: move to x (in its client pixels), or commit when capture ends (`wParam` is nonzero).
+pub(super) const WM_SPLIT_DRAG: u32 = WM_APP + 7;
+/// To the top-level window: a virtual key and whether Shift is down.
+pub(super) const WM_SPLIT_KEY: u32 = WM_APP + 8;
+const MK_LBUTTON: WPARAM = 1;
 pub const BN_CLICKED: u32 = 0;
 /// The code a combo sends after updating its window text; [`combo_value`] reads the chosen entry.
 pub const CBN_SELENDOK: u32 = 9;
@@ -173,6 +175,14 @@ pub enum Look {
     Combo {
         items: Vec<String>,
     },
+    Splitter,
+    /// A source in the list: a mark, then lines and type icons laid out by the page, at places relative to the
+    /// control's top-left corner. Its window text says all of it, for a screen reader.
+    Source {
+        mark: Mark,
+        selected: bool,
+        parts: Vec<Deco>,
+    },
 }
 
 impl Look {
@@ -211,6 +221,8 @@ struct Ctl {
     at: Rect,
     hover: bool,
     down: bool,
+    /// A splitter press keeps the grip under the same point on the pointer, in pixels from its left edge.
+    drag_offset: Option<i32>,
     layout: OnceCell<RowParts>,
     hot: Option<RowTarget>,
     pressed: Option<RowTarget>,
@@ -225,8 +237,6 @@ struct Panel {
     bg: Role,
     scroll: i32,
     dpi: u32,
-    /// The mouse is on the panel itself, not on one of its controls.
-    hover: bool,
     row_tip: HWND,
 }
 
@@ -289,16 +299,32 @@ fn notify(hwnd: HWND, code: u32) {
     unsafe { SendMessageW(GetParent(hwnd), WM_COMMAND, ((code << 16) | (id & 0xFFFF)) as usize, hwnd as isize) };
 }
 
-/// The mouse came onto `hwnd`: asks for `WM_MOUSELEAVE` when it goes, and says so to the top-level window.
 fn track_hover(hwnd: HWND) {
     let mut track = TRACKMOUSEEVENT { cbSize: size_of::<TRACKMOUSEEVENT>() as u32, dwFlags: TME_LEAVE, hwndTrack: hwnd, dwHoverTime: 0 };
     unsafe { TrackMouseEvent(&mut track) };
-    hovered(hwnd);
 }
 
-/// Posted, not sent: the control that says so may be in the middle of a change.
-fn hovered(hwnd: HWND) {
-    unsafe { PostMessageW(GetAncestor(hwnd, GA_ROOT), WM_HOVER, 0, 0) };
+fn splitter_control(hwnd: HWND) -> bool {
+    ctl_of(hwnd).is_some_and(|c| c.try_borrow().is_ok_and(|c| matches!(c.look, Look::Splitter)))
+}
+
+pub(super) fn split_key(key: WPARAM) -> Option<SplitKey> {
+    Some(match u16::try_from(key).ok()? {
+        VK_LEFT => SplitKey::Left,
+        VK_RIGHT => SplitKey::Right,
+        VK_HOME => SplitKey::Home,
+        VK_END => SplitKey::End,
+        _ => return None,
+    })
+}
+
+fn move_splitter(hwnd: HWND, lp: LPARAM, offset: i32) {
+    let mut point = POINT { x: i32::from(lp as i16) - offset, y: 0 };
+    unsafe {
+        let root = GetAncestor(hwnd, GA_ROOT);
+        MapWindowPoints(hwnd, root, &mut point, 1);
+        SendMessageW(root, WM_SPLIT_DRAG, 0, point.x as LPARAM);
+    }
 }
 
 fn invalidate(hwnd: HWND) {
@@ -354,6 +380,7 @@ fn activate(hwnd: HWND) {
         Err(_) => return,
     };
     match look {
+        Look::Splitter => {}
         Look::Row { disclosure: None, commands, .. } => {
             if !commands.is_empty() {
                 notify(hwnd, ROW_MENU);
@@ -581,6 +608,25 @@ fn draw_ctl(hwnd: HWND) {
                 paint::line([left + gw, y, tw + 2, h], &text, font, ink);
             }
         }
+        Look::Source { mark, selected, parts } => {
+            let bg = if *selected { Role::Sel } else { tint };
+            paint::fill(c.at, 4, bg, Role::None);
+            if *selected {
+                paint::fill([x, y + (h - 16) / 2, 3, 16], 2, Role::Accent, Role::None);
+            }
+            match mark {
+                Mark::Dot(tone) => paint::dot([x + 12, y + 8, 16, 16], *tone),
+                Mark::Glyph(ch, role) => paint::glyph([x + 12, y + 6, 16, 20], *ch, 16, *role),
+            }
+            let shift = |[px, py, pw, ph]: Rect| [x + px, y + py, pw, ph];
+            for part in parts {
+                match part {
+                    Deco::Fill { at, radius, fill, border } => paint::fill(shift(*at), *radius, *fill, *border),
+                    Deco::Glyph { at, ch, size, ink } => paint::glyph(shift(*at), *ch, *size, *ink),
+                    Deco::Text { at, text, font, ink, flags } => paint::text(shift(*at), text, *font, *ink, *flags),
+                }
+            }
+        }
         Look::Nav { mark, ink, selected } => {
             let (text, sub) = lines(&text);
             let bg = if *selected { Role::Sel } else { tint };
@@ -679,8 +725,19 @@ fn draw_ctl(hwnd: HWND) {
             paint::line([x + 12, y, w - 12 - 32, h], combo_value(&text), Font::Body, if enabled { Role::Text } else { Role::Text3 });
             paint::glyph([x + w - 32, y, 22, h], glyph::CHEVRON_DOWN, 12, Role::Text2);
         }
+        Look::Splitter => {
+            let focused = unsafe { GetFocus() } == hwnd;
+            let frame = 36.min(h);
+            let top = y + (h - frame) / 2;
+            let ink = if focused || c.hover || c.drag_offset.is_some() { Role::Text } else { Role::Text2 };
+            let grip = 4.min(w);
+            paint::fill([x + (w - grip) / 2, top + 4, grip, frame - 8], 2, ink, Role::None);
+            if focused {
+                paint::fill([x + 1, top, w - 2, frame], 4, Role::None, Role::Text);
+            }
+        }
     }
-    if focus_shown(hwnd) {
+    if !matches!(c.look, Look::Splitter) && focus_shown(hwnd) {
         let radius = if matches!(c.look, Look::Toggle { .. } | Look::Row { .. }) { 4 } else { 5 };
         paint::fill(c.at, radius, Role::None, Role::Text);
         paint::fill([x + 1, y + 1, w - 2, h - 2], radius - 1, Role::None, Role::Text);
@@ -710,8 +767,19 @@ unsafe extern "system" fn ctl_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
             paint_with(hwnd, &|| draw_ctl(hwnd));
             return 0;
         }
+        WM_SETCURSOR if lp as u16 == HTCLIENT as u16 && splitter_control(hwnd) => {
+            unsafe { SetCursor(LoadCursorW(null_mut(), IDC_SIZEWE)) };
+            return 1;
+        }
         WM_MOUSEMOVE => {
             if let Some(Ok(mut c)) = ctl_of(hwnd).map(RefCell::try_borrow_mut) {
+                if let Some(offset) = c.drag_offset {
+                    drop(c);
+                    if wp & MK_LBUTTON != 0 && unsafe { GetCapture() } == hwnd {
+                        move_splitter(hwnd, lp, offset);
+                    }
+                    return 0;
+                }
                 let target = c.target(hwnd, lp);
                 let mut changed = c.hot != target;
                 c.hot = target;
@@ -722,6 +790,8 @@ unsafe extern "system" fn ctl_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
                 }
                 if matches!(c.look, Look::Row { .. }) && !c.down {
                     row_tool_move(hwnd, &mut c, wp, lp);
+                } else if matches!(c.look, Look::Source { .. }) && !c.down {
+                    source_tool_move(hwnd, &mut c, wp, lp);
                 }
                 if changed {
                     invalidate(hwnd);
@@ -736,25 +806,45 @@ unsafe extern "system" fn ctl_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
                 remove_tools(hwnd, &mut c);
                 invalidate(hwnd);
             }
-            hovered(hwnd);
             return 0;
         }
         WM_LBUTTONDOWN | WM_LBUTTONDBLCLK => {
             unsafe { SetFocus(hwnd) };
             if let Some(Ok(mut c)) = ctl_of(hwnd).map(RefCell::try_borrow_mut) {
-                c.down = true;
-                c.hover = true;
-                c.hot = c.target(hwnd, lp);
-                c.pressed = c.hot;
-                remove_tools(hwnd, &mut c);
+                if matches!(c.look, Look::Splitter) {
+                    c.drag_offset = Some(i32::from(lp as i16));
+                } else {
+                    c.down = true;
+                    c.hover = true;
+                    c.hot = c.target(hwnd, lp);
+                    c.pressed = c.hot;
+                    remove_tools(hwnd, &mut c);
+                }
             }
             unsafe { SetCapture(hwnd) };
+            if unsafe { GetCapture() } != hwnd {
+                if let Some(Ok(mut c)) = ctl_of(hwnd).map(RefCell::try_borrow_mut) {
+                    c.drag_offset = None;
+                }
+            }
             invalidate(hwnd);
             return 0;
         }
         WM_LBUTTONUP => {
             let Some(cell) = ctl_of(hwnd) else { return 0 };
             let Ok(c) = cell.try_borrow() else { return 0 };
+            if matches!(c.look, Look::Splitter) {
+                let offset = c.drag_offset;
+                drop(c);
+                if let Some(offset) = offset.filter(|_| unsafe { GetCapture() } == hwnd) {
+                    move_splitter(hwnd, lp, offset);
+                    if unsafe { GetCapture() } == hwnd {
+                        // WM_CAPTURECHANGED commits, whether released here or taken by another window.
+                        unsafe { ReleaseCapture() };
+                    }
+                }
+                return 0;
+            }
             let row = matches!(c.look, Look::Row { .. });
             let clicked = c.down && c.hover;
             let target = c.pressed.filter(|&t| c.down && c.target(hwnd, lp) == Some(t));
@@ -773,7 +863,9 @@ unsafe extern "system" fn ctl_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
             return 0;
         }
         WM_CAPTURECHANGED => {
+            let mut split = false;
             if let Some(Ok(mut c)) = ctl_of(hwnd).map(RefCell::try_borrow_mut) {
+                split = c.drag_offset.take().is_some();
                 c.down = false;
                 c.pressed = None;
                 // Still under the mouse? Hover is checked again on the next move.
@@ -786,13 +878,17 @@ unsafe extern "system" fn ctl_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
                 c.hover = pt.x >= rc.left && pt.x < rc.right && pt.y >= rc.top && pt.y < rc.bottom;
             }
             invalidate(hwnd);
+            if split {
+                unsafe { SendMessageW(GetAncestor(hwnd, GA_ROOT), WM_SPLIT_DRAG, 1, 0) };
+            }
             return 0;
         }
         WM_GETDLGCODE => {
             let msg = lp as *const MSG;
             if !msg.is_null()
                 && unsafe {
-                    ((*msg).message == WM_KEYDOWN && (*msg).wParam == usize::from(VK_RETURN))
+                    ((*msg).message == WM_KEYDOWN
+                        && ((*msg).wParam == usize::from(VK_RETURN) || (split_key((*msg).wParam).is_some() && splitter_control(hwnd))))
                         || (matches!((*msg).message, WM_KEYDOWN | WM_SYSKEYDOWN) && row_menu_key(hwnd, (*msg).wParam))
                 }
             {
@@ -803,6 +899,12 @@ unsafe extern "system" fn ctl_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
         WM_KEYDOWN | WM_SYSKEYDOWN if row_menu_key(hwnd, wp) => {
             if lp & (1 << 30) == 0 && unsafe { IsWindowEnabled(hwnd) != 0 && GetFocus() == hwnd } {
                 notify(hwnd, ROW_MENU);
+            }
+            return 0;
+        }
+        WM_KEYDOWN if split_key(wp).is_some() && splitter_control(hwnd) => {
+            if unsafe { IsWindowEnabled(hwnd) != 0 && GetFocus() == hwnd } {
+                unsafe { SendMessageW(GetAncestor(hwnd, GA_ROOT), WM_SPLIT_KEY, wp, (GetKeyState(i32::from(VK_SHIFT)) < 0).into()) };
             }
             return 0;
         }
@@ -881,7 +983,6 @@ pub fn panel(parent: HWND, id: i32, bg: Role) -> HWND {
         bg,
         scroll: 0,
         dpi: dpi_of(parent),
-        hover: false,
         row_tip: null_mut(),
     })));
     let hwnd = unsafe {
@@ -1040,6 +1141,7 @@ fn make_ctl(panel: HWND, item: &Item, scroll: i32, dpi: u32, after: HWND) -> HWN
         at: item.at,
         hover: false,
         down: false,
+        drag_offset: None,
         layout: OnceCell::new(),
         hot: None,
         pressed: None,
@@ -1300,21 +1402,6 @@ unsafe extern "system" fn panel_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARA
             reveal(hwnd, wp as HWND);
             return 0;
         }
-        WM_MOUSEMOVE => {
-            if let Some(Ok(mut p)) = panel_of(hwnd).map(RefCell::try_borrow_mut) {
-                if !p.hover {
-                    p.hover = true;
-                    track_hover(hwnd);
-                }
-            }
-        }
-        WM_MOUSELEAVE => {
-            if let Some(Ok(mut p)) = panel_of(hwnd).map(RefCell::try_borrow_mut) {
-                p.hover = false;
-            }
-            hovered(hwnd);
-            return 0;
-        }
         _ => {}
     }
     unsafe { DefWindowProcW(hwnd, msg, wp, lp) }
@@ -1404,6 +1491,38 @@ fn row_tool_move(hwnd: HWND, c: &mut Ctl, wp: WPARAM, lp: LPARAM) {
         add([left, y, right - left, h], &body);
         c.tools = Some((tip, strings));
     }
+    relay_tip(hwnd, c, wp, lp);
+}
+
+/// A source entry's whole name as one tool over the entry, as it is often cut off when painted.
+fn source_tool_move(hwnd: HWND, c: &mut Ctl, wp: WPARAM, lp: LPARAM) {
+    let text = wide(&text_of(hwnd));
+    if c.tools.as_ref().is_some_and(|(_, strings)| strings.first() != Some(&text)) {
+        remove_tools(hwnd, c);
+    }
+    if c.tools.is_none() {
+        let parent = unsafe { GetParent(hwnd) };
+        let Some(Ok(mut p)) = panel_of(parent).map(RefCell::try_borrow_mut) else { return };
+        if p.row_tip.is_null() {
+            p.row_tip = make_tip(parent);
+        }
+        let tip = p.row_tip;
+        drop(p);
+        if tip.is_null() {
+            return;
+        }
+        let mut text = text;
+        let mut info = tool_info(hwnd, 1);
+        info.rect = client_rect(c.at, c.at, dpi_of(hwnd));
+        info.lpszText = text.as_mut_ptr();
+        unsafe { SendMessageW(tip, TTM_ADDTOOLW, 0, (&raw const info) as isize) };
+        c.tools = Some((tip, vec![text]));
+    }
+    relay_tip(hwnd, c, wp, lp);
+}
+
+/// Explicit relay includes the first mouse move, even when the pointer entered and then stayed still.
+fn relay_tip(hwnd: HWND, c: &Ctl, wp: WPARAM, lp: LPARAM) {
     if let Some((tip, _)) = &c.tools {
         let mut msg: MSG = unsafe { zeroed() };
         msg.hwnd = hwnd;
@@ -1595,11 +1714,16 @@ mod tests {
 
     thread_local! {
         static COMMANDS: RefCell<Vec<(i32, u32)>> = const { RefCell::new(Vec::new()) };
+        static SPLIT_INPUT: RefCell<Vec<(u32, WPARAM, LPARAM)>> = const { RefCell::new(Vec::new()) };
     }
 
     unsafe extern "system" fn record(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
         if msg == WM_COMMAND {
             COMMANDS.with(|c| c.borrow_mut().push(((wp & 0xFFFF) as i32, ((wp >> 16) & 0xFFFF) as u32)));
+            return 0;
+        }
+        if matches!(msg, WM_SPLIT_DRAG | WM_SPLIT_KEY) {
+            SPLIT_INPUT.with(|c| c.borrow_mut().push((msg, wp, lp)));
             return 0;
         }
         unsafe { DefWindowProcW(hwnd, msg, wp, lp) }
@@ -1628,6 +1752,45 @@ mod tests {
         let panel = panel(top, 1, Role::Bg);
         unsafe { SetWindowPos(panel, null_mut(), 0, 0, 600, 500, SWP_NOZORDER | SWP_NOACTIVATE) };
         (top, panel)
+    }
+
+    #[test]
+    fn splitter_ignores_hover_and_commits_on_release_or_capture_loss() {
+        use windows_sys::Win32::UI::WindowsAndMessaging::GWL_STYLE;
+
+        let (top, panel) = test_panel();
+        let dpi = dpi_of(panel);
+        unsafe { SetWindowPos(panel, null_mut(), 240, 66, scale(12, dpi), scale(100, dpi), SWP_NOZORDER | SWP_NOACTIVATE) };
+        set(panel, page::splitter(12, 100));
+        let splitter = child(panel, page::id::SPLITTER);
+        assert_eq!(text_of(splitter), "Resize list");
+        assert_ne!(unsafe { GetWindowLongPtrW(splitter, GWL_STYLE) } & WS_TABSTOP as isize, 0);
+        unsafe {
+            SendMessageW(splitter, WM_MOUSEMOVE, 0, 4);
+            SendMessageW(splitter, WM_MOUSELEAVE, 0, 0);
+        }
+        assert!(SPLIT_INPUT.with(|c| c.take()).is_empty());
+
+        for lose_capture in [false, true] {
+            unsafe { SendMessageW(splitter, WM_LBUTTONDOWN, MK_LBUTTON, 4) };
+            assert_eq!(unsafe { GetCapture() }, splitter);
+            unsafe { SendMessageW(splitter, WM_MOUSEMOVE, MK_LBUTTON, 28) };
+            assert_eq!(SPLIT_INPUT.with(|c| c.take()), [(WM_SPLIT_DRAG, 0, 264)]);
+            set(panel, page::splitter(12, 90));
+            assert_eq!(child(panel, page::id::SPLITTER), splitter, "layout changes must not destroy the grip mid-drag");
+            if lose_capture {
+                unsafe { SetCapture(panel) };
+            } else {
+                unsafe { SendMessageW(splitter, WM_LBUTTONUP, 0, 28) };
+            }
+            let events = SPLIT_INPUT.with(|c| c.take());
+            let expected: &[_] = if lose_capture { &[(WM_SPLIT_DRAG, 1, 0)] } else { &[(WM_SPLIT_DRAG, 0, 264), (WM_SPLIT_DRAG, 1, 0)] };
+            assert_eq!(events, expected);
+        }
+        unsafe {
+            ReleaseCapture();
+            DestroyWindow(top);
+        }
     }
 
     #[test]
@@ -1717,6 +1880,53 @@ mod tests {
             set(panel, page(text, vec![]));
             assert_eq!(tip_at(1, 1), expected);
         }
+        unsafe { DestroyWindow(top) };
+    }
+
+    #[test]
+    fn issue8_a_source_entry_shows_its_whole_name_as_a_tooltip() {
+        use windows_sys::Win32::UI::Controls::{TTHITTESTINFOW, TTM_GETTEXTW, TTM_GETTOOLCOUNT, TTM_HITTESTW};
+
+        let (top, panel) = test_panel();
+        let at = [8, 5, 232, 86];
+        let page = |text: &str| Surface {
+            items: vec![Item {
+                id: FIRST,
+                at,
+                text: text.into(),
+                look: Look::Source { mark: Mark::Dot(Tone::Ok), selected: false, parts: vec![] },
+                enabled: true,
+            }],
+            decos: vec![],
+            height: 100,
+        };
+        let first = "o/a-repository-with-a-long-name, main, a/long/folder. Skills 3, Instructions: Sync off. Up to date";
+        set(panel, page(first));
+        let entry = child(panel, FIRST);
+        let dpi = dpi_of(entry);
+        let tip_at = |x: i32, y: i32| {
+            unsafe { SendMessageW(entry, WM_MOUSEMOVE, 0, ((y << 16) | x) as LPARAM) };
+            let tip = panel_of(panel).unwrap().borrow().row_tip;
+            assert!(!tip.is_null(), "no tooltip for a source entry");
+            let mut hit = TTHITTESTINFOW { hwnd: entry, pt: POINT { x, y }, ti: tool_info(entry, 0) };
+            assert_ne!(unsafe { SendMessageW(tip, TTM_HITTESTW, 0, (&raw mut hit) as isize) }, 0, "missing tooltip at {x},{y}");
+            let mut buf = [0u16; 256];
+            hit.ti.lpszText = buf.as_mut_ptr();
+            unsafe { SendMessageW(tip, TTM_GETTEXTW, buf.len(), (&raw mut hit.ti) as isize) };
+            String::from_utf16_lossy(&buf[..buf.iter().position(|&n| n == 0).unwrap()])
+        };
+        let bounds = client_rect(at, at, dpi);
+        for (x, y) in [(0, 0), (bounds.right / 2, bounds.bottom / 2), (bounds.right - 1, bounds.bottom - 1)] {
+            assert_eq!(tip_at(x, y), first);
+        }
+        unsafe { SendMessageW(entry, WM_MOUSELEAVE, 0, 0) };
+        let tip = panel_of(panel).unwrap().borrow().row_tip;
+        assert_eq!(unsafe { SendMessageW(tip, TTM_GETTOOLCOUNT, 0, 0) }, 0, "leaving the entry removes its tooltip");
+
+        let second = "o/a-repository-with-a-long-name, main, a/long/folder. Skills 3. Needs attention";
+        set(panel, page(second));
+        assert_eq!(child(panel, FIRST), entry);
+        assert_eq!(tip_at(1, 1), second, "the tooltip follows the entry's new text");
         unsafe { DestroyWindow(top) };
     }
 

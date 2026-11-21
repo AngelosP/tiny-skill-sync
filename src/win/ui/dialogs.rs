@@ -55,10 +55,20 @@ pub type Verify = dyn Fn(&str, usize) -> Result<String, String>;
 pub type Check = Box<Verify>;
 
 pub enum Field {
-    /// A line of text. `hint` is shown under it while it is empty.
-    Text { label: String, hint: String, initial: String, check: Option<Check> },
+    /// A line of text. `hint` is shown under it while it is empty. OK refuses an empty one unless `empty_ok`, where
+    /// empty means none.
+    Text { label: String, hint: String, initial: String, check: Option<Check>, empty_ok: bool },
     /// A hidden line, such as a token. OK refuses an empty one.
     Secret { label: String, hint: String },
+}
+
+/// Whether OK takes a text field's trimmed text: an empty one only where it means none, any other only when its check,
+/// if any, accepts it.
+pub(super) fn accepts(text: &str, empty_ok: bool, check: Option<&Verify>, choice: usize) -> bool {
+    if text.is_empty() {
+        return empty_ok;
+    }
+    check.is_none_or(|check| check(text, choice).is_ok())
 }
 
 #[derive(Default)]
@@ -95,6 +105,8 @@ struct State {
     /// The hint while the text box is empty.
     plain: String,
     check: Option<Check>,
+    /// An empty answer means none.
+    empty_ok: bool,
     done: bool,
     reply: Option<Reply>,
 }
@@ -157,13 +169,13 @@ pub fn ask(owner: HWND, a: Ask) -> Option<Reply> {
     if !register_class(CLASS, Some(proc), null_mut()) || !control::register() {
         return None;
     }
-    let (field, plain, initial, secret, check) = match a.field {
-        Some(Field::Text { label, hint, initial, check }) => {
+    let (field, plain, initial, secret, check, empty_ok) = match a.field {
+        Some(Field::Text { label, hint, initial, check, empty_ok }) => {
             let shown = hint_of(&initial, &hint, check.as_deref(), 0);
-            (Some((label, shown)), hint, initial, false, check)
+            (Some((label, shown)), hint, initial, false, check, empty_ok)
         }
-        Some(Field::Secret { label, hint }) => (Some((label, Hint::Plain(hint.clone()))), hint, String::new(), true, None),
-        None => (None, String::new(), String::new(), false, None),
+        Some(Field::Secret { label, hint }) => (Some((label, Hint::Plain(hint.clone()))), hint, String::new(), true, None, false),
+        None => (None, String::new(), String::new(), false, None, false),
     };
     let has_field = field.is_some();
     let q = Question {
@@ -193,7 +205,7 @@ pub fn ask(owner: HWND, a: Ask) -> Option<Reply> {
     let panel = control::panel(hwnd, PANEL, Role::Card);
     fit_panel(hwnd);
     let edit = if has_field { make_edit(panel, &initial, secret, dpi_of(hwnd)) } else { null_mut() };
-    STATE.with(|s| *s.borrow_mut() = Some(State { q, edit, secret, plain, check, done: false, reply: None }));
+    STATE.with(|s| *s.borrow_mut() = Some(State { q, edit, secret, plain, check, empty_ok, done: false, reply: None }));
     OPEN.with(|o| o.set(hwnd));
     update(hwnd);
     control::hide_cues(hwnd);
@@ -350,8 +362,8 @@ fn accept() {
         reply.secret = Some(Secret::new(text.expose().trim()));
     } else if !edit.is_null() {
         let text = text_of(edit).trim().to_string();
-        let wrong = STATE.with(|s| s.try_borrow().ok()?.as_ref()?.check.as_ref().map(|check| check(&text, choice).is_err())).unwrap_or(false);
-        if text.is_empty() || wrong {
+        let taken = STATE.with(|s| s.try_borrow().ok()?.as_ref().map(|s| accepts(&text, s.empty_ok, s.check.as_deref(), choice))).unwrap_or(!text.is_empty());
+        if !taken {
             refuse(edit);
             return;
         }

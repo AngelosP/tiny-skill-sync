@@ -1,14 +1,19 @@
-//! Discovers skills or loose files in a listing relative to the configured GitHub folder.
+//! Discovers skills or loose files for one source, relative to its configured GitHub folder.
 //!
-//! A skill is a folder with a `SKILL.md`. If the configured folder itself holds a `SKILL.md`, the whole
-//! folder is ONE skill (its sub-folders belong to it). Otherwise every immediate child folder with a
-//! `SKILL.md` is a skill. A skill that breaks a safety rule is rejected as a whole, never half-installed.
+//! A check reads every lane of a source from one complete branch-root listing: `lane_discovery` takes the lane's
+//! items from the recursive inventory built from it (see `inventory`).
+//!
+//! `discover_source` reads a listing of the source folder itself (the add preview and the confirmation of a pinned
+//! commit). There a skill is a folder with a `SKILL.md`: if the configured folder itself holds one, the whole folder
+//! is ONE skill (its sub-folders belong to it); otherwise every immediate child folder with a `SKILL.md` is a skill.
+//! A skill that breaks a safety rule is rejected as a whole, never half-installed.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use serde::Deserialize;
 
 use crate::config::RepoConfig;
+use crate::inventory::{Inventory, Status};
 use crate::pathsafe;
 use crate::source::SourceKind;
 use crate::win::fs::same_win_name;
@@ -119,6 +124,12 @@ pub struct SourceDiscovery<'a> {
     tree_id: String,
     items: SourceItems,
     rejected: Vec<Rejected>,
+    /// Listed but not to be synced: filtered or bundled in a package. Evidence that the name is still present.
+    protected: Vec<Rejected>,
+    /// Folded install name to the item's path relative to the source folder (a skill's folder or a file).
+    remote: HashMap<String, String>,
+    /// Built from a branch-root inventory: a refused item is evidence for its own name only.
+    from_inventory: bool,
     safe_for_absence: bool,
     leaf_names: LeafNames,
 }
@@ -136,6 +147,15 @@ impl SourceDiscovery<'_> {
         &self.rejected
     }
 
+    pub fn protected(&self) -> &[Rejected] {
+        &self.protected
+    }
+
+    /// Where an item is, relative to the source folder. `None` for a folder listing, where the name is the path.
+    pub fn remote_path(&self, name: &str) -> Option<&str> {
+        self.remote.get(&pathsafe::fold(name)).map(String::as_str)
+    }
+
     pub fn names(&self) -> Vec<String> {
         match &self.items {
             SourceItems::Skills { skills, .. } => skills.iter().map(|s| s.name.clone()).collect(),
@@ -147,7 +167,11 @@ impl SourceDiscovery<'_> {
     /// For a loose file, `confirms_leaf_absent` also checks names omitted by the literal suffix filter.
     /// A clean empty listing still needs the mass-deletion guard; local ownership and full verification are separate.
     pub fn complete_for(&self, recorded: &RepoConfig) -> bool {
-        self.safe_for_absence && self.rejected.is_empty() && self.same_scope(recorded)
+        self.safe_for_absence && (self.from_inventory || self.rejected.is_empty()) && self.same_scope(recorded)
+    }
+
+    pub(crate) fn is_lane_view(&self) -> bool {
+        self.from_inventory
     }
 
     pub(crate) fn covers_leaf(&self, recorded: &RepoConfig, name: &str) -> bool {
@@ -188,7 +212,81 @@ pub(crate) fn discover_source<'a>(source: &'a RepoConfig, snapshot: Snapshot, in
         let Discovery { skills, rejected } = discover(&snapshot.entries, &source.single_skill_name(), install_root_len);
         (SourceItems::Skills { single, skills }, rejected, LeafNames::default())
     };
-    Ok(SourceDiscovery { source, tree_id: snapshot.sha, items, rejected, safe_for_absence, leaf_names })
+    Ok(SourceDiscovery {
+        source,
+        tree_id: snapshot.sha,
+        items,
+        rejected,
+        protected: Vec::new(),
+        remote: HashMap::new(),
+        from_inventory: false,
+        safe_for_absence,
+        leaf_names,
+    })
+}
+
+/// One lane of a source, from the complete branch-root `snapshot` and the inventory built from it for the source's
+/// folder. Only installable items are offered; every other listed item of the lane's type is evidence that its name
+/// is still present. The tree ID is the source folder's own, so `github::confirm_source_at` can corroborate it.
+pub(crate) fn lane_discovery<'a>(lane: &'a RepoConfig, snapshot: &Snapshot, found: &Inventory) -> Result<SourceDiscovery<'a>, String> {
+    entry_index(snapshot)?;
+    let scope = lane.path.as_str();
+    let prefix = if scope.is_empty() { String::new() } else { format!("{scope}/") };
+    let inside = |path: &str| -> Option<String> { if path == scope { Some(String::new()) } else { path.strip_prefix(prefix.as_str()).map(str::to_owned) } };
+    let tree_id = if scope.is_empty() {
+        snapshot.sha.clone()
+    } else {
+        let folder = snapshot.entries.iter().find(|e| e.path == scope && e.kind == EntryKind::Tree && e.mode == "040000");
+        folder.map(|e| e.sha.clone()).ok_or_else(|| format!("'{}' is missing or is not a folder on this branch", pathsafe::printable(scope)))?
+    };
+    let scoped: Vec<TreeEntry> =
+        snapshot.entries.iter().filter_map(|e| inside(&e.path).filter(|rel| !rel.is_empty()).map(|rel| TreeEntry { path: rel, ..e.clone() })).collect();
+    let safe_for_absence = listing_safe(lane.kind, &scoped);
+    let mut rejected = Vec::new();
+    let mut protected = Vec::new();
+    let mut remote = HashMap::new();
+    let mut leaf_names = LeafNames::default();
+    let mut refuse = |status: &Status, name: &str| {
+        let entry = Rejected { name: name.to_owned(), reason: status.reason().unwrap_or_default() };
+        if matches!(status, Status::Rejected(_) | Status::Collision) { rejected.push(entry) } else { protected.push(entry) }
+    };
+    let items = match lane.kind {
+        SourceKind::Skills => {
+            let mut skills = Vec::new();
+            for item in &found.skills {
+                match (&item.status, inside(&item.path)) {
+                    (Status::Installable, Some(dir)) => {
+                        remote.insert(pathsafe::fold(&item.install_name), dir);
+                        skills.push(Skill { name: item.install_name.clone(), files: item.data.clone() });
+                    }
+                    (status, _) => refuse(status, &item.install_name),
+                }
+            }
+            skills.sort_by(|a, b| pathsafe::fold(&a.name).cmp(&pathsafe::fold(&b.name)).then_with(|| a.name.cmp(&b.name)));
+            SourceItems::Skills { single: false, skills }
+        }
+        SourceKind::Agents | SourceKind::Instructions => {
+            let suffix = loose_suffix(lane.kind).unwrap_or_default();
+            let listed = if lane.kind == SourceKind::Agents { &found.agents } else { &found.instructions };
+            let mut files = Vec::new();
+            for item in listed {
+                leaf_names.record(&item.install_name, suffix);
+                match (&item.status, &item.data, inside(&item.path)) {
+                    (Status::Installable, Some(file), Some(rel)) => {
+                        remote.insert(pathsafe::fold(&item.install_name), rel);
+                        files.push(SkillFile { path: item.install_name.clone(), ..file.clone() });
+                    }
+                    (status, _, _) => refuse(status, &item.install_name),
+                }
+            }
+            files.sort_by_cached_key(|f| pathsafe::fold(&f.path));
+            SourceItems::Files(files)
+        }
+        SourceKind::Plugins => return Err("Plugins use the branch-root marketplace catalog".into()),
+    };
+    rejected.sort_by(|a, b| a.name.cmp(&b.name));
+    protected.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(SourceDiscovery { source: lane, tree_id, items, rejected, protected, remote, from_inventory: true, safe_for_absence, leaf_names })
 }
 
 pub(crate) fn entry_index(snapshot: &Snapshot) -> Result<HashMap<&str, &TreeEntry>, String> {
@@ -222,10 +320,14 @@ pub(crate) fn entry_index(snapshot: &Snapshot) -> Result<HashMap<&str, &TreeEntr
 
 fn check_listing(kind: SourceKind, snapshot: &Snapshot) -> Result<bool, String> {
     entry_index(snapshot)?;
+    Ok(listing_safe(kind, &snapshot.entries))
+}
+
+fn listing_safe(kind: SourceKind, entries: &[TreeEntry]) -> bool {
     // Positive matches can still be displayed independently. But filtering out a malformed entry,
     // non-plain object or Windows alias must never turn it into negative evidence about an owned name.
     let mut folded = HashSet::new();
-    Ok(snapshot.entries.iter().all(|e| {
+    entries.iter().all(|e| {
         pathsafe::check_rel_path(&e.path).is_ok()
             && folded.insert(pathsafe::fold(&e.path))
             && match e.kind {
@@ -233,7 +335,7 @@ fn check_listing(kind: SourceKind, snapshot: &Snapshot) -> Result<bool, String> 
                 EntryKind::Blob => regular_mode(&e.mode) && e.size.is_some(),
                 EntryKind::Commit => false,
             }
-    }))
+    })
 }
 
 fn loose_suffix(kind: SourceKind) -> Option<&'static str> {

@@ -260,6 +260,10 @@ struct FakeRepo {
     file_errors: BTreeMap<String, RemoteError>,
     lies: BTreeMap<String, Vec<u8>>,
     truncated: bool,
+    /// Branch names; none means just `main`, which is also the default branch.
+    heads: Vec<String>,
+    /// Gives a listing at HEAD and one of the branch by name different ETags for the same tree.
+    branch_etags: bool,
 }
 
 impl FakeRepo {
@@ -316,7 +320,13 @@ fn listing(files: &BTreeMap<String, Vec<u8>>, folder: &str) -> Option<Vec<TreeEn
     if entries.is_empty() && !folder.is_empty() {
         return None;
     }
-    entries.extend(dirs.into_iter().map(|d| TreeEntry { path: d, kind: EntryKind::Tree, mode: "040000".into(), sha: "0".repeat(40), size: None }));
+    // A folder's ID is the ID of its own listing, as with Git, so a folder listed inside its parent has the ID that
+    // listing the folder itself reports.
+    entries.extend(dirs.into_iter().map(|d| {
+        let full = format!("{prefix}{d}");
+        let sha = listing(files, &full).map(|inner| etag_of(&inner).trim_matches('"').to_string()).unwrap_or_else(|| "0".repeat(40));
+        TreeEntry { path: d, kind: EntryKind::Tree, mode: "040000".into(), sha, size: None }
+    }));
     entries.sort_by(|a, b| a.path.cmp(&b.path));
     Some(entries)
 }
@@ -389,6 +399,17 @@ impl FakeRemote {
     /// The tree the live fixture repositories have, under `skills/`.
     pub fn seed_standard(&self, repo: &str) {
         self.seed(repo, STANDARD);
+    }
+
+    /// The branch names the repository has; the first is its default branch. The fake lists the same files on each.
+    pub fn set_heads(&self, repo: &str, heads: &[&str]) {
+        self.with(repo, |r| r.heads = heads.iter().map(|h| (*h).to_string()).collect());
+    }
+
+    /// Makes a listing's ETag depend on the branch asked for, so a reply at HEAD and one for the branch by name differ.
+    /// Off by default: GitHub gives both the same ETag today (measured on two public repositories, 2026-11-21).
+    pub fn set_branch_etags(&self, repo: &str, on: bool) {
+        self.with(repo, |r| r.branch_etags = on);
     }
 
     pub fn make_private(&self, repo: &str, token: &str) {
@@ -564,6 +585,23 @@ impl Remote for Client {
         }))
     }
 
+    fn matching_heads(&self, repo: &RepoRef, prefix: &str, token: Option<&Secret>, _cancel: &AtomicBool) -> Result<Vec<String>, RemoteError> {
+        self.0.note("heads", format!("heads {}/{} {prefix}", repo.owner, repo.name), token, |_| {});
+        let g = self.0.inner.lock().unwrap();
+        let r = g.repos.get(&key(repo)).ok_or_else(|| not_found(&repo.label()))?;
+        check_access(r, token, &repo.label())?;
+        let heads = if r.heads.is_empty() { vec!["main".to_string()] } else { r.heads.clone() };
+        Ok(heads.into_iter().filter(|h| h == prefix || h.starts_with(&format!("{prefix}/"))).collect())
+    }
+
+    fn default_branch(&self, repo: &RepoRef, token: Option<&Secret>, _cancel: &AtomicBool) -> Result<String, RemoteError> {
+        self.0.note("default_branch", format!("default_branch {}/{}", repo.owner, repo.name), token, |_| {});
+        let g = self.0.inner.lock().unwrap();
+        let r = g.repos.get(&key(repo)).ok_or_else(|| not_found(&repo.label()))?;
+        check_access(r, token, &repo.label())?;
+        Ok(r.heads.first().cloned().unwrap_or_else(|| "main".to_string()))
+    }
+
     fn tree(&self, repo: &RepoRef, etag: Option<&str>, token: Option<&Secret>, cancel: &AtomicBool) -> Result<TreeReply, RemoteError> {
         let fake = &self.0;
         fake.note("tree", format!("tree {}/{}@{}:{}", repo.owner, repo.name, repo.branch, repo.path), token, |c| {
@@ -585,11 +623,11 @@ impl Remote for Client {
             return Err(e.clone());
         }
         let entries = listing(&r.files, repo.path).ok_or_else(|| not_found(&format!("{} : {}", repo.label(), repo.path)))?;
-        let current = etag_of(&entries);
+        let sha = etag_of(&entries).trim_matches('"').to_string();
+        let current = if r.branch_etags { format!("\"{sha}@{}\"", repo.branch) } else { format!("\"{sha}\"") };
         if etag == Some(current.as_str()) {
             return Ok(TreeReply::NotModified);
         }
-        let sha = current.trim_matches('"').to_string();
         Ok(TreeReply::Snapshot { etag: Some(current), snapshot: Snapshot { sha, truncated: r.truncated, entries } })
     }
 
@@ -669,7 +707,7 @@ pub fn repo(id: &str, name: &str, path: &str) -> RepoConfig {
 }
 
 pub fn config(repos: Vec<RepoConfig>) -> Config {
-    Config { repos, ..Config::default() }
+    Config::from_lanes(repos)
 }
 
 /// One repository, `o/fixtures`, id `fx`, folder `skills`.

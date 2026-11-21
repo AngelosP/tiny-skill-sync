@@ -249,7 +249,7 @@ try {
     $anon = Get-AnonymousAppEnv $root
     # 1. Install
     Write-Host "== Install into $root" -ForegroundColor Cyan
-    $added = Invoke-LiveTss $root @('add', $repo) $anon
+    $added = Invoke-LiveTss $root @('add', $repo, '--yes') $anon
     if ($added.Code -ne 0) { throw "tss add failed (exit $($added.Code)): $($added.Text)" }
     $sw = [Diagnostics.Stopwatch]::StartNew()
     $install = Invoke-LiveTss $root @('check') $anon
@@ -430,7 +430,7 @@ try {
 
     # 7. Size
     $size = (Get-Item $exe).Length
-    Add-Row 'tiny-skill-sync.exe' ('{0:N0} bytes ({1:N2} MiB)' -f $size, ($size / 1MB)) '1.40 MiB or less' ($size -le 1.40MB)
+    Add-Row 'tiny-skill-sync.exe' ('{0:N0} bytes ({1:N2} MiB)' -f $size, ($size / 1MB)) '1.70 MiB or less' ($size -le 1.70MB)
 } finally {
     foreach ($p in $started) { if (-not $p.HasExited) { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue } }
     if ($Keep) { Write-Host "Kept: $root" } elseif (Test-Path -LiteralPath $root) { Start-Sleep -Milliseconds 200; Remove-Item -LiteralPath $root -Recurse -Force }

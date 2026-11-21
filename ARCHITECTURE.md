@@ -34,9 +34,13 @@ case by case. Code that talks to Windows is kept in `src\win\`.
 
 | Module | Job | Pure? |
 | --- | --- | --- |
-| `config` | Configuration model and local `config.json` parsing and writing. | file I/O |
+| `config` | Configuration model and local `config.json` parsing and writing; the lane views of each source. | file I/O |
+| `sources` | Source settings (format 3): the type and folder rules, lane IDs, and the migration of typed entries. | yes |
+| `location` | Reads `owner/repo` and github.com addresses, and splits a `tree/` address into a branch and a folder. | yes |
+| `inventory` | Everything a branch listing holds below a folder, per type, each with its status and install name. | yes |
 | `portable` | Versioned settings and repository companion files beside the executables; portable skills-path expansion. | file I/O |
-| `tree` | Reads a GitHub tree listing and finds entries of the selected type. | yes |
+| `tree` | Reads a GitHub tree listing; turns the inventory into one lane's installable items (`lane_discovery`) and checks each skill's files against the path rules. | yes |
+| `seen` | `seen.json`: what each source's last complete listing held (branch and per-type summary), for display only. | file I/O |
 | `source` | Source kinds, preview data and per-machine selection of flat or repo-named file destinations. | yes, except root lookup |
 | `pathsafe` | Rules for names and paths that come from GitHub (no `..`, no `CON`, no case clashes, length). | yes |
 | `plugins::catalog`, `plugins::plan` | Match plugin manifests at a branch root; decide native actions from the catalog, local consent and Copilot's listings. | yes |
@@ -168,6 +172,93 @@ flowchart TD
   again. `use_token` in the settings sends it from the first request. Without a token, the failure is reported with
   what to do; as with every failure, nothing is decided from it.
 - **`gh` is only a token source.** All requests are made by the app's own WinHTTP client.
+
+### Sources and lanes
+
+A source is one GitHub location: a repository, a branch (empty = whatever the default branch is now) and a folder. It
+fans out into a **lane** per type (skills, agents, instructions, plugins). Each lane has its own stable ID, saved in
+the source (`lanes`), and that ID is the key of its record in `state.json`; the per-type records did not change, and
+the engine runs each lane through the same typed pipeline as before, using a `RepoConfig` view of it
+(`Config::repos`).
+
+- **Lane IDs come from the settings file only.** Loading never looks at `state.json`: missing lane IDs are filled in
+  deterministically from the source ID (`foo`, `foo-agents`, `foo-instructions`, `foo-plugins`, then `-2`, `-3` on a
+  clash with another ID in the settings; `sources::complete_lanes`), so every copy that reads the same file derives
+  the same IDs. Only a brand-new source also avoids the IDs already in `state.json`
+  (`Engine::preview_location` with `sources::allocate_source_ids`, rechecked by `check_fresh_id` before saving).
+  When a settings change turns a type on (`tss source ID types`, `tss settings types` or the window's switches),
+  `engine::source_preview::fresh_lane_ids` gives that lane a new ID (`SOURCE-TYPE`, then `-2`...) if its current ID
+  carries records of another type or of another repository, branch or folder; its own records, kept while the type
+  was off, are not foreign. `state.json` is read for this only when some type is turned on. After the window saves
+  such a change, `App::finish` queues a check of each lane that is on now but was off or missing before, as it does
+  for a source turned back on.
+
+- `Config` keeps the sources and the global rules as the only truth and rebuilds the lane views after every change
+  (`rebuild`). `repos()` holds only lanes whose type is on (`SourceConfig::effective_types`), in source order and then
+  skills, agents, instructions, plugins. `known_lanes()` / `is_known_lane` hold every saved lane, on or off: a
+  record of an off lane is not an orphan, is never checked and stays as it is.
+- `engine::root::sync_source` checks every lane of a source together, on one listing, applying the lanes in the order
+  skills, agents, instructions, plugins. It lists the **branch root** once (`git/trees/BRANCH:?recursive=1`, `HEAD:`
+  for the default branch), pins the commit, downloads every plugin manifest and the root `marketplace.json` at that
+  commit (each checked against its blob hash, and counted against the check's `max_download_bytes` budget, which is
+  checked before each download; a cancel is honoured between files), and builds the `inventory` with the source's
+  effective rules. A preview uses the default 512 MiB budget (`engine::DEFAULT_MAX_DOWNLOAD`).
+  For a bare repository (no branch set) an unchanged poll is one conditional request against `HEAD:`. With the
+  plugins lane on, a first check, a forced full check, a fresh listing for a choice, or a poll whose `HEAD:` listing
+  came back changed first asks GitHub for the default branch's name and lists that branch by name, which every lane
+  then uses, so the listing and the branch the plugins install from agree. When both listings show the same tree, the
+  `HEAD:` reply's ETag is kept, so the next unchanged poll is again one 304. A change of default branch is noticed on
+  the next full check.
+  Each file lane then takes its items from
+  the inventory (`tree::lane_discovery`) and runs the existing reconcile and apply path; the plugin lane takes the
+  marketplace and manifests from the same listing into the [plugin pipeline](#copilot-cli-plugins).
+- **Only what the listing still shows is kept, never removed.** An owned name the inventory still holds in any status
+  (filtered by a folder rule, bundled in a plugin, colliding, rejected, standalone, or of a type that is off) is
+  `Skip::Protected`: its files and ownership stay, nothing is updated, and the board shows "Sync off". Once it is
+  installable again the normal full check runs, so an edit made meanwhile holds. Owned names are matched against the
+  protected list with the Windows file-name rule (`win::fs::same_win_name`, `reconcile::listed_as`: case-insensitive the
+  way NTFS compares names), not plain lowercasing. Two ASCII names are compared without asking Windows. A Windows name
+  clash between two items installs neither and keeps any current owner.
+- A failed, cut-short or invalid listing, a missing folder, an Agents or Instructions lane with no usable destination,
+  or a failed or wrong manifest download fails every lane of the source before any of them runs. A remote failure
+  inside one lane (a download, say) ends the source: the lanes after it are not run and report the same failure, but a
+  lane before it that already finished keeps what it applied (contract D7). A local failure (Copilot CLI, for example)
+  ends only its own lane.
+  Absence is proved only by a complete listing, confirmed at the pin (`github::confirm_source_at`). The Agents and
+  Instructions lanes of one listing confirm it once (`RootListing::confirmed`): the second lane reuses a proof of the
+  same folder, pin and tree ID instead of asking for the pinned tree again. The empty-listing
+  guard is per lane: a lane that owns items and whose type has nothing in the listing that the lane would install or
+  rejects holds its deletions, even when other types are listed. Items it never syncs (filtered by a folder rule or
+  bundled in a plugin) still keep a matching owned item as it is, but do not cancel the guard. A type that is off is
+  not checked at all, so nothing of it is deleted. Confirmation is per
+  lane too: `tss check LANE-ID --delete-all` confirms only that lane, and the source ID confirms its skills lane
+  (`cli::check` passes the matched lane ID; `sync_source` clears `confirm_mass_delete` for every other lane).
+- **One request when nothing changed.** Each lane saves the root ETag tagged with a hash of its rules
+  (`etag#rules`). The request is conditional only when every lane holds the same tag, so changing a rule forces one
+  full listing. When the skills lane keeps a finished history search, the poll asks for the branch commit instead of
+  the tree; an unchanged commit means every lane stands as it was, as long as each lane could have skipped on its own
+  (same tag, no retry, no choice, no confirmation); otherwise the source is listed in full.
+  A file lane with no record and none of its type to place chooses no destination and installs nothing,
+  and a plugin lane waiting for approval installs nothing either. Such a lane keeps its poll data in `state.json`
+  (`lane_polls`, format 3, per lane ID): the tagged ETag, the last check time, whether it listed nothing, for a plugins
+  lane whether it needs attention, and the location it was taken at. So after a restart it waits its normal interval,
+  and an unchanged source still costs one conditional request. These entries are scheduling data only: they own
+  nothing and never decide an adoption, an update or a deletion. One goes when the lane gets a real record, and it is
+  ignored and dropped at the next save when the lane's location changed or the lane is no longer configured.
+- Scheduling and **Check now** are per source: a due lane, or `Which::One` with the source ID or a file lane's ID,
+  checks every lane of that source, plugins included. `Which::One` with a plugin lane's ID (as `tss resolve` and the
+  plugin rows use) checks only that lane. Reports stay per lane.
+- After every complete listing `sync_source` hands the engine the source's branch (the one the plugin lane resolved,
+  else the configured one, so `""` for a bare repository without plugins) and the inventory's summary. `seen.rs` keeps
+  them in the local `seen.json` (format 1) only for the window and `tss status` to show what a source holds before
+  and between checks. It is written only when the branch or summary changed, drops removed sources, and is never read
+  by a decision; a missing, damaged or newer file just shows no details yet. The file is read again just before each
+  save, and a file written by a newer version is never overwritten.
+- `Engine::preview_location` reads an address (`location::Location::parse`, `matching_heads` and
+  `location::resolve_tree` for `tree/` addresses), lists the branch root, checks the folder exists, and returns the
+  inventory under the global rules, the branch it resolved (and whether it follows the default), the lane IDs the
+  source would get, and where its files would go. It writes nothing and never starts Copilot CLI;
+  `Config::add_source_config` saves the result.
 
 ## Deciding: the reconcile table
 
@@ -352,9 +443,21 @@ text comparison rules used for ordinary sync, or make unrelated files part of a 
 
 ### Copilot CLI plugins
 
-`engine::plugins` polls the branch root even when the source selects a subfolder. A fresh listing must be complete,
-and every downloaded manifest must match its Git blob hash. `plugins::catalog` selects the local entries in scope
-and records what they declare. A preview stops here: it checks for the CLI executable but does not run it.
+The plugin lane of a source reads the same complete branch-root listing as its other lanes (see
+[Sources and lanes](#sources-and-lanes)), even when the source selects a subfolder, and every downloaded manifest must
+match its Git blob hash. `plugins::catalog` selects the entries in the source's folder and records what they declare.
+The capabilities shown for a plugin (`inventory::plugin_items`) are the manifest's declared fields together with the
+files and folders Copilot loads by convention, so an undeclared one is still shown before approval: MCP servers from
+`.mcp.json`, `.github/mcp.json` or `mcp.json`; hooks from `hooks.json`, `hooks/hooks.json` or
+`com.github.copilot/hooks/hooks.json`; LSP servers from `lsp.json`, `.github/lsp.json` or
+`com.github.copilot/lsp.json` (`catalog::MCP_PATHS`, `HOOK_PATHS`, `LSP_PATHS`); and agents, skills and commands from
+files in the default `agents/`, `skills/` and `commands/` folders.
+A plugin root that the branch-root `marketplace.json` does not list is shown but never installed
+(`catalog::NOT_LISTED`, spike S4 in [spikes/README.md](spikes/README.md)). Without a marketplace at the top of the
+branch nothing installs and installed plugins are kept. A preview stops here: it never starts Copilot CLI.
+A lane that follows the default branch records the branch it resolved; when the default branch moves to another
+branch, the lane asks for fresh approval ("The default branch is now ...; approve this source's plugins again to
+follow it") and keeps acting on the branch its record was made for.
 
 A complete check keeps the ETag even if some plugins need attention; `PluginPoll` saves `needs_attention` separately.
 A timer poll answered with a 304 starts no process and writes no file. The tray keeps the last rows and choices.
@@ -382,13 +485,13 @@ makes the proof fail and blocks the source. Copilot errors mask tokens, URL cred
 values, `token=` and `password=` values, and likely hex or base64 runs of 40 or more characters. Ordinary URLs and paths
 stay readable when they can be told apart from those long runs.
 
-Consent (name and publisher) lives in the format-2 `plugin_sources` namespace in local `state.json`, bound to the
-source, marketplace and Copilot home. Adding from a preview saves settings first, then records consent from the same
+Consent (name and publisher) lives in the `plugin_sources` namespace in local `state.json`, bound to the
+source, marketplace and Copilot home; its approval roots need state format 3. Adding from a preview saves settings first, then records consent from the same
 preview. IDs must not overlap any other state record. If the origin, marketplace or Copilot home changes while the
 source still lists installed plugins, approval refuses to replace the record. Portable settings carry only the source,
 not consent. Plugin records share an ordered name index with the catalog and plan. They use JSON objects on disk,
-written in key order and read only if the keys are unique. State format 2 refuses unknown top-level keys; format 1
-still ignores them.
+written in key order and read only if the keys are unique. State formats 2 and 3 refuse unknown top-level keys;
+format 1 still ignores them.
 The CLI follows a moving branch; the app cannot force it to install the exact commit used to build the catalog.
 
 ## Finding edits: quick and full checks
@@ -485,11 +588,13 @@ commands 1098 and 1099, which fake such an install with a right or wrong digest 
 `scheduler.rs` is pure: the time is passed in.
 
 - A repository that was never checked is due now; otherwise one interval after its last successful check (so
-  restarting the app causes no extra requests).
+  restarting the app causes no extra requests). That holds for a lane without a record too: its last check comes from
+  `state.json`'s `lane_polls`.
 - Except: a repository without an ETag (its last check held something, or a choice about one of its skills was made)
   is checked once in each run of the app, as soon as the app sees it so, usually straight after start. What a check
   held is known only to the run that found it, so without this the window would show no rows for those skills until
-  the next interval. That is at most one request per run for each such repository (`Schedule::checked`).
+  the next interval. That is at most one request per run for each such repository (`Schedule::checked`). A plugins
+  lane waiting for approval counts as holding something: its rows are rebuilt the same way, once per run.
 - After a failure: 5 minutes, then 10, 20, 40 and so on, never later than the repository's own interval. A rate limit
   waits for the time GitHub named.
 - Nothing runs more often than every 5 minutes. A month is a calendar month, clamped to the end of a shorter month.
@@ -505,6 +610,7 @@ flowchart TD
     Home["%LOCALAPPDATA%\tiny-skill-sync"] --> Config[config.json: what you set]
     Home --> StateFile[state.json: what the app owns]
     Home --> LockFile[engine.lock: one worker at a time]
+    Home --> Seen[seen.json: what each source held, for display]
     Exe["Executable folder (shared, optional)"] --> Settings[tiny-skill-sync.settings.json]
     Exe --> Sources[tiny-skill-sync.sources.json]
     Parent["%USERPROFILE%\.copilot"] --> Skills[skills: only skill folders]
@@ -520,9 +626,19 @@ flowchart TD
   portable poll or explicit check and when the window opens. Saves compare the changed portion with the version last
   loaded and write only that portion; separate files are not a cross-file transaction, so simultaneous writers are
   unsupported.
-- A missing source `kind` is Skills, preserving old IDs and skill records. Typed local config, portable sources
-  and state use format 2, which old Skills-only readers refuse; the portable settings companion stays separate.
-  Binding and loose-file ownership are stored only in local state, not in portable sources.
+- `config.json` and the portable sources file are written in format 3: global `types`, `include_repo_items` and
+  `ignore_folders`, then the sources with their own overrides (`types`, `include_repo_items`, `ignore_add`,
+  `ignore_allow`) and `lanes`. Formats 1 and 2 are migrated on load (`sources::migrate_legacy`): each typed entry
+  becomes a source with only its type on (a missing `kind` is Skills) and its old ID as that lane's ID; entries with
+  the same location, token, interval and enabled state and different types merge into one source. Lane IDs are
+  derived from the settings file alone (see [Sources and lanes](#sources-and-lanes)); a file without `version` that
+  holds `sources` or `global` is refused rather than read as an empty format 1 file. Plugin approval is never inferred.
+- `state.json` is written in the oldest format that holds everything in it (`State::wire_version`): format 1 for
+  skills only, 2 with loose-file or plugin records, 3 once it holds plugin approval roots or lane poll data
+  (`lane_polls`). A file below format 3 that contains those fields is refused, so an older app never drops them.
+  Binding, loose-file ownership, plugin approvals, `seen.json` and the window's splitter width stay local, not in
+  portable files.
+  The portable settings file (`tiny-skill-sync.settings.json`) stays format 1.
 - `state.json`, `engine.lock`, window size, the startup-offer marker, mutex and saved token stay per machine. Shared
   repository records include their enabled state and interval. A missing shared repository becomes an orphan in the
   local ownership record; it is not a request to delete its skills.
@@ -546,6 +662,15 @@ flowchart TD
   the file alone and ask for a check first. `sweep` waits
   while a set-aside record holds an unfinished change, because two skills folders can share a work folder.
 - `engine.lock` stops the tray and `tss` from working at the same time; the loser is told to try again.
+- `.tss-settings.lock` (beside the executables in portable mode, in the settings home otherwise) keeps settings
+  writers apart: it is held while a writer re-reads, decides and replaces a settings file. A check takes it before its
+  first change (`Session::authorize`) and, because another computer may hold it briefly while saving the shared
+  files, waits up to 10 seconds for it (`config::settings_write_lock_within` with `engine::SETTINGS_LOCK_WAIT`)
+  instead of failing at once. Window and `tss` settings saves and `tss portable` use `config::settings_write_lock`,
+  which does not wait: a busy lock fails the save with "cannot lock settings ... try again". A 304 never takes it.
+  Cooperating writers must see the same folder; separately synchronised cloud copies do not share a lock.
+- `seen.json` (local, beside `state.json`, format 1) is the display cache described in
+  [Sources and lanes](#sources-and-lanes). It never travels with portable settings and nothing is decided from it.
 - The app keeps nothing inside the skills folder, so Copilot only ever sees skill folders.
 
 ## The tray and the window
@@ -554,7 +679,10 @@ flowchart TD
 text, and the buttons that make sense. It is pure, so every sentence and button is tested. The newest news about a
 skill wins; a failed check or a 304 says nothing new about the skills, so the last real rows stay. A repository whose
 last listing had no skills in it says "No skills found". That comes from the record, not from an empty list of rows,
-because after a restart a repository whose skills were all held or skipped has no rows either.
+because after a restart a repository whose skills were all held or skipped has no rows either. A check of the disk
+(`note_verify`) changes only the rows of the lanes it walked (`VerifyReport.lanes`), so a type that is off keeps its
+"Sync off" rows. A source whose listing (or saved summary) holds only items of types that are off is "Sync off", not
+"Nothing found" (`worst_of`).
 
 The windows (`src\win\ui\`) are Win32 windows with no dialog templates, no COM and no UI library: the app draws
 everything they show.
@@ -592,15 +720,13 @@ everything they show.
   numbers. The window is made when opened and destroyed when
   closed (its fonts and bitmap released, the memory trimmed), so it costs nothing while closed. Its size is saved in
   `window.txt` when you finish resizing it.
-- **The list on the left widens under the mouse** when a repository's name or a diff file's path or summary is cut
-  (`page::nav_width`, `page::diff_files_width`): after the pointer has rested on it for 250 ms, taking room from the
-  adjacent page or comparison. The repository list stops at half the window; the diff list at half the space shared
-  by its two cards, excluding the margins and gap. The cards, headers and contents use the same `DiffLayout`.
-  Selection, opened unchanged lines and scroll positions survive the resize. The list narrows when the pointer leaves;
-  entering or leaving the diff view resets the hover timer and width. Nothing polls: every
-  control and panel posts `WM_HOVER` to the window when the pointer enters or leaves it (`control::track_hover`), and
-  the window then asks Windows where the pointer is. One gap: leaving from the list's scroll bar straight across the
-  window's border sends no message, so the list stays wide until the next mouse move over the window.
+- **The same splitter resizes the list on the left** in the main and diff views. Its own strip separates the panes;
+  it captures the mouse while dragged and is also a Tab stop named "Resize list". The layout keeps at least 160 DIPs
+  for the list and, when there is room, 360 for the page. The arrow keys move it 8 DIPs (32 with Shift), Home and End
+  to the narrowest and widest list (`page::width_after_key`). A drag or resize key saves the preferred list width as the
+  third number in `window.txt`; a smaller window limits what is shown without changing that preference. The cards,
+  headers and contents use the same `DiffLayout`. Selection, opened unchanged lines and scroll positions survive
+  the resize. Hovering never changes the width and the splitter adds no timer.
 - **`dialogs.rs`** asks questions in a small modal window drawn the same way, with a native edit box for typing.
   The client fits the monitor's work area after allowing for the frame. The panel scrolls to show the rest of the
   question and brings the focused control into view. It is not `TaskDialogIndirect`, which lives only in comctl32
@@ -624,14 +750,20 @@ A window procedure can be entered again while it runs (a control notifies its pa
 it). So the UI state lives in thread-local `RefCell`s borrowed only with `try_borrow_mut`, and no borrow is held across a
 call that runs a message loop (a question, the tray menu, `DestroyWindow`).
 
-The band at the top says how everything is in one title, the worst first: a problem of the app, repositories that
-can't be read, skills that need you, repositories that need you, the first check still to come, or all up to date. The
-line under it says where, when the last check was, and when the next one is (`page::hero_of`). While the app works, or
+The band at the top says how everything is in one title, the worst first: a problem of the app, sources that can't be
+read, items that need you, sources that need you, the first check still to come, or all up to date. The line under it
+says where, when the last check was, and when the next one is (`page::hero_of`). It counts sources, not lanes: it
+takes the snapshot's `SourceView`s, so the four types of one source count once, and it says "items" instead of
+"skills" when more than one type is present (`board::item_nouns`). When every type found is off, nothing is counted
+as up to date: it says "Nothing is being synced" in the calm tone. While the app works, or
 just after it told you something, that line says so instead. After a check you asked for, it is `summary` in `app.rs`:
 a failed check puts the reason first, and a check that found nothing new says "Checked: nothing new on GitHub" unless
-all is well. Each skill header paints only its name, actions and status badge. Its window text also carries the
+all is well. Each sentence names only the types of the lanes it is about (`item_nouns` over the lanes that need you,
+found nothing, or changed), so a source whose skills alone changed says "skills were updated". Each skill header
+paints only its name, actions and status badge. Its window text also carries the
 explanation (`Row.text`, `board.rs`) and known facts for the row tooltip, whether open or closed; hovering an
-action shows that action's tooltip instead.
+action shows that action's tooltip instead. A source entry in the list on the left uses the same tooltip for its whole
+window text (`page::nav_name`), which its painted lines may cut short.
 Only attention/error rows with resolution choices expand. Routine commands remain beside the name even while
 those choices are open. The facts (`Row.facts`) come from the record after every job
 (`engine::facts`, which reads nothing from disk) and are worded by `board::facts_text`; a plain row ("Up to date",
@@ -680,9 +812,7 @@ icon (`RT_ICON` and `RT_GROUP_ICON` from `assets\tiny-skill-sync.ico`), so Setti
 ## Measuring
 
 When `TSS_BENCH_REPORT` names a file, the tray app appends timing marks to it (`src\win\ui\bench.rs`): the tray icon
-shown, each finished job (with how long it took), the window painted, the list on the left widened or narrowed (`nav`
-for repositories, `files` for diff files),
-quit and exit. `scripts\bench.ps1` reads the marks together with Windows' process counters and compares them with the
+shown, each finished job (with how long it took), the window painted, quit and exit. `scripts\bench.ps1` reads the marks together with Windows' process counters and compares them with the
 budgets. Without the variable, nothing is written. `scripts\e2e.ps1` and `scripts\soak.ps1` read the same marks to know
 when a job has finished; the first also reads and drives the real windows with Win32 messages and measures whether
 text fits (`scripts\e2e-lib.ps1`). See [CONTRIBUTING.md](CONTRIBUTING.md#live-end-to-end-runs).
@@ -691,7 +821,8 @@ text fits (`scripts\e2e-lib.ps1`). See [CONTRIBUTING.md](CONTRIBUTING.md#live-en
 
 | To change... | Look in |
 | --- | --- |
-| Which folders count as skills | `tree.rs` |
+| Which folders count as skills, agents, instructions or plugins, and the folder rules | `inventory.rs` (then `tree.rs` for one lane's items) |
+| Source settings, type switches and migration of older settings | `sources.rs`, `config.rs`, `portable.rs` |
 | What is installed, updated, deleted or held | `reconcile.rs` (and its tests first) |
 | How a change is made on disk | `apply.rs` |
 | How edits are found | `verify.rs`, `win\fs.rs` |

@@ -48,7 +48,7 @@ if (-not $Repo) {
 $root = Join-Path $TempRoot ('tss-dryrun-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
 try {
     $code = Invoke-InSandbox -Root $root -Body {
-        $add = @('add', $Repo)
+        $add = @('add', $Repo, '--yes')
         if ($UseToken) { $add += '--use-token' }
         $added = Invoke-Tss $add
         if ($added -ne 0) { return $added }

@@ -32,8 +32,10 @@ Start with `scripts\dev.ps1`; it runs the others.
 | `scripts\dev.ps1 clean` | Close the sandbox copy and any copy a live script left running, and delete the sandbox, test and live-script leftovers in `%TEMP%` and `bench\out`, and the test copies' Start with Windows keys (`HKCU\Software\tiny-skill-sync-test`). Keeps `target\`. |
 | `scripts\dev.ps1 logo` | Write the files in `assets\` again from `src\logo.rs`: `logo.svg`, `logo-16.png` to `logo-256.png`, `favicon.ico` and `tiny-skill-sync.ico` (the exes' icon). Run it after changing the logo, look at the files, and commit them with the change; a test fails while they differ from what the code draws. |
 
-The **sandbox** is `.tss-test\` in the repository (ignored by git): its own settings (`.tss-test\home`) and skills
-folder (`.tss-test\skills`), set through `TSS_HOME` and `TSS_SKILLS_DIR`. A sandbox copy of the tray runs beside a
+The **sandbox** is `.tss-test\` in the repository (ignored by git): its own settings (`.tss-test\home`), skills
+folder (`.tss-test\skills`), agents folder (`.tss-test\agents`) and instructions folder (`.tss-test\instructions`),
+set through `TSS_HOME`, `TSS_SKILLS_DIR`, `TSS_AGENTS_DIR` and `TSS_INSTRUCTIONS_DIR`. The live scripts set all four
+too. A sandbox copy of the tray runs beside a
 real one, with its own icon. Its Start with Windows entry is kept under `HKCU\Software\tiny-skill-sync-test`, which
 Windows never reads, so turning it on there starts nothing at sign-in. The saved GitHub token is the one thing it
 shares with the real app, so `scripts\dev.ps1 tss token set` and `token clear` are refused.
@@ -49,7 +51,7 @@ scripts\dev.ps1 test
 ```
 
 This runs `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings` and `cargo test --no-fail-fast`. All three
-must pass. There are 869 tests (567 in the library, 302 integration tests); the whole gate takes about 40 seconds when
+must pass. There are 982 tests (620 in the library, 362 integration tests); the whole gate takes about 40 seconds when
 the code is already built.
 
 If the change can affect speed, memory or disk use (startup, verification, the poll, the tray, the window),
@@ -113,7 +115,8 @@ its rows have not been rebuilt. A blocker or stale choice clears the saved ETag 
 Explicit checks and plugin choices are always full. Actions reuse the latest Copilot snapshot; Adopt, Approve and
 Forget start nothing. A cancel after the runner sees the child exit does not skip verification. Finished commands
 get a fresh snapshot, and every verified action is saved before the next one. A timeout stops the remaining actions.
-State format 2 rejects unknown top-level keys; legacy format 1 still ignores them.
+State formats 2 and 3 reject unknown top-level keys; legacy format 1 still ignores them. Plugin approval roots and
+lane poll data need format 3, and a lower-format file that contains them is refused.
 
 The app finds `copilot.exe` using `TSS_COPILOT_CLI` (an absolute path to the exe), then
 `%LOCALAPPDATA%\GitHubCopilotCLI\copilot.exe`, then absolute entries on `PATH`, excluding the current folder.
@@ -144,7 +147,9 @@ ends up on disk, what the app says and what it leaves alone.
   it). The `places` scenario, which runs the app
   without the `TSS_` folders, points `USERPROFILE` and `LOCALAPPDATA` into `%TEMP%` and checks with `cmd.exe` and
   `tss status` that the app sees only those before it lets the app write anything. A small proxy inside the script makes
-  GitHub fail in the ways the `failures` scenario needs.
+    GitHub fail in the ways the `failures` scenario needs (`scripts\e2e-proxy.ps1`). Its `empty-tree` mode answers every
+    listing with an empty tree; `empty-tree:FOLDER` keeps that folder and the folders above it, with nothing in them, so a
+    folder source still finds its folder but lists no skills.
 - **You will see** one tray icon per running copy of the app (Windows 11 keeps new ones in the overflow flyout), and the
   `ui` scenario opens, moves and photographs windows and the tray menu, keeping its throwaway window in front.
   It also moves the mouse pointer onto the window for a moment, then puts it back; puts text on the clipboard, then
@@ -159,7 +164,8 @@ ends up on disk, what the app says and what it leaves alone.
 | `places` | With `TSS_HOME` and `TSS_SKILLS_DIR` unset and the profile folders pointed at `%TEMP%`: skills go to `%USERPROFILE%\.copilot\skills` beside a skill written by hand, the settings to `%LOCALAPPDATA%\tiny-skill-sync`, nothing anywhere else except an optional `GitHub CLI` folder when the app asks `gh` for a token. Then `skills_dir` set in `config.json`: the new folder gets its own copies and the old one is left as it is; taken out again while the tray runs, the first folder is managed as before, with an edit made there meanwhile kept and shown. |
 | `portable` | `tss portable` exports two companion files without changing `config.json`; two tray copies read those shared sources but keep separate local state and skills folders. Uses the public fixture's existing branch without pushing. |
 | `plugins` | Preview, install, update and remove real Copilot CLI plugins on a disposable public branch. Verifies installed versions with Copilot, checks that plain remove keeps plugins, and saves preview and row screenshots. |
-| `mixed` | On a disposable branch of the public fixture, two isolated profiles share one portable Skills, Agents and Instructions source list. Exercises CLI preview and checks, tray preview/cancel and add, exact paths, separate state/work, repo-namespaced adoption and an unchanged neighbor. |
+| `mixed` | On a disposable branch of the public fixture, two isolated profiles share one portable source list with Skills, Agents and Instructions. Exercises CLI preview and checks, tray preview/cancel and add, exact paths, separate state/work, repo-namespaced adoption and an unchanged neighbor. |
+| `autodetect` | One bare branch holds skills at several depths, an agent, an instructions file, a plugin listed by a branch-root marketplace, a plugin no marketplace lists, a skill bundled in the plugin, `AGENTS.md`, and skills under `tests` and `.github`. The preview turns on all four types, lists each item once, skips the filtered folders and the bundled skill, says the unlisted plugin cannot be installed and lists `AGENTS.md` as never synced; it saves and installs nothing. `tss add --yes` without `--approve-plugins` leaves the plugin waiting and starts no Copilot CLI; the check installs exactly the five skills, the agent and the instructions file, byte-equal to upstream. With Copilot CLI found, `tss resolve ... approve PUBLISHER` and a check install the plugin into throwaway Copilot folders. A second profile adds the `kit` folder and gets only the one skill inside it. |
 | `changes` | Six kinds of upstream change reach the disk through the tray's **Sync now**. |
 | `local-edit` | An edit made while the app runs, then an upstream change to the same skill. |
 | `converged` | Three skills edited here, then the edits pushed to GitHub: one with Windows line endings against GitHub's Unix ones, one byte for byte, one differently. The first two are marked as in sync with nothing written and take the next update; the third stays edited. |
@@ -171,8 +177,8 @@ ends up on disk, what the app says and what it leaves alone.
 | `names` | Upstream names with control and direction characters are shown escaped, and can still be selected. |
 | `failures` | A bad network, bad answers, a bad token: the skills folder must not change. |
 | `stale` | GitHub answering with a listing that is newer than its commit. |
-| `empty` | A repository added as a whole when its skills are in a subfolder. |
-| `ui` | The window, its questions and the tray menu, driven and read from outside: layout, tab order, painting, failure text, skill details in row tooltips, inline folder and clipboard actions, **Preview**, and repair choices for an edited skill. **Show changes** compares a fixture update; neither comparison nor preview should list a file the user added. Also checks the repository and diff lists widening under the mouse, scroll positions, and remembering a new window size. Runs in the current Windows light or dark mode. |
+| `empty` | A folder location with no skills in it: "No skills found", and the message names the folder it read. |
+| `ui` | The window, its questions and the tray menu, driven and read from outside: layout, tab order, painting, failure text, skill details in row tooltips, inline folder and clipboard actions, **Preview**, and repair choices for an edited skill. **Show changes** compares a fixture update; neither comparison nor preview should list a file the user added. Also checks the splitter between the list and the details on the Sources and Show changes pages (dragged with the mouse, moved with the arrow keys, Home and End, and its width remembered), scroll positions, and remembering a new window size. Runs in the current Windows light or dark mode. |
 | `signin` | Start with Windows: `tss startup` on, off, and switched off in Task Manager; the app started from its entry the way Windows starts it at sign-in: only the tray, nothing looked at or checked for 30 seconds, then the look and the check; started by hand during that wait, it looks at once; a second start; settings that cannot be read; copies in folders too deep for the entry (named by the short path, or not possible). |
 
 Run it when you change the engine's visible behaviour, the tray, the window or anything GitHub-facing, at least
@@ -180,7 +186,7 @@ the scenarios that cover the change (`-Only`). `scripts\dev.ps1 soak` is the lon
 are checked on real screen copies, not on `PrintWindow`, which sometimes returns an unpainted bottom band for a window
 that is fully painted on screen.
 
-For mixed-source work, use `scripts\dev.ps1 e2e -Only mixed` and inspect its screenshots. Each profile needs
+For mixed-source work, use `scripts\dev.ps1 e2e -Only mixed,autodetect` and inspect the screenshots. Each profile needs
 disposable `USERPROFILE`, `LOCALAPPDATA`, `TSS_HOME`, `TSS_SKILLS_DIR`, `TSS_AGENTS_DIR` and `TSS_INSTRUCTIONS_DIR`
 values. Their sibling work folders must also be separate and disposable. The harness disables saved-token reads and
 app updates and never places test files in the real Copilot folders. Run the normal test and benchmark gates too.
@@ -281,6 +287,8 @@ poll. The app writes timing marks only when `TSS_BENCH_REPORT` names a file (`sr
 
 It prints a table, saves it as `bench\out\bench-<time>.md` (ignored by git) and exits with 1 if any row is over budget.
 The window step briefly shows the app's window five times; leave the mouse and keyboard alone while it runs.
+Since mixed sources, the bench adds its fixture with `tss add --yes`, so the source syncs every type that is on by
+default. Its start-up job and window rows are therefore not directly comparable with reports from before that change.
 
 The budgets, agreed before the app was written:
 
@@ -295,14 +303,17 @@ The budgets, agreed before the app was written:
 | Unchanged poll | 50 ms CPU, 0 file reads or writes, 1 request |
 | After a poll | 20 MiB working set, 5 MiB private, 10 threads, 350 handles |
 | Quit | 2 s at most |
-| `tiny-skill-sync.exe` | 1.40 MiB |
+| `tiny-skill-sync.exe` | 1.70 MiB |
 
 The exe's budget was 1 MiB until the shared-folder settings, the new skill rows and the check that marks an edit
 GitHub also has as in sync took it to 1.01 MiB; the owner raised it to 1.1 MiB. Agents and Instructions sources took
 it to 1.30 MiB; taking the Universal C Runtime from Windows brought it back to 1.23 MiB, and the owner raised the
 budget to 1.25 MiB. Plugin sources took it to 1.39 MiB; sharing map and JSON code between the plugin records brought
 it back to 1.35 MiB, and the budget became 1.40 MiB (the coordinator's call while the owner was away; the owner may
-change it). The review fixes for plugins left it at 1.37 MiB. The other rows are as first agreed.
+change it). The review fixes for plugins left it at 1.37 MiB. Sources that mix skills, agents, instructions and plugins
+(the inventory, discovery, a list per type and the location preview) took it to 1.63 MiB with no new dependency; a
+symbol map showed the growth spread over that new code rather than in one place to cut, and the budget became 1.70 MiB (again the
+coordinator's call; the owner may change it). The other rows are as first agreed.
 
 The recorded results and their test conditions are in [the user guide](docs/GUIDE.md#measured-cost).
 
@@ -324,8 +335,9 @@ The recorded results and their test conditions are in [the user guide](docs/GUID
 `Cargo.toml` and `.cargo\config.toml` set the release profile: `opt-level = "z"`, fat LTO, one codegen unit,
 `panic = "abort"`, stripped symbols and a static Visual C++ runtime. `build.rs` links the Universal C Runtime part from
 Windows (`ucrtbase.dll`, part of Windows 10 and 11), which saves about 75 KB per exe; no Visual C++ redistributable is
-needed, and `tests\cli.rs` checks that neither exe imports one. The tray budget is 1.40 MiB; the build with Agents and
-Instructions sources measured 1,287,680 bytes, and with Plugins sources 1,434,112 bytes. In the earlier size
+needed, and `tests\cli.rs` checks that neither exe imports one. The tray budget is 1.70 MiB; the build with Agents and
+Instructions sources measured 1,287,680 bytes, with Plugins sources 1,434,112 bytes, and with mixed sources 1,711,104
+bytes. In the earlier size
 comparison, `opt-level = "s"` made the 0.89 MiB exe
 1.01 MiB, `opt-level = 3` larger still. Building for size costs about 12% of SHA-1 speed (339 MB/s instead of 384).
 `build.rs` embeds

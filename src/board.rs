@@ -16,15 +16,21 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 use crate::apply::Note;
 use crate::config::{Config, RepoConfig};
 use crate::engine::{
-    ApplyResult, Failure, LocalStatus, Outcome, PluginReport, RepoReport, Resolution, SkillFacts, SkillReport, StartupReport, SyncReport, VerifyReport,
+    ApplyResult, Failure, LocalStatus, LocationPreview, Outcome, PluginReport, RepoReport, Resolution, SkillFacts, SkillReport, StartupReport, SyncReport,
+    VerifyReport,
 };
 use crate::github::FailureKind;
 use crate::interval::UnixSecs;
+use crate::inventory::SummaryNote;
 use crate::pathsafe::{fold, printable};
 use crate::plugins::{Choice, Operation, Status};
 use crate::reconcile::{Hold, LocalState, Skip, Verdict};
-use crate::source::{PreviewDestination, SourceKind, SourcePreview};
+use crate::seen::Seen;
+use crate::source::{PreviewDestination, SourceKind};
+use crate::sources::SourceConfig;
 use crate::state::PluginSourceState;
+
+const KINDS: [SourceKind; 4] = [SourceKind::Skills, SourceKind::Agents, SourceKind::Instructions, SourceKind::Plugins];
 
 pub const APP_NAME: &str = "Tiny Skill Sync";
 /// A tray tooltip holds 127 UTF-16 units (128 with the closing zero).
@@ -63,100 +69,6 @@ pub(crate) fn source_folder(source: &RepoConfig) -> &str {
 pub(crate) fn item_nouns(mut kinds: impl Iterator<Item = SourceKind>) -> (&'static str, &'static str) {
     let first = kinds.next().unwrap_or_default();
     if kinds.all(|k| k == first) { first.nouns() } else { ("item", "items") }
-}
-
-impl SourcePreview {
-    pub(crate) fn blocker(&self, source: &RepoConfig) -> Option<&'static str> {
-        if self.kind != source.kind {
-            Some("The preview is for a different source type.")
-        } else if !self.errors.is_empty() {
-            Some("The listing contains rejected items. Choose a different source or fix the listing first.")
-        } else if self.names.is_empty() {
-            Some(match source.kind {
-                SourceKind::Skills => "No folders with a SKILL.md file were found. Check the source type and folder.",
-                SourceKind::Agents => "No *.agent.md files were found directly in this folder. Check the source type and folder.",
-                SourceKind::Instructions => "No *.instructions.md files were found directly in this folder. Check the source type and folder.",
-                SourceKind::Plugins => "No matching plugins were found. Check the source folder.",
-            })
-        } else if source.kind == SourceKind::Plugins {
-            match &self.plugins {
-                Some(catalog) if !catalog.plugins().is_empty() && catalog.rejected().is_empty() => None,
-                _ => Some("The plugin marketplace preview could not be confirmed."),
-            }
-        } else if !matches!(self.destination, PreviewDestination::Resolved(_)) {
-            Some("The destination could not be confirmed.")
-        } else {
-            None
-        }
-    }
-
-    pub(crate) fn description(&self, source: &RepoConfig) -> String {
-        use std::fmt::Write;
-        let mut text = format!("Type: {}\n", self.kind.heading());
-        if self.kind == SourceKind::Plugins {
-            text.push_str("Installs with: GitHub Copilot CLI\n");
-            if let Some(catalog) = &self.plugins {
-                let _ = writeln!(text, "Marketplace: {}", printable(catalog.market()));
-            }
-        } else {
-            let destination = match &self.destination {
-                PreviewDestination::Resolved(dir) => printable(&dir.to_string_lossy()).into_owned(),
-                PreviewDestination::Held(why) => format!("not available: {}", printable(why)),
-                PreviewDestination::NotChecked => "not checked".into(),
-            };
-            let _ = writeln!(text, "Destination: {destination}");
-        }
-        let (one, many) = self.kind.nouns();
-        let n = self.count();
-        if n == 0 {
-            let _ = write!(text, "Matched no {many}.");
-        } else {
-            let _ = write!(text, "Matched {n} {}:", if n == 1 { one } else { many });
-        }
-        if let Some(catalog) = &self.plugins {
-            for plugin in catalog.plugins().values() {
-                let _ = write!(text, "\n  {}", printable(&plugin.name));
-                if let Some(version) = &plugin.version {
-                    let _ = write!(text, " {}", printable(version));
-                }
-                if let Some(publisher) = &plugin.publisher {
-                    let _ = write!(text, ", by {}", printable(publisher));
-                } else {
-                    text.push_str(", publisher not declared");
-                }
-                let caps = &plugin.capabilities;
-                if caps.hooks || caps.mcp || caps.lsp {
-                    let mut sep = " (can start: ";
-                    for (has, name) in [(caps.hooks, "hooks"), (caps.mcp, "MCP servers"), (caps.lsp, "LSP servers")] {
-                        if has {
-                            text.push_str(sep);
-                            text.push_str(name);
-                            sep = ", ";
-                        }
-                    }
-                    text.push(')');
-                }
-            }
-            for name in catalog.hosted_elsewhere() {
-                let _ = write!(text, "\n  {}: Hosted elsewhere; not handled", printable(name));
-            }
-        } else {
-            for name in &self.names {
-                let _ = write!(text, "\n  {}", printable(name));
-            }
-        }
-        for why in &self.errors {
-            let _ = write!(text, "\nRejected: {}", printable(why));
-        }
-        if self.kind == SourceKind::Plugins {
-            let _ = write!(
-                text,
-                "\n\nPlugins can run programs on this PC. Adding this source installs these plugins with GitHub Copilot CLI and installs new versions from {} automatically. New plugins, and plugins whose publisher changes, wait for your approval.",
-                printable(&source.branch)
-            );
-        }
-        text
-    }
 }
 
 /// How serious something is. The worst one wins when levels are rolled up.
@@ -293,6 +205,244 @@ impl RepoView {
     }
 }
 
+/// One type of a source: its lane, whether it syncs, what the last listing held and the items on record.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KindView {
+    pub kind: SourceKind,
+    pub lane: String,
+    /// Whether the type syncs. Items of a type that is off are kept as they are and shown as "Sync off".
+    pub on: bool,
+    /// Items the last complete listing had that nothing stops from syncing; none before the first listing.
+    pub found: Option<u32>,
+    /// Items a folder rule skipped in the last listing.
+    pub filtered: u32,
+    /// Items listed but never synced, with the reason.
+    pub notes: Vec<SummaryNote>,
+    pub rows: Vec<Row>,
+    pub status: String,
+    pub level: Level,
+}
+
+impl KindView {
+    /// "Skills 3", "Plugins 1 (needs approval)", "Instructions: Sync off".
+    pub fn summary(&self) -> String {
+        if !self.on {
+            return format!("{}: Sync off", self.kind.heading());
+        }
+        let n = self.found.map_or(self.rows.len(), |n| n as usize);
+        let mut text = format!("{} {n}", self.kind.heading());
+        let attention = self.rows.iter().filter(|r| r.level >= Level::Attention).count();
+        if self.rows.iter().any(|r| r.actions.contains(&Action::ApprovePlugin)) {
+            text.push_str(" (needs approval)");
+        } else if attention > 0 {
+            text.push_str(&format!(" ({attention} need{} attention)", if attention == 1 { "s" } else { "" }));
+        }
+        text
+    }
+}
+
+/// One source: a GitHub location and every type it syncs. Its status is the worst of its types that sync.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SourceView {
+    pub id: String,
+    pub label: String,
+    pub repo: String,
+    /// The configured branch; empty when the source follows the default branch.
+    pub branch: String,
+    /// The branch the last listing read, from the display cache.
+    pub seen_branch: Option<String>,
+    pub folder: String,
+    pub enabled: bool,
+    pub status: String,
+    pub detail: Option<String>,
+    pub level: Level,
+    pub last_check: Option<UnixSecs>,
+    pub private: bool,
+    /// The types the last listing found or the record owns, in the order skills, agents, instructions, plugins.
+    pub kinds: Vec<KindView>,
+    /// Files the last listing had that are never synced, such as AGENTS.md.
+    pub notes: Vec<SummaryNote>,
+    pub more_notes: u32,
+}
+
+impl SourceView {
+    /// "Skills 3 | Agents 1 | Instructions: Sync off | Plugins 1 (needs approval)".
+    pub fn types_line(&self) -> String {
+        if self.kinds.is_empty() {
+            return "Nothing found yet".to_string();
+        }
+        self.kinds.iter().map(KindView::summary).collect::<Vec<_>>().join(" | ")
+    }
+
+    pub fn last_check_text(&self, now: UnixSecs) -> String {
+        match self.last_check {
+            Some(at) => ago(now, at),
+            None => "never".to_string(),
+        }
+    }
+}
+
+/// "owner/repo@branch : folder", like a lane's label.
+pub fn source_label(source: &SourceConfig) -> String {
+    let mut label = source.repo.clone();
+    if !source.branch.is_empty() {
+        label.push('@');
+        label.push_str(&source.branch);
+    }
+    if !source.path.is_empty() {
+        label.push_str(" : ");
+        label.push_str(&source.path);
+    }
+    label
+}
+
+/// The read-only preview of a location, line by line, for both `tss add` and the window: where it is, and for each type
+/// what would sync, what would not and why. An empty line separates two sections. Item lines start with two spaces,
+/// plugin details with four.
+pub fn preview_lines(preview: &LocationPreview, skills_dir: &std::path::Path) -> Vec<String> {
+    use crate::inventory::Status as ItemStatus;
+    let source = &preview.source;
+    let mut out = Vec::new();
+    out.push(format!("Read-only preview of {}", printable(&source.repo)));
+    let default = if preview.follows_default { " (default branch)" } else { "" };
+    out.push(format!("Branch: {}{default}", printable(&preview.branch)));
+    out.push(format!("Folder: {}", printable(if source.path.is_empty() { "the whole repository" } else { &source.path })));
+    for kind in KINDS {
+        let on = preview.types.enabled(kind);
+        let items = preview_items(preview, kind);
+        out.push(String::new());
+        out.push(format!("{}: Sync {}", kind.heading(), if on { "on" } else { "off" }));
+        let mut shown = 0;
+        let mut filtered: BTreeMap<String, u32> = BTreeMap::new();
+        for (name, path, status, plugin) in &items {
+            let state = match status {
+                ItemStatus::Bundled { .. } => continue,
+                ItemStatus::Filtered(_) => {
+                    *filtered.entry(status.reason().unwrap_or_default()).or_default() += 1;
+                    continue;
+                }
+                ItemStatus::Installable if !on => "Sync off".to_string(),
+                ItemStatus::Installable if kind == SourceKind::Plugins => "will sync after you approve it".to_string(),
+                ItemStatus::Installable => "will sync".to_string(),
+                ItemStatus::Standalone => format!("cannot be installed: {}", status.reason().unwrap_or_default()),
+                other => format!("not synced: {}", other.reason().unwrap_or_default()),
+            };
+            shown += 1;
+            let at = if path.is_empty() || path == name { String::new() } else { format!(" ({})", printable(path)) };
+            out.push(format!("  {}{at}: {}", printable(name), printable(&state)));
+            if let Some(details) = plugin {
+                out.push(format!(
+                    "    Publisher: {}. Version: {}. Declares: {}.",
+                    printable(details.publisher.as_deref().unwrap_or("not stated")),
+                    printable(details.version.as_deref().unwrap_or("not stated")),
+                    plugin_capabilities(details)
+                ));
+            }
+        }
+        if shown == 0 {
+            out.push("  None found.".into());
+        }
+        for (reason, count) in &filtered {
+            out.push(format!("  Skipped {count} by a folder rule: {}.", printable(reason)));
+        }
+        for collision in preview.inventory.collisions.iter().filter(|c| c.kind == kind) {
+            let paths: Vec<_> = collision.paths.iter().map(|p| printable(p).into_owned()).collect();
+            out.push(format!("  Same install name on Windows, so none of these sync: {}", paths.join(", ")));
+        }
+        if !items.iter().any(|(_, _, status, _)| preview.syncs(kind, status)) {
+            continue;
+        }
+        out.push(match kind {
+            SourceKind::Skills => format!("  Destination: {}", skills_dir.display()),
+            SourceKind::Plugins => "  Plugins can run programs on this PC. GitHub Copilot CLI installs them after you approve them.".into(),
+            _ => match preview.destinations.iter().find(|(k, _)| *k == kind).map(|(_, d)| d) {
+                Some(PreviewDestination::Resolved(dir)) => format!("  Destination: {}", dir.display()),
+                Some(PreviewDestination::Held(why)) => format!("  Held, nothing would be placed: {}", printable(why)),
+                Some(PreviewDestination::NotChecked) | None => "  Destination: not checked yet.".into(),
+            },
+        });
+    }
+    if let Some(problem) = &preview.inventory.marketplace_problem {
+        out.push(format!("  Marketplace problem: {}", printable(problem)));
+    }
+    if !preview.inventory.not_synced.is_empty() {
+        out.push(String::new());
+        out.push("Never synced:".into());
+        for file in &preview.inventory.not_synced {
+            out.push(format!("  {}: {}", printable(&file.path), file.reason));
+        }
+    }
+    out
+}
+
+/// Whether a preview has anything of `kind` that would sync.
+pub fn preview_syncs(preview: &LocationPreview, kind: SourceKind) -> bool {
+    preview_items(preview, kind).iter().any(|(_, _, status, _)| preview.syncs(kind, status))
+}
+
+/// The install names of the plugins a preview would sync. Only these can be approved.
+pub fn previewed_plugins(preview: &LocationPreview) -> Vec<&str> {
+    preview.inventory.plugins.iter().filter(|p| preview.syncs(SourceKind::Plugins, &p.status)).map(|p| p.install_name.as_str()).collect()
+}
+
+type PreviewItem<'a> = (&'a str, &'a str, &'a crate::inventory::Status, Option<&'a crate::inventory::PluginDetails>);
+
+fn preview_items(preview: &LocationPreview, kind: SourceKind) -> Vec<PreviewItem<'_>> {
+    let inv = &preview.inventory;
+    match kind {
+        SourceKind::Skills => inv.skills.iter().map(|i| (i.install_name.as_str(), i.path.as_str(), &i.status, None)).collect(),
+        SourceKind::Agents => inv.agents.iter().map(|i| (i.install_name.as_str(), i.path.as_str(), &i.status, None)).collect(),
+        SourceKind::Instructions => inv.instructions.iter().map(|i| (i.install_name.as_str(), i.path.as_str(), &i.status, None)).collect(),
+        SourceKind::Plugins => inv.plugins.iter().map(|i| (i.install_name.as_str(), i.path.as_str(), &i.status, Some(&i.data))).collect(),
+    }
+}
+
+/// What a plugin declares it can bring, in a few words.
+fn plugin_capabilities(details: &crate::inventory::PluginDetails) -> String {
+    let c = &details.capabilities;
+    let names: Vec<&str> = [
+        (c.hooks, "hooks"),
+        (c.mcp_servers, "MCP servers"),
+        (c.lsp_servers, "LSP servers"),
+        (c.agents, "agents"),
+        (c.skills, "skills"),
+        (c.commands, "commands"),
+    ]
+    .into_iter()
+    .filter_map(|(on, name)| on.then_some(name))
+    .collect();
+    if names.is_empty() { "nothing declared".to_string() } else { names.join(", ") }
+}
+
+/// The status of a source from its lanes that sync: an error first, then every row that needs attention, then the
+/// worst lane. A lane whose listing had nothing in it does not count while another lane has something, unless its last
+/// check failed. When the listing has items only of types that are off, the source is "Sync off", not "Nothing found".
+fn worst_of(label: &str, lanes: Vec<(Level, String, Option<String>, usize, bool)>, off_listed: bool) -> (Level, String, Option<String>) {
+    let some = lanes.iter().any(|l| !l.4);
+    if !some && off_listed {
+        return (Level::Ok, "Sync off".to_string(), None);
+    }
+    if !some && lanes.len() > 1 {
+        return (Level::Attention, "Nothing found".to_string(), Some(format!("Nothing to sync was found in {label}. Check the branch and folder.")));
+    }
+    let lanes: Vec<_> = lanes.into_iter().filter(|l| !(some && l.4)).collect();
+    if let Some(failed) = lanes.iter().find(|l| l.0 == Level::Error) {
+        return (Level::Error, failed.1.clone(), failed.2.clone());
+    }
+    let attention: usize = lanes.iter().map(|l| l.3).sum();
+    if attention > 0 {
+        return (Level::Attention, format!("Needs attention ({attention})"), None);
+    }
+    if let Some(worst) = lanes.iter().find(|l| l.0 == Level::Attention) {
+        return (Level::Attention, worst.1.clone(), worst.2.clone());
+    }
+    match lanes.iter().find(|l| l.1 != "Up to date") {
+        Some(other) => (Level::Ok, other.1.clone(), other.2.clone()),
+        None if lanes.is_empty() => (Level::Ok, "Not checked yet".to_string(), None),
+        None => (Level::Ok, "Up to date".to_string(), None),
+    }
+}
+
 /// Something worth telling the user once: what recovery did after a crash, or a problem that was not fatal.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Message {
@@ -329,6 +479,8 @@ enum Fact {
     Waiting,
     Clash(String),
     NotSafe(String),
+    /// Listed, but not synced (a folder rule, a package or a type switch): kept as it is.
+    SyncOff(String),
     /// The check left it alone, for this reason.
     Stopped(String),
     Failed(String),
@@ -414,6 +566,7 @@ fn fact_of(verdict: &Verdict, done: bool) -> Option<Fact> {
         Verdict::Skipped(Skip::Ignored) => Fact::Kept,
         Verdict::Skipped(Skip::Collision { owner }) => Fact::Clash(owner.clone()),
         Verdict::Skipped(Skip::Rejected { reason }) => Fact::NotSafe(reason.clone()),
+        Verdict::Skipped(Skip::Protected { reason }) => Fact::SyncOff(reason.clone()),
     })
 }
 
@@ -583,6 +736,7 @@ fn present(local: Option<&LocalStatus>, fact: Option<&Fact>) -> Shown {
         Some(Fact::Waiting) => shown("Managed again: the next check will handle it", "Managed again", Ok, &[]),
         Some(Fact::Clash(owner)) => shown(Verdict::Skipped(Skip::Collision { owner: owner.clone() }).message(), CLASH_TAG, Attention, &[]),
         Some(Fact::NotSafe(reason)) => shown(Verdict::Skipped(Skip::Rejected { reason: reason.clone() }).message(), NOT_SAFE_TAG, Attention, &[]),
+        Some(Fact::SyncOff(reason)) => shown(Verdict::Skipped(Skip::Protected { reason: reason.clone() }).message(), "Sync off", Ok, &[]),
         Some(Fact::Stopped(why)) => shown(format!("Not changed: {why}"), NOT_CHANGED_TAG, Attention, &[]),
         Some(Fact::Failed(why)) => shown(format!("Failed: {why}"), FAILED_TAG, Level::Error, &[]),
     }
@@ -615,6 +769,8 @@ fn plugin_row(report: &PluginReport) -> Row {
             Status::AlreadyTracked(id) => ("Already tracked", format!("Source {id} already tracks this plugin.")),
             Status::HostedElsewhere => ("Hosted elsewhere", "Hosted in another repository; this source does not manage it.".into()),
             Status::Rejected(why) => ("Rejected", format!("Rejected: {}.", why.trim_end_matches('.'))),
+            Status::NotSynced(why) => ("Not synced", format!("Not synced: {}.", why.trim_end_matches('.'))),
+            Status::Protected(why) => ("Kept as it is", format!("Kept as it is and not updated: {}.", why.trim_end_matches('.'))),
             Status::Blocked if report.result == ApplyResult::DryRun => {
                 ("Not checked in Copilot", "A dry run does not check the plugins installed in Copilot.".into())
             }
@@ -733,6 +889,8 @@ pub struct Board {
     /// Started at sign-in, nothing was looked at yet: the app waits for Windows to finish starting.
     waiting: bool,
     messages: VecDeque<Message>,
+    /// What each source's last complete listing held, by source ID. Display only.
+    seen: BTreeMap<String, Seen>,
 }
 
 impl Board {
@@ -746,9 +904,11 @@ impl Board {
         self.note_verify(&report.verify, now);
     }
 
-    /// A look at the disk replaces what was known about every folder. What upstream said stays.
+    /// A look at the disk replaces what was known about every folder of the lanes it walked. What upstream said stays,
+    /// and a lane it did not walk (its type is off) is left as it is.
     pub fn note_verify(&mut self, report: &VerifyReport, now: UnixSecs) {
-        for repo in self.repos.values_mut() {
+        let walked = |id: &str| report.lanes.iter().any(|lane| lane == id) || report.skills.iter().any(|found| found.repo_id == id);
+        for (_, repo) in self.repos.iter_mut().filter(|(id, _)| walked(id)) {
             for skill in repo.skills.values_mut() {
                 skill.local = None;
             }
@@ -769,7 +929,7 @@ impl Board {
                 });
             }
         }
-        for repo in self.repos.values_mut() {
+        for (_, repo) in self.repos.iter_mut().filter(|(id, _)| walked(id)) {
             repo.skills.retain(|_, skill| skill.local.is_some() || skill.fact.as_ref().is_some_and(|fact| !fact.needs_ownership()));
         }
         self.orphans = report.orphans.clone();
@@ -784,6 +944,9 @@ impl Board {
     pub(crate) fn note_source_sync(&mut self, report: &SyncReport, now: UnixSecs, cfg: &Config) {
         for repo_report in &report.repos {
             self.note_source_report(repo_report, now, cfg);
+        }
+        for (id, seen) in &report.seen {
+            self.seen.insert(id.clone(), seen.clone());
         }
         self.tell(now, &report.notes, &report.warnings);
     }
@@ -836,7 +999,7 @@ impl Board {
         let source = cfg.find(&report.repo_id);
         let kind = source.map_or(SourceKind::Skills, |s| s.kind);
         let label = source
-            .filter(|s| kind != SourceKind::Skills || cfg.repos.iter().any(|r| r.id != s.id && r.repo.eq_ignore_ascii_case(&s.repo)))
+            .filter(|s| kind != SourceKind::Skills || cfg.repos().iter().any(|r| r.id != s.id && r.repo.eq_ignore_ascii_case(&s.repo)))
             .map(|s| format!("{}: {} [{}]", kind.heading(), s.label(), s.id));
         let from = label.as_deref().unwrap_or_else(|| repo_name(&report.label));
         for verdict in [Verdict::Install, Verdict::Update, Verdict::Delete, Verdict::Adopt, Verdict::AdoptHistorical, Verdict::CatchUp] {
@@ -960,19 +1123,108 @@ impl Board {
         self.messages.iter()
     }
 
-    /// One entry per repository in the settings, in the same order.
+    /// One entry per lane in the settings, in the same order.
     pub fn views(&self, cfg: &Config, now: UnixSecs) -> Vec<RepoView> {
-        cfg.repos.iter().map(|repo| self.view_of(repo, now)).collect()
+        cfg.repos().iter().map(|repo| self.view_of(repo, now)).collect()
+    }
+
+    /// What each source's last complete listing held, by source ID. Display only.
+    pub fn set_seen(&mut self, seen: BTreeMap<String, Seen>) {
+        self.seen = seen;
+    }
+
+    pub fn seen(&self) -> &BTreeMap<String, Seen> {
+        &self.seen
+    }
+
+    /// One entry per source in the settings, in the same order, with its lanes grouped by type.
+    pub fn source_views(&self, cfg: &Config, now: UnixSecs) -> Vec<SourceView> {
+        cfg.sources().iter().map(|source| self.source_view(cfg, source, now)).collect()
+    }
+
+    fn source_view(&self, cfg: &Config, source: &SourceConfig, now: UnixSecs) -> SourceView {
+        let types = source.effective_types(cfg.global());
+        let seen = self.seen.get(&source.id);
+        let mut kinds = Vec::new();
+        // (level, status, detail, attention rows, lists nothing and has no rows)
+        let mut lanes = Vec::new();
+        let mut last_check = None;
+        let mut private = source.use_token;
+        // The listing has items of a type that is off.
+        let mut off_listed = false;
+        for (index, kind) in KINDS.into_iter().enumerate() {
+            let Some(lane) = source.lanes.id(kind) else { continue };
+            let board = self.repos.get(lane);
+            private |= board.is_some_and(|b| b.needs_token);
+            let on = types.enabled(kind);
+            let (rows, status, level) = match cfg.find(lane).filter(|_| on) {
+                Some(repo) => {
+                    let view = self.view_of(repo, now);
+                    last_check = last_check.max(view.last_check);
+                    // A later process does not remember an agents or instructions lane that listed nothing
+                    // (`engine::root`); the source's last complete listing, which found none of the type, says so too.
+                    let listed_none = board.is_some_and(|b| b.lists_nothing) || seen.is_some_and(|s| s.summary.found[index] == 0);
+                    let empty = listed_none && view.skills.is_empty() && view.level != Level::Error;
+                    let attention = view.skills.iter().filter(|r| r.level >= Level::Attention).count();
+                    lanes.push((view.level, view.status.clone(), view.detail.clone(), attention, empty));
+                    (view.skills, view.status, view.level)
+                }
+                None => {
+                    let mut rows = board.map(|b| b.rows(kind)).unwrap_or_default();
+                    for row in rows.iter_mut().filter(|r| r.level == Level::Ok) {
+                        row.tag = "Sync off";
+                        row.text = format!("Sync off: {} are not synced from this source, so it is kept as it is.", kind.heading());
+                        row.actions.clear();
+                    }
+                    off_listed |= seen.is_some_and(|s| s.summary.found[index] > 0) || rows.iter().any(|r| r.listed);
+                    (rows, "Sync off".to_string(), Level::Ok)
+                }
+            };
+            let found = seen.map(|s| s.summary.found[index]).unwrap_or(0);
+            if found == 0 && rows.is_empty() {
+                continue;
+            }
+            kinds.push(KindView {
+                kind,
+                lane: lane.to_string(),
+                on,
+                found: seen.map(|s| s.summary.installable[index]),
+                filtered: seen.map_or(0, |s| s.summary.filtered[index]),
+                notes: seen.map(|s| s.summary.notes.iter().filter(|n| n.kind == Some(kind)).cloned().collect()).unwrap_or_default(),
+                rows,
+                status,
+                level,
+            });
+        }
+        let (level, status, detail) =
+            if !source.enabled { (Level::Ok, "Disabled".to_string(), None) } else { worst_of(&source_label(source), lanes, off_listed) };
+        SourceView {
+            id: source.id.clone(),
+            label: source_label(source),
+            repo: source.repo.clone(),
+            branch: source.branch.clone(),
+            seen_branch: seen.map(|s| s.branch.clone()).filter(|b| !b.is_empty()),
+            folder: source.path.clone(),
+            enabled: source.enabled,
+            status,
+            detail,
+            level,
+            last_check,
+            private,
+            kinds,
+            notes: seen.map(|s| s.summary.notes.iter().filter(|n| n.kind.is_none()).cloned().collect()).unwrap_or_default(),
+            more_notes: seen.map_or(0, |s| s.summary.more_notes),
+        }
     }
 
     pub fn health(&self, cfg: &Config) -> Health {
         if self.working {
             return Health::Working;
         }
-        if !cfg.repos.iter().any(|repo| repo.enabled) {
+        if !cfg.repos().iter().any(|repo| repo.enabled) {
             return Health::NotConfigured;
         }
-        let from_repos = self.views(cfg, 0).iter().filter(|view| view.enabled).map(|view| view.level).max().unwrap_or(Level::Ok);
+        let from_repos = self.source_views(cfg, 0).iter().filter(|view| view.enabled).map(|view| view.level).max().unwrap_or(Level::Ok);
         let from_problem = if self.problem.is_some() || self.failure.is_some() { Level::Error } else { Level::Ok };
         match from_repos.max(from_problem) {
             // Nothing was looked at yet, so all is not known to be well.
@@ -985,18 +1237,25 @@ impl Board {
 
     /// The tray tooltip. It says what the state is, never when: it is not redrawn as time passes.
     pub fn tooltip(&self, cfg: &Config) -> String {
-        let views = self.views(cfg, 0);
+        let views = self.source_views(cfg, 0);
         let enabled = || views.iter().filter(|view| view.enabled);
-        let (one_item, many_items) = item_nouns(enabled().map(|v| v.kind));
+        let on_rows = |view: &SourceView| view.kinds.iter().filter(|k| k.on).flat_map(|k| k.rows.iter()).cloned().collect::<Vec<Row>>();
+        let syncing: Vec<SourceKind> = enabled().flat_map(|v| v.kinds.iter().filter(|k| k.on).map(|k| k.kind)).collect();
+        let (one_item, many_items) = if syncing.is_empty() {
+            item_nouns(enabled().flat_map(|v| cfg.lanes_of(&v.id).into_iter().map(|r| r.kind)))
+        } else {
+            item_nouns(syncing.iter().copied())
+        };
         let body = match self.health(cfg) {
             Health::Working => "checking for updates…".to_string(),
             Health::Waiting => "waiting for Windows to finish starting".to_string(),
             Health::NotConfigured => "no repositories are set up".to_string(),
+            Health::Ok if syncing.is_empty() && enabled().any(|v| !v.kinds.is_empty()) => "nothing is being synced".to_string(),
             Health::Ok => format!("all {many_items} are up to date"),
             Health::Attention => {
-                let count: usize = enabled().map(|view| view.skills.iter().filter(|row| row.level >= Level::Attention).count()).sum();
+                let count: usize = enabled().map(|view| on_rows(view).iter().filter(|row| row.level >= Level::Attention).count()).sum();
                 // A repository that needs attention without a single skill to blame is one that lists none.
-                let empty: Vec<&RepoView> = enabled().filter(|view| view.level >= Level::Attention && view.skills.is_empty()).collect();
+                let empty: Vec<&SourceView> = enabled().filter(|view| view.level >= Level::Attention && on_rows(view).is_empty()).collect();
                 match (count, empty.as_slice()) {
                     (0, [one]) => format!("{}: {}", one.label, one.status),
                     (0, many) if !many.is_empty() => format!("{} repositories have no {many_items}", many.len()),
@@ -1005,7 +1264,7 @@ impl Board {
                 }
             }
             Health::Error => {
-                let failed: Vec<&RepoView> = enabled().filter(|view| view.level == Level::Error).collect();
+                let failed: Vec<&SourceView> = enabled().filter(|view| view.level == Level::Error).collect();
                 match (self.problem.as_ref().or(self.failure.as_ref()), failed.as_slice()) {
                     (Some(problem), _) => problem.clone(),
                     (None, [one]) => format!("{}: {}", one.label, one.status),
@@ -1079,7 +1338,7 @@ fn judge(repo: &RepoConfig, board: Option<&RepoBoard>, rows: &[Row], now: UnixSe
         if repo.kind != SourceKind::Skills {
             let status = format!("No {} found", repo.kind.nouns().1);
             let level = if repo.kind == SourceKind::Plugins { Level::Ok } else { Level::Attention };
-            return (level, status.clone(), Some(format!("{status} in {}. Check the source type, branch and folder.", repo.label())));
+            return (level, status.clone(), Some(format!("{status} in {}. Check the branch and folder.", repo.label())));
         }
         return (Level::Attention, NO_SKILLS.to_string(), Some(no_skills_advice(repo)));
     }
@@ -1231,46 +1490,9 @@ mod tests {
         }
     }
 
-    #[test]
-    fn plugin_preview_explains_an_empty_match_without_a_file_destination() {
-        let mut cfg = Config::default();
-        let source = cfg.add_source(SourceKind::Plugins, &crate::config::RepoSpec::parse("https://github.com/o/r/tree/main").unwrap(), None, false);
-        let empty = SourcePreview { kind: source.kind, names: vec![], destination: PreviewDestination::NotChecked, errors: vec![], plugins: None };
-        let description = empty.description(source);
-        assert!(description.contains("Installs with: GitHub Copilot CLI"), "{description}");
-        assert!(description.contains("Matched no plugins."));
-        assert!(empty.blocker(source).unwrap().contains("source folder"));
-        assert!(!description.contains("Destination:"));
-    }
-
     use super::*;
     use crate::engine::{LocalReport, Tracking};
 
-    #[test]
-    fn add_source_empty_previews_have_no_list_heading() {
-        let summaries = [SourceKind::Skills, SourceKind::Agents, SourceKind::Instructions].map(|kind| {
-            let empty = SourcePreview { kind, names: vec![], destination: PreviewDestination::NotChecked, errors: vec![], plugins: None };
-            empty.description(&repo("o/r", true)).lines().last().unwrap().to_string()
-        });
-        assert_eq!(summaries, ["Matched no skills.", "Matched no agents.", "Matched no instruction files."]);
-    }
-
-    #[test]
-    fn add_source_empty_skills_preview_says_what_file_was_missing() {
-        let source = RepoConfig::default();
-        let empty = SourcePreview { kind: source.kind, names: vec![], destination: PreviewDestination::NotChecked, errors: vec![], plugins: None };
-        assert_eq!(empty.blocker(&source), Some("No folders with a SKILL.md file were found. Check the source type and folder."));
-    }
-
-    #[test]
-    fn continuation_an_empty_loose_source_does_not_say_it_was_looking_for_skills() {
-        let source = RepoConfig { kind: SourceKind::Instructions, ..Default::default() };
-        let empty = SourcePreview { kind: source.kind, names: vec![], destination: PreviewDestination::NotChecked, errors: vec![], plugins: None };
-        assert!(empty.blocker(&source).unwrap().contains("*.instructions.md"), "{:?}", empty.blocker(&source));
-        let source = RepoConfig { kind: SourceKind::Agents, ..Default::default() };
-        let empty = SourcePreview { kind: source.kind, ..empty };
-        assert!(empty.blocker(&source).unwrap().contains("*.agent.md"), "{:?}", empty.blocker(&source));
-    }
     use crate::reconcile::DirtyInfo;
     use crate::tree::Rejected;
     use crate::verify::{Check, Stats};
@@ -1283,7 +1505,7 @@ mod tests {
     }
 
     fn cfg(repos: &[(&str, bool)]) -> Config {
-        Config { repos: repos.iter().map(|(id, enabled)| repo(id, *enabled)).collect(), ..Config::default() }
+        Config::from_lanes(repos.iter().map(|(id, enabled)| repo(id, *enabled)).collect())
     }
 
     fn one() -> Config {
@@ -1327,7 +1549,7 @@ mod tests {
     }
 
     fn sync_of(repos: Vec<RepoReport>) -> SyncReport {
-        SyncReport { repos, notes: Vec::new(), warnings: Vec::new() }
+        SyncReport { repos, notes: Vec::new(), warnings: Vec::new(), seen: Vec::new() }
     }
 
     fn failure(kind: FailureKind) -> Failure {
@@ -1352,9 +1574,18 @@ mod tests {
         board
     }
 
+    /// A look at the disk that walked the lanes of what it found.
     fn verified(found: Vec<(&str, &str, LocalStatus)>) -> VerifyReport {
+        let mut lanes: Vec<String> = found.iter().map(|(repo_id, _, _)| repo_id.to_string()).collect();
+        lanes.dedup();
+        walked(&lanes.iter().map(String::as_str).collect::<Vec<_>>(), found)
+    }
+
+    /// A look at the disk that walked `lanes` and found `found`.
+    fn walked(lanes: &[&str], found: Vec<(&str, &str, LocalStatus)>) -> VerifyReport {
         VerifyReport {
             skills: found.into_iter().map(|(repo_id, name, status)| LocalReport { repo_id: repo_id.to_string(), name: name.to_string(), status }).collect(),
+            lanes: lanes.iter().map(|lane| lane.to_string()).collect(),
             orphans: Vec::new(),
             stats: Stats::default(),
             tracking: Tracking { check: Check::Full, volume_changed: false, journal: true, folder_missing: false },
@@ -1390,6 +1621,43 @@ mod tests {
     fn sorted(mut list: Vec<String>) -> Vec<String> {
         list.sort();
         list
+    }
+
+    /// Source `s` with a lane for every type, all on.
+    fn mixed() -> Config {
+        let mut cfg = Config::default();
+        let (id, lanes) = crate::sources::allocate_source_ids("s", &mut cfg.taken_ids());
+        cfg.add_source_config(SourceConfig { id, repo: "o/s".into(), lanes, ..SourceConfig::default() }).unwrap();
+        cfg
+    }
+
+    #[test]
+    fn a_source_is_one_entry_with_the_worst_status_of_its_types() {
+        let cfg = mixed();
+        assert_eq!(cfg.repos().len(), 4);
+        let seen = Seen { summary: crate::inventory::Summary { found: [1, 1, 0, 0], installable: [1, 1, 0, 0], ..Default::default() }, ..Seen::default() };
+        let mut board = Board::new();
+        board.set_seen(BTreeMap::from([("s".to_string(), seen)]));
+        board.note_sync(
+            &sync_of(vec![
+                report("s", Outcome::Unchanged, vec![in_sync("alpha")]),
+                report("s-agents", Outcome::Unchanged, vec![deleted_locally("helper.agent.md")]),
+                nothing_listed("s-instructions", Outcome::Unchanged, vec![]),
+                nothing_listed("s-plugins", Outcome::Unchanged, vec![]),
+            ]),
+            NOW,
+        );
+        let views = board.source_views(&cfg, NOW);
+        assert_eq!(views.len(), 1, "one entry per source, not per lane");
+        let view = &views[0];
+        assert_eq!((view.level, view.status.as_str()), (Level::Attention, "Needs attention (1)"));
+        assert_eq!(view.types_line(), "Skills 1 | Agents 1 (1 needs attention)", "types with nothing found or owned are not shown");
+        assert_eq!(board.health(&cfg), Health::Attention);
+
+        board.note_sync(&sync_of(vec![report("s-plugins", failed(FailureKind::Network), vec![])]), NOW);
+        let view = board.source_views(&cfg, NOW).remove(0);
+        assert_eq!(view.level, Level::Error, "a type that could not be checked is the worst");
+        assert_eq!(board.health(&cfg), Health::Error);
     }
 
     #[test]
@@ -1777,7 +2045,7 @@ mod tests {
     #[test]
     fn the_tooltip_always_fits() {
         let long = RepoConfig { id: "a".to_string(), repo: format!("owner/{}", "n".repeat(300)), ..RepoConfig::default() };
-        let config = Config { repos: vec![long], ..Config::default() };
+        let config = Config::from_lanes(vec![long]);
         let tip = after(failed(FailureKind::Network), Vec::new()).tooltip(&config);
         assert_eq!(tip.encode_utf16().count(), TOOLTIP_UNITS, "{tip}");
         assert!(tip.ends_with('…'));
@@ -1961,7 +2229,7 @@ mod tests {
         board.note_sync(&sync_of(vec![nothing_listed("a", Outcome::Unchanged, Vec::new())]), NOW);
         assert_eq!(view(&board).status, "No skills found");
         board.note_sync(&sync_of(vec![report("a", Outcome::Unchanged, vec![in_sync("s")])]), NOW);
-        board.note_verify(&verified(Vec::new()), NOW);
+        board.note_verify(&walked(&["a"], Vec::new()), NOW);
         assert!(view(&board).skills.is_empty());
         assert_ne!(view(&board).status, "No skills found");
     }
@@ -1975,7 +2243,7 @@ mod tests {
         board.note_private("a", false);
         assert!(!view(&board).private, "read without the token again");
 
-        let marked = Config { repos: vec![RepoConfig { use_token: true, ..repo("a", true) }], ..Config::default() };
+        let marked = Config::from_lanes(vec![RepoConfig { use_token: true, ..repo("a", true) }]);
         assert!(Board::new().views(&marked, NOW)[0].private, "marked to send the token");
 
         let mut untouched = Board::new();
@@ -1986,7 +2254,7 @@ mod tests {
     #[test]
     fn what_to_do_about_no_skills_depends_on_where_the_repository_was_looked_at() {
         let said = |branch: &str, path: &str| {
-            let config = Config { repos: vec![RepoConfig { branch: branch.to_string(), path: path.to_string(), ..repo("a", true) }], ..Config::default() };
+            let config = Config::from_lanes(vec![RepoConfig { branch: branch.to_string(), path: path.to_string(), ..repo("a", true) }]);
             after_nothing(Outcome::Unchanged, Vec::new()).views(&config, NOW).remove(0).detail.expect("a detail")
         };
         assert!(said("", "").contains("https://github.com/owner/a/tree/main/skills"));
@@ -2288,5 +2556,117 @@ mod tests {
         assert_eq!(ids, ["b", "new"], "in the order of the settings; a repository that is not in them is not shown");
         assert_eq!(views[0].label, "owner/b");
         assert_eq!(board.health(&cfg(&[("b", true)])), Health::Ok, "nor does it count");
+    }
+
+    /// What the last complete listing of source `s` found and could sync, as [skills, agents, instructions, plugins].
+    fn seen_found(found: [u32; 4]) -> BTreeMap<String, Seen> {
+        let summary = crate::inventory::Summary { found, installable: found, ..Default::default() };
+        BTreeMap::from([("s".to_string(), Seen { summary, ..Seen::default() })])
+    }
+
+    /// `mixed()` with one type turned off in the global settings.
+    fn mixed_without(kind: SourceKind) -> Config {
+        let mut cfg = mixed();
+        cfg.edit(|_, g| g.set_type(kind, false));
+        cfg
+    }
+
+    /// A check of every lane of `mixed()` that GitHub answered with "not modified".
+    fn all_unchanged() -> SyncReport {
+        sync_of(["s", "s-agents", "s-instructions", "s-plugins"].into_iter().map(|id| report(id, Outcome::Unchanged, Vec::new())).collect())
+    }
+
+    #[test]
+    fn issue8_an_installed_agent_has_a_row_again_after_agents_are_turned_off_and_on() {
+        let on = mixed();
+        let mut board = Board::new();
+        board.set_seen(seen_found([1, 1, 0, 0]));
+        board.note_verify(&verified(vec![("s", "alpha", clean()), ("s-agents", "helper.agent.md", clean())]), NOW);
+        board.note_source_sync(
+            &sync_of(vec![
+                report("s", Outcome::Unchanged, vec![in_sync("alpha")]),
+                report("s-agents", Outcome::Unchanged, vec![in_sync("helper.agent.md")]),
+                nothing_listed("s-instructions", Outcome::Unchanged, vec![]),
+                nothing_listed("s-plugins", Outcome::Unchanged, vec![]),
+            ]),
+            NOW,
+            &on,
+        );
+        let agents = |board: &Board| {
+            let view = board.source_views(&on, NOW).remove(0);
+            view.kinds.into_iter().find(|k| k.kind == SourceKind::Agents).map(|k| k.rows.into_iter().map(|r| r.name).collect::<Vec<_>>())
+        };
+        assert_eq!(agents(&board), Some(vec!["helper.agent.md".to_string()]), "the agent is listed before Agents is turned off");
+
+        // Agents off: a look at the disk covers only the lanes of the types that sync (`engine::verify_in` walks
+        // `cfg.repos()`), so it says nothing about the agent.
+        board.note_verify(&verified(vec![("s", "alpha", clean())]), NOW);
+        // Agents on again. The check this queues can be answered "not modified", because the lane kept its saved
+        // listing tag: no listing, and no look at the disk.
+        board.note_source_sync(&all_unchanged(), NOW, &on);
+        assert_eq!(
+            agents(&board),
+            Some(vec!["helper.agent.md".to_string()]),
+            "the installed, up-to-date agent has its row once Agents is on again, not 'Its agents are listed here after the next check'"
+        );
+    }
+
+    #[test]
+    fn issue8_a_source_whose_items_are_all_of_a_type_that_is_off_is_not_nothing_found() {
+        let off = mixed_without(SourceKind::Skills);
+        let mut board = Board::new();
+        board.set_seen(seen_found([3, 0, 0, 0]));
+        board.note_source_sync(
+            &sync_of(vec![
+                report("s", Outcome::Unchanged, vec![in_sync("alpha"), in_sync("beta"), in_sync("gamma")]),
+                nothing_listed("s-agents", Outcome::Unchanged, vec![]),
+                nothing_listed("s-instructions", Outcome::Unchanged, vec![]),
+                nothing_listed("s-plugins", Outcome::Unchanged, vec![]),
+            ]),
+            NOW,
+            &mixed(),
+        );
+        let view = board.source_views(&off, NOW).remove(0);
+        let skills = view.kinds.iter().find(|k| k.kind == SourceKind::Skills).expect("the skills are still shown");
+        assert_eq!(skills.rows.iter().map(|r| r.tag).collect::<Vec<_>>(), ["Sync off"; 3]);
+        assert_eq!((view.level, view.status.as_str(), view.detail.as_deref()), (Level::Ok, "Sync off", None), "the rows the listing had");
+
+        // After a restart only the summary of the last listing says the skills are there.
+        let mut restarted = Board::new();
+        restarted.set_seen(seen_found([3, 0, 0, 0]));
+        for lane in ["s-agents", "s-instructions", "s-plugins"] {
+            restarted.note_last_check(lane, CHECKED);
+            restarted.note_lists_nothing(lane, true);
+        }
+        let view = restarted.source_views(&off, NOW).remove(0);
+        assert_eq!((view.level, view.status.as_str(), view.detail.as_deref()), (Level::Ok, "Sync off", None), "the summary of the last listing");
+    }
+
+    #[test]
+    fn issue8_the_tray_does_not_call_types_that_are_off_up_to_date() {
+        let off = mixed_without(SourceKind::Skills);
+        let mut board = Board::new();
+        board.set_seen(seen_found([3, 0, 0, 0]));
+        let lanes = ["s-agents", "s-instructions", "s-plugins"].into_iter().map(|id| nothing_listed(id, Outcome::Unchanged, vec![]));
+        board.note_source_sync(&sync_of(std::iter::once(report("s", Outcome::Unchanged, vec![in_sync("alpha")])).chain(lanes).collect()), NOW, &mixed());
+        assert_eq!(board.health(&off), Health::Ok, "nothing is wrong, so the icon stays as it is");
+        assert_eq!(board.tooltip(&off), "Tiny Skill Sync: nothing is being synced");
+        assert_eq!(board.tooltip(&mixed()), "Tiny Skill Sync: all skills are up to date", "a type that syncs is still counted");
+    }
+
+    #[test]
+    fn issue8_a_listing_with_nothing_of_any_type_is_still_nothing_found() {
+        let nothing = || {
+            let mut board = Board::new();
+            board.set_seen(seen_found([0, 0, 0, 0]));
+            let lanes = ["s", "s-agents", "s-instructions", "s-plugins"];
+            board.note_source_sync(&sync_of(lanes.into_iter().map(|id| nothing_listed(id, Outcome::Unchanged, vec![])).collect()), NOW, &mixed());
+            board
+        };
+        for cfg in [mixed(), mixed_without(SourceKind::Skills)] {
+            let view = nothing().source_views(&cfg, NOW).remove(0);
+            assert_eq!((view.level, view.status.as_str()), (Level::Attention, "Nothing found"), "skills on: {}", cfg.global().types.skills);
+            assert!(view.detail.is_some_and(|d| d.contains("Check the branch and folder")));
+        }
     }
 }

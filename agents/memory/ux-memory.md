@@ -26,6 +26,15 @@
 - `-Filter cli` runs the lib `cli` tests and only `tests\cli.rs` tests whose names contain "cli".
 - Live evidence: screenshots in `bench\out\shots-<stamp>\`, logs in `bench\out\e2e-<stamp>.txt`.
 
+- Issue #8 (mixed sources): `page::what_to_sync` `combo_line` sizes each combo from its label width (caps the label at
+  120 DIP), so at the default list width in a 640-wide window "Repository-specific skills and agents" and its value
+  ("Default ...") are both cut; screenshots 05e/05g/17-long-names-narrow-items show it.
+- `board::item_nouns` falls back to Skills for an empty iterator, so `page::hero_of` says "All skills are up to date /
+  0 skills" when every detected type is off (07c shot).
+- Source entries in the nav (`Look::Source`) have no tooltip; type-icon labels exist only in the accessible name
+  (`page::nav_name`). Item rows do have hover tips (`control::row_tool_move`).
+- Live UI shot names: 05e/05f/05g come in compact and wide pairs; 17-long-names-{narrow,narrow-items,wide}.
+
 ## Baselines
 
 - 2026-11-20, uncommitted issue #7 F on 893cebe: `scripts\dev.ps1 test -Quick -Filter page` 36 passed;

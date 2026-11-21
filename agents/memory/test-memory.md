@@ -23,6 +23,12 @@
 - `tests\cli.rs` `tss()` runs `cli::run` in-process with a TestHost and FakePluginManager; no exe is spawned.
 - No test constructs the real `Copilot` manager; engine tests inject FakePluginManager via `with_plugin_manager`. An unscripted
   fake mutation panics; `Done(None)` means exit 0 with no change. Never mutate `copilot.rs` `launch()`: it could reach the real CLI.
+- Smart App Control (os error 4551) blocks fresh build-script and test exes in a new CARGO_TARGET_DIR. Seed it with
+  `robocopy target\<idle-dir> target\rev-test /E` and, if a test exe stays blocked, rebuild from a source copy in
+  `target\rev-copy` (no `.cargo` folder there: a nested copy merges rustflags and rebuilds everything) with a salt comment
+  added to that copy's test file. Mutants also go in that copy, so the shared tree other agents build is never touched.
+- `FakeRemote::tree` ETags hash only the listed entries by default, as real GitHub answers HEAD and the branch by name with
+  the same ETag. `set_branch_etags(repo, true)` makes them differ per ref, so a test can tell which ETag the engine kept.
 - Released v0.7.0 has state format 1 and refuses format 2; format 2 first appeared unreleased (loose sources, then plugins).
 
 ## Coverage gaps seen (issue #7 F, uncommitted review)
@@ -30,11 +36,28 @@
 - Untested at review time: remove `--uninstall-plugins` "held" branch (`engine\plugins.rs`), `launch()` isolation wiring and
   error mapping, mid-action timeout/cancel in a check, failed native probe before planning, plugin kind guards in `tss resolve`/`remove`.
 
+## Coverage gaps seen (issue #8, uncommitted review)
+
+- Fixed and covered: bundled or filtered items no longer cancel a lane's empty-listing guard; a finished history search keeps
+  an unchanged mixed source at one request; E (HEAD ETag kept), type off/on holds an edit, two sources on one agent,
+  `check_claims`, and the instructions-lane guard in a mixed source now have tests that killed their mutants.
+- Still untested: the single confirm for a mass delete (`window.rs` `act`); only a live UI run can count the dialogs.
+
 ## Baselines
 
 - Relaunch restart tests (proc, app, updater x2, shell) pass by filter; relaunch-smoke.ps1 -NoBuild: 5 PASS, exit 0 (one run observed by the test specialist).
 - Issue #7 F (uncommitted): `-Filter plugin` 44 passed (23 lib, 1 app, 4 cli, 16 engine_plugins); `-Filter copilot` 4 passed;
   `add_source` 3 passed.
+- Issue #8 (uncommitted, 2026-11-21, final gate): lib 620, app 44, cli 63, downtime 23, engine_failures 29, engine_lanes 28,
+  engine_lifecycle 41, engine_plugins 43, engine_sources 9, engine_sync 57, http 21, plugin_manager 1, source_preview 3: all pass.
+  Mutants killed: `root.rs` per-lane confirm, `cli.rs` F rule, `fresh_lane_ids` foreign-record check.
+- Issue #8 UX tests (`issue8_` in `page.rs`, `control.rs`, `board.rs`) check the pure Surface and Board: the hero and tray
+  tooltip when every type is off, What to sync layout at 344/420/560/900 px, the Edit-first empty preview, the source tooltip.
+- The ui e2e uses most of the anonymous 60 requests/hour by itself. In a rate-limited run, checks that look local-only
+  can fail too (08:46 ui run: two repo-specific switch checks failed, then passed on the rerun after the reset). Rerun
+  after the reset before triaging. Only scenarios that strip `gh` from the PATH (mixed, portable, the private step
+  without sign-in) or poll `Get-PublicCommit`/`Get-PublicFiles` (unmanaged, stale, plugins, ui, mixed) need the
+  anonymous quota; the app falls back to the `gh` token when the anonymous limit is reached.
 
 ## Open proposals
 

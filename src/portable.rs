@@ -16,15 +16,17 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::config::{
-    Config, DEFAULT_INTERVAL, Format, RepoConfig, UpdatePrefs, legacy_version, parse_json_object, read_optional, settings_write_lock, source_version,
-    write_json_atomic,
+    Config, DEFAULT_INTERVAL, Format, RepoConfig, UpdatePrefs, assign_legacy_ids, legacy_version, parse_json_object, read_optional, settings_write_lock,
+    source_version, write_json_atomic,
 };
 use crate::interval::Interval;
+use crate::sources::{GlobalSettings, SourceConfig};
 
 pub const SETTINGS_FILE: &str = "tiny-skill-sync.settings.json";
 pub const SOURCES_FILE: &str = "tiny-skill-sync.sources.json";
 pub const SETTINGS_VERSION: u32 = 1;
-pub const SOURCES_VERSION: u32 = 2;
+/// Format 3 lists location-based sources and the global type and filter settings; 1 and 2 are migrated on load.
+pub const SOURCES_VERSION: u32 = crate::sources::CONFIG_VERSION;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct WriteResult {
@@ -70,22 +72,37 @@ impl Settings {
 #[serde(deny_unknown_fields)]
 struct Sources {
     version: u32,
+    #[serde(default, skip_serializing_if = "is_default_global")]
+    global: GlobalSettings,
+    #[serde(default)]
+    sources: Vec<SourceConfig>,
+}
+
+fn is_default_global(global: &GlobalSettings) -> bool {
+    *global == GlobalSettings::default()
+}
+
+/// Format 1 and 2: one entry per typed source. Read only, to migrate.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacySources {
+    #[allow(dead_code)]
+    version: u32,
     #[serde(default)]
     repos: Vec<RepoConfig>,
 }
 
 impl Default for Sources {
     fn default() -> Self {
-        Sources { version: legacy_version(), repos: Vec::new() }
+        Sources { version: SOURCES_VERSION, global: GlobalSettings::default(), sources: Vec::new() }
     }
 }
 
 impl Sources {
     fn from_config(config: &Config) -> Sources {
-        Sources { version: config.wire_version(), repos: config.repos.clone() }
+        Sources { version: SOURCES_VERSION, global: config.global().clone(), sources: config.sources().to_vec() }
     }
 }
-
 /// Exports a local configuration without replacing either companion file. The skills folder is
 /// deliberately omitted because its default belongs to each machine.
 pub fn export(directory: &Path, config: &Config) -> Result<(), String> {
@@ -146,30 +163,36 @@ fn parse_settings(bytes: &[u8], path: &Path) -> Result<Settings, String> {
 
 fn parse_sources(bytes: &[u8], path: &Path) -> Result<Sources, String> {
     let invalid = |error| format!("{} is not valid: {error} ({})", SOURCES_FILE, path.display());
+    let at = |error: String| format!("{error} ({})", path.display());
     let Format { version } = parse_json_object(bytes).map_err(invalid)?;
-    if version != legacy_version() {
-        validate_version(SOURCES_FILE, version, SOURCES_VERSION).map_err(|error| format!("{error} ({})", path.display()))?;
+    let sources = if (legacy_version()..SOURCES_VERSION).contains(&version) {
+        legacy_sources(bytes, version).map_err(at)?
+    } else {
+        validate_version(SOURCES_FILE, version, SOURCES_VERSION).map_err(at)?;
+        parse_json_object(bytes).map_err(invalid)?
+    };
+    // Fill missing IDs the way local settings do, so a comparison with a loaded config is exact.
+    let config = Config::from_parts(None, DEFAULT_INTERVAL, UpdatePrefs::default(), sources.global, sources.sources).map_err(at)?;
+    Ok(Sources::from_config(&config))
+}
+
+fn legacy_sources(bytes: &[u8], version: u32) -> Result<Sources, String> {
+    let mut legacy: LegacySources = parse_json_object(bytes).map_err(|error| format!("{SOURCES_FILE} is not valid: {error}"))?;
+    if version < source_version(&legacy.repos) {
+        return Err(format!("typed sources require {SOURCES_FILE} format 2"));
     }
-    let mut sources: Sources = parse_json_object(bytes).map_err(invalid)?;
-    sources.version = source_version(&sources.repos);
-    if version < sources.version {
-        return Err(format!("typed sources require {SOURCES_FILE} format 2 ({})", path.display()));
-    }
-    let mut config = Config { repos: sources.repos, ..Config::default() };
-    config.assign_missing_ids();
-    config.check_typed_ids()?;
-    sources.repos = config.repos;
-    Ok(sources)
+    assign_legacy_ids(&mut legacy.repos);
+    let sources = crate::sources::migrate_legacy(&legacy.repos, &std::collections::HashSet::new())?;
+    Ok(Sources { sources, ..Sources::default() })
 }
 
 /// Loads portable companions beside `directory`. `Ok(None)` means neither exists and local mode
 /// should remain active; a present but unreadable, malformed, unknown-key, or unsupported file is
-/// an error and must not be replaced.
+/// an error and must not be replaced. Format 1 and 2 sources are migrated in memory.
 pub fn load(directory: &Path) -> Result<Option<Config>, String> {
-    load_sources(directory)?.map(Config::skills_only).transpose()
+    load_sources(directory)
 }
 
-/// The typed settings model. Only the guarded [`load`] is used by today's skills-only consumers.
 pub fn load_sources(directory: &Path) -> Result<Option<Config>, String> {
     let settings_path = directory.join(SETTINGS_FILE);
     let sources_path = directory.join(SOURCES_FILE);
@@ -182,10 +205,9 @@ pub fn load_sources(directory: &Path) -> Result<Option<Config>, String> {
     let settings = settings_bytes.as_deref().map(|bytes| parse_settings(bytes, &settings_path)).transpose()?.unwrap_or_default();
     let sources = sources_bytes.as_deref().map(|bytes| parse_sources(bytes, &sources_path)).transpose()?.unwrap_or_default();
 
-    let config = Config { skills_dir: settings.skills_dir, default_interval: settings.default_interval, app_update: settings.app_update, repos: sources.repos };
+    let config = Config::from_parts(settings.skills_dir, settings.default_interval, settings.app_update, sources.global, sources.sources)?;
     Ok(Some(config))
 }
-
 /// Writes the settings and repository portions whose values changed from `before` to `after`.
 /// Existing companions are parsed before any write, and a changed file must still match `before`;
 /// this prevents malformed or concurrently edited settings from being overwritten.
@@ -316,12 +338,13 @@ mod tests {
         assert_eq!(fs::read(dir.join(SETTINGS_FILE)).unwrap(), settings.as_bytes());
         let typed = fs::read(dir.join(SOURCES_FILE)).unwrap();
         assert!(!accepts_sources(&typed));
+        assert_eq!(serde_json::from_slice::<serde_json::Value>(&typed).unwrap()["version"], 3);
         assert_eq!(load_sources(&dir).unwrap().unwrap(), mixed);
-        assert!(load(&dir).is_err());
-        assert!(save_changes(&dir, &old, &mixed).is_err(), "stale v1 writer");
+        assert_eq!(load(&dir).unwrap().unwrap(), mixed, "mixed types load normally now");
+        assert!(save_changes(&dir, &old, &mixed).is_err(), "stale writer");
         assert_eq!(fs::read(dir.join(SOURCES_FILE)).unwrap(), typed);
         save_changes(&dir, &mixed, &old).unwrap();
-        assert!(accepts_sources(&fs::read(dir.join(SOURCES_FILE)).unwrap()));
+        assert_eq!(load(&dir).unwrap().unwrap(), old);
         assert_eq!(fs::read(dir.join(SETTINGS_FILE)).unwrap(), settings.as_bytes());
         let shared = temp_dir("typed-export");
         export(&shared, &mixed).unwrap();
@@ -365,7 +388,7 @@ mod tests {
         let config = load(&dir).unwrap().unwrap();
         assert_eq!(config.default_interval, Interval::new(12, Unit::Hour));
         assert_eq!(config.app_update, UpdatePrefs::default());
-        assert!(config.repos.is_empty());
+        assert!(config.repos().is_empty());
         assert_eq!(config.skills_dir, None);
 
         fs::remove_file(dir.join(SETTINGS_FILE)).unwrap();
@@ -374,7 +397,7 @@ mod tests {
         assert_eq!(config.default_interval, DEFAULT_INTERVAL);
         assert_eq!(config.app_update, UpdatePrefs::default());
         assert_eq!(config.skills_dir, None);
-        assert_eq!(config.repos[0].id, "shared-id");
+        assert_eq!(config.repos()[0].id, "shared-id");
 
         fs::remove_dir_all(dir).unwrap();
     }
@@ -390,13 +413,33 @@ mod tests {
         );
 
         let config = load(&dir).unwrap().unwrap();
-        assert_eq!(config.repos[0].id, "stable-id");
-        assert_eq!(config.repos[0].repo, "o/r");
-        assert_eq!(config.repos[0].interval, Some(Interval::new(6, Unit::Hour)));
-        assert!(!config.repos[0].enabled);
-        assert!(config.repos[0].use_token);
+        assert_eq!(config.repos()[0].id, "stable-id");
+        assert_eq!(config.repos()[0].repo, "o/r");
+        assert_eq!(config.repos()[0].interval, Some(Interval::new(6, Unit::Hour)));
+        assert!(!config.repos()[0].enabled);
+        assert!(config.repos()[0].use_token);
         assert_eq!(config.skills_dir.as_deref(), Some(r"%USERPROFILE%\.copilot\skills"));
 
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn an_exported_folder_carries_sources_and_global_rules_unchanged() {
+        let dir = temp_dir("export-v3");
+        let local = Config::parse(
+            br#"{"version":3,"global":{"types":{"agents":false},"ignore_folders":["demo"]},
+            "sources":[{"id":"kit","repo":"o/kit","branch":"dev","types":{"plugins":true},"ignore_allow":["demo"],"interval":"6h",
+            "lanes":{"skills":"kit","agents":"kit-agents","instructions":"kit-instructions","plugins":"kit-plugins"}}]}"#,
+        )
+        .unwrap();
+        let target = dir.join("out");
+        fs::create_dir(&target).unwrap();
+        export(&target, &local).unwrap();
+        let sources: serde_json::Value = serde_json::from_slice(&fs::read(target.join(SOURCES_FILE)).unwrap()).unwrap();
+        assert_eq!(sources["version"], SOURCES_VERSION);
+        let back = load(&target).unwrap().unwrap();
+        assert_eq!(back.sources(), local.sources());
+        assert_eq!(back.global(), local.global());
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -444,7 +487,7 @@ mod tests {
         let mut before = Config::default();
         let repo = RepoSpec::parse("o/r").unwrap();
         before.add_repo(&repo, Some(Interval::new(6, Unit::Hour)), true);
-        before.repos[0].id = "original-id".to_string();
+        before.update_lane_at(0, |r| r.id = "original-id".to_string());
         let sources = Sources::from_config(&before);
         fs::write(dir.join(SOURCES_FILE), serde_json::to_vec_pretty(&sources).unwrap()).unwrap();
         let source_bytes = fs::read(dir.join(SOURCES_FILE)).unwrap();
@@ -465,7 +508,7 @@ mod tests {
         write_json(&dir, SOURCES_FILE, r#"{"version":1,"repos":[]}"#);
         let before = Config::default();
         let mut after = before.clone();
-        after.repos.push(RepoConfig { id: "kept-id".into(), repo: "o/r".into(), ..RepoConfig::default() });
+        after.push_lane(RepoConfig { id: "kept-id".into(), repo: "o/r".into(), ..RepoConfig::default() });
         let written = save_changes(&dir, &before, &after).unwrap();
         assert_eq!(written, WriteResult { settings_written: false, sources_written: true });
 

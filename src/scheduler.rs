@@ -102,12 +102,12 @@ impl Schedule {
 
     /// Repositories that are due, in the order they appear in the settings.
     pub fn due_repos(&self, cfg: &Config, state: &State, now: UnixSecs) -> Vec<String> {
-        cfg.repos.iter().filter(|r| schedulable(cfg, r)).filter(|r| self.due_of(cfg, r, state, now) <= now).map(|r| r.id.clone()).collect()
+        cfg.repos().iter().filter(|r| schedulable(cfg, r)).filter(|r| self.due_of(cfg, r, state, now) <= now).map(|r| r.id.clone()).collect()
     }
 
     /// When the app next needs to wake up. `None` means never (nothing is configured): a fully idle process.
     pub fn next_wake(&self, cfg: &Config, state: &State, now: UnixSecs) -> Option<UnixSecs> {
-        cfg.repos.iter().filter(|r| schedulable(cfg, r)).map(|r| self.due_of(cfg, r, state, now)).min()
+        cfg.repos().iter().filter(|r| schedulable(cfg, r)).map(|r| self.due_of(cfg, r, state, now)).min()
     }
 
     fn due_of(&self, cfg: &Config, repo: &RepoConfig, state: &State, now: UnixSecs) -> UnixSecs {
@@ -154,7 +154,9 @@ mod tests {
     }
 
     fn config(default_interval: Interval, repos: Vec<RepoConfig>) -> Config {
-        Config { default_interval, repos, ..Config::default() }
+        let mut cfg = Config::from_lanes(repos);
+        cfg.default_interval = default_interval;
+        cfg
     }
 
     /// Repositories whose last check settled everything (so they kept an ETag).

@@ -477,7 +477,11 @@ $UiId = @{
     Sync = 200; HeroTitle = 201; HeroSub = 202
     NavAdd = 300; NavActivity = 301; NavSettings = 302; NavHead = 303; NavRepo = 1000
     WelcomeAdd = 305; More = 310; Every = 311; Enabled = 312; Retry = 313; OpenSettings = 314
-    ConfirmSource = 315; CancelSource = 316; RetrySource = 317; EditSource = 318
+    ConfirmSource = 315; CancelSource = 316; RetrySource = 317; EditSource = 318; ApproveSource = 319
+    # Plus the index of the type (Skills, Agents, Instructions, Plugins).
+    SourceType = 326; GlobalType = 414
+    RepoItems = 405; FolderRules = 406; FolderRulesText = 407
+    GlobalRepoItems = 418; IgnoredEdit = 419; IgnoredText = 429; SourcesHeading = 430
     DefaultEvery = 320; OpenSkills = 321; OpenBackups = 322; Startup = 325; StartupText = 413
     AppHeading = 420; AppStatus = 421; AppCheck = 422; AppInstall = 423; AppAuto = 424; AppEvery = 425; AppWhen = 426
     Title = 400; Private = 401; Sub = 402; InfoLead = 403; InfoText = 404; SkillsDir = 410; TokenText = 411; Empty = 412
@@ -593,14 +597,19 @@ function Remove-LiveRoot([string]$Root) {
 }
 
 # Waits until the script block returns something true; returns it. Throws after the time is up.
-function Wait-Live([scriptblock]$Until, [string]$What, [int]$TimeoutSec = 60, [int]$EveryMs = 300) {
+# $Explain, when given, says what the app showed instead; its text is added to the failure.
+function Wait-Live([scriptblock]$Until, [string]$What, [int]$TimeoutSec = 60, [int]$EveryMs = 300, [scriptblock]$Explain) {
     $sw = [Diagnostics.Stopwatch]::StartNew()
     do {
         $r = & $Until
         if ($r) { return $r }
         Start-Sleep -Milliseconds $EveryMs
     } while ($sw.Elapsed.TotalSeconds -lt $TimeoutSec)
-    throw "Gave up after $TimeoutSec s waiting for: $What"
+    $why = ''
+    if ($Explain) {
+        $why = try { " ($(& $Explain))" } catch { " (could not read what the app showed: $($_.Exception.Message))" }
+    }
+    throw "Gave up after $TimeoutSec s waiting for: $What$why"
 }
 
 # ---------------------------------------------------------------- what is on disk
@@ -675,17 +684,22 @@ function Get-UpstreamFiles([string]$Repo, [string]$Ref, [string]$Path = '') {
     $map
 }
 
-# What a public repository's folder lists for anyone without a token, asked exactly as the app asks it. GitHub's servers
-# may keep that answer for up to a minute after a push, so a scenario whose repository is read without a token waits
-# for this one, not for the signed-in listing. Paths are relative to the folder. At most a few calls: the limit
-# without a token is 60 an hour.
+# What a public repository's folder lists for anyone without a token, asked exactly as the app asks it: the app lists
+# the branch root ("ref:") for every source, even one set to a folder. GitHub's servers keep each address's answer on
+# its own for up to a minute after a push, so a scenario whose repository is read without a token waits for this one,
+# not for the signed-in listing or the folder's own address. Paths are relative to the folder. At most a few calls:
+# the limit without a token is 60 an hour.
 function Get-PublicFiles([string]$Repo, [string]$Ref, [string]$Path) {
-    $spec = [uri]::EscapeDataString($(if ($Path) { "${Ref}:${Path}" } else { $Ref }))
+    $spec = [uri]::EscapeDataString("${Ref}:")
     $headers = @{ 'Accept' = 'application/vnd.github+json'; 'X-GitHub-Api-Version' = '2022-11-28'; 'User-Agent' = 'tss-e2e' }
     $tree = Invoke-RestMethod -UseBasicParsing -Headers $headers -Uri "https://api.github.com/repos/$Repo/git/trees/${spec}?recursive=1"
     if ($tree.truncated) { throw 'the listing is truncated' }
+    $prefix = if ($Path) { $Path.Trim('/') + '/' } else { '' }
     $map = [ordered]@{}
-    foreach ($e in $tree.tree) { if ($e.type -eq 'blob') { $map[[string]$e.path] = $e.sha } }
+    foreach ($e in $tree.tree) {
+        $p = [string]$e.path
+        if ($e.type -eq 'blob' -and $p.StartsWith($prefix, [StringComparison]::Ordinal)) { $map[$p.Substring($prefix.Length)] = $e.sha }
+    }
     $map
 }
 
@@ -913,13 +927,22 @@ function Read-Hero([IntPtr]$Window) {
     [pscustomobject]@{ Title = (Read-Ui $Window $UiPanel.Hero $UiId.HeroTitle); Sub = (Read-Ui $Window $UiPanel.Hero $UiId.HeroSub) }
 }
 
-# The repositories in the list at the left, top to bottom: the label and the line under it. Wrap the call in @( ).
+# The sources in the list at the left, top to bottom. Each entry's accessible text is one sentence (page.rs, nav_name):
+# "owner/repo, branch, folder. Skills 3, Agents: Sync off. Status". Label is all before the status, Sub the status;
+# Kinds the type summaries ('' when no type is shown). Wrap the call in @( ).
 function Read-Nav([IntPtr]$Window) {
     for ($i = 0; ; $i++) {
         $t = Read-Ui $Window $UiPanel.Nav ($UiId.NavRepo + $i)
         if ($null -eq $t) { break }
-        $two = $t -split "`n", 2
-        [pscustomobject]@{ Index = $i; Label = $two[0]; Sub = $(if ($two.Count -gt 1) { $two[1] } else { '' }) }
+        $kinds = '(?:Skills|Agents|Instructions|Plugins)(?: \d+| ?:)'
+        if ($t -match "^(?<repo>[^,]+), (?<branch>[^,]+), (?<folder>.+?)\.(?: (?<kinds>$kinds[^.]*)\.)? (?<status>[^.]+)$") {
+            [pscustomobject]@{
+                Index = $i; Label = $t.Substring(0, $t.Length - $Matches.status.Length - 1); Sub = $Matches.status
+                Repo = $Matches.repo; Branch = $Matches.branch; Folder = $Matches.folder; Kinds = [string]$Matches.kinds; Text = $t
+            }
+        } else {
+            [pscustomobject]@{ Index = $i; Label = $t; Sub = ''; Repo = ''; Branch = ''; Folder = ''; Kinds = ''; Text = $t }
+        }
     }
 }
 

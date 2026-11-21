@@ -11,6 +11,7 @@ use tiny_skill_sync::engine::{Access, ApplyResult, Outcome, Resolution, SyncOpti
 use tiny_skill_sync::github::{FailureKind, RemoteError};
 use tiny_skill_sync::reconcile::{Hold, Verdict};
 use tiny_skill_sync::source::SourceKind;
+use tiny_skill_sync::sources::{SourceConfig, allocate_source_ids};
 
 const AGENT: &str = "review.agent.md";
 const RULE: &str = "rust.instructions.md";
@@ -18,13 +19,40 @@ const RULE: &str = "rust.instructions.md";
 fn mixed() -> (World, std::sync::Arc<FakeRemote>, Config) {
     let w = World::new("mixed");
     let remote = FakeRemote::new();
-    remote.seed(REPO, &[("pack/sample/SKILL.md", "skill"), ("pack/review.agent.md", "one\n"), ("pack/rust.instructions.md", "rule"), ("pack/README", "other")]);
+    remote.seed(REPO, &[("pack/demo/SKILL.md", "skill"), ("pack/review.agent.md", "one\n"), ("pack/rust.instructions.md", "rule"), ("pack/README", "other")]);
     let mut cfg = Config::default();
     let spec = RepoSpec::parse("https://github.com/o/fixtures/tree/main/pack").unwrap();
     for kind in [SourceKind::Skills, SourceKind::Agents, SourceKind::Instructions] {
         cfg.add_source(kind, &spec, None, false);
     }
     (w, remote, cfg)
+}
+
+#[test]
+fn a_full_check_confirms_the_shared_listing_once_for_both_file_lanes() {
+    let w = World::new("confirm-once");
+    let remote = FakeRemote::new();
+    remote.seed(REPO, &[("pack/review.agent.md", "one"), ("pack/rust.instructions.md", "rule")]);
+    let mut cfg = Config::default();
+    let (id, lanes) = allocate_source_ids("pack", &mut cfg.taken_ids());
+    let mut source = SourceConfig { id, repo: REPO.into(), branch: "main".into(), path: "pack".into(), lanes, ..SourceConfig::default() };
+    for kind in [SourceKind::Skills, SourceKind::Plugins] {
+        source.types.set(kind, false);
+    }
+    cfg.add_source_config(source).unwrap();
+    let mut engine = w.engine(&remote);
+    let report = sync_all(&mut engine, &cfg);
+    assert!(report.repos.iter().all(|r| matches!(r.outcome, Outcome::Synced)), "{report:?}");
+
+    remote.put(REPO, "pack/review.agent.md", "two");
+    remote.put(REPO, "pack/rust.instructions.md", "rule two");
+    remote.reset();
+    let report = sync_all(&mut engine, &cfg);
+    assert_eq!(report.repos.len(), 2, "{report:?}");
+    assert!(report.repos.iter().all(|r| matches!(r.outcome, Outcome::Synced)), "{report:?}");
+    let pinned: Vec<String> = remote.log().into_iter().filter(|c| c.starts_with("historical_tree ")).collect();
+    assert_eq!(pinned.len(), 1, "one pinned root tree confirms the listing for both lanes: {:?}", remote.log());
+    assert_eq!(fs::read_to_string(w.root.join("instructions").join(RULE)).unwrap(), "rule two");
 }
 
 #[test]
@@ -38,11 +66,11 @@ fn mixed_sources_adopt_install_hold_and_poll_independently() {
     fs::write(&neighbor, "private").unwrap();
     let lock = fs::OpenOptions::new().read(true).share_mode(0).open(&neighbor).unwrap();
     let (mut engine, clock) = w.engine_at(&remote, &FakeTokens::none());
-    let id = &cfg.repos[1].id;
+    let id = &cfg.repos()[1].id;
     let report = sync_which(&mut engine, &cfg, &Which::Due);
     assert_eq!(report.repos.len(), 3);
     assert_eq!(skill(&report.repos[1], AGENT).verdict, Verdict::Adopt);
-    assert_eq!(w.read("sample/SKILL.md"), "skill");
+    assert_eq!(w.read("demo/SKILL.md"), "skill");
     assert_eq!(fs::read_to_string(agents.join(AGENT)).unwrap(), "one\r\n");
     assert_eq!(fs::read_to_string(rules.join(RULE)).unwrap(), "rule");
     assert_eq!(remote.calls().tree, 3);
@@ -78,7 +106,7 @@ fn loose_file_review_rejects_changed_bytes_and_a_successful_overwrite_clears_the
     let (w, remote, cfg) = mixed();
     let mut engine = w.engine(&remote);
     sync_all(&mut engine, &cfg);
-    let source = &cfg.repos[1];
+    let source = &cfg.repos()[1];
     let target = w.state().loose_sources()[&source.id].binding().directory().join(AGENT);
     remote.put(REPO, "pack/review.agent.md", "two");
 
@@ -101,7 +129,7 @@ fn incomplete_or_unconfirmed_removal_never_deletes_a_file() {
     let mut e = w.engine(&remote);
     sync_all(&mut e, &cfg);
     let target = w.root.join("agents").join(AGENT);
-    let one = Which::One(cfg.repos[1].id.clone());
+    let one = Which::One(cfg.repos()[1].id.clone());
     remote.remove(REPO, "pack/review.agent.md");
     let confirmed = SyncOptions { confirm_mass_delete: true, ignore_etag: true, ..Default::default() };
     remote.set_truncated(REPO, true);
@@ -134,10 +162,10 @@ fn restart_recovers_only_a_configured_leaf_and_keeps_detached_work() {
     fs::write(agents.join("neighbor"), "mine").unwrap();
     remote.put(REPO, "pack/review.agent.md", "new");
     engine.set_step_hook(|s| if s == Step::OldMoved { Err(RemoteError::new(FailureKind::Local, "fixture stop")) } else { Ok(()) });
-    let id = &cfg.repos[1].id;
+    let id = &cfg.repos()[1].id;
     assert!(matches!(only(&sync_which(&mut engine, &cfg, &Which::One(id.clone()))).outcome, Outcome::Failed(_)));
     let mut detached = cfg.clone();
-    detached.repos.remove(1);
+    detached.remove(id);
     let mut restarted = w.engine(&remote);
     let work = w.root.join(".tss-leaf-work");
     let before = snapshot_of(&work);
@@ -161,7 +189,7 @@ fn interrupted_loose_file_waits_for_its_original_source_before_recovery() {
     let mut cfg = Config::default();
     cfg.add_source(SourceKind::Agents, &spec, None, false);
 
-    let source_id = cfg.repos[0].id.clone();
+    let source_id = cfg.repos()[0].id.clone();
     let mut engine = w.engine(&remote);
     assert!(matches!(only(&sync_all(&mut engine, &cfg)).outcome, Outcome::Synced));
     let record = w.state().loose_sources()[&source_id].binding().clone();
@@ -179,8 +207,8 @@ fn interrupted_loose_file_waits_for_its_original_source_before_recovery() {
     let before = snapshot_of(&work);
 
     let mut rebound = cfg.clone();
-    rebound.repos[0].branch = "feature/other".into();
-    assert_eq!(rebound.repos[0].id, source_id);
+    rebound.update_lane_at(0, |r| r.branch = "feature/other".into());
+    assert_eq!(rebound.repos()[0].id, source_id);
     let mut restarted = w.engine(&remote);
     restarted.startup(&rebound).unwrap();
     assert!(w.state().loose_sources()[&source_id].leaf(AGENT).unwrap().interrupted());
@@ -204,7 +232,7 @@ fn explicit_sync_on_rebound_agents_source_fails_before_remote_request() {
     let mut cfg = Config::default();
     cfg.add_source(SourceKind::Agents, &spec, None, false);
 
-    let source_id = cfg.repos[0].id.clone();
+    let source_id = cfg.repos()[0].id.clone();
     let mut engine = w.engine(&remote);
     assert!(matches!(only(&sync_all(&mut engine, &cfg)).outcome, Outcome::Synced));
     let binding = w.state().loose_sources()[&source_id].binding().clone();
@@ -217,8 +245,8 @@ fn explicit_sync_on_rebound_agents_source_fails_before_remote_request() {
     assert!(w.state().loose_sources()[&source_id].leaf(AGENT).unwrap().interrupted());
 
     let mut rebound = cfg.clone();
-    rebound.repos[0].branch = "feature/other".into();
-    assert_eq!(rebound.repos[0].id, source_id);
+    rebound.update_lane_at(0, |r| r.branch = "feature/other".into());
+    assert_eq!(rebound.repos()[0].id, source_id);
     let mut restarted = w.engine(&remote);
     restarted.startup(&rebound).unwrap();
     assert!(w.state().loose_sources()[&source_id].leaf(AGENT).unwrap().interrupted());
@@ -258,7 +286,7 @@ fn interrupted_loose_file_rejects_a_skills_source_reusing_its_id() {
     let mut agents_cfg = Config::default();
     agents_cfg.add_source(SourceKind::Agents, &spec, None, false);
 
-    let source_id = agents_cfg.repos[0].id.clone();
+    let source_id = agents_cfg.repos()[0].id.clone();
     let mut engine = w.engine(&remote);
     assert!(matches!(only(&sync_all(&mut engine, &agents_cfg)).outcome, Outcome::Synced));
     let record = w.state().loose_sources()[&source_id].binding().clone();
@@ -274,7 +302,7 @@ fn interrupted_loose_file_rejects_a_skills_source_reusing_its_id() {
 
     let mut skills_cfg = Config::default();
     skills_cfg.add_source(SourceKind::Skills, &spec, None, false);
-    assert_eq!(skills_cfg.repos[0].id, source_id);
+    assert_eq!(skills_cfg.repos()[0].id, source_id);
 
     let managed_before = fs::read(&managed).unwrap();
     let neighbor_before = fs::read(&neighbor).unwrap();
@@ -311,7 +339,7 @@ fn continuation_a_blocked_bound_file_does_not_hold_or_relocate_its_sibling() {
         fs::write(&alpha, "one\r\n").unwrap();
         remote.put(REPO, "pack/beta.agent.md", "beta before");
         let mut engine = w.engine(&remote);
-        let which = Which::One(cfg.repos[1].id.clone());
+        let which = Which::One(cfg.repos()[1].id.clone());
         let installed = sync_which(&mut engine, &cfg, &which);
         assert!(matches!(only(&installed).outcome, Outcome::Synced), "{installed:?}");
         assert_eq!(skill(only(&installed), AGENT).result, ApplyResult::Done);

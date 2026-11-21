@@ -194,7 +194,7 @@ fn a_listing_that_github_cut_short_is_never_trusted() {
 fn an_overwrite_that_goes_wrong_leaves_the_edited_skill_as_it_was() {
     type Break = fn(&FakeRemote);
     let cases: [(&str, Break, &str); 6] = [
-        ("cut-short", |r| r.set_truncated(REPO, true), "cut the listing short"),
+        ("cut-short", |r| r.set_truncated(REPO, true), "in one piece"),
         ("listing-error", |r| r.fail_tree(REPO, Some(error(FailureKind::Network))), "Network"),
         ("gone-upstream", |r| r.remove(REPO, "skills/alpha"), "cannot be installed"),
         ("no-commit", |r| r.fail_commit(REPO, Some(error(FailureKind::Server))), "Server"),
@@ -238,7 +238,7 @@ fn losing_access_to_a_private_repository_removes_nothing() {
     assert_eq!(w.snapshot(), before);
 
     // Without any token GitHub answers 'not found' for a private repository.
-    cfg.repos[0].use_token = false;
+    cfg.update_lane_at(0, |r| r.use_token = false);
     let mut engine = w.engine_with(&remote, &FakeTokens::none());
     let report = sync_all(&mut engine, &cfg);
     assert_eq!(failure(only(&report)).kind, FailureKind::NotFound);
@@ -738,7 +738,7 @@ fn an_unknown_repository_is_an_error_and_a_paused_one_is_checked_only_by_name() 
     assert!(matches!(&err, EngineError::Failed(why) if why.contains("nope")), "{err}");
     assert_eq!(s.remote.calls(), Calls::default());
 
-    s.cfg.repos[0].enabled = false;
+    s.cfg.update_lane_at(0, |r| r.enabled = false);
     assert!(sync_which(&mut s.engine, &s.cfg, &Which::All).repos.is_empty(), "a paused repository is not part of 'check all'");
     assert!(sync_which(&mut s.engine, &s.cfg, &Which::Due).repos.is_empty());
     let report = sync_which(&mut s.engine, &s.cfg, &Which::One("fx".into()));

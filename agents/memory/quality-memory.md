@@ -31,6 +31,10 @@
 - `proc::capture` (src\win\proc.rs, about line 161) checks cancel again after the child has exited, so a finished command can still report Cancelled. When that happens, `apply::plugins::execute` skips its verification snapshot.
 - `plugins::NameMap` rejects duplicate JSON keys on read, which ARCHITECTURE.md documents. `tss resolve` reads the action from the third word, so a skill named like a plugin action still parses.
 
+- Issue #8: `Which::One(lane)` for a non-plugin lane still expands to the whole source (engine.rs `sync_in`). Round 2 scoped `confirm_mass_delete` to the named lane (root.rs `sync_source` `confirmed`; cli.rs `check` maps a lane-ID query to that lane). Check any new per-lane option the same way.
+- Issue #8 round 2: `state.json` format 3 (`needs_format_3`: `lane_polls` or plugin approval `roots`); `seen::update` re-reads before merging and never overwrites a newer file; `catalog::Capabilities` is computed but read only by tests (board reads `inventory::PluginCapabilities`).
+- Issue #8 lanes of one source run in order (skills, agents, instructions, plugins) after one shared root listing (src\engine\root.rs `sync_source`); a remote failure in a later lane stops only the lanes after it.
+
 ## Baselines
 
 - `cargo test --lib win::proc` with TSS_NO_APP_UPDATES=1 and TSS_NO_SAVED_TOKEN=1: 9 passed.

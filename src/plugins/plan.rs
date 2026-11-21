@@ -65,6 +65,10 @@ pub enum Status {
     WaitingForMarketplace,
     Planned(Operation),
     Blocked,
+    /// In the source but never installed from it, with the reason (standalone, filtered, not listed by the marketplace).
+    NotSynced(String),
+    /// Owned, and still in the source, but not installable from it now: kept as it is, never updated or removed.
+    Protected(String),
 }
 
 impl Status {
@@ -72,7 +76,14 @@ impl Status {
         match self {
             Self::NeedsApproval | Self::RemovedFromGitHub | Self::Rejected(_) | Self::WaitingForMarketplace | Self::Blocked => true,
             Self::Planned(_) => !done,
-            Self::UpToDate | Self::TurnedOff | Self::RemovedInCopilot | Self::AlreadyInstalled | Self::AlreadyTracked(_) | Self::HostedElsewhere => false,
+            Self::UpToDate
+            | Self::TurnedOff
+            | Self::RemovedInCopilot
+            | Self::AlreadyInstalled
+            | Self::AlreadyTracked(_)
+            | Self::HostedElsewhere
+            | Self::NotSynced(_)
+            | Self::Protected(_) => false,
         }
     }
 }
@@ -98,6 +109,7 @@ pub enum Operation {
 #[derive(Clone, Debug)]
 struct Desired {
     publisher: Option<String>,
+    root: String,
     version: Option<String>,
     fingerprint: String,
 }
@@ -114,6 +126,7 @@ pub struct Action {
     had_record: bool,
     owned: Option<OwnedPlugin>,
     approved: Option<Option<String>>,
+    root: Option<String>,
     desired: Option<Desired>,
 }
 
@@ -143,7 +156,11 @@ impl Action {
                 && record.origin == self.origin
                 && record.market == self.market
                 && record.copilot_home == self.home
-                && self.name().is_none_or(|name| record.plugins.get(name) == self.owned.as_ref() && record.approved.get(name) == self.approved.as_ref())
+                && self.name().is_none_or(|name| {
+                    record.plugins.get(name) == self.owned.as_ref()
+                        && record.approved.get(name) == self.approved.as_ref()
+                        && record.roots.get(name) == self.root.as_ref()
+                })
         })
     }
 
@@ -220,6 +237,7 @@ impl Action {
             poll: Default::default(),
             approved: NameMap::new(),
             plugins: NameMap::new(),
+            roots: NameMap::new(),
         });
         if self.operation == Operation::Register {
             record.registered_by_app = true;
@@ -227,6 +245,7 @@ impl Action {
             let name = self.name().expect("plugin actions have a name");
             if let Some(desired) = &self.desired {
                 record.approved.insert(name.into(), desired.publisher.clone());
+                record.roots.insert(name.into(), desired.root.clone());
                 if self.operation != Operation::Approve {
                     let native = after.plugin(name, &self.market).expect("verified plugin list").expect("verified plugin");
                     let by_app = match self.operation {
@@ -239,6 +258,7 @@ impl Action {
             } else {
                 record.plugins.remove(name);
                 record.approved.remove(name);
+                record.roots.remove(name);
             }
         }
         record.poll.etag = None;
@@ -285,6 +305,14 @@ impl<'a> Context<'a> {
     fn approved(&self, name: &str) -> Option<&Option<String>> {
         self.record?.approved.get(name)
     }
+    /// The recorded approval covers this publisher at this plugin root. An approval recorded without a root (before
+    /// roots were kept) covers any root.
+    fn approves(&self, plugin: &Plugin) -> bool {
+        self.approved(&plugin.name) == Some(&plugin.publisher) && self.record.and_then(|r| r.roots.get(&plugin.name)).is_none_or(|root| *root == plugin.path)
+    }
+    fn root(&self, name: &str) -> Option<&String> {
+        self.record?.roots.get(name)
+    }
 
     fn action(&self, operation: Operation, name: Option<&str>, before: Option<&NativePlugin>, plugin: Option<&Plugin>) -> Action {
         Action {
@@ -298,7 +326,13 @@ impl<'a> Context<'a> {
             had_record: self.record.is_some(),
             owned: name.and_then(|n| self.owned(n)).cloned(),
             approved: name.and_then(|n| self.approved(n)).cloned(),
-            desired: plugin.map(|p| Desired { publisher: p.publisher.clone(), version: p.version.clone(), fingerprint: p.fingerprint.clone() }),
+            root: name.and_then(|n| self.root(n)).cloned(),
+            desired: plugin.map(|p| Desired {
+                publisher: p.publisher.clone(),
+                root: p.path.clone(),
+                version: p.version.clone(),
+                fingerprint: p.fingerprint.clone(),
+            }),
         }
     }
 
@@ -347,7 +381,7 @@ pub fn plan(source: &RepoConfig, catalog: Option<&Catalog>, state: &State, snaps
         let approve = matches!(choice, Some(Choice::Approve { name: n, publisher }) if n == name && *publisher == plugin.publisher);
         let (mut status, op) = if let Some(other) = state.plugin_owner_elsewhere(&source.id, cx.market, name) {
             (Status::AlreadyTracked(other.into()), None)
-        } else if !approve && cx.approved(name) != Some(&plugin.publisher) {
+        } else if !approve && !cx.approves(plugin) {
             (Status::NeedsApproval, None)
         } else {
             decide(&cx, plugin, before, choice)
@@ -365,7 +399,7 @@ pub fn plan(source: &RepoConfig, catalog: Option<&Catalog>, state: &State, snaps
             } else {
                 plan.actions.push(cx.action(op, Some(name), before, Some(plugin)));
             }
-        } else if approve && status != Status::NeedsApproval && !matches!(status, Status::AlreadyTracked(_)) && cx.approved(name) != Some(&plugin.publisher) {
+        } else if approve && status != Status::NeedsApproval && !matches!(status, Status::AlreadyTracked(_)) && !cx.approves(plugin) {
             plan.actions.push(cx.action(Operation::Approve, Some(name), before, Some(plugin)));
         }
         plan.statuses.insert(name.clone(), status);
@@ -383,12 +417,20 @@ pub fn plan(source: &RepoConfig, catalog: Option<&Catalog>, state: &State, snaps
         rejected.insert(name_key(&r.name), i);
         plan.statuses.insert(r.name.clone(), Status::Rejected(r.reason.clone()));
     }
+    for held in catalog.held.iter().filter(|h| h.shown && cx.owned(&h.name).is_none()) {
+        if !plan.statuses.contains_key(&held.name) {
+            plan.statuses.insert(held.name.clone(), Status::NotSynced(held.reason.clone()));
+        }
+    }
     if let Some(record) = cx.record {
         for name in record.plugins.keys().filter(|n| !catalog.plugins.contains_key(n)) {
             let status = if let Some(&i) = rejected.get(name).or_else(|| rejected.get("")) {
                 Status::Rejected(catalog.rejected[i].reason.clone())
             } else if hosted.contains(name) || hosted.contains("") {
                 Status::HostedElsewhere
+            } else if let Some(held) = catalog.held.iter().find(|h| h.name == *name) {
+                // Still in the source: its absence from the installable plugins proves nothing.
+                Status::Protected(held.reason.clone())
             } else if matches!(choice, Some(Choice::Uninstall(n) | Choice::Forget(n)) if n == name) {
                 let Ok(before) = cx.native.plugin(name, cx.market) else {
                     return hold(Blocker::BadNativeSnapshot);
@@ -422,6 +464,33 @@ fn decide(cx: &Context<'_>, plugin: &Plugin, before: Option<&NativePlugin>, choi
         (Some(_), Some(_)) => return (Status::UpToDate, None),
     };
     (Status::Planned(op), Some(op))
+}
+
+/// The rows of a source with no plugin record yet, without asking Copilot: every installable plugin needs approval,
+/// and nothing can be done. Its plugins are only ever installed after the user approves them.
+pub fn plan_unapproved(source: &RepoConfig, catalog: &Catalog, state: &State) -> Plan {
+    let mut plan = Plan::default();
+    for name in catalog.plugins.keys() {
+        let status = match state.plugin_owner_elsewhere(&source.id, &catalog.market, name) {
+            Some(other) => Status::AlreadyTracked(other.into()),
+            None => Status::NeedsApproval,
+        };
+        plan.statuses.insert(name.clone(), status);
+    }
+    for name in &catalog.hosted_elsewhere {
+        if !plan.statuses.contains_key(name) {
+            plan.statuses.insert(name.clone(), Status::HostedElsewhere);
+        }
+    }
+    for r in &catalog.rejected {
+        plan.statuses.insert(r.name.clone(), Status::Rejected(r.reason.clone()));
+    }
+    for held in catalog.held.iter().filter(|h| h.shown) {
+        if !plan.statuses.contains_key(&held.name) {
+            plan.statuses.insert(held.name.clone(), Status::NotSynced(held.reason.clone()));
+        }
+    }
+    plan
 }
 
 /// Only for an explicit remove-source-and-uninstall request, never for a sync or a plain source removal.

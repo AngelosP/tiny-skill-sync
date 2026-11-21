@@ -1,5 +1,5 @@
 use super::*;
-use crate::plugins::catalog::{Capabilities, Plugin};
+use crate::plugins::catalog::Plugin;
 use crate::plugins::native::{MarketOrigin, NativeMarket};
 use crate::tree::Rejected;
 
@@ -18,7 +18,6 @@ fn fixture() -> (RepoConfig, Catalog, State, NativeSnapshot) {
         version: Some("2".into()),
         publisher: Some("Team".into()),
         description: None,
-        capabilities: Capabilities::default(),
         fingerprint: "b".repeat(40),
     };
     let catalog = Catalog::fixture(source.clone(), "market", plugin);

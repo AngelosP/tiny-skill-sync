@@ -20,6 +20,7 @@
     portable      export settings once, then run two copies with separate state and skills folders
     mixed         two disposable profiles share Skills, Agents and Instructions sources via the CLI and tray
     plugins       preview, install, update and remove real Copilot CLI plugins in disposable Copilot folders
+    autodetect    a bare branch with every kind mixed in, and folders the rules leave out: preview, add, approve, a folder
     changes       six kinds of upstream change reach the disk through the tray's "Sync now"
     local-edit    an edit made while the app runs, then an upstream change to the same skill
     converged     an edit made here that GitHub has too is marked as in sync; one GitHub does not have stays held
@@ -31,7 +32,7 @@
     names         upstream names with control and direction characters are shown escaped
     failures      a bad network, bad answers, a bad token: the skills folder must not change
     stale         GitHub answering with a tree that is newer than its commit
-    empty         a repository added as a whole when its skills are in a subfolder
+    empty         a folder location with no skills in it: "No skills found"
     signin        Start with Windows: the entry, a start the way Windows starts it at sign-in, copies in long folders
     ui            the window, its questions and the tray menu, driven and read from outside, with screenshots (it moves
                   the mouse pointer and uses the clipboard, putting both back, and opens a skill's folder in File
@@ -153,7 +154,7 @@ function Get-Address($c, [string]$Path = 'skills') { "https://github.com/$($c.Re
 
 function Add-Repo($c, [string[]]$Options = @('--use-token', '--every', '6h'), [string]$Address = '') {
     if (-not $Address) { $Address = Get-Address $c }
-    $r = Tss $c (@('add', $Address) + $Options)
+    $r = Tss $c (@('add', $Address, '--yes') + $Options)
     if ($r.Code -ne 0) { throw "tss add failed: $($r.Text)" }
     if ($r.Text -match "as '([^']+)'") { $c.Id = $Matches[1] } else { throw "tss add did not name the repository: $($r.Text)" }
 }
@@ -270,7 +271,7 @@ function Test-Places {
         $copilot = Join-Path $user '.copilot'
         $skills = Join-Path $copilot 'skills'
         $appDir = Join-Path $local 'tiny-skill-sync'
-        $real = @{ TSS_HOME = $null; TSS_SKILLS_DIR = $null; USERPROFILE = $user; LOCALAPPDATA = $local }
+        $real = @{ TSS_HOME = $null; TSS_SKILLS_DIR = $null; TSS_AGENTS_DIR = $null; TSS_INSTRUCTIONS_DIR = $null; USERPROFILE = $user; LOCALAPPDATA = $local }
 
         # What a computer that uses Copilot already has: a skill written by hand, and Copilot's own files.
         New-Item -ItemType Directory -Force (Join-Path $skills 'my-own'), $local | Out-Null
@@ -280,7 +281,8 @@ function Test-Places {
         $copilotFile = Get-BlobId (Join-Path $copilot 'config.json')
 
         $seen = Get-LiveChildEnv $c.Root $real
-        $safe = $seen['USERPROFILE'] -eq $user -and $seen['LOCALAPPDATA'] -eq $local -and -not $seen.ContainsKey('TSS_HOME') -and -not $seen.ContainsKey('TSS_SKILLS_DIR')
+        $safe = $seen['USERPROFILE'] -eq $user -and $seen['LOCALAPPDATA'] -eq $local -and -not $seen.ContainsKey('TSS_HOME') -and -not $seen.ContainsKey('TSS_SKILLS_DIR') -and
+            -not $seen.ContainsKey('TSS_AGENTS_DIR') -and -not $seen.ContainsKey('TSS_INSTRUCTIONS_DIR')
         Check 'a program started this way sees the throwaway profile and no TSS_ folders' $safe "USERPROFILE=$($seen['USERPROFILE']); LOCALAPPDATA=$($seen['LOCALAPPDATA'])"
         if (-not $safe) { throw 'refusing to start the app: it could use the real folders' }
 
@@ -289,7 +291,7 @@ function Test-Places {
         Check 'tss status names %USERPROFILE%\.copilot\skills and %LOCALAPPDATA%\tiny-skill-sync' $where ''
         if (-not $where) { throw 'refusing to go on: the app chose other folders' }
 
-        $r = Tss $c @('add', (Get-Address $c), '--every', '6h') $real
+        $r = Tss $c @('add', (Get-Address $c), '--every', '6h', '--yes') $real
         if ($r.Text -match "as '([^']+)'") { $c.Id = $Matches[1] }
         Check 'tss add saves the settings in %LOCALAPPDATA%\tiny-skill-sync' ($r.Code -eq 0 -and $c.Id -and (Test-Path -LiteralPath (Join-Path $appDir 'config.json'))) "exit $($r.Code)"
 
@@ -326,7 +328,7 @@ function Test-Places {
         Set-SkillsDir $cfgFile $moved
         $r = Tss $c @('status') $real
         $told = $r.Text -match [regex]::Escape("Warning: the skills folder changed from $skills to $moved")
-        Check 'with skills_dir in config.json, tss status names that folder, has nothing installed there, and says why' ($r.Text -match [regex]::Escape("Skills folder: $moved") -and $r.Text -match 'No skills from it are installed' -and $told) "exit $($r.Code)"
+        Check 'with skills_dir in config.json, tss status names that folder, has nothing installed there, and says why' ($r.Text -match [regex]::Escape("Skills folder: $moved") -and $r.Text -match 'No items from it are installed' -and $told) "exit $($r.Code)"
         $r = Tss $c @('check') $real
         $diff = Compare-WithUpstream $moved $c.Repo $c.Ref 'skills'
         $names = Get-Entries $moved
@@ -378,7 +380,7 @@ function Test-Portable {
     try {
         $anon = Get-AnonymousAppEnv $c.Root
         $address = Get-Address $c
-        $added = Tss $c @('add', $address, '--every', '6h') $anon
+        $added = Tss $c @('add', $address, '--every', '6h', '--yes') $anon
         Check 'a fixture repository can be added to the local settings first' ($added.Code -eq 0 -and $added.Text -match "Added .* as '") $added.Text
         if ($added.Code -ne 0) { throw 'refusing to continue: the local settings were not created' }
 
@@ -395,7 +397,7 @@ function Test-Portable {
 
         $secondHome = Join-Path $c.Root 'machine-2\home'
         $secondSkills = Join-Path $c.Root 'machine-2\skills'
-        New-Item -ItemType Directory -Force $secondHome, $secondSkills | Out-Null
+        New-Item -ItemType Directory -Force $secondHome, $secondSkills, (Join-Path $c.Root 'machine-2\agents'), (Join-Path $c.Root 'machine-2\instructions') | Out-Null
         Copy-Item -LiteralPath $localConfig -Destination (Join-Path $secondHome 'config.json')
         $secondReport = Join-Path $c.Root 'out\machine-2-marks.txt'
         $anon.TSS_BENCH_REPORT = $c.Report
@@ -403,6 +405,8 @@ function Test-Portable {
         $other = $anon.Clone()
         $other.TSS_HOME = $secondHome
         $other.TSS_SKILLS_DIR = $secondSkills
+        $other.TSS_AGENTS_DIR = Join-Path $c.Root 'machine-2\agents'
+        $other.TSS_INSTRUCTIONS_DIR = Join-Path $c.Root 'machine-2\instructions'
         $other.TSS_BENCH_REPORT = $secondReport
         $c.Tray2 = Start-LiveTray $c.Root @() $other
         $firstSkill = Join-Path $c.Skills 'alpha\scripts\hello.ps1'
@@ -430,11 +434,12 @@ function Test-Portable {
 function Test-Mixed {
     $c = New-Env 'mixed' -Repo 'AngelosP/tiny-skill-sync-fixtures-public'
     try {
-        $skill = "---`nname: sample`ndescription: Mixed-source fixture`n---`nFixture skill.`n"
+        # Not 'sample': that folder name is ignored by default (sources.rs, DEFAULT_IGNORE).
+        $skill = "---`nname: starter`ndescription: Mixed-source fixture`n---`nFixture skill.`n"
         $agent = "---`ndescription: Mixed-source fixture`n---`nFixture agent.`n"
         $rule = "---`napplyTo: '**/*.rs'`n---`nFixture instruction.`n"
         $pin = Push-Upstream $c.Repo $c.Ref @(
-            @{ Path = 'issue7/skills/sample/SKILL.md'; Text = $skill }
+            @{ Path = 'issue7/skills/starter/SKILL.md'; Text = $skill }
             @{ Path = 'issue7/custom-agents/review.agent.md'; Text = $agent }
             @{ Path = 'issue7/custom-agents/ignore.instructions.md'; Text = 'ignore' }
             @{ Path = 'issue7/instructions/style.instructions.md'; Text = $rule }
@@ -470,12 +475,15 @@ function Test-Mixed {
         $skillsUrl = Get-Address $c 'issue7/skills'
         $agentsUrl = Get-Address $c 'issue7/custom-agents'
         $rulesUrl = Get-Address $c 'issue7/instructions'
-        if ((Tss $c @('add', $skillsUrl, '--every', '6h') $first).Code -ne 0) { throw 'could not add the legacy Skills source' }
-        $legacy = [IO.File]::ReadAllText($configFile) | ConvertFrom-Json
-        $skillsId = $legacy.repos[0].id
+        if ((Tss $c @('add', $skillsUrl, '--every', '6h', '--yes') $first).Code -ne 0) { throw 'could not add the Skills folder source' }
+        $local = [IO.File]::ReadAllText($configFile) | ConvertFrom-Json
+        $skillsId = @($local.sources)[0].id
         $installed = Tss $c @('check', $skillsId) $first
-        $localSkill = Join-Path $first.TSS_SKILLS_DIR 'sample\SKILL.md'
-        Check 'legacy Skills source installs with a format-1 config' ($installed.Code -eq 0 -and $legacy.version -eq 1 -and [IO.File]::ReadAllText($localSkill) -ceq $skill)
+        $localSkill = Join-Path $first.TSS_SKILLS_DIR 'starter\SKILL.md'
+        Check 'the Skills folder source installs with a format-3 config' (
+            $installed.Code -eq 0 -and $local.version -eq 3 -and @($local.sources).Count -eq 1 -and @($local.sources)[0].lanes.skills -eq $skillsId -and
+            (Test-Path -LiteralPath $localSkill) -and [IO.File]::ReadAllText($localSkill) -ceq $skill
+        ) "exit $($installed.Code); version $($local.version)"
         $edit = "My local skill edit.`r`n"
         [IO.File]::WriteAllText($localSkill, $edit)
 
@@ -490,109 +498,183 @@ function Test-Mixed {
         $neighborHash = Get-BlobId $neighbor
         $configHash = Get-BlobId $configFile
         $stateHash = Get-BlobId $firstState
-        $preview = Tss $c @('add', $agentsUrl, '--type', 'agents', '--preview') $first
+        $preview = Tss $c @('add', $agentsUrl, '--preview') $first
         Check 'CLI preview names the type, match and exact existing destination without writing' (
-            $preview.Code -eq 0 -and $preview.Text -match 'Matched 1 agent:' -and $preview.Text.Contains("Destination: $nested") -and
+            $preview.Code -eq 0 -and $preview.Text -match '(?m)^Agents: Sync on\r?$' -and $preview.Text -match '(?m)^  review\.agent\.md\b.*: will sync\r?$' -and $preview.Text.Contains("Destination: $nested") -and
             (Get-BlobId $configFile) -eq $configHash -and (Get-BlobId $firstState) -eq $stateHash -and (Get-Entries $nested) -eq 'personal.agent.md,review.agent.md'
         )
-        if ((Tss $c @('portable') $first).Code -ne 0) { throw 'could not export the legacy source' }
-        $sourceHash = Get-BlobId $sources
+        if ((Tss $c @('portable') $first).Code -ne 0) { throw 'could not export the Skills folder source' }
         $c.Tray = Start-LiveTray $c.Root @() $second
-        [void](Wait-Live { Test-Path -LiteralPath (Join-Path $second.TSS_SKILLS_DIR 'sample\SKILL.md') } 'the tray to install the shared skill' 90)
+        [void](Wait-Live { Test-Path -LiteralPath (Join-Path $second.TSS_SKILLS_DIR 'starter\SKILL.md') } 'the tray to install the shared skill' 90)
         $win = Open-Window $c.Tray
         [void](Wait-Quiet $second.TSS_BENCH_REPORT 4)
-        $chooseAddType = {
-            param($Dialog, [string]$Kind)
-            foreach ($id in @($AskId.Choice, ($AskId.Choice + 1), ($AskId.Choice + 2))) {
-                if ((Read-Ui $Dialog $AskPanel $id) -eq $Kind) {
-                    Click-Ui $Dialog $AskPanel $id
-                    return
-                }
-            }
-            throw "the Add Source question has no '$Kind' choice"
+        $readShared = { try { [IO.File]::ReadAllText($sources) | ConvertFrom-Json } catch { $null } }
+        $sourceAt = { param($Path) @((& $readShared).sources | Where-Object { $_.path -eq $Path })[0] }
+        # A switch in the Sources group of Settings (0 Skills, 1 Agents, 2 Instructions), saved in the shared file.
+        $globalSwitch = {
+            param([int]$Kind, [bool]$On)
+            $name = @('skills', 'agents', 'instructions')[$Kind]
+            Click-Ui $win $UiPanel.Nav $UiId.NavSettings
+            [void](Wait-Live { (Find-Ui $win $UiPanel.Page ($UiId.GlobalType + $Kind)) -ne [IntPtr]::Zero } 'the Sources switches in Settings' 10)
+            if ((Get-Checked $win $UiPanel.Page ($UiId.GlobalType + $Kind)) -ne $On) { Click-Ui $win $UiPanel.Page ($UiId.GlobalType + $Kind) }
+            [void](Wait-Live {
+                    $g = (& $readShared).global
+                    $saved = -not ($g -and $g.types -and $g.types.PSObject.Properties[$name] -and $g.types.$name -eq $false)
+                    $saved -eq $On -and (Get-Checked $win $UiPanel.Page ($UiId.GlobalType + $Kind)) -eq $On
+                } "the global $name switch to be saved $(if ($On) { 'on' } else { 'off' })" 10)
+        }
+        # Turns one type of the source at this folder off on its own page, and returns the page's rows.
+        $sourceTypeOff = {
+            param($Path, [int]$Kind)
+            $name = @('skills', 'agents', 'instructions')[$Kind]
+            $row = Wait-Live { @(Read-Nav $win | Where-Object { $_.Folder -eq $Path })[0] } "the list row of $Path" 30
+            Open-Repo $win $row.Index
+            Choose-Ui $win $UiPanel.Page ($UiId.SourceType + $Kind) 'Off'
+            [void](Wait-Live { $s = & $sourceAt $Path; if ($s -and $s.types -and $s.types.PSObject.Properties[$name] -and $s.types.$name -eq $false) { $true } } "$Path to save $name off" 10)
         }
         $previewInTray = {
-            param($Url, [string]$Kind)
+            param($Url)
             Click-Ui $win $UiPanel.Nav $UiId.NavAdd
             $ask = Wait-Live { $d = Find-Ask $c.Tray; if ($d -ne [IntPtr]::Zero) { $d } } 'the Add source question' 10
             Set-UiText (Get-Ui $ask $AskPanel $AskId.Edit) $Url
-            & $chooseAddType $ask $Kind
             Click-Ui $ask $AskPanel $AskId.Ok
-            [void](Wait-Live { (Read-Ui $win $UiPanel.Page 315) -eq 'Add and check' } 'the read-only source preview' 60)
+            [void](Wait-Live { (Read-Ui $win $UiPanel.Page $UiId.ConfirmSource) -eq 'Add and check' } 'the read-only source preview' 60)
             Read-Ui $win $UiPanel.Page $UiId.InfoText
         }
+        # What the tray showed instead of an installation: its status line (a refused click says why there), the page
+        # (a save that failed says why there) and its last jobs.
+        $trayShowed = {
+            $page = ((Read-Ui $win $UiPanel.Page $UiId.InfoText) -replace '\s+', ' ')
+            if ($page.Length -gt 240) { $page = $page.Substring(0, 240) + '...' }
+            $jobs = @(Read-Marks $second.TSS_BENCH_REPORT | Select-Object -Last 6 | ForEach-Object { $_.Mark }) -join ', '
+            "status: '$(Read-Ui $win $UiPanel.Hero $UiId.HeroSub)'; page: '$page'; last jobs: $jobs"
+        }
 
-        $previewText = & $previewInTray $agentsUrl 'Agents'
+        # The custom-agents folder holds an agent and an instructions file. With instructions off in Settings, the
+        # preview finds both, and only the agent would sync.
+        & $globalSwitch 2 $false
+        [void](Save-Shot $win 'mixed-settings-instructions-off')
+        $sourceHash = Get-BlobId $sources
+        $previewText = & $previewInTray $agentsUrl
         [void](Save-Shot $win 'mixed-agent-preview')
-        Check 'tray preview offers only the selected agent and writes nothing' (
-            $previewText -match 'Type:\s*Agents' -and $previewText -match 'Matched\s+1\s+agent' -and
+        Check 'the tray preview finds both types in the folder, syncs only the agent, and writes nothing' (
+            $previewText -match '(?m)^Agents: Sync on\r?$' -and $previewText -match '(?m)^  review\.agent\.md\b.*: will sync\r?$' -and
+            $previewText -match '(?m)^Instructions: Sync off\r?$' -and $previewText -match '(?m)^  ignore\.instructions\.md\b.*: Sync off\r?$' -and
             (Get-BlobId $sources) -eq $sourceHash -and (Get-Entries $second.TSS_AGENTS_DIR) -eq ''
-        )
-        Click-Ui $win $UiPanel.Page 316 # Cancel source
-        [void](Wait-Live { $null -eq (Read-Ui $win $UiPanel.Page 315) } 'the preview to close')
+        ) ($previewText -replace '\s+', ' ')
+        Click-Ui $win $UiPanel.Page $UiId.CancelSource
+        [void](Wait-Live { $null -eq (Read-Ui $win $UiPanel.Page $UiId.ConfirmSource) } 'the preview to close')
         Check 'cancel leaves the shared settings and installed files alone' ((Get-BlobId $sources) -eq $sourceHash -and (Get-Entries $second.TSS_AGENTS_DIR) -eq '')
-        [void](& $previewInTray $agentsUrl 'Agents')
+        [void](& $previewInTray $agentsUrl)
         $checks = Get-MarkCount $second.TSS_BENCH_REPORT 'job-check'
-        Click-Ui $win $UiPanel.Page 315
+        Click-Ui $win $UiPanel.Page $UiId.ConfirmSource
         $flatAgent = Join-Path $second.TSS_AGENTS_DIR 'review.agent.md'
-        [void](Wait-Live { (Test-Path -LiteralPath $flatAgent) -and (Get-MarkCount $second.TSS_BENCH_REPORT 'job-check') -gt $checks } 'tray installation of the agent' 90)
-        Check 'the agent source does not install instructions' ((Get-Entries $second.TSS_INSTRUCTIONS_DIR) -eq '')
+        [void](Wait-Live { (Test-Path -LiteralPath $flatAgent) -and (Get-MarkCount $second.TSS_BENCH_REPORT 'job-check') -gt $checks } 'tray installation of the agent' 90 -Explain $trayShowed)
+        Check 'with instructions off, the folder source does not install its instructions file' ((Get-Entries $second.TSS_INSTRUCTIONS_DIR) -eq '')
+        & $sourceTypeOff 'issue7/custom-agents' 2
+        & $globalSwitch 2 $true
+
         Click-Ui $win $UiPanel.Nav $UiId.NavAdd
-        $duplicateAsk = Wait-Live { $d = Find-Ask $c.Tray; if ($d -ne [IntPtr]::Zero) { $d } } 'the duplicate Agent source question' 10
+        $duplicateAsk = Wait-Live { $d = Find-Ask $c.Tray; if ($d -ne [IntPtr]::Zero) { $d } } 'the duplicate source question' 10
         Set-UiText (Get-Ui $duplicateAsk $AskPanel $AskId.Edit) $agentsUrl
-        & $chooseAddType $duplicateAsk 'Agents'
         Click-Ui $duplicateAsk $AskPanel $AskId.Ok
-        [void](Wait-Live { (Find-Ask $c.Tray) -eq [IntPtr]::Zero } 'the duplicate Agent source question to close')
+        [void](Wait-Live { (Find-Ask $c.Tray) -eq [IntPtr]::Zero } 'the duplicate source question to close')
+        $agentId = (& $sourceAt 'issue7/custom-agents').id
+        $refusal = Wait-Maybe { $t = Read-Ui $win $UiPanel.Page $UiId.InfoText; if ($t -and $t -ceq "This source is already set up. Its ID is '$agentId'.") { $t } } 10
+        Check 'adding the same folder again is refused with the ID of the saved source' ($null -ne $refusal -and $null -eq (Read-Ui $win $UiPanel.Page $UiId.ConfirmSource)) (Read-Ui $win $UiPanel.Page $UiId.InfoText)
         Click-Ui $win $UiPanel.Nav $UiId.NavAdd
         $reopenedAsk = Wait-Live { $d = Find-Ask $c.Tray; if ($d -ne [IntPtr]::Zero) { $d } } 'Add Source to reopen after the duplicate error' 10
         $reopenedAddress = [TssLive]::Text((Get-Ui $reopenedAsk $AskPanel $AskId.Edit))
-        $reopenedAgentSelected = (Read-Ui $reopenedAsk $AskPanel $AskId.Choice) -eq 'Agents' -and (Get-Checked $reopenedAsk $AskPanel $AskId.Choice)
-        Check 'duplicate Agent source keeps its typed URL and type when Add Source is reopened' (
-            $reopenedAddress -eq $agentsUrl -and $reopenedAgentSelected
-        ) "URL: '$reopenedAddress'; Agents selected: $reopenedAgentSelected"
+        Check 'the duplicate source keeps its typed URL when Add Source is reopened, and no type is asked for' (
+            $reopenedAddress -eq $agentsUrl -and $null -eq (Read-Ui $reopenedAsk $AskPanel $AskId.Choice)
+        ) "URL: '$reopenedAddress'; choice: $(Read-Ui $reopenedAsk $AskPanel $AskId.Choice)"
         Click-Ui $reopenedAsk $AskPanel $AskId.Cancel
         [void](Wait-Live { (Find-Ask $c.Tray) -eq [IntPtr]::Zero } 'the reopened Add Source question to close')
-        [void](& $previewInTray $rulesUrl 'Instructions')
-        $checks = Get-MarkCount $second.TSS_BENCH_REPORT 'job-check'
-        Click-Ui $win $UiPanel.Page 315
-        $flatRule = Join-Path $second.TSS_INSTRUCTIONS_DIR 'style.instructions.md'
-        [void](Wait-Live { (Test-Path -LiteralPath $flatRule) -and (Get-MarkCount $second.TSS_BENCH_REPORT 'job-check') -gt $checks } 'tray installation of the instruction' 90)
-        [void](Wait-Live { @(Read-Nav $win).Count -eq 3 } 'three source rows in the tray')
-        [void](Save-Shot $win 'mixed-sources')
 
-        $shared = [IO.File]::ReadAllText($sources) | ConvertFrom-Json
-        $agentId = ($shared.repos | Where-Object { $_.kind -eq 'agents' }).id
-        $ruleId = ($shared.repos | Where-Object { $_.kind -eq 'instructions' }).id
-        if (-not $agentId -or -not $ruleId) { throw 'the tray did not save both typed source IDs' }
+        # The instructions folder holds an instructions file and an agent: the same again with agents off.
+        & $globalSwitch 1 $false
+        $previewText = & $previewInTray $rulesUrl
+        Check 'the instructions folder preview syncs only its instructions file' (
+            $previewText -match '(?m)^Instructions: Sync on\r?$' -and $previewText -match '(?m)^  style\.instructions\.md\b.*: will sync\r?$' -and
+            $previewText -match '(?m)^Agents: Sync off\r?$' -and $previewText -match '(?m)^  ignore\.agent\.md\b.*: Sync off\r?$'
+        ) ($previewText -replace '\s+', ' ')
+        $checks = Get-MarkCount $second.TSS_BENCH_REPORT 'job-check'
+        Click-Ui $win $UiPanel.Page $UiId.ConfirmSource
+        $flatRule = Join-Path $second.TSS_INSTRUCTIONS_DIR 'style.instructions.md'
+        [void](Wait-Live { (Test-Path -LiteralPath $flatRule) -and (Get-MarkCount $second.TSS_BENCH_REPORT 'job-check') -gt $checks } 'tray installation of the instruction' 90 -Explain $trayShowed)
+        & $sourceTypeOff 'issue7/instructions' 1
+        & $globalSwitch 1 $true
+        [void](Wait-Quiet $second.TSS_BENCH_REPORT 4)
+
+        # One row per source, each with the types it found; a type that is off says so.
+        $want = [ordered]@{ 'issue7/skills' = 'Skills 1'; 'issue7/custom-agents' = 'Agents 1, Instructions: Sync off'; 'issue7/instructions' = 'Agents: Sync off, Instructions 1' }
+        $rows = Wait-Maybe {
+            $n = @(Read-Nav $win)
+            $ok = $n.Count -eq 3 -and @($want.Keys | Where-Object { $k = $_; @($n | Where-Object { $_.Folder -eq $k -and $_.Kinds -eq $want[$k] -and $_.Sub -eq 'Up to date' -and $_.Branch -eq $c.Ref }).Count -ne 1 }).Count -eq 0
+            if ($ok) { $n }
+        } 30
+        Check 'the list has one row per source, each naming its folder, branch, types and status' ($null -ne $rows) (Show-Nav $win)
+        $pic = Save-Shot $win 'mixed-sources'
+        Test-Painted $pic $win 'three sources' @(@($UiPanel.Nav, $UiId.NavRepo), @($UiPanel.Nav, ($UiId.NavRepo + 1)), @($UiPanel.Nav, ($UiId.NavRepo + 2)))
+        Test-Layout $win 'three sources'
+        $row = @(Read-Nav $win | Where-Object { $_.Folder -eq 'issue7/custom-agents' })[0]
+        Open-Repo $win $row.Index
+        $types = @(0..3 | ForEach-Object { (Read-Ui $win $UiPanel.Page ($UiId.SourceType + $_)) -replace "`r?`n", ' / ' })
+        Check 'the source page shows the What to sync choice of every type, with Instructions off' (
+            $types[0] -eq 'Sync skills / Default (On)' -and $types[1] -eq 'Sync agents / Default (On)' -and $types[2] -match '^Sync instruction files / Off$' -and $types[3] -eq 'Sync plugins / Default (On)'
+        ) ($types -join ' ;; ')
+        $items = @(Wait-Maybe { $s = @(Read-Skills $win); if ($s.Count -gt 0) { , $s } } 30)
+        Check 'its page lists only the agent: the instructions file it never installed has no row' (
+            $items.Count -eq 1 -and $items[0].Name -like 'review*' -and $items[0].Tag -match '^(Installed|Up to date)$'
+        ) (($items | ForEach-Object { "$($_.Name) / $($_.Tag)" }) -join ' ;; ')
+        $pic = Save-Shot $win 'mixed-agent-page'
+        Test-Painted $pic $win 'a mixed source page' @(@($UiPanel.Page, $UiId.Title), @($UiPanel.Page, ($UiId.SourceType + 2)), @($UiPanel.Page, $UiId.Skill))
+        Test-Layout $win 'a mixed source page'
+
+        $shared = & $readShared
+        $agentSource = & $sourceAt 'issue7/custom-agents'
+        $ruleSource = & $sourceAt 'issue7/instructions'
+        $agentId = $agentSource.id
+        $ruleId = $ruleSource.id
+        if (-not $agentId -or -not $ruleId) { throw 'the tray did not save both folder sources' }
+        $agentLane = $agentSource.lanes.agents
+        $ruleLane = $ruleSource.lanes.instructions
+        Check 'the shared file keeps each source''s own type choice, and the global switches back on' (
+            $shared.version -eq 3 -and $agentSource.types.instructions -eq $false -and $ruleSource.types.agents -eq $false -and
+            -not ($shared.global -and $shared.global.types) -and $agentLane -and $ruleLane
+        ) ($shared | ConvertTo-Json -Depth 6 -Compress)
         $ambiguous = Tss $c @('check', $c.Repo) $first
         $adopt = Tss $c @('check', $agentId) $first
         $rules = Tss $c @('check', $ruleId) $first
         Check 'CLI needs exact IDs and adopts the repo-namespaced agent' (
             $ambiguous.Code -eq 3 -and $ambiguous.Text -match 'use the id' -and $adopt.Code -eq 0 -and
             $adopt.Text -match 'Now managing review.agent.md' -and $rules.Code -eq 0
-        )
+        ) "exit $($ambiguous.Code), $($adopt.Code), $($rules.Code)"
         Check 'both profiles have only the expected files in all three destinations' (
             (Get-Entries $first.TSS_AGENTS_DIR) -eq (Split-Path -Leaf $nested) -and (Get-Entries $nested) -eq 'personal.agent.md,review.agent.md' -and
             (Get-Entries $second.TSS_AGENTS_DIR) -eq 'review.agent.md' -and [IO.File]::ReadAllText($flatAgent) -ceq $agent -and
             (Get-Entries $first.TSS_INSTRUCTIONS_DIR) -eq 'style.instructions.md' -and (Get-Entries $second.TSS_INSTRUCTIONS_DIR) -eq 'style.instructions.md' -and
             [IO.File]::ReadAllText($flatRule) -ceq $rule -and [IO.File]::ReadAllText((Join-Path $first.TSS_INSTRUCTIONS_DIR 'style.instructions.md')) -ceq $rule -and
-            (Get-Entries $first.TSS_SKILLS_DIR) -eq 'sample' -and (Get-Entries $second.TSS_SKILLS_DIR) -eq 'sample'
-        )
+            (Get-Entries $first.TSS_SKILLS_DIR) -eq 'starter' -and (Get-Entries $second.TSS_SKILLS_DIR) -eq 'starter'
+        ) "first: $(Get-Entries $first.TSS_AGENTS_DIR) | $(Get-Entries $first.TSS_INSTRUCTIONS_DIR); second: $(Get-Entries $second.TSS_AGENTS_DIR) | $(Get-Entries $second.TSS_INSTRUCTIONS_DIR)"
         Check 'the adopted copy, local skill edit and handwritten neighbor retain their exact bytes' (
             (Get-BlobId $existing) -eq $existingHash -and (Get-BlobId $neighbor) -eq $neighborHash -and [IO.File]::ReadAllText($localSkill) -ceq $edit
         )
         $a = [IO.File]::ReadAllText($firstState) | ConvertFrom-Json
         $b = [IO.File]::ReadAllText($secondState) | ConvertFrom-Json
+        # Types that list nothing keep their poll times in state.json (lane_polls), which is format 3.
         Check 'shared IDs, independent ownership and work folders' (
-            $shared.version -eq 2 -and $a.version -eq 2 -and $b.version -eq 2 -and $null -ne $a.repos.$skillsId -and $null -ne $b.repos.$skillsId -and
+            $a.version -eq 3 -and $b.version -eq 3 -and $null -ne $a.repos.$skillsId -and $null -ne $b.repos.$skillsId -and
             $a.skills_dir -eq $first.TSS_SKILLS_DIR -and $b.skills_dir -eq $second.TSS_SKILLS_DIR -and
-            $a.loose_sources.$agentId.binding.root -eq $first.TSS_AGENTS_DIR -and $a.loose_sources.$agentId.binding.child -eq (Split-Path -Leaf $nested) -and
-            $b.loose_sources.$agentId.binding.root -eq $second.TSS_AGENTS_DIR -and -not $b.loose_sources.$agentId.binding.child -and
-            $a.loose_sources.$ruleId.binding.root -eq $first.TSS_INSTRUCTIONS_DIR -and $b.loose_sources.$ruleId.binding.root -eq $second.TSS_INSTRUCTIONS_DIR -and
+            $a.loose_sources.$agentLane.binding.root -eq $first.TSS_AGENTS_DIR -and $a.loose_sources.$agentLane.binding.child -eq (Split-Path -Leaf $nested) -and
+            $b.loose_sources.$agentLane.binding.root -eq $second.TSS_AGENTS_DIR -and -not $b.loose_sources.$agentLane.binding.child -and
+            $a.loose_sources.$ruleLane.binding.root -eq $first.TSS_INSTRUCTIONS_DIR -and $b.loose_sources.$ruleLane.binding.root -eq $second.TSS_INSTRUCTIONS_DIR -and
             (Test-Path -LiteralPath (Join-Path (Split-Path -Parent $first.TSS_AGENTS_DIR) '.tss-leaf-work\.owner')) -and
             (Test-Path -LiteralPath (Join-Path (Split-Path -Parent $second.TSS_AGENTS_DIR) '.tss-leaf-work\.owner')) -and
             (Get-BlobId $configFile) -eq $configHash
-        )
+        ) ("lanes $agentLane, $ruleLane; versions $($a.version), $($b.version); agents $($a.loose_sources.$agentLane.binding.root)\" +
+            "$($a.loose_sources.$agentLane.binding.child), $($b.loose_sources.$agentLane.binding.root)\$($b.loose_sources.$agentLane.binding.child); " +
+            "instructions $($a.loose_sources.$ruleLane.binding.root), $($b.loose_sources.$ruleLane.binding.root); config unchanged $((Get-BlobId $configFile) -eq $configHash)")
     } finally { Close-Env $c }
 }
 
@@ -1007,6 +1089,8 @@ function Test-Private {
         # Added like any repository, without --use-token: the app has to find out by itself that it needs the token.
         $c = New-Env 'private' $PrivateRepo -NoBranch -WithProxy
         Add-Repo $c @('--every', '6h')
+        # The add's own preview requests are not part of what is checked here.
+        $c.Proxy.Clear()
         $r = Tss $c @('check')
         $printed.Add($r.Text)
         $diff = Compare-WithUpstream $c.Skills $c.Repo $c.Ref 'skills'
@@ -1031,6 +1115,8 @@ function Test-Private {
         $d = New-Env 'private-anon' $PrivateRepo -NoBranch -WithProxy
         $noSignIn = @{ PATH = "$env:SystemRoot\System32;$env:SystemRoot"; GH_TOKEN = $null; GITHUB_TOKEN = $null }
         Add-Repo $d @('--every', '6h')
+        # The add's own preview requests are not part of what is checked here.
+        $d.Proxy.Clear()
         $r = Tss $d @('token', 'status') $noSignIn
         $printed.Add($r.Text)
         if ($r.Text -match 'Saved token: yes') {
@@ -1069,7 +1155,7 @@ function Test-Hostile {
             Check "the check names $bad as refused" ($first.Text -match "(?mi)^\s*!\s+$bad\b") ''
         }
 
-        $allowed = @('home', 'skills', 'bin', 'out', '.tss-work')
+        $allowed = @('home', 'skills', 'agents', 'instructions', 'bin', 'out', '.tss-work', '.tss-leaf-work')
         $top = @(Get-ChildItem -LiteralPath $c.Root -Force | ForEach-Object { $_.Name })
         $extra = @($top | Where-Object { $allowed -notcontains $_ })
         Check 'nothing was written outside the skills, settings and work folders' ($extra.Count -eq 0) ('top level: ' + ($top -join ', '))
@@ -1203,7 +1289,8 @@ function Test-Failures {
             $same = (Get-DiskStamp $c.Skills) -eq $good
             Check "the listing fails ($($m.Mode)): says '$($m.Word)', exits with an error, deletes and changes nothing" ($r.Code -ge 2 -and $r.Text -match [regex]::Escape($m.Word) -and $r.Text -match 'Nothing is deleted because a check failed' -and $same) "exit $($r.Code); folder unchanged: $same"
         }
-        $c.Proxy.SetMode('api', 'empty-tree')
+        # The source's folder is still there, with nothing in it.
+        $c.Proxy.SetMode('api', 'empty-tree:skills')
         $r = Tss $c @('check')
         $same = (Get-DiskStamp $c.Skills) -eq $good
         Check 'a listing that is suddenly empty deletes nothing, and the app says the removals are held' ($r.Code -ne 0 -and $r.Text -match 'lists no skills at all' -and $same) "exit $($r.Code); folder unchanged: $same"
@@ -1272,10 +1359,11 @@ function Test-Stale {
 function Test-Empty {
     $c = New-Env 'empty' -NoBranch
     try {
-        Add-Repo $c @('--use-token', '--every', '6h') "https://github.com/$($c.Repo)"
+        # A whole repository finds skills in any subfolder now, so the empty source is a folder that holds none.
+        Add-Repo $c @('--use-token', '--every', '6h') (Get-Address $c 'docs')
         $r = Tss $c @('check')
-        Check 'a repository added as a whole, with its skills in a subfolder: "No skills found", needs attention' ($r.Code -eq 1 -and $r.Text -match 'No skills found') "exit $($r.Code)"
-        Check 'it points at the folder to use, as an address' ($r.Text -match 'tree/main/skills')
+        Check 'a folder with no skills in it: "No skills found", needs attention' ($r.Code -eq 1 -and $r.Text -match 'No skills found') "exit $($r.Code)"
+        Check 'it says which folder it read and what to look at' ($r.Text.Contains("No skills were found in the folder 'docs' of"))
         Check 'and the output is plain ASCII' (-not ($r.Text -match '[^\x00-\x7f]'))
         Check 'nothing was installed' (@(Get-ChildItem -LiteralPath $c.Skills -Force).Count -eq 0)
 
@@ -1284,17 +1372,17 @@ function Test-Empty {
         $win = Open-Window $c.Tray
         $nav = @(Read-Nav $win)
         # The record says the last listing was empty, so this needs no check of its own.
-        Check 'after a restart, before any check, the repository list already says "No skills found"' ($nav.Count -ge 1 -and $nav[0].Sub -eq 'No skills found') (($nav | ForEach-Object { "$($_.Label) | $($_.Sub)" }) -join ' ;; ')
+        Check 'after a restart, before any check, the source list already says "Nothing found" for the docs folder' ($nav.Count -ge 1 -and $nav[0].Sub -eq 'Nothing found' -and $nav[0].Folder -eq 'docs' -and -not $nav[0].Kinds) (($nav | ForEach-Object { "$($_.Label) | $($_.Sub)" }) -join ' ;; ')
         [void](Invoke-TrayCheck $c.Tray $c.Report)
         Start-Sleep -Milliseconds 800
         $nav = @(Read-Nav $win)
-        Check 'after "Sync now", the repository list says "No skills found"' ($nav.Count -ge 1 -and $nav[0].Sub -eq 'No skills found') (($nav | ForEach-Object { "$($_.Label) | $($_.Sub)" }) -join ' ;; ')
+        Check 'after "Sync now", the source list says "Nothing found"' ($nav.Count -ge 1 -and $nav[0].Sub -eq 'Nothing found' -and $nav[0].Folder -eq 'docs') (($nav | ForEach-Object { "$($_.Label) | $($_.Sub)" }) -join ' ;; ')
         $hero = Read-Hero $win
-        Check 'and the top of the window says the repository needs attention' ($hero.Title -eq '1 repository needs your attention') "$($hero.Title) | $($hero.Sub)"
+        Check 'and the top of the window says the source needs attention' ($hero.Title -eq '1 source needs your attention') "$($hero.Title) | $($hero.Sub)"
         Open-Repo $win 0
         $lead = Read-Ui $win $UiPanel.Page $UiId.InfoLead
         $detail = Read-Ui $win $UiPanel.Page $UiId.InfoText
-        Check 'its page says "No skills found." and tells what to do (the address with the folder)' ($lead -eq 'No skills found.' -and $detail -match 'tree/main/skills') ("$lead " + ($detail -replace "\s+", ' '))
+        Check 'its page says "Nothing found." and names the source and folder it read' ($lead -eq 'Nothing found.' -and $detail -ceq "Nothing to sync was found in $($c.Repo)@$($c.Ref) : docs. Check the branch and folder.") ("$lead " + ($detail -replace "\s+", ' '))
         Check 'with a "Try again" button' ($null -ne (Read-Ui $win $UiPanel.Page $UiId.Retry))
         Close-Window $c.Tray
     } finally { Close-Env $c }
@@ -1335,6 +1423,13 @@ function Save-Shot([IntPtr]$Window, [string]$Name) {
         [void][TssLive]::SetWindowPos($Window, [IntPtr]::Zero, 0, 0, 0, 0, 0x13)
         [void](Wait-Maybe { [TssLive]::CoveredBy($Window) -eq '' } 2)
         $over = [TssLive]::CoveredBy($Window)
+        if ($over -ne '') {
+            # Another app's active window stays in front of a window that is only raised; bring the fixture forward.
+            [void][TssLive]::Foreground($Window)
+            [void](Wait-Maybe { [TssLive]::CoveredBy($Window) -eq '' } 2)
+            [void][TssLive]::DwmFlush()
+            $over = [TssLive]::CoveredBy($Window)
+        }
     }
     try {
         if ($over -eq '') { [void][TssLive]::CaptureScreen($Window, $path, 0) }
@@ -1440,81 +1535,124 @@ function Show-Nav([IntPtr]$Window) { (@(Read-Nav $Window) | ForEach-Object { "$(
 
 function Get-Width([IntPtr]$Handle) { $b = ([TssLive]::Bounds($Handle)) -split ','; [int]$b[2] - [int]$b[0] }
 
+# Scrolls the page from its top just far enough that the control is wholly in view, as a person scrolling to it would.
+function Show-PageControl([IntPtr]$Window, [int]$Id) {
+    $pane = [TssLive]::GetDlgItem($Window, $UiPanel.Page)
+    [void][TssLive]::SendMessageW($pane, 0x115, [IntPtr]6, [IntPtr]::Zero) # WM_VSCROLL, SB_TOP
+    $bottom = ([int[]]([TssLive]::Bounds($pane) -split ','))[3]
+    for ($i = 0; $i -lt 80 -and ([int[]]([TssLive]::Bounds((Get-Ui $Window $UiPanel.Page $Id)) -split ','))[3] -gt $bottom; $i++) {
+        [void][TssLive]::SendMessageW($pane, 0x115, [IntPtr]1, [IntPtr]::Zero) # SB_LINEDOWN
+        Start-Sleep -Milliseconds 30
+    }
+    Start-Sleep -Milliseconds 300
+}
+
 function Move-Pointer([IntPtr]$Handle) {
     $b = ([TssLive]::Bounds($Handle)) -split ','
     [void][TssLive]::SetCursorPos([int](([int]$b[0] + [int]$b[2]) / 2), [int](([int]$b[1] + [int]$b[3]) / 2))
 }
 
-# The list on the left widens when the mouse rests on it and a name in it is cut, taking the room from the page, and
-# narrows when the mouse leaves it. The window asks Windows where the mouse is, so this moves the real mouse pointer,
-# and puts it back afterwards.
-function Test-ListHover($c, [IntPtr]$Window, [switch]$Diff) {
+# The fixed strip's panel and control IDs, kept here with the splitter probe.
+$splitPanel = 107
+$splitId = 304
+
+function Read-WindowSizeFile($c) {
+    try { [IO.File]::ReadAllText((Join-Path $c.Home 'window.txt')).Trim() } catch { '' }
+}
+
+function Test-ListSplitter($c, [IntPtr]$Window, [switch]$Diff) {
+    $state = if ($Diff) { 'the diff file list' } else { 'the source list' }
     $over = [TssLive]::CoveredBy($Window)
-    if ($over -ne '') { Check 'the list hover probe has an unobstructed view' $false $over; return }
+    if ($over -ne '' -or -not [TssLive]::Foreground($Window)) { Check "${state}: the fixture window can receive input" $false $over; return }
     $listPanel = if ($Diff) { $UiPanel.Files } else { $UiPanel.Nav }
     $pagePanel = if ($Diff) { $UiPanel.Code } else { $UiPanel.Page }
     $entry = if ($Diff) { $UiId.File + 4 } else { $UiId.NavRepo }
-    $mark = if ($Diff) { 'files' } else { 'nav' }
-    $state = if ($Diff) { 'the diff file list widened' } else { 'the repository list widened' }
     $nav = [TssLive]::GetDlgItem($Window, $listPanel)
     $pane = [TssLive]::GetDlgItem($Window, $pagePanel)
+    $splitter = Get-Ui $Window $splitPanel $splitId
+    $dpi = [int][TssLive]::GetDpiForWindow($Window)
     $was = ([TssLive]::CursorAt()) -split ','
     try {
-        # The pointer could be resting on the list already.
-        Move-Pointer $pane
-        Start-Sleep -Milliseconds 300
         if ($Diff) {
             Click-Ui $Window $listPanel $entry
             Start-Sleep -Milliseconds 100
-            # Keep both panes away from the top: widening must not lose the place or the selected file.
+            # Both panes can scroll; changing their widths should not lose the place.
             [void][TssLive]::SendMessageW($nav, 0x115, [IntPtr]1, [IntPtr]::Zero)
             [void][TssLive]::SendMessageW($pane, 0x115, [IntPtr]1, [IntPtr]::Zero)
         }
         $listScroll = [TssLive]::GetScrollPos($nav, 1)
         $pageScroll = [TssLive]::GetScrollPos($pane, 1)
-        $narrow = Get-Width $nav
-        $both = $narrow + (Get-Width $pane)
-        $windowWidth = Get-Width $Window
-        $half = [int](([TssLive]::Client($Window)) -split ',')[0] / 2
-        $marks = Get-MarkCount $c.Report $mark
-        if ($Diff) { [void](Save-Shot $Window '09a-files-narrow') }
-        Move-Pointer (Get-Ui $Window $listPanel $entry)
-        Start-Sleep -Milliseconds 100
-        $early = Get-Width $nav
-        $wide = Wait-Maybe { $n = Get-Width $nav; if ($n -gt $narrow) { $n } } 3 25
-        if ($null -ne $wide) { [void](Wait-Maybe { if ((Get-MarkCount $c.Report $mark) -gt $marks) { $true } } 3 25) }
-        $took = @(Read-Marks $c.Report | Where-Object { $_.Mark -eq $mark } | Select-Object -Skip $marks | ForEach-Object { $_.TookMs })
-        $evidence = "list $narrow, then $early after 0.1 s, then $wide px; list and page $both, then $($wide + (Get-Width $pane)) px; half the window $half px; re-laid out in $($took -join ', ') ms"
-        Check "${state}: resting the mouse on a cut name widens the list after a moment, taking room from the page" ($early -eq $narrow -and $null -ne $wide -and $wide -le $half + 1 -and [math]::Abs($wide + (Get-Width $pane) - $both) -le 1 -and (Get-Width $Window) -eq $windowWidth) $evidence
-        $pic = Save-Shot $Window $(if ($Diff) { '09b-files-widened' } else { '05b-list-widened' })
-        $painted = if ($Diff) { @(@($UiPanel.Files, $entry), @($UiPanel.Head, $UiId.Title)) } else { @(@($UiPanel.Nav, $UiId.NavRepo), @($UiPanel.Page, $UiId.Title)) }
-        Test-Painted $pic $Window $state $painted
-        Test-Layout $Window $state
-        if ($Diff) {
-            Check 'widening the diff keeps both scroll positions' ($listScroll -gt 0 -and $pageScroll -gt 0 -and [TssLive]::GetScrollPos($nav, 1) -eq $listScroll -and [TssLive]::GetScrollPos($pane, 1) -eq $pageScroll) "files $listScroll, code $pageScroll"
-            Move-Pointer (Get-Ui $Window $listPanel ($entry + 1))
-            Start-Sleep -Milliseconds 300
-            Check 'moving between diff files keeps the list wide' ((Get-Width $nav) -eq $wide)
-        }
         Move-Pointer $pane
-        # The window sizes the list, then the page: wait for both, as a reader from outside can see one between them.
-        $back = Wait-Maybe { if ((Get-Width $nav) -eq $narrow -and (Get-Width $nav) + (Get-Width $pane) -eq $both) { $true } } 3 25
-        Check "${state}: moving the mouse onto the page narrows the list again" ($null -ne $back -and (Get-Width $nav) + (Get-Width $pane) -eq $both) ("list $(Get-Width $nav) px, page $(Get-Width $pane) px")
+        Start-Sleep -Milliseconds 400
+        $before = Get-Width $nav
+        $pageBefore = Get-Width $pane
+        $oldSize = Read-WindowSizeFile $c
         if ($Diff) {
-            Check 'narrowing the diff keeps both scroll positions' ([TssLive]::GetScrollPos($nav, 1) -eq $listScroll -and [TssLive]::GetScrollPos($pane, 1) -eq $pageScroll)
-            Move-Pointer (Get-Ui $Window $listPanel $entry)
-            Start-Sleep -Milliseconds 100
-            Move-Pointer $pane
-            Start-Sleep -Milliseconds 300
-            Check 'passing over the diff file list does not widen it' ((Get-Width $nav) -eq $narrow)
-            Move-Pointer (Get-Ui $Window $listPanel $entry)
-            $wideAgain = Wait-Maybe { if ((Get-Width $nav) -gt $narrow) { $true } } 3 25
-            Send-Key (Get-Ui $Window $UiPanel.Head $UiId.Back) $VK_ESCAPE
-            $left = Wait-Maybe { if (-not [TssLive]::Shown($nav)) { $true } } 5
-            Move-Pointer ([TssLive]::GetDlgItem($Window, $UiPanel.Page))
-            $dpi = [int][TssLive]::GetDpiForWindow($Window)
-            Check 'leaving the widened diff resets the repository list width' ($wideAgain -and $left -and [math]::Abs((Get-Width ([TssLive]::GetDlgItem($Window, $UiPanel.Nav))) - 248 * $dpi / 96) -le 1)
+            $saved = $oldSize -split '\s+'
+            Check 'Show changes uses the list width set in the main view' ($saved.Count -eq 3 -and [math]::Abs($before - [int]$saved[2] * $dpi / 96) -le 1) "list $before px at $dpi dpi; window.txt: $oldSize"
         }
+        Move-Pointer (Get-Ui $Window $listPanel $entry)
+        Start-Sleep -Milliseconds 500
+        $overList = Get-Width $nav
+        Move-Pointer $pane
+        Start-Sleep -Milliseconds 500
+        Check "${state}: hovering and leaving do not change its width" ($before -eq $overList -and $before -eq (Get-Width $nav)) "list $before, $overList, $(Get-Width $nav) px"
+
+        $size = [TssLive]::Client($splitter) -split ','
+        $x = [int]([int]$size[0] / 2)
+        $y = [int]([int]$size[1] / 2) -shl 16
+        $press = [IntPtr]($y -bor $x)
+        # lParam is relative to the splitter's old position until the move is handled.
+        $move = [IntPtr]($y -bor ($x + [int](24 * $dpi / 96)))
+        [void][TssLive]::SendMessageW($splitter, $WM_LBUTTONDOWN, [IntPtr]1, $press)
+        try {
+            [void][TssLive]::SendMessageW($splitter, 0x200, [IntPtr]1, $move) # WM_MOUSEMOVE with the left button held
+            $after = Get-Width $nav
+            $pageAfter = Get-Width $pane
+            Check "${state}: dragging changes both panes live within their bounds" (
+                $after -gt $before -and $after -ge [math]::Floor(160 * $dpi / 96) -and $pageAfter -ge [math]::Floor(360 * $dpi / 96) -and
+                $after + $pageAfter -eq $before + $pageBefore
+            ) "list $before to $after px, page $pageBefore to $pageAfter px at $dpi dpi"
+            Check "${state}: dragging has not written window.txt yet" ((Read-WindowSizeFile $c) -eq $oldSize)
+        } finally {
+            # Release at the grip in its new position.
+            [void][TssLive]::SendMessageW($splitter, $WM_LBUTTONUP, [IntPtr]::Zero, $press)
+        }
+        $dragDip = [int][math]::Round($after * 96 / $dpi)
+        $dragSaved = Read-WindowSizeFile $c
+        Check "${state}: releasing the splitter saves the new list width" ($dragSaved -match "^\d+ \d+ $dragDip$") "window.txt: $dragSaved"
+
+        if ($Diff) {
+            Check 'resizing the diff keeps both scroll positions' (
+                $listScroll -gt 0 -and $pageScroll -gt 0 -and [TssLive]::GetScrollPos($nav, 1) -eq $listScroll -and [TssLive]::GetScrollPos($pane, 1) -eq $pageScroll
+            ) "files $listScroll, code $pageScroll"
+        }
+
+        $focused = [TssLive]::Focused($Window) -eq $splitter
+        $tabbedBack = $false
+        if ($focused) {
+            Send-FocusedKeys $Window $splitter '{TAB}'
+            $next = Wait-Maybe { $h = [TssLive]::Focused($Window); if ($h -ne [IntPtr]::Zero -and $h -ne $splitter) { $h } } 3
+            if ($next) {
+                Send-FocusedKeys $Window $next '+{TAB}'
+                $tabbedBack = Wait-Maybe { [TssLive]::Focused($Window) -eq $splitter } 3
+            }
+        }
+        Check "${state}: Tab reaches the splitter, named Resize list" ($tabbedBack -and [TssLive]::Text($splitter) -ceq 'Resize list')
+        if ($tabbedBack) {
+            Send-FocusedKeys $Window $splitter '{LEFT}'
+            $keyDip = $dragDip - 8
+            $keySaved = Wait-Maybe { $t = Read-WindowSizeFile $c; if ($t -match "^\d+ \d+ $keyDip$") { $t } } 3
+            $keyWidth = Get-Width $nav
+            Check "${state}: Left changes the focused splitter width by 8 DIP and saves it" (
+                $null -ne $keySaved -and [math]::Abs(($after - $keyWidth) - 8 * $dpi / 96) -le 1
+            ) "list $after to $keyWidth px at $dpi dpi; window.txt: $(Read-WindowSizeFile $c)"
+        }
+
+        $pic = Save-Shot $Window $(if ($Diff) { '09b-diff-splitter' } else { '05b-source-splitter' })
+        $painted = if ($Diff) { @(@($UiPanel.Files, $entry), @($UiPanel.Head, $UiId.Title), @($splitPanel, $splitId)) } else { @(@($UiPanel.Nav, $entry), @($UiPanel.Page, $UiId.Title), @($splitPanel, $splitId)) }
+        Test-Painted $pic $Window "${state} after resizing" $painted
+        Test-Layout $Window "${state} after resizing"
     } finally {
         [void][TssLive]::SetCursorPos([int]$was[0], [int]$was[1])
     }
@@ -1794,8 +1932,34 @@ function Test-Ui {
         $startNote = Read-Ui $win $UiPanel.Page $UiId.StartupText
         $offSwitch = $switch -ne [IntPtr]::Zero -and [TssLive]::IsWindowEnabled($switch) -and -not (Get-Checked $win $UiPanel.Page $UiId.Startup)
         Check 'it has a Start with Windows switch, off and ready to turn on, and says what it does' ($offSwitch -and $startNote -eq 'Starts in the tray when you sign in to Windows, without opening its window.') $startNote
+        $globals = @(0..3 | ForEach-Object { '{0}={1}' -f (Read-Ui $win $UiPanel.Page ($UiId.GlobalType + $_)), (Get-Checked $win $UiPanel.Page ($UiId.GlobalType + $_)) }) -join ', '
+        Check 'its Sources group has the four type switches, all on' (
+            (Read-Ui $win $UiPanel.Page $UiId.SourcesHeading) -eq 'Sources' -and
+            $globals -eq 'Sync skills by default=True, Sync agents by default=True, Sync instruction files by default=True, Sync plugins by default=True'
+        ) $globals
+        $ignored = Read-Ui $win $UiPanel.Page $UiId.IgnoredText
+        Check 'repository-specific items are off, and the default ignored folders are listed with an Edit button' (
+            (Read-Ui $win $UiPanel.Page $UiId.GlobalRepoItems) -eq 'Include repo-specific skills and agents' -and -not (Get-Checked $win $UiPanel.Page $UiId.GlobalRepoItems) -and
+            $ignored -eq 'Folders with these names are skipped in every source: sample, example, samples, examples, test, tests.' -and
+            (Read-Ui $win $UiPanel.Page $UiId.IgnoredEdit) -eq "Edit$([char]0x2026)"
+        ) $ignored
         $pic = Save-Shot $win '02-settings'
-        Test-Painted $pic $win 'Settings' @(@($UiPanel.Page, $UiId.DefaultEvery), @($UiPanel.Page, $UiId.Startup), @($UiPanel.Page, $UiId.SkillsDir), @($UiPanel.Page, 323))
+        Test-Painted $pic $win 'Settings' @(@($UiPanel.Page, $UiId.DefaultEvery), @($UiPanel.Page, $UiId.GlobalType))
+        $pagePane = [TssLive]::GetDlgItem($win, $UiPanel.Page)
+        $pageBottom = ([int[]]([TssLive]::Bounds($pagePane) -split ','))[3]
+        for ($i = 0; $i -lt 60 -and ([int[]]([TssLive]::Bounds((Get-Ui $win $UiPanel.Page $UiId.IgnoredEdit)) -split ','))[3] -gt $pageBottom; $i++) {
+            [void][TssLive]::SendMessageW($pagePane, 0x115, [IntPtr]1, [IntPtr]::Zero) # WM_VSCROLL, SB_LINEDOWN
+            Start-Sleep -Milliseconds 30
+        }
+        Start-Sleep -Milliseconds 300
+        $pic = Save-Shot $win '02b-settings-sources'
+        Test-Painted $pic $win 'Settings, its Sources group' @(@($UiPanel.Page, ($UiId.GlobalType + 3)), @($UiPanel.Page, $UiId.GlobalRepoItems), @($UiPanel.Page, $UiId.IgnoredEdit))
+        Test-Layout $win 'Settings, its Sources group'
+        Show-PageControl $win 323
+        $pic = Save-Shot $win '02c-settings-startup-token'
+        Test-Painted $pic $win 'Settings, Start with Windows and the token' @(@($UiPanel.Page, $UiId.Startup), @($UiPanel.Page, $UiId.SkillsDir), @($UiPanel.Page, 323))
+        [void][TssLive]::SendMessageW($pagePane, 0x115, [IntPtr]6, [IntPtr]::Zero) # SB_TOP
+        Start-Sleep -Milliseconds 300
         Test-Layout $win 'Settings'
         Test-TabOrder $win 'Settings'
 
@@ -1809,11 +1973,10 @@ function Test-Ui {
         Note "the question: $said"
         $note = Read-Ui $ask $AskPanel $AskId.Note
         Check 'it has no box for a token; a note says private repositories work by themselves' ($note -like 'Private repositories work automatically*' -and $said -notmatch 'Use my token|Private repository$') $note
-        $types = @(0..3 | ForEach-Object { Read-Ui $ask $AskPanel ($AskId.Choice + $_) }) -join ','
-        Check 'it offers the four types, with Skills chosen' ($types -eq 'Skills,Agents,Instructions,Plugins' -and (Get-Checked $ask $AskPanel $AskId.Choice)) $types
+        Check 'it asks for the location only: no type picker, as the app finds every type' ($null -eq (Read-Ui $ask $AskPanel $AskId.Choice) -and (Read-Ui $ask $AskPanel $AskId.Label) -eq 'GitHub repository, branch or folder') (Read-Ui $ask $AskPanel $AskId.Label)
         Check 'it offers how often to check, starting at the default' ((Read-Ui $ask $AskPanel $AskId.Combo) -eq 'Default (1 day)') (Read-Ui $ask $AskPanel $AskId.Combo)
         Set-UiText (Get-Ui $ask $AskPanel $AskId.Edit) (Get-Address $c)
-        $hint = Wait-Maybe { $t = Read-Ui $ask $AskPanel $AskId.Hint; if ($t -match [regex]::Escape($c.Repo) -and $t -match 'skills folder on') { $t } } 5
+        $hint = Wait-Maybe { $t = Read-Ui $ask $AskPanel $AskId.Hint; if ($t -eq "$($c.Repo) $dot $($c.Ref)/skills (GitHub tells where the branch name ends)") { $t } } 5
         Check 'as the address is typed, the question says what it reads it as' ($null -ne $hint) (Read-Ui $ask $AskPanel $AskId.Hint)
         $askArea = [System.Windows.Forms.Screen]::FromHandle($ask).WorkingArea
         $askBox = [int[]]([TssLive]::Bounds($ask) -split ',')
@@ -1826,7 +1989,7 @@ function Test-Ui {
             $box[1] -ge $paneBox[1] -and $box[3] -le $paneBox[3]
         }
         $pic = Save-Shot $ask '03-add'
-        $top = @(@($AskPanel, $AskId.Heading), @($AskPanel, $AskId.Edit), @($AskPanel, $AskId.Choice))
+        $top = @(@($AskPanel, $AskId.Heading), @($AskPanel, $AskId.Edit), @($AskPanel, $AskId.Hint))
         $foot = @(@($AskPanel, $AskId.Ok), @($AskPanel, $AskId.Cancel))
         if (-not (& $shows $AskId.Ok)) {
             Test-Painted $pic $ask 'the Add question at the top' $top
@@ -1843,8 +2006,11 @@ function Test-Ui {
         Check 'the question closed once Preview was clicked' ($null -ne (Wait-Maybe { if ((Find-Ask $tray) -eq [IntPtr]::Zero) { $true } } 5))
         $preview = Wait-Maybe { if ((Read-Ui $win $UiPanel.Page $UiId.ConfirmSource) -eq 'Add and check') { Read-Ui $win $UiPanel.Page $UiId.InfoText } } 60
         Note "the preview: $($preview -replace '\s+', ' ')"
-        Check 'the preview names the type, the skills folder and the three skills, and saves and installs nothing' (
-            $preview -match 'Type: Skills' -and $preview -match "Destination: $([regex]::Escape($c.Skills))\r?\n" -and $preview -match 'Matched 3 skills:\s+alpha\s+beta\s+gamma' -and
+        Check 'the preview names the folder, finds the three skills and no other type, shows the skills folder, and saves and installs nothing' (
+            $preview -match "(?m)^Branch: $([regex]::Escape($c.Ref))\r?$" -and $preview -match '(?m)^Folder: skills\r?$' -and $preview -match '(?m)^Skills: Sync on\r?$' -and
+            @('alpha', 'beta', 'gamma' | Where-Object { $preview -notmatch "(?m)^  $_ \(skills/$_\): will sync\r?$" }).Count -eq 0 -and
+            ([regex]::Matches($preview, '(?m)^  None found\.\r?$')).Count -eq 3 -and
+            $preview -match "Destination: $([regex]::Escape($c.Skills))\r?\n" -and $preview -match 'Add this source to save it and start its first check\.' -and
             (Get-Entries $c.Skills) -eq '' -and @(Read-Nav $win).Count -eq 0
         ) "$(Get-Entries $c.Skills); $(@(Read-Nav $win).Count) source(s)"
         $pic = Save-Shot $win '03b-preview'
@@ -1884,17 +2050,26 @@ function Test-Ui {
             $answer = [TssLive]::Ping($win, 3000)
             $worst = [math]::Max($worst, $(if ($answer -lt 0) { 3000 } else { $answer }))
             $nav = @(Read-Nav $win)
-            if ($nav.Count -ge 1 -and $nav[0].Sub -match 'up to date$') { $done = $true }
+            if ($nav.Count -ge 1 -and $nav[0].Sub -eq 'Up to date') { $done = $true }
             Start-Sleep -Milliseconds 100
         }
         $c.Proxy.SetMode('api', 'pass')
         Check 'while it checked, the top of the window said "Checking for updates"' (@($seen | Where-Object { $_ -match 'Checking for updates' }).Count -ge 1) ($seen -join ' / ')
         Check 'the window kept answering while it checked' ($worst -lt 500) "slowest answer $worst ms over $([int]$watch.Elapsed.TotalSeconds) s"
-        Check 'the check ends with the list saying "3 skills, up to date"' ($done -and @(Read-Nav $win)[0].Sub -eq "3 skills $dot up to date") (Show-Nav $win)
+        Check 'the check ends with the source''s row saying its folder, branch, "Skills 3" and "Up to date"' (
+            $done -and ($n0 = @(Read-Nav $win)[0]) -and $n0.Repo -eq $c.Repo -and $n0.Branch -eq $c.Ref -and $n0.Folder -eq 'skills' -and $n0.Kinds -eq 'Skills 3' -and $n0.Sub -eq 'Up to date'
+        ) (Show-Nav $win)
         $title = Read-Ui $win $UiPanel.Page $UiId.Title
         $sub = Read-Ui $win $UiPanel.Page $UiId.Sub
         Note "the page: $title / $sub"
-        Check 'the page of the new source is shown: its type and ID, public, its folder and branch, when it was checked' ($title -eq $c.Repo -and $sub -match "^Skills \[[^\]]+\] $dot Public $dot" -and $sub -match "the skills folder on $([regex]::Escape($c.Ref))" -and $sub -match 'checked') "$title / $sub"
+        Check 'the page of the new source is shown: public, its folder and branch, when it was checked' ($title -eq $c.Repo -and $sub -match "^Public $dot the skills folder on $([regex]::Escape($c.Ref)) $dot checked ") "$title / $sub"
+        $types = @(0..3 | ForEach-Object { (Read-Ui $win $UiPanel.Page ($UiId.SourceType + $_)) -replace "`r?`n", ' / ' })
+        Check 'its What to sync card follows Settings for every type, repo-specific items and folder rules' (
+            ($types -join ' ;; ') -eq 'Sync skills / Default (On) ;; Sync agents / Default (On) ;; Sync instruction files / Default (On) ;; Sync plugins / Default (On)' -and
+            (Read-Ui $win $UiPanel.Page $UiId.RepoItems) -match '^Repository-specific skills and agents\r?\nDefault \(skip\)$' -and
+            (Read-Ui $win $UiPanel.Page $UiId.FolderRules) -eq "Folder rules$([char]0x2026)" -and
+            (Read-Ui $win $UiPanel.Page $UiId.FolderRulesText) -eq 'Skips the ignored folders set in Settings.'
+        ) (($types -join ' ;; ') + ' | ' + (Read-Ui $win $UiPanel.Page $UiId.RepoItems) + ' | ' + (Read-Ui $win $UiPanel.Page $UiId.FolderRulesText))
         $skills = @(Read-Skills $win)
         Note ('the skills: ' + (($skills | ForEach-Object { "$($_.Name) / $($_.Tag)" }) -join ' ;; '))
         Check 'alpha, beta and gamma each show installed status and facts without repair buttons' ((($skills | ForEach-Object { $_.Name }) -join ',') -eq 'alpha,beta,gamma' -and @($skills | Where-Object { $_.Tag -notmatch '^(Installed|Up to date)$' -or -not $_.Facts -or $_.Buttons.Count }).Count -eq 0)
@@ -1906,7 +2081,8 @@ function Test-Ui {
         Test-Painted $pic $win 'a repository added' @(@($UiPanel.Hero, $UiId.HeroTitle), @($UiPanel.Hero, $UiId.Sync), @($UiPanel.Nav, $UiId.NavRepo), @($UiPanel.Nav, $UiId.NavSettings), @($UiPanel.Page, $UiId.Title), @($UiPanel.Page, $UiId.Every), @($UiPanel.Page, $UiId.Skill))
         Test-Layout $win 'a repository added'
         Test-TabOrder $win 'a repository added'
-        Test-ListHover $c $win
+        Test-ListSplitter $c $win
+        $mainSplitter = Get-Ui $win $splitPanel $splitId
         Test-SkillRow $c $win
         Click-Ui $win $UiPanel.Nav $UiId.NavActivity
         $notes = Wait-Maybe { $t = Read-Ui $win $UiPanel.Page $UiId.Note; if ($t) { $t } } 5
@@ -1916,7 +2092,7 @@ function Test-Ui {
         # ---- Check every, of the repository and the default
         Open-Repo $win 0
         Choose-Ui $win $UiPanel.Page $UiId.Every '12 hours'
-        $cfg = Wait-Maybe { $x = Get-Config $c; if ($x -and $x.repos[0].interval -eq '12h') { $x } } 8
+        $cfg = Wait-Maybe { $x = Get-Config $c; if ($x -and $x.sources[0].interval -eq '12h') { $x } } 8
         Check 'choosing 12 hours in "Check every" is saved for that repository, and shown' ($null -ne $cfg -and (Read-Ui $win $UiPanel.Page $UiId.Every) -eq '12 hours') (Read-Ui $win $UiPanel.Page $UiId.Every)
         $hero = Wait-Maybe { $h = Read-Hero $win; if ($h.Sub -like "3 skills from 1 source $dot checked * $dot next check in *") { $h } } 5
         Check 'once the user does something else, the top of the window sums up: the skills, when they were checked, the next check' ($null -ne $hero) ((Read-Hero $win).Sub)
@@ -1924,7 +2100,7 @@ function Test-Ui {
         [void](Wait-Maybe { Read-Ui $win $UiPanel.Page $UiId.DefaultEvery } 5)
         Choose-Ui $win $UiPanel.Page $UiId.DefaultEvery '6 hours'
         $cfg = Wait-Maybe { $x = Get-Config $c; if ($x -and $x.default_interval -eq '6h') { $x } } 8
-        Check 'choosing 6 hours as the default in Settings is saved, and the repository keeps its own' ($null -ne $cfg -and $cfg.repos[0].interval -eq '12h') ('default ' + $(if ($cfg) { $cfg.default_interval } else { '-' }))
+        Check 'choosing 6 hours as the default in Settings is saved, and the repository keeps its own' ($null -ne $cfg -and $cfg.sources[0].interval -eq '12h') ('default ' + $(if ($cfg) { $cfg.default_interval } else { '-' }))
 
         # ---- Start with Windows, in Settings
         Click-Ui $win $UiPanel.Page $UiId.Startup
@@ -1938,6 +2114,7 @@ function Test-Ui {
         Click-Ui $win $UiPanel.Nav $UiId.NavSettings
         $said = Wait-Maybe { $t = Read-Ui $win $UiPanel.Page $UiId.StartupText; if ($t -match 'turned off in Windows' -and -not (Get-Checked $win $UiPanel.Page $UiId.Startup)) { $t } } 8
         Check 'switched off in Task Manager, Settings shows the switch off, says so, and how to start it again' ($said -match 'Turn it on here to start it again') (Read-Ui $win $UiPanel.Page $UiId.StartupText)
+        Show-PageControl $win $UiId.StartupText
         $pic = Save-Shot $win '07b-off-in-windows'
         Test-Painted $pic $win 'Start with Windows switched off in Windows' @(@($UiPanel.Page, $UiId.Startup), @($UiPanel.Page, $UiId.StartupText))
         Click-Ui $win $UiPanel.Page $UiId.Startup
@@ -1949,22 +2126,117 @@ function Test-Ui {
 
         Open-Repo $win 0
         Choose-Ui $win $UiPanel.Page $UiId.Every 'Default (6 hours)'
-        $cfg = Wait-Maybe { $x = Get-Config $c; if ($x -and -not $x.repos[0].interval) { $x } } 8
+        $cfg = Wait-Maybe { $x = Get-Config $c; if ($x -and -not $x.sources[0].interval) { $x } } 8
         Check 'choosing "Default (6 hours)" makes the repository follow the default' ($null -ne $cfg -and (Read-Ui $win $UiPanel.Page $UiId.Every) -eq 'Default (6 hours)') (Read-Ui $win $UiPanel.Page $UiId.Every)
 
         # ---- Keep in sync
         $checks = Get-MarkCount $c.Report 'job-check'
         Click-Ui $win $UiPanel.Page $UiId.Enabled
-        $paused = Wait-Maybe { $n = @(Read-Nav $win); if ($n.Count -ge 1 -and $n[0].Sub -eq 'Paused') { $true } } 8
+        $paused = Wait-Maybe { $n = @(Read-Nav $win); if ($n.Count -ge 1 -and $n[0].Sub -eq 'Disabled') { $true } } 8
         $cfg = Get-Config $c
-        Check 'turning Keep in sync off is saved, and the list says Paused' ($paused -and $cfg.repos[0].enabled -eq $false) (Show-Nav $win)
+        Check 'turning Keep in sync off is saved, and the list says Disabled' ($paused -and $cfg.sources[0].enabled -eq $false) (Show-Nav $win)
         $hero = Read-Hero $win
         Check 'the top of the window says every repository is paused, and Sync now is greyed out' ($hero.Title -eq 'Every repository is paused' -and -not [TssLive]::IsWindowEnabled((Get-Ui $win $UiPanel.Hero $UiId.Sync))) "$($hero.Title) / $($hero.Sub)"
         [void](Save-Shot $win '07-paused')
         Click-Ui $win $UiPanel.Page $UiId.Enabled
         $again = Wait-Maybe { if ((Get-MarkCount $c.Report 'job-check') -gt $checks) { $true } } 30
         Check 'turning it on again checks the repository at once' ($again -and (Get-Checked $win $UiPanel.Page $UiId.Enabled))
-        [void](Wait-Maybe { $n = @(Read-Nav $win); if ($n.Count -ge 1 -and $n[0].Sub -match 'up to date$') { $true } } 20)
+        [void](Wait-Maybe { $n = @(Read-Nav $win); if ($n.Count -ge 1 -and $n[0].Sub -eq 'Up to date') { $true } } 20)
+        Wait-Settled $c
+
+        # ---- What to sync: a type turned off keeps its items as they are and shows them as "Sync off"
+        $before = Get-DiskFiles $c.Skills
+        Choose-Ui $win $UiPanel.Page $UiId.SourceType 'Off'
+        $cfg = Wait-Maybe { $x = Get-Config $c; if ($x -and $x.sources[0].types -and $x.sources[0].types.skills -eq $false) { $x } } 8
+        $offRows = Wait-Maybe { $r = @(Read-Skills $win); if ($r.Count -eq 3 -and @($r | Where-Object { $_.Tag -ne 'Sync off' }).Count -eq 0) { $r } } 15
+        $nav = @(Read-Nav $win)
+        Check 'turning Skills off for the source is saved, its row says "Skills: Sync off", and the list keeps the source' (
+            $null -ne $cfg -and $nav.Count -eq 1 -and $nav[0].Kinds -eq 'Skills: Sync off' -and
+            ((Read-Ui $win $UiPanel.Page $UiId.SourceType) -replace "`r?`n", ' / ') -eq 'Sync skills / Off'
+        ) (Show-Nav $win)
+        Check 'its three skills show "Sync off", say they are kept as they are, offer no repair, and are untouched on disk' (
+            $null -ne $offRows -and @($offRows | Where-Object { $_.Detail -ne 'Sync off: Skills are not synced from this source, so it is kept as it is.' -or $_.Buttons.Count }).Count -eq 0 -and
+            ((Get-DiskFiles $c.Skills) | ConvertTo-Json -Compress) -eq ($before | ConvertTo-Json -Compress)
+        ) ((@(Read-Skills $win) | ForEach-Object { "$($_.Name) / $($_.Tag) / $($_.Detail)" }) -join ' ;; ')
+        Show-PageControl $win $UiId.Skill
+        $pic = Save-Shot $win '07c-skills-sync-off'
+        Test-Painted $pic $win 'a type turned off' @(@($UiPanel.Nav, $UiId.NavRepo), @($UiPanel.Page, $UiId.SourceType), @($UiPanel.Page, $UiId.Skill))
+        Test-Layout $win 'a type turned off'
+        Test-TabOrder $win 'a type turned off'
+        Choose-Ui $win $UiPanel.Page $UiId.SourceType 'Default (On)'
+        $cfg = Wait-Maybe { $x = Get-Config $c; if ($x -and -not ($x.sources[0].types -and $x.sources[0].types.PSObject.Properties['skills'])) { $x } } 8
+        $back = Wait-Maybe { $n = @(Read-Nav $win); if ($n.Count -eq 1 -and $n[0].Kinds -eq 'Skills 3' -and $n[0].Sub -eq 'Up to date') { $true } } 30
+        Check 'choosing "Default (On)" again follows Settings, and the skills are up to date again' ($null -ne $cfg -and $null -ne $back) (Show-Nav $win)
+
+        # ---- repository-specific items and folder rules of one source
+        Choose-Ui $win $UiPanel.Page $UiId.RepoItems 'Include'
+        $cfg = Wait-Maybe { $x = Get-Config $c; if ($x -and $x.sources[0].include_repo_items -eq $true) { $x } } 8
+        Check 'choosing Include for repository-specific items is saved for that source' ($null -ne $cfg -and (Read-Ui $win $UiPanel.Page $UiId.RepoItems) -match '\nInclude$') (Read-Ui $win $UiPanel.Page $UiId.RepoItems)
+        Choose-Ui $win $UiPanel.Page $UiId.RepoItems 'Default (skip)'
+        $cfg = Wait-Maybe { $x = Get-Config $c; if ($x -and -not $x.sources[0].PSObject.Properties['include_repo_items']) { $x } } 8
+        Check 'choosing "Default (skip)" removes the source''s own choice' ($null -ne $cfg) (Read-Ui $win $UiPanel.Page $UiId.RepoItems)
+        $answerFolders = {
+            param([string]$Heading, [string]$Names)
+            $d = Wait-Maybe { $q = Find-Ask $tray; if ($q -ne [IntPtr]::Zero -and (Read-Ui $q $AskPanel $AskId.Heading) -eq $Heading) { $q } } 8
+            if ($null -eq $d) { return $false }
+            Set-UiText (Get-Ui $d $AskPanel $AskId.Edit) $Names
+            Start-Sleep -Milliseconds 200
+            Click-Ui $d $AskPanel $AskId.Ok
+            if ($null -ne (Wait-Maybe { if ((Find-Ask $tray) -ne $d) { $true } } 5)) { return $true }
+            # Refused: close it so the rest of the scenario can go on.
+            Note "the question '$Heading' refused '$Names': $(Read-Ui $d $AskPanel $AskId.Hint)"
+            [void][TssLive]::PostMessageW($d, 0x0010, [IntPtr]::Zero, [IntPtr]::Zero) # WM_CLOSE
+            [void](Wait-Maybe { if ((Find-Ask $tray) -ne $d) { $true } } 5)
+            $false
+        }
+        Click-Ui $win $UiPanel.Page $UiId.FolderRules
+        $asked = (& $answerFolders 'Also skip these folders' 'drafts') -and (& $answerFolders 'Never skip these folders' 'tests')
+        $cfg = Wait-Maybe { $x = Get-Config $c; if ($x -and (@($x.sources[0].ignore_add) -join ',') -eq 'drafts' -and (@($x.sources[0].ignore_allow) -join ',') -eq 'tests') { $x } } 8
+        $rulesText = Wait-Maybe { $t = Read-Ui $win $UiPanel.Page $UiId.FolderRulesText; if ($t -eq 'Also skips: drafts. Never skips: tests.') { $t } } 5
+        Check 'Folder rules asks for folders to also skip, then folders never to skip, saves both and says so' ($asked -and $null -ne $cfg -and $null -ne $rulesText) (Read-Ui $win $UiPanel.Page $UiId.FolderRulesText)
+        [void](Save-Shot $win '07d-folder-rules')
+        Click-Ui $win $UiPanel.Page $UiId.FolderRules
+        $asked = (& $answerFolders 'Also skip these folders' '') -and (& $answerFolders 'Never skip these folders' '')
+        $cfg = Wait-Maybe { $x = Get-Config $c; if ($x -and -not $x.sources[0].PSObject.Properties['ignore_add'] -and -not $x.sources[0].PSObject.Properties['ignore_allow']) { $x } } 8
+        Check 'emptying both lists removes the folder rules' ($asked -and $null -ne $cfg -and (Read-Ui $win $UiPanel.Page $UiId.FolderRulesText) -eq 'Skips the ignored folders set in Settings.') (Read-Ui $win $UiPanel.Page $UiId.FolderRulesText)
+        [void](Wait-Maybe { $n = @(Read-Nav $win); if ($n.Count -ge 1 -and $n[0].Sub -eq 'Up to date') { $true } } 20)
+        Wait-Settled $c
+
+        # ---- the Sources settings every source follows
+        Click-Ui $win $UiPanel.Nav $UiId.NavSettings
+        [void](Wait-Live { (Find-Ui $win $UiPanel.Page $UiId.GlobalType) -ne [IntPtr]::Zero } 'the Sources switches in Settings' 10)
+        Click-Ui $win $UiPanel.Page $UiId.GlobalType
+        $cfg = Wait-Maybe { $x = Get-Config $c; if ($x -and $x.global -and $x.global.types -and $x.global.types.skills -eq $false) { $x } } 8
+        $nav = Wait-Maybe { $n = @(Read-Nav $win); if ($n.Count -eq 1 -and $n[0].Kinds -eq 'Skills: Sync off') { $n[0] } } 15
+        Check 'turning "Sync skills by default" off is saved, and the source that follows it stops syncing its skills' ($null -ne $cfg -and $null -ne $nav -and -not (Get-Checked $win $UiPanel.Page $UiId.GlobalType)) (Show-Nav $win)
+        Click-Ui $win $UiPanel.Page $UiId.GlobalType
+        $cfg = Wait-Maybe { $x = Get-Config $c; if ($x -and -not ($x.global -and $x.global.types -and $x.global.types.PSObject.Properties['skills'])) { $x } } 8
+        $back = Wait-Maybe { $n = @(Read-Nav $win); if ($n.Count -eq 1 -and $n[0].Kinds -eq 'Skills 3' -and $n[0].Sub -eq 'Up to date') { $true } } 30
+        Check 'turning it on again is saved, and the skills are up to date again' ($null -ne $cfg -and $null -ne $back -and (Get-Checked $win $UiPanel.Page $UiId.GlobalType)) (Show-Nav $win)
+        Click-Ui $win $UiPanel.Page $UiId.GlobalRepoItems
+        $cfg = Wait-Maybe { $x = Get-Config $c; if ($x -and $x.global -and $x.global.include_repo_items -eq $true) { $x } } 8
+        Check 'the repo-specific switch is saved for every source' ($null -ne $cfg -and (Get-Checked $win $UiPanel.Page $UiId.GlobalRepoItems))
+        Click-Ui $win $UiPanel.Page $UiId.GlobalRepoItems
+        $cfg = Wait-Maybe { $x = Get-Config $c; if ($x -and -not ($x.global -and $x.global.include_repo_items)) { $x } } 8
+        Check 'switching it off again is saved' ($null -ne $cfg -and -not (Get-Checked $win $UiPanel.Page $UiId.GlobalRepoItems))
+        $defaultIgnored = Read-Ui $win $UiPanel.Page $UiId.IgnoredText
+        Click-Ui $win $UiPanel.Page $UiId.IgnoredEdit
+        $asked = & $answerFolders 'Ignored folders' 'drafts, sample'
+        $cfg = Wait-Maybe { $x = Get-Config $c; if ($x -and $x.global -and (@($x.global.ignore_folders) -join ',') -eq 'drafts,sample') { $x } } 8
+        $ignored = Wait-Maybe { $t = Read-Ui $win $UiPanel.Page $UiId.IgnoredText; if ($t -eq 'Folders with these names are skipped in every source: drafts, sample.') { $t } } 5
+        Check 'editing the ignored folders saves the list and shows it' ($asked -and $null -ne $cfg -and $null -ne $ignored) (Read-Ui $win $UiPanel.Page $UiId.IgnoredText)
+        Click-Ui $win $UiPanel.Page $UiId.IgnoredEdit
+        $asked = & $answerFolders 'Ignored folders' ''
+        $cfg = Wait-Maybe { $x = Get-Config $c; if ($x -and $x.global -and $x.global.PSObject.Properties['ignore_folders'] -and @($x.global.ignore_folders).Count -eq 0) { $x } } 8
+        $ignored = Wait-Maybe { $t = Read-Ui $win $UiPanel.Page $UiId.IgnoredText; if ($t -eq 'No folder is skipped. Every folder in a source is searched.') { $t } } 5
+        Check 'emptying it is saved as no ignored folder at all, and says so' ($asked -and $null -ne $cfg -and $null -ne $ignored) (Read-Ui $win $UiPanel.Page $UiId.IgnoredText)
+        Click-Ui $win $UiPanel.Page $UiId.IgnoredEdit
+        $asked = & $answerFolders 'Ignored folders' 'sample, example, samples, examples, test, tests'
+        $ignored = Wait-Maybe { $t = Read-Ui $win $UiPanel.Page $UiId.IgnoredText; if ($t -eq $defaultIgnored) { $t } } 5
+        $cfg = Wait-Maybe { $x = Get-Config $c; if ($x -and -not ($x.global -and $x.global.PSObject.Properties['ignore_folders'])) { $x } } 8
+        Check 'typing the default list back shows the defaults again and saves nothing of its own' ($asked -and $null -ne $ignored -and $null -ne $cfg) (Read-Ui $win $UiPanel.Page $UiId.IgnoredText)
+        Open-Repo $win 0
+        [void](Wait-Maybe { $n = @(Read-Nav $win); if ($n.Count -ge 1 -and $n[0].Sub -eq 'Up to date') { $true } } 20)
         Wait-Settled $c
 
         # ---- a local edit appears by itself, with what can be done about it
@@ -1974,7 +2246,7 @@ function Test-Ui {
         [IO.File]::WriteAllText((Join-Path $c.Skills 'alpha\my-notes.md'), "my notes`n")
         $edited = Wait-Maybe { $r = @(Read-Skills $win | Where-Object { $_.Name -eq 'alpha' -and $_.Tag -eq 'Edited on this PC' }); if ($r.Count -ge 1) { $r[0] } } 40
         Check 'an edit made to a skill shows as "Edited on this PC" without anyone asking' ($null -ne $edited) ((@(Read-Skills $win) | ForEach-Object { "$($_.Name) / $($_.Tag)" }) -join ' ;; ')
-        $nav = Wait-Maybe { $n = @(Read-Nav $win); if ($n.Count -ge 1 -and $n[0].Sub -eq "3 skills $dot 1 needs you") { $n[0] } } 10
+        $nav = Wait-Maybe { $n = @(Read-Nav $win); if ($n.Count -ge 1 -and $n[0].Sub -eq 'Needs attention (1)' -and $n[0].Kinds -eq 'Skills 3 (1 needs attention)') { $n[0] } } 10
         $hero = Read-Hero $win
         Check 'the list says the repository needs you, and the top of the window says a skill does' ($null -ne $nav -and $hero.Title -eq '1 skill needs your attention') ((Show-Nav $win) + " / $($hero.Title)")
         if ($null -eq $edited) { return }
@@ -2045,32 +2317,35 @@ function Test-Ui {
         Start-Sleep -Milliseconds 400
         $pic = Save-Shot $win '09c-only-on-github'
         Test-Painted $pic $win 'a file only on GitHub' @(@($UiPanel.Head, $UiId.Back), @($UiPanel.Head, $UiId.Title))
-        Test-ListHover $c $win -Diff
+        Test-ListSplitter $c $win -Diff
+        $diffWidth = Get-Width ([TssLive]::GetDlgItem($win, $UiPanel.Files))
+        Check 'Show changes uses the same splitter control' ((Get-Ui $win $splitPanel $splitId) -eq $mainSplitter)
         if ([TssLive]::Shown([TssLive]::GetDlgItem($win, $UiPanel.Head))) {
             Send-Key (Get-Ui $win $UiPanel.Head $UiId.Back) $VK_ESCAPE
         }
         $back = Wait-Maybe { if ([TssLive]::Shown([TssLive]::GetDlgItem($win, $UiPanel.Page)) -and -not [TssLive]::Shown([TssLive]::GetDlgItem($win, $UiPanel.Head))) { $true } } 5
         Check 'Esc goes back to the page of the repository, and nothing changed' ($back -and (Read-Skill $c 'alpha\SKILL.md') -match 'my own words')
+        Check 'returning to the main view keeps the list width set in Show changes' ($back -and (Get-Width ([TssLive]::GetDlgItem($win, $UiPanel.Nav))) -eq $diffWidth)
 
-        # ---- More, then Remove repository: it asks first
+        # ---- More, then Remove source: it asks first
         Click-Ui $win $UiPanel.Page $UiId.More
         $menu = Wait-Menu $tray
         Check 'More opens a menu' ($menu -ne [IntPtr]::Zero)
         if ($menu -ne [IntPtr]::Zero) {
             $items = @([TssLive]::MenuItems($menu))
-            Check 'it offers Sync this repository, Open on GitHub, Open skills folder and Remove repository' (($items -join ' | ') -like 'Sync this repository | Open on GitHub | Open skills folder | - | Remove repository*') ($items -join ' | ')
+            Check 'it offers Check now, Open on GitHub, Open skills folder and Remove source' (($items -join ' | ') -ceq "Check now | Open on GitHub | Open skills folder | - | Remove source$([char]0x2026)") ($items -join ' | ')
             New-Item -ItemType Directory -Force $Shots | Out-Null
             [void][TssLive]::CaptureScreen($menu, (Join-Path $Shots '10-more-menu.png'), 24)
-            Choose-MenuItem $menu ([array]::IndexOf($items, @($items | Where-Object { $_ -like 'Remove repository*' })[0]))
+            Choose-MenuItem $menu ([array]::IndexOf($items, "Remove source$([char]0x2026)"))
             $ask = Wait-Maybe { $d = Find-Ask $tray; if ($d -ne [IntPtr]::Zero) { $d } } 8
-            Check 'Remove repository asks before it does anything' ($null -ne $ask)
+            Check 'Remove source asks before it does anything' ($null -ne $ask)
             if ($null -ne $ask) {
                 Start-Sleep -Milliseconds 400
                 [void](Save-Shot $ask '11-remove-asks')
                 Note ('the question: ' + (Read-Panel $ask $AskPanel))
                 $one = Read-Ui $ask $AskPanel $AskId.Choice
                 $two = Read-Ui $ask $AskPanel ($AskId.Choice + 1)
-                Check 'it offers two choices, and the one that keeps the skills installed is chosen to start with' ($one -like 'Leave its skills installed*' -and $two -like 'Delete its skills too*' -and (Get-Checked $ask $AskPanel $AskId.Choice) -and -not (Get-Checked $ask $AskPanel ($AskId.Choice + 1))) "$one / $two"
+                Check 'it offers two choices, and the one that keeps the skills installed is chosen to start with' ($one -ceq 'Leave its files installed; they become yours' -and $two -ceq 'Delete its skills too; skills you edited are kept' -and (Get-Checked $ask $AskPanel $AskId.Choice) -and -not (Get-Checked $ask $AskPanel ($AskId.Choice + 1))) "$one / $two"
                 Send-Key (Get-Ui $ask $AskPanel $AskId.Cancel) $VK_ESCAPE
                 $gone = Wait-Maybe { if ((Find-Ask $tray) -eq [IntPtr]::Zero) { $true } } 5
                 Check 'Esc cancels the question; the repository and its skills are still there' ($gone -and @(Read-Nav $win).Count -eq 1 -and (Test-Path -LiteralPath (Join-Path $c.Skills 'alpha\SKILL.md')))
@@ -2104,7 +2379,7 @@ function Test-Ui {
         $c.Proxy.SetMode('api', 'pass')
         Click-Ui $win $UiPanel.Page $UiId.Retry
         # Alpha is still edited, so a repository that is well again needs the user for that.
-        $healed = Wait-Maybe { $n = @(Read-Nav $win); if ($n.Count -ge 1 -and $n[0].Sub -eq "3 skills $dot 1 needs you") { $n[0] } } 30
+        $healed = Wait-Maybe { $n = @(Read-Nav $win); if ($n.Count -ge 1 -and $n[0].Sub -eq 'Needs attention (1)' -and $n[0].Kinds -eq 'Skills 3 (1 needs attention)') { $n[0] } } 30
         Check 'when GitHub answers again, Try again clears the failure, and the edited skill is what the repository needs you for' ($null -ne $healed -and $null -eq (Read-Ui $win $UiPanel.Page $UiId.InfoLead)) (Show-Nav $win)
 
         # ---- the tray menu
@@ -2120,15 +2395,15 @@ function Test-Ui {
             Check 'the menu goes away when it is dismissed' $closed
         }
 
-        # ---- the window keeps the size it is given
+        # ---- the window keeps its size and its splitter setting
         $dpi = [int][TssLive]::GetDpiForWindow($win)
+        $listDips = [int][math]::Round((Get-Width ([TssLive]::GetDlgItem($win, $UiPanel.Nav))) * 96 / $dpi)
         [void][TssLive]::SetWindowPos($win, [IntPtr]::Zero, 0, 0, [int](860 * $dpi / 96), [int](600 * $dpi / 96), 0x16)
         [void][TssLive]::PostMessageW($win, $WM_EXITSIZEMOVE, [IntPtr]::Zero, [IntPtr]::Zero)
         $client = ([TssLive]::Client($win)) -split ','
-        $want = '{0} {1}' -f [math]::Floor([int]$client[0] * 96 / $dpi), [math]::Floor([int]$client[1] * 96 / $dpi)
-        $sizeFile = Join-Path $c.Home 'window.txt'
-        $saved = Wait-Maybe { $t = $(try { [IO.File]::ReadAllText($sizeFile).Trim() } catch { '' }); if ($t -eq $want) { $t } } 5
-        Check 'a window given a new size remembers it' ($null -ne $saved) ("window.txt: " + $(try { [IO.File]::ReadAllText($sizeFile).Trim() } catch { '-' }) + "; wanted $want at $dpi dpi")
+        $want = '{0} {1} {2}' -f [math]::Floor([int]$client[0] * 96 / $dpi), [math]::Floor([int]$client[1] * 96 / $dpi), $listDips
+        $saved = Wait-Maybe { $t = Read-WindowSizeFile $c; if ($t -eq $want) { $t } } 5
+        Check 'the window saves its new size without losing the third value, the list width in DIP' ($null -ne $saved) "window.txt: $(Read-WindowSizeFile $c); wanted $want at $dpi dpi"
         $pic = Save-Shot $win '14-smaller'
         Test-Painted $pic $win 'a smaller window' @(@($UiPanel.Hero, $UiId.Sync), @($UiPanel.Nav, $UiId.NavSettings), @($UiPanel.Page, $UiId.More))
         Test-Layout $win 'a smaller window'
@@ -2151,6 +2426,9 @@ function Test-Ui {
             $was = @($want -split ' ' | ForEach-Object { [int]$_ })
             Check 'it opens at the size it was given, with the repository still there' ([math]::Abs($now[0] - $was[0]) -le 1 -and [math]::Abs($now[1] - $was[1]) -le 1 -and @(Read-Nav $win).Count -eq 1) ("$($now -join ' ') for $want; " + (Show-Nav $win))
 
+            $reopenedList = Get-Width ([TssLive]::GetDlgItem($win, $UiPanel.Nav))
+            Check 'reopening restores the list width from window.txt' ([math]::Abs($reopenedList - $was[2] * $dpi / 96) -le 1) "list $reopenedList px at $dpi dpi; wanted $($was[2]) DIP"
+
             # ---- bad input in the Add question
             Click-Ui $win $UiPanel.Nav $UiId.NavAdd
             $ask = Wait-Maybe { $d = Find-Ask $tray; if ($d -ne [IntPtr]::Zero) { $d } } 8
@@ -2163,10 +2441,10 @@ function Test-Ui {
                 Start-Sleep -Milliseconds 600
                 Check 'an address that is not a repository is refused: the question stays, says why, and keeps what was typed' ($null -ne $hint -and (Find-Ask $tray) -ne [IntPtr]::Zero -and [TssLive]::Text($edit) -eq 'not a repo' -and @(Read-Nav $win).Count -eq 1) $hint
                 Set-UiText $edit (Get-Address $c)
-                [void](Wait-Maybe { $t = Read-Ui $ask $AskPanel $AskId.Hint; if ($t -match 'skills folder on') { $t } } 5)
+                [void](Wait-Maybe { $t = Read-Ui $ask $AskPanel $AskId.Hint; if ($t -match '\(GitHub tells where the branch name ends\)') { $t } } 5)
                 Click-Ui $ask $AskPanel $AskId.Ok
                 $saved = Get-Config $c
-                $expected = if ($saved -and @($saved.repos).Count -eq 1) { "This source is already set up. Its ID is '$($saved.repos[0].id)'." }
+                $expected = if ($saved -and @($saved.sources).Count -eq 1) { "This source is already set up. Its ID is '$($saved.sources[0].id)'." }
                 $told = Wait-Maybe { $t = Read-Ui $win $UiPanel.Page $UiId.InfoText; if ($t -and $t -ceq $expected) { $t } } 5
                 Check 'the Add source page refuses the duplicate and shows its full ID, not in the header' (
                     $null -ne $told -and (Read-Ui $win $UiPanel.Page $UiId.Title) -eq 'Add source' -and
@@ -2178,32 +2456,88 @@ function Test-Ui {
                 Test-Layout $win 'a duplicate source refusal'
             }
 
-            # ---- a repository with no skills at its top: the preview says so and offers no way to add it
+            # ---- a folder with nothing to sync in it: the preview says so and offers no way to add it
             Click-Ui $win $UiPanel.Nav $UiId.NavAdd
             $ask = Wait-Maybe { $d = Find-Ask $tray; if ($d -ne [IntPtr]::Zero) { $d } } 8
             if ($null -ne $ask) {
                 $edit = Get-Ui $ask $AskPanel $AskId.Edit
                 Check 'Add source opens again with what was typed' ([TssLive]::Text($edit) -eq (Get-Address $c)) ([TssLive]::Text($edit))
-                Set-UiText $edit "https://github.com/$($c.Repo)"
-                [void](Wait-Maybe { $t = Read-Ui $ask $AskPanel $AskId.Hint; if ($t -match 'top of the repository') { $t } } 5)
+                Set-UiText $edit (Get-Address $c 'skills/alpha/scripts')
+                [void](Wait-Maybe { $t = Read-Ui $ask $AskPanel $AskId.Hint; if ($t -match 'alpha/scripts \(GitHub tells where the branch name ends\)') { $t } } 5)
                 Click-Ui $ask $AskPanel $AskId.Ok
                 $why = Wait-Maybe {
                     $t = Read-Ui $win $UiPanel.Page $UiId.InfoText
-                    if ($t -match '(?m)^Matched no skills\.\r?$' -and $t -clike '*No folders with a SKILL.md file were found. Check the source type and folder.*') { $t }
+                    if (($t -match '(?m)^Folder: skills/alpha/scripts\r?$') -and ([regex]::Matches($t, '(?m)^  None found\.\r?$')).Count -eq 4 -and $t -clike '*Nothing here would sync. Check the branch and folder, or edit the location.*') { $t }
                 } 40
                 Check 'the next preview does not show the duplicate refusal' ((Read-Hero $win).Sub -notlike '*already set up*' -and $why -notlike '*already set up*') ((Read-Hero $win).Sub)
                 Note "the preview: $($why -replace '\s+', ' ')"
                 $offered = @($UiId.ConfirmSource, $UiId.RetrySource, $UiId.EditSource, $UiId.CancelSource | Where-Object { $null -ne (Read-Ui $win $UiPanel.Page $_) }) -join ','
                 $want = "$($UiId.RetrySource),$($UiId.EditSource),$($UiId.CancelSource)"
-                Check 'a repository with no skills at its top: the preview says nothing matched and offers Retry, Edit and Cancel, not Add' ($null -ne $why -and $offered -eq $want -and @(Read-Nav $win).Count -eq 1) "buttons $offered"
-                $pic = Save-Shot $win '16-no-skills-found'
-                Test-Painted $pic $win 'a preview without skills' @(@($UiPanel.Page, $UiId.InfoText), @($UiPanel.Page, $UiId.RetrySource), @($UiPanel.Page, $UiId.EditSource), @($UiPanel.Page, $UiId.CancelSource))
-                Test-Layout $win 'a preview without skills'
+                Check 'a folder with nothing to sync: the preview says nothing was found and offers Retry, Edit and Cancel, not Add' ($null -ne $why -and $offered -eq $want -and @(Read-Nav $win).Count -eq 1) "buttons $offered"
+                $pic = Save-Shot $win '16-nothing-found'
+                Test-Painted $pic $win 'a preview with nothing to sync' @(@($UiPanel.Page, $UiId.InfoText), @($UiPanel.Page, $UiId.RetrySource), @($UiPanel.Page, $UiId.EditSource), @($UiPanel.Page, $UiId.CancelSource))
+                Test-Layout $win 'a preview with nothing to sync'
                 Click-Ui $win $UiPanel.Page $UiId.CancelSource
                 $gone = Wait-Maybe { if ($null -eq (Read-Ui $win $UiPanel.Page $UiId.CancelSource)) { $true } } 5
                 Check 'Cancel closes the preview and keeps only the first source' ($null -ne $gone -and @(Read-Nav $win).Count -eq 1) (Show-Nav $win)
             } else {
                 Check 'Add source opens again with what was typed' $false 'the question did not open'
+            }
+
+            # ---- a second source with a long folder name, in a narrow and a wide window
+            $longFolder = 'a-folder-with-a-rather-long-name-for-the-layout/and-a-second-level-that-keeps-on-going'
+            $longSkill = 'a-skill-whose-name-is-long-as-well'
+            $pin = Push-Upstream $c.Repo $c.Ref @(@{ Path = "$longFolder/$longSkill/SKILL.md"; Text = "---`nname: $longSkill`ndescription: Layout fixture`n---`nFixture skill.`n" }) 'long-name layout fixture'
+            $pushed = Get-Date
+            $published = Wait-Maybe { (Get-PublicCommit $c.Repo $c.Ref) -eq $pin } 90 5000
+            Check 'the long-name fixture reached the branch' ($null -ne $published)
+            # The preview just above read this branch's listing, and GitHub may answer the same request from its
+            # cache for 60 seconds (Cache-Control max-age=60), so the new folder is previewed after that.
+            $left = 65 - ((Get-Date) - $pushed).TotalSeconds
+            if ($null -ne $published -and $left -gt 0) { Start-Sleep -Seconds ([int][math]::Ceiling($left)) }
+            Click-Ui $win $UiPanel.Nav $UiId.NavAdd
+            $ask = Wait-Maybe { $d = Find-Ask $tray; if ($d -ne [IntPtr]::Zero) { $d } } 8
+            if ($null -ne $published -and $null -ne $ask) {
+                Set-UiText (Get-Ui $ask $AskPanel $AskId.Edit) (Get-Address $c $longFolder)
+                Start-Sleep -Milliseconds 300
+                Click-Ui $ask $AskPanel $AskId.Ok
+                $offer = Wait-Maybe { if ((Read-Ui $win $UiPanel.Page $UiId.ConfirmSource) -eq 'Add and check') { $true } } 40
+                Check 'the long folder previews with an Add and check button' ($null -ne $offer) ((Read-Ui $win $UiPanel.Page $UiId.InfoText) -replace '\s+', ' ')
+                if ($null -ne $offer) { Click-Ui $win $UiPanel.Page $UiId.ConfirmSource }
+                $two = Wait-Maybe { $n = @(Read-Nav $win); if ($n.Count -eq 2 -and @($n | Where-Object { $_.Folder -eq $longFolder -and $_.Kinds -eq 'Skills 1' -and $_.Sub -eq 'Up to date' }).Count -eq 1) { $n } } 60
+                Check 'the list has one row per source, and the long one keeps its whole folder and branch in its accessible name' (
+                    $null -ne $two -and @($two | Where-Object { $_.Branch -ne $c.Ref }).Count -eq 0
+                ) (Show-Nav $win)
+                Check 'the long source''s skill is installed' (Test-Path -LiteralPath (Join-Path $c.Skills "$longSkill\SKILL.md"))
+                if ($null -eq $two) { throw 'the long source has no row, so its window sizes can not be looked at' }
+                $rowHeights = @(0, 1 | ForEach-Object { $r = [int[]]([TssLive]::Bounds((Get-Ui $win $UiPanel.Nav ($UiId.NavRepo + $_))) -split ','); $r[3] - $r[1] })
+                Check 'both rows have one line of type icons, so they are the same height' ($rowHeights[0] -gt 0 -and $rowHeights[0] -eq $rowHeights[1]) ($rowHeights -join ', ')
+                Wait-Settled $c
+                $dpi = [int][TssLive]::GetDpiForWindow($win)
+                foreach ($size in @(@('narrow', 640, 560), @('wide', [math]::Min(1400, [int]($area.Width * 96 / $dpi) - 40), [math]::Min(860, [int]($area.Height * 96 / $dpi) - 40)))) {
+                    [void][TssLive]::SetWindowPos($win, [IntPtr]::Zero, 0, 0, [int]($size[1] * $dpi / 96), [int]($size[2] * $dpi / 96), 0x16)
+                    [void][TssLive]::PostMessageW($win, $WM_EXITSIZEMOVE, [IntPtr]::Zero, [IntPtr]::Zero)
+                    Start-Sleep -Milliseconds 600
+                    Open-Repo $win (@($two | Where-Object { $_.Folder -eq $longFolder })[0].Index)
+                    Start-Sleep -Milliseconds 400
+                    $client = ([TssLive]::Client($win)) -split ','
+                    Note ("$($size[0]) window: client $([math]::Floor([int]$client[0] * 96 / $dpi))x$([math]::Floor([int]$client[1] * 96 / $dpi)) DIP, list $([int]((Get-Width ([TssLive]::GetDlgItem($win, $UiPanel.Nav))) * 96 / $dpi)) DIP")
+                    $pic = Save-Shot $win "17-long-names-$($size[0])"
+                    $parts = @(@($UiPanel.Nav, $UiId.NavRepo), @($UiPanel.Nav, ($UiId.NavRepo + 1)), @($UiPanel.Page, $UiId.Title))
+                    if ($size[0] -eq 'wide') { $parts += , @($UiPanel.Page, $UiId.Skill) }
+                    Test-Painted $pic $win "a $($size[0]) window with a long folder name" $parts
+                    Test-Layout $win "a $($size[0]) window with a long folder name"
+                    Test-TabOrder $win "a $($size[0]) window with a long folder name"
+                    if ($size[0] -eq 'narrow') {
+                        # The skill is below the fold of a narrow window; scroll it into view and look again.
+                        Show-PageControl $win $UiId.Skill
+                        $pic = Save-Shot $win '17-long-names-narrow-items'
+                        Test-Painted $pic $win 'a narrow window scrolled to the long skill' @(@($UiPanel.Nav, ($UiId.NavRepo + 1)), @($UiPanel.Page, $UiId.Skill))
+                        Test-Layout $win 'a narrow window scrolled to the long skill'
+                    }
+                }
+            } elseif ($null -ne $ask) {
+                Send-Key (Get-Ui $ask $AskPanel $AskId.Cancel) $VK_ESCAPE
             }
         }
 
@@ -2231,7 +2565,7 @@ function Test-Signin {
         $real = Get-RealStartup
         $mainTray = [TssLive]::LongPath((Join-Path $c.Root 'bin\tiny-skill-sync.exe'))
         $entry = "`"$mainTray`" --background"
-        $quiet = @{ TSS_HOME = $c.Home; TSS_SKILLS_DIR = $c.Skills; TSS_BENCH_REPORT = $null }
+        $quiet = @{ TSS_HOME = $c.Home; TSS_SKILLS_DIR = $c.Skills; TSS_AGENTS_DIR = (Join-Path $c.Root 'agents'); TSS_INSTRUCTIONS_DIR = (Join-Path $c.Root 'instructions'); TSS_BENCH_REPORT = $null }
         $plain = 'Starts in the tray when you sign in to Windows, without opening its window.'
         $other = { param([string]$Path) "Windows starts another copy when you sign in: $Path. Run 'tss startup on' to start this copy instead." }
         # What tss startup printed: exit 0, the state in a few words, then the note.
@@ -2436,7 +2770,7 @@ function Test-Plugins {
         $child = New-LiveStartInfo $c.Root 'tss.exe' @() $isolated
         Assert-LiveCopilotEnv $c.Root $child.EnvironmentVariables
         foreach ($slot in 'COPILOT_HOME', 'COPILOT_CACHE_HOME', 'TSS_AGENTS_DIR', 'TSS_INSTRUCTIONS_DIR') {
-            New-Item -ItemType Directory -Path $isolated[$slot] | Out-Null
+            New-Item -ItemType Directory -Force -Path $isolated[$slot] | Out-Null
         }
         Check 'both Copilot directories are isolated before either app starts' $true
         [void](Invoke-Gh @('api', 'user', '--jq', '.login'))
@@ -2463,8 +2797,13 @@ function Test-Plugins {
         }
         $pin = Push-Upstream $c.Repo $c.Ref $changes 'inert live plugin fixtures'
         $url = Get-Address $c 'e2e-pack'
-        $add = @('add', '--type', 'plugins', $url, '--use-token', '--every', '6h')
-        $matchesPreview = { param($text) $text -match 'Matched\s+2\s+plugins:' -and $text -match "$alpha 1\.0\.0, by TSS Fixture" -and $text -match "$beta 1\.0\.0, by TSS Fixture" }
+        $add = @('add', $url, '--use-token', '--every', '6h')
+        $matchesPreview = {
+            param($text)
+            $text -match "(?m)^  $alpha\b.*: will sync after you approve it\r?$" -and $text -match "(?m)^  $beta\b.*: will sync after you approve it\r?$" -and
+            ([regex]::Matches($text, 'Publisher: TSS Fixture\. Version: 1\.0\.0\.')).Count -eq 2
+        }
+        # The window shows the same read-only preview lines as tss add --preview (board.rs, preview_lines).
         $emptyHomes = { (Get-Entries $isolated.COPILOT_HOME) -eq '' -and (Get-Entries $isolated.COPILOT_CACHE_HOME) -eq '' }
         $preview = Tss $c ($add + '--preview') $isolated
         Check 'tss preview shows both plugins and does not start Copilot or save settings' (
@@ -2472,7 +2811,7 @@ function Test-Plugins {
             $null -eq (Get-Config $c) -and (& $emptyHomes))
         if ($preview.Code -ne 0) { throw 'Cannot continue without a valid plugin preview.' }
 
-        # The picker reads anonymously. Wait for the public view once; subsequent reads use the token.
+        # The window's preview reads anonymously. Wait for the public view once; subsequent reads use the token.
         $core = (Invoke-RestMethod -UseBasicParsing -Uri 'https://api.github.com/rate_limit' -Headers @{'User-Agent' = 'tss-e2e'}).resources.core
         if ($core.remaining -lt 6) { throw "GitHub anonymous rate limit: $($core.remaining) requests left; not retrying." }
         [void](Wait-Live { (Get-PublicCommit $c.Repo $c.Ref) -eq $pin } 'the public plugin fixture commit' 65 6000)
@@ -2484,14 +2823,14 @@ function Test-Plugins {
         Click-Ui $win $UiPanel.Nav $UiId.NavAdd
         $ask = Wait-Live { $d = Find-Ask $c.Tray; if ($d -ne [IntPtr]::Zero) { $d } } 'the Add source question' 10
         Set-UiText (Get-Ui $ask $AskPanel $AskId.Edit) $url
-        $fourth = $AskId.Choice + 3
-        Check 'Plugins is the fourth choice in the Add source picker' ((Read-Ui $ask $AskPanel $fourth) -eq 'Plugins')
-        Click-Ui $ask $AskPanel $fourth
+        Check 'Add source asks for the location only, with no type picker' ($null -eq (Read-Ui $ask $AskPanel $AskId.Choice)) (Read-Panel $ask $AskPanel)
         Click-Ui $ask $AskPanel $AskId.Ok
-        [void](Wait-Live { (Read-Ui $win $UiPanel.Page $UiId.ConfirmSource) -eq 'Add and check' -or (Read-Ui $win $UiPanel.Page $UiId.RetrySource) -eq 'Retry' } 'the tray plugin preview' 60)
+        [void](Wait-Live { (Read-Ui $win $UiPanel.Page $UiId.ConfirmSource) -or (Read-Ui $win $UiPanel.Page $UiId.RetrySource) -eq 'Retry' } 'the tray plugin preview' 60)
         $previewText = Read-Ui $win $UiPanel.Page $UiId.InfoText
-        Check 'the window previews both plugins without touching Copilot' (
-            (& $matchesPreview $previewText) -and $previewText -match 'GitHub Copilot CLI' -and (& $emptyHomes))
+        Check 'the window previews both plugins with publisher and version, and offers to add with or without approving them, without touching Copilot' (
+            (& $matchesPreview $previewText) -and $previewText.Contains('Plugins can run programs on this PC.') -and $previewText -match 'GitHub Copilot CLI' -and
+            (Read-Ui $win $UiPanel.Page $UiId.ConfirmSource) -eq 'Add without approving plugins' -and (Read-Ui $win $UiPanel.Page $UiId.ApproveSource) -eq 'Add and approve these plugins' -and
+            (& $emptyHomes)) ($previewText -replace '\s+', ' ')
         Test-Layout $win 'plugin preview'
         $shot = Save-Shot $win 'plugins-preview'
         Check 'saved the plugin preview screenshot' ($null -ne $shot) $shot.Path
@@ -2505,9 +2844,10 @@ function Test-Plugins {
         }
         $a = "$alpha@$market=1.0.0"
         $b = "$beta@$market=1.0.0"
-        $r = Tss $c $add $isolated -InputLine 'yes'
+        $r = Tss $c ($add + '--approve-plugins' + '--yes') $isolated
         if ($r.Code -ne 0 -or $r.Text -notmatch "as '([^']+)'") { throw 'tss did not save the previewed plugin source.' }
         $c.Id = $Matches[1]
+        Check 'tss add --approve-plugins approves both plugins it showed' ($r.Text.Contains("Approved 2 plugins: $alpha, $beta"))
         $r = Tss $c @('sync', $c.Id) $isolated
         $list = & $installed
         Check 'add then sync installs both declared name@marketplace versions' ($r.Code -eq 0 -and $list -eq "$a,$b") $list
@@ -2537,6 +2877,8 @@ function Test-Plugins {
         Check 'tray plugin rows show the version, publisher, and explain the removal choices' (
             $rows.Count -eq 2 -and $rows[0].Name -eq $alpha -and $rows[0].Facts -match '1.0.0.*TSS Fixture' -and $rows[0].Detail -eq $gone -and
             ($rows[0].Buttons.Text -join ',') -eq 'Uninstall,Forget' -and $rows[1].Name -eq $beta -and $rows[1].Facts -match '2.0.0.*TSS Fixture')
+        $nav = @(Read-Nav $win)
+        Check 'the source has one row in the list, showing only its plugins' ($nav.Count -eq 1 -and $nav[0].Kinds -match '^Plugins \d') (Show-Nav $win)
         Test-Layout $win 'plugin rows'
         $shot = Save-Shot $win 'plugins-rows'
         Check 'saved the plugin rows screenshot' ($null -ne $shot) $shot.Path
@@ -2570,16 +2912,16 @@ function Test-Plugins {
         $r = Tss $c @('remove', $c.Id) $isolated
         $list = & $installed
         Check 'plain remove says plugins stay in Copilot and leaves the other plugin installed' (
-            $r.Code -eq 0 -and $r.Text.Contains('Plugins stay installed in Copilot.') -and $list -eq $b -and @((Get-Config $c).repos).Count -eq 0) $list
+            $r.Code -eq 0 -and $r.Text.Contains('Plugins stay installed in Copilot.') -and $list -eq $b -and @((Get-Config $c).sources | Where-Object { $_ }).Count -eq 0) $list
 
-        $r = Tss $c $add $isolated -InputLine 'yes'
+        $r = Tss $c ($add + '--approve-plugins' + '--yes') $isolated
         if ($r.Code -ne 0 -or $r.Text -notmatch "as '([^']+)'") { throw 'tss could not add the source again.' }
         $c.Id = $Matches[1]
         $r = Tss $c @('sync', $c.Id) $isolated
         if ($r.Code -ne 0) { throw 'Could not track the remaining plugin again.' }
         $r = Tss $c @('remove', $c.Id, '--uninstall-plugins') $isolated
         Check 'explicit remove verifies uninstall and then drops the source' (
-            $r.Code -eq 0 -and $r.Text.Contains('Uninstalled 1 plugin') -and (& $installed) -eq '' -and @((Get-Config $c).repos).Count -eq 0)
+            $r.Code -eq 0 -and $r.Text.Contains('Uninstalled 1 plugin') -and (& $installed) -eq '' -and @((Get-Config $c).sources | Where-Object { $_ }).Count -eq 0)
     } finally {
         try { Close-Env $c } finally {
             if ($created) {
@@ -2589,6 +2931,151 @@ function Test-Plugins {
                 } catch { Check 'deleted the disposable fixture branch' $false "Could not delete $($c.Ref)." }
             }
         }
+    }
+}
+
+# ---------------------------------------------------------------- autodetect
+
+# One branch holds skills at several depths, an agent, an instructions file, a plugin listed by a branch-root
+# marketplace, a plugin no marketplace lists, and items the folder rules leave out. 'tss add' of the bare branch finds
+# each kind, installs what it may, and leaves the plugin for approval; a folder location sees only its subtree.
+function Test-Autodetect {
+    $exe = Get-LiveCopilotExe
+    $c = New-Env 'autodetect'
+    $k = $null
+    try {
+        $isolated = @{
+            COPILOT_HOME = (Join-Path $c.Root 'copilot-home')
+            COPILOT_CACHE_HOME = (Join-Path $c.Root 'copilot-cache')
+            COPILOT_AUTO_UPDATE = 'false'; NO_COLOR = '1'
+            TSS_AGENTS_DIR = (Join-Path $c.Root 'agents')
+            TSS_INSTRUCTIONS_DIR = (Join-Path $c.Root 'instructions')
+            TSS_API_BASE = $null; TSS_RAW_BASE = $null
+        }
+        if ($exe) { $isolated.TSS_COPILOT_CLI = $exe }
+        $child = New-LiveStartInfo $c.Root 'tss.exe' @() $isolated
+        Assert-LiveCopilotEnv $c.Root $child.EnvironmentVariables
+        foreach ($slot in 'COPILOT_HOME', 'COPILOT_CACHE_HOME', 'TSS_AGENTS_DIR', 'TSS_INSTRUCTIONS_DIR') {
+            New-Item -ItemType Directory -Force -Path $isolated[$slot] | Out-Null
+        }
+        $emptyHomes = { (Get-Entries $isolated.COPILOT_HOME) -eq '' -and (Get-Entries $isolated.COPILOT_CACHE_HOME) -eq '' }
+
+        $market = 'tss-e2e-autodetect'
+        $publisher = 'TSS Fixture'
+        $plugin = 'tss-auto'
+        $loose = 'tss-loose'
+        $skill = { param($name) "---`nname: $name`ndescription: Inert test fixture`n---`nFixture text only.`n" }
+        $manifest = { param($name) @{ name = $name; version = '1.0.0'; author = @{ name = $publisher }; description = 'Inert test fixture' } | ConvertTo-Json -Compress }
+        $changes = @(
+            @{ Path = 'kit/topskill/SKILL.md'; Text = (& $skill 'topskill') }
+            @{ Path = 'mixed/deep/nested/deepskill/SKILL.md'; Text = (& $skill 'deepskill') }
+            @{ Path = 'mixed/deep/nested/deepskill/references/notes.md'; Text = "Deep notes.`n" }
+            @{ Path = 'agents/review.agent.md'; Text = "---`ndescription: Inert test fixture`n---`nReview text only.`n" }
+            @{ Path = 'rules/style.instructions.md'; Text = "---`napplyTo: '**'`n---`nStyle text only.`n" }
+            @{ Path = 'tests/fixture-skill/SKILL.md'; Text = (& $skill 'fixture-skill') }
+            @{ Path = '.github/skills/repo-only/SKILL.md'; Text = (& $skill 'repo-only') }
+            @{ Path = 'AGENTS.md'; Text = "Repository notes for agents.`n" }
+            @{ Path = '.github/plugin/marketplace.json'; Text = (@{ name = $market; owner = @{ name = $publisher }; plugins = @(
+                @{ name = $plugin; source = "./e2e-pack/$plugin"; description = 'Inert test fixture' }) } | ConvertTo-Json -Depth 5 -Compress) }
+            @{ Path = "e2e-pack/$plugin/.plugin/plugin.json"; Text = (& $manifest $plugin) }
+            @{ Path = "e2e-pack/$plugin/skills/$plugin/SKILL.md"; Text = (& $skill $plugin) }
+            @{ Path = "loose/$loose/.plugin/plugin.json"; Text = (& $manifest $loose) }
+        )
+        $pin = Push-Upstream $c.Repo $c.Ref $changes 'mixed tree for autodetect'
+        $upstream = Get-UpstreamFiles $c.Repo $pin
+        $location = "https://github.com/$($c.Repo)/tree/$($c.Ref)"
+        $add = @('add', $location, '--use-token', '--every', '6h')
+
+        $r = Tss $c ($add + '--preview') $isolated
+        $t = $r.Text
+        Check 'the preview names the repository, the branch and the whole repository' (
+            $r.Code -eq 0 -and $t.Contains("Read-only preview of $($c.Repo)") -and $t -match "(?m)^Branch: $([regex]::Escape($c.Ref))\r?$" -and
+            $t.Contains('Folder: the whole repository')) "exit $($r.Code)"
+        Check 'it turns on all four kinds' ((@('Skills', 'Agents', 'Instructions', 'Plugins') | Where-Object { $t -notmatch "(?m)^${_}: Sync on\r?$" }).Count -eq 0)
+        $want = [ordered]@{ alpha = 'skills/alpha'; beta = 'skills/beta'; gamma = 'skills/gamma'; topskill = 'kit/topskill'; deepskill = 'mixed/deep/nested/deepskill' }
+        $missing = @($want.Keys | Where-Object { $t -notmatch "(?m)^  $_ \($([regex]::Escape($want[$_]))\): will sync\r?$" })
+        Check 'it lists the skills at every depth' ($missing.Count -eq 0) ($missing -join ', ')
+        Check 'it lists the agent and the instructions file' (
+            $t -match '(?m)^  review\.agent\.md\b.*: will sync\r?$' -and $t -match '(?m)^  style\.instructions\.md\b.*: will sync\r?$')
+        Check 'the marketplace plugin waits for approval and the unlisted one cannot be installed' (
+            $t -match "(?m)^  $plugin\b.*: will sync after you approve it\r?$" -and
+            $t -match "(?m)^  $loose\b.*: cannot be installed: Copilot CLI can install a plugin from a branch only through a marketplace that lists it")
+        Check 'tests and .github are left out by folder rules, and their items are not listed' (
+            $t -match "Skipped 1 by a folder rule: 'tests' is an ignored folder\." -and $t -match "Skipped 1 by a folder rule: '\.github' is a repository-specific folder" -and
+            $t -notmatch 'fixture-skill' -and $t -notmatch 'repo-only')
+        Check 'the skill bundled in the plugin is not listed as a skill of its own' ($t -notmatch "e2e-pack/$plugin/skills")
+        Check 'AGENTS.md is listed as never synced' ($t -match '(?m)^Never synced:\r?$' -and $t -match '(?m)^  AGENTS\.md: ')
+        $nothing = { (Get-Entries $c.Skills) -eq '' -and (Get-Entries $isolated.TSS_AGENTS_DIR) -eq '' -and (Get-Entries $isolated.TSS_INSTRUCTIONS_DIR) -eq '' }
+        Check 'the preview saved and installed nothing' ($t.Contains('Nothing was saved or installed.') -and $null -eq (Get-Config $c) -and (& $nothing) -and (& $emptyHomes))
+
+        $r = Tss $c ($add + '--yes') $isolated
+        if ($r.Code -ne 0 -or $r.Text -notmatch "as '([^']+)'") { throw 'tss did not save the mixed source.' }
+        $c.Id = $Matches[1]
+        Check 'add without --approve-plugins leaves the plugin waiting' ($r.Text.Contains("Its plugins wait for your approval: $plugin.") -and (& $emptyHomes))
+        $cfg = Get-Config $c
+        $lanes = @($cfg.sources)[0].lanes
+        Check 'one source with all four kinds on' (@($cfg.sources).Count -eq 1 -and $lanes.skills -and $lanes.agents -and $lanes.instructions -and $lanes.plugins) ($lanes | ConvertTo-Json -Compress)
+        $r = Tss $c @('check', $c.Id) $isolated
+
+        Check 'the skills folder holds exactly the five skills' ((Get-Entries $c.Skills) -eq 'alpha,beta,deepskill,gamma,topskill') (Get-Entries $c.Skills)
+        $diff = New-Object System.Collections.Generic.List[string]
+        foreach ($name in $want.Keys) {
+            $prefix = $want[$name] + '/'
+            $have = Get-DiskFiles (Join-Path $c.Skills $name)
+            $up = [ordered]@{}
+            foreach ($p in $upstream.Keys) { if ($p.StartsWith($prefix)) { $up[$p.Substring($prefix.Length)] = $upstream[$p].Id } }
+            foreach ($p in $up.Keys) { if ($have[$p] -ne $up[$p]) { $diff.Add("${name}/${p}") } }
+            foreach ($p in $have.Keys) { if (-not $up.Contains($p)) { $diff.Add("unexpected ${name}/${p}") } }
+        }
+        Check 'each skill is byte-equal to upstream' ($diff.Count -eq 0) (($diff | Select-Object -First 4) -join '; ')
+        $agents = Get-DiskFiles $isolated.TSS_AGENTS_DIR
+        $rules = Get-DiskFiles $isolated.TSS_INSTRUCTIONS_DIR
+        Check 'the agent is in the agents folder, byte-equal to upstream' (
+            @($agents.Keys) -join ',' -eq 'review.agent.md' -and $agents['review.agent.md'] -eq $upstream['agents/review.agent.md'].Id) (@($agents.Keys) -join ',')
+        Check 'the instructions file is in the instructions folder, byte-equal to upstream' (
+            @($rules.Keys) -join ',' -eq 'style.instructions.md' -and $rules['style.instructions.md'] -eq $upstream['rules/style.instructions.md'].Id) (@($rules.Keys) -join ',')
+        $stray = @('fixture-skill', 'repo-only', $plugin, 'AGENTS.md') | Where-Object {
+            (Test-Path -LiteralPath (Join-Path $c.Skills $_)) -or (Test-Path -LiteralPath (Join-Path $isolated.TSS_AGENTS_DIR $_)) -or
+            (Test-Path -LiteralPath (Join-Path $isolated.TSS_INSTRUCTIONS_DIR $_))
+        }
+        Check 'ignored, repository-specific, bundled and never-synced items are not on disk' (@($stray).Count -eq 0) (@($stray) -join ', ')
+        Check 'the check says the plugin needs approval and did not start Copilot' ($r.Text -match "$plugin" -and $r.Text -match 'approv' -and (& $emptyHomes)) "exit $($r.Code)"
+
+        if ($exe) {
+            $r = Tss $c @('resolve', $c.Id, $plugin, 'approve', $publisher) $isolated
+            Check 'tss resolve ... approve approves the waiting plugin' ($r.Code -eq 0) "exit $($r.Code)"
+            $r = Tss $c @('check', $c.Id) $isolated
+            $list = @(Get-LivePluginList $c.Root $isolated | Where-Object { $_.marketplace -eq $market -and $_.source -eq 'installed' } | ForEach-Object { "$($_.name)=$($_.version)" }) -join ','
+            Check 'after approval a check installs the plugin into the throwaway Copilot home' ($list -eq "$plugin=1.0.0") $list
+        } else {
+            Note 'GitHub Copilot CLI not found (set TSS_COPILOT_CLI); the approval and install steps were not run.'
+        }
+
+        $k = New-Env 'autodetect' -NoBranch
+        $k.Ref = $c.Ref
+        $kitEnv = @{}
+        foreach ($key in $isolated.Keys) { $kitEnv[$key] = $isolated[$key] }
+        $kitEnv.TSS_AGENTS_DIR = Join-Path $k.Root 'agents'
+        $kitEnv.TSS_INSTRUCTIONS_DIR = Join-Path $k.Root 'instructions'
+        $kitEnv.COPILOT_HOME = Join-Path $k.Root 'copilot-home'
+        $kitEnv.COPILOT_CACHE_HOME = Join-Path $k.Root 'copilot-cache'
+        foreach ($slot in 'COPILOT_HOME', 'COPILOT_CACHE_HOME', 'TSS_AGENTS_DIR', 'TSS_INSTRUCTIONS_DIR') { New-Item -ItemType Directory -Force -Path $kitEnv[$slot] | Out-Null }
+        $kit = Get-Address $k 'kit'
+        $r = Tss $k @('add', $kit, '--use-token', '--preview') $kitEnv
+        $t = $r.Text
+        $items = @(($t -split "`r?`n") | Where-Object { $_ -match ': (will sync|cannot be installed|not synced)' })
+        Check 'a folder location sees only its subtree' (
+            $r.Code -eq 0 -and $t.Contains('Folder: kit') -and $items.Count -eq 1 -and $items[0] -match '^  topskill \(kit/topskill\): will sync\r?$') ($items -join ' ;; ')
+        $r = Tss $k @('add', $kit, '--use-token', '--yes') $kitEnv
+        if ($r.Code -ne 0 -or $r.Text -notmatch "as '([^']+)'") { throw 'tss did not save the folder source.' }
+        $k.Id = $Matches[1]
+        $r = Tss $k @('check', $k.Id) $kitEnv
+        $files = Get-DiskFiles (Join-Path $k.Skills 'topskill')
+        Check 'and installs only that skill' (
+            (Get-Entries $k.Skills) -eq 'topskill' -and $files['SKILL.md'] -eq $upstream['kit/topskill/SKILL.md'].Id -and
+            (Get-Entries $kitEnv.TSS_AGENTS_DIR) -eq '' -and (Get-Entries $kitEnv.TSS_INSTRUCTIONS_DIR) -eq '') (Get-Entries $k.Skills)
+    } finally {
+        try { Close-Env $k } finally { Close-Env $c }
     }
 }
 
@@ -2602,6 +3089,7 @@ $scenarios = [ordered]@{
     'portable'     = 'Test-Portable'
     'mixed'        = 'Test-Mixed'
     'plugins'      = 'Test-Plugins'
+    'autodetect'   = 'Test-Autodetect'
     'changes'      = 'Test-Changes'
     'local-edit'   = 'Test-LocalEdit'
     'converged'    = 'Test-Converged'

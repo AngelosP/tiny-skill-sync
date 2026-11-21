@@ -3,6 +3,7 @@
 
 mod common;
 
+use std::collections::BTreeMap;
 use std::ffi::c_void;
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
@@ -39,6 +40,8 @@ struct TestHost {
     home_reads: std::cell::Cell<u32>,
     plugins: FakePluginManager,
     confirm_add: std::cell::Cell<Option<bool>>,
+    /// Whether input comes from a terminal, so `tss add` may ask.
+    interactive: std::cell::Cell<bool>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -114,7 +117,11 @@ impl Host for TestHost {
     }
 
     fn confirm_source(&self) -> Result<bool, String> {
-        Ok(self.confirm_add.take().expect("a command not adding a typed source asked for confirmation"))
+        Ok(self.confirm_add.take().expect("a command not adding a source asked for confirmation"))
+    }
+
+    fn interactive(&self) -> bool {
+        self.interactive.get()
     }
 
     fn token_saved(&self) -> bool {
@@ -187,6 +194,7 @@ impl TestHost {
             change_before_second_home_read: Mutex::new(None),
             home_reads: std::cell::Cell::new(0),
             confirm_add: std::cell::Cell::new(None),
+            interactive: std::cell::Cell::new(true),
         }
     }
 
@@ -274,8 +282,8 @@ fn a_check_installs_and_status_looks_only_at_the_disk() {
 fn app_status_and_manual_actions_work_with_automation_off_and_a_bad_skill_repository() {
     let host = TestHost::for_app("cli-app-manual");
     let mut cfg = standard_config();
-    cfg.repos[0].repo = "not a repository".into();
-    cfg.repos[0].use_token = true;
+    cfg.update_lane_at(0, |r| r.repo = "not a repository".into());
+    cfg.update_lane_at(0, |r| r.use_token = true);
     cfg.app_update = UpdatePrefs { enabled: false, interval: UpdateInterval::Weekly, timing: UpdateTiming::OnQuit };
     host.save(&cfg);
     host.world.write("handmade/SKILL.md", "leave this alone\n");
@@ -467,6 +475,58 @@ fn an_empty_listing_deletes_only_when_confirmed() {
 }
 
 #[test]
+fn delete_all_for_a_source_confirms_only_its_skills_lane() {
+    let host = TestHost::empty("cli-delete-all-source");
+    host.remote.put(REPO, "alpha/SKILL.md", "one\n");
+    host.remote.put(REPO, "helper.agent.md", "two\n");
+    // A legacy config whose first entry is the agents lane: the migrated source takes that lane's ID.
+    let legacy = r#"{"version":2,"repos":[{"id":"kit-ag","repo":"o/fixtures","kind":"agents"},{"id":"kit","repo":"o/fixtures"}]}"#;
+    std::fs::write(host.config_file(), legacy).unwrap();
+    let source = host.config().sources()[0].clone();
+    assert_eq!((source.id.as_str(), source.lanes.id(SourceKind::Skills), source.lanes.id(SourceKind::Agents)), ("kit-ag", Some("kit"), Some("kit-ag")));
+    let agent = host.world.root.join("agents").join("helper.agent.md");
+    expect(&tss(&host, "check"), 0, &["Installed alpha"]);
+    assert!(agent.exists() && host.world.skill_names() == ["alpha"], "fixture: both items are installed");
+
+    host.remote.remove(REPO, "alpha");
+    host.remote.remove(REPO, "helper.agent.md");
+    let ran = tss(&host, "check");
+    assert_eq!(ran.code, 1, "both removals are held: {ran:?}");
+    assert!(agent.exists() && host.world.skill_names() == ["alpha"], "nothing is deleted unconfirmed: {ran:?}");
+
+    // The source named by its repository confirms only its skills lane, never the agents lane whose ID it took.
+    let ran = tss(&host, "check o/fixtures --delete-all");
+    assert!(host.world.skill_names().is_empty(), "the skills removal was confirmed: {ran:?}");
+    assert!(agent.exists(), "the agents removal was confirmed by a query that names the source, not the agents lane: {ran:?}");
+}
+
+#[test]
+fn delete_all_for_a_source_with_skills_off_confirms_nothing() {
+    let host = TestHost::empty("cli-delete-all-no-skills");
+    host.remote.put(REPO, "helper.agent.md", "two\n");
+    // A legacy config with only an agents lane: the migrated source takes that lane's ID, and its skills lane is only
+    // a reserved ID with the type off (every source gets an ID for each type, so none lacks a skills lane).
+    let legacy = r#"{"version":2,"repos":[{"id":"kit-ag","repo":"o/fixtures","kind":"agents"}]}"#;
+    std::fs::write(host.config_file(), legacy).unwrap();
+    let source = host.config().sources()[0].clone();
+    assert_eq!((source.id.as_str(), source.lanes.id(SourceKind::Skills), source.lanes.id(SourceKind::Agents)), ("kit-ag", Some("kit-ag-2"), Some("kit-ag")));
+    assert_eq!(source.types.skills, Some(false));
+    let agent = host.world.root.join("agents").join("helper.agent.md");
+    expect(&tss(&host, "check"), 0, &[]);
+    assert!(agent.exists(), "fixture: the agent is installed");
+
+    host.remote.remove(REPO, "helper.agent.md");
+    host.remote.put(REPO, "README.md", "nothing to sync\n");
+    let ran = tss(&host, "check o/fixtures --delete-all");
+    assert_eq!(ran.code, 1, "the removal is still held: {ran:?}");
+    assert!(agent.exists(), "a query naming the source confirms only its (off) skills lane, never the agents lane: {ran:?}");
+
+    // Naming the agents lane itself confirms it.
+    tss(&host, "check kit-ag --delete-all");
+    assert!(!agent.exists(), "the lane named by its ID was confirmed");
+}
+
+#[test]
 fn names_from_upstream_cannot_steer_the_terminal() {
     let host = TestHost::new("cli-spoof");
     // A folder name that erases the line and returns the cursor, and a file with such a name inside an ordinary skill.
@@ -515,7 +575,7 @@ fn keep_refuses_a_skill_another_repository_manages() {
     let host = TestHost::new("cli-keep-other");
     host.remote.seed_standard("o/other");
     let mut cfg = standard_config();
-    cfg.repos.push(repo("other", "o/other", "skills"));
+    cfg.push_lane(repo("other", "o/other", "skills"));
     host.save(&cfg);
     let ran = tss(&host, "check");
     expect(&ran, 1, &["another repository (fx) already provides this name"]);
@@ -527,7 +587,7 @@ fn a_disabled_repository_is_shown_but_checked_only_when_named() {
     let host = TestHost::new("cli-disabled");
     expect(&tss(&host, "check"), 0, &[]);
     let mut cfg = standard_config();
-    cfg.repos[0].enabled = false;
+    cfg.update_lane_at(0, |r| r.enabled = false);
     host.save(&cfg);
     host.world.write("alpha/SKILL.md", "mine\n");
 
@@ -541,43 +601,152 @@ fn a_disabled_repository_is_shown_but_checked_only_when_named() {
 
 #[test]
 fn repositories_are_added_once_and_named_unambiguously() {
-    let host = TestHost::empty("cli-add");
+    let host = TestHost { tokens: FakeTokens::some("tok"), ..TestHost::empty("cli-add") };
     expect(&tss(&host, "status"), 0, &["No repositories are set up. Add one with: tss add OWNER/NAME"]);
     expect(&tss(&host, "check"), 0, &["No repositories are set up"]);
 
-    let ran = tss(&host, "add o/fixtures --every 6h");
+    host.remote.seed_standard(REPO);
+    let ran = tss(&host, "add o/fixtures --every 6h --yes");
     expect(&ran, 0, &["Added o/fixtures as 'o-fixtures'. Checked every 6 hours.", "tss check o-fixtures"]);
-    let repos = host.config().repos;
-    assert_eq!((repos.len(), repos[0].interval.map(|i| i.to_string())), (1, Some("6h".to_string())));
+    let config = host.config();
+    assert_eq!(config.sources().len(), 1);
+    assert_eq!(config.sources()[0].interval.map(|i| i.to_string()), Some("6h".to_string()));
 
-    expect(&tss(&host, "add O/Fixtures"), 3, &["This source is already set up. Its ID is 'o-fixtures'."]);
+    expect(&tss(&host, "add O/Fixtures --yes"), 3, &["This source is already set up. Its ID is 'o-fixtures'."]);
     expect(&tss(&host, "add not-a-repo"), 3, &[]);
-    expect(&tss(&host, "add https://github.com/o/fixtures/tree/main/skills --use-token"), 0, &["as 'o-fixtures-2'", "sends the GitHub token"]);
-    assert_eq!(host.config().repos.len(), 2);
-    expect(&tss(&host, "check o/fixtures"), 3, &["matches several repositories (o-fixtures, o-fixtures-2); use the id"]);
-    expect(&tss(&host, "check nope"), 3, &["no repository 'nope' is set up; the ids are: o-fixtures, o-fixtures-2"]);
+    expect(&tss(&host, "add https://github.com/o/fixtures/tree/main/skills --use-token --yes"), 0, &["as 'o-fixtures-2'", "sends the GitHub token"]);
+    assert_eq!(host.config().sources().len(), 2);
+    expect(&tss(&host, "check o/fixtures"), 3, &["Several sources match 'o/fixtures' (o-fixtures, o-fixtures-2); use the ID"]);
+    expect(&tss(&host, "check nope"), 3, &["No source 'nope' is set up; the IDs are: o-fixtures, o-fixtures-2"]);
 }
 
 #[test]
-fn source_preview_is_read_only_and_typed_add_requires_consent() {
+fn source_and_settings_changes_round_trip_into_the_settings_file() {
+    let host = TestHost::new("cli-source-settings");
+    expect(&tss(&host, "settings"), 0, &["Defaults for every source:", "Skills: Sync on", "Ignored folders: "]);
+    expect(&tss(&host, "settings types plugins=off agents=off"), 0, &["Saved."]);
+    expect(&tss(&host, "settings ignore add vendor"), 0, &["Saved."]);
+    expect(&tss(&host, "settings ignore remove tests"), 0, &["Saved."]);
+    expect(&tss(&host, "settings repo-items on"), 0, &["Saved."]);
+    expect(&tss(&host, "settings ignore add ../up"), 3, &["That folder name cannot be used"]);
+    let global = host.config().global().clone();
+    assert!(!global.types.plugins && !global.types.agents && global.types.skills && global.include_repo_items);
+    assert!(global.ignore_folders.contains(&"vendor".to_string()) && !global.ignore_folders.contains(&"tests".to_string()));
+
+    expect(&tss(&host, "source fx types agents=on skills=default"), 0, &["Saved. The change applies on the next check of 'fx'."]);
+    expect(&tss(&host, "source fx-agents ignore allow samples"), 0, &["Saved."]);
+    expect(&tss(&host, "source o/fixtures ignore add drafts"), 0, &["Saved."]);
+    expect(&tss(&host, "source fx repo-items off"), 0, &["Saved."]);
+    expect(&tss(&host, "source fx types instructions=default"), 0, &["Saved."]);
+    expect(&tss(&host, "source fx repo-items off"), 0, &["Nothing changed"]);
+    let source = host.config().find_source("fx").unwrap().clone();
+    assert_eq!(
+        (source.types.skills, source.types.agents, source.types.instructions),
+        (None, Some(true), None),
+        "a migrated source kept its old types until changed"
+    );
+    assert_eq!((source.ignore_allow, source.ignore_add, source.include_repo_items), (vec!["samples".to_string()], vec!["drafts".to_string()], Some(false)));
+    expect(&tss(&host, "source fx-agents"), 0, &["[fx]", "Also ignored for this source", "drafts", "Not ignored for this source", "samples"]);
+    expect(&tss(&host, "source nope"), 3, &["No source 'nope'"]);
+    assert!(host.remote.log().is_empty(), "settings commands never ask GitHub");
+}
+
+#[test]
+fn status_shows_one_entry_per_source_grouped_by_type_from_what_was_seen() {
+    use tiny_skill_sync::inventory::{Summary, SummaryNote};
+    let host = TestHost::new("cli-status-seen");
+    expect(&tss(&host, "check"), 0, &["Installed alpha"]);
+    expect(&tss(&host, "source fx types agents=on"), 0, &["Saved."]);
+    let summary = Summary {
+        found: [3, 2, 1, 0],
+        installable: [3, 2, 1, 0],
+        filtered: [0, 4, 0, 0],
+        notes: vec![SummaryNote { kind: None, path: "AGENTS.md".into(), reason: "It is read by Copilot from the repository itself".into() }],
+        more_notes: 0,
+    };
+    let seen = BTreeMap::from([("fx".to_string(), tiny_skill_sync::seen::Seen { at: 1, branch: "main".into(), summary })]);
+    tiny_skill_sync::seen::save(&host.source_paths(host.world.skills.clone()).seen_file(), &seen).unwrap();
+
+    let ran = tss(&host, "status");
+    expect(
+        &ran,
+        0,
+        &[
+            "Skills 3 | Agents 2 | Instructions: Sync off",
+            "Skipped 4 in repository-specific or ignored folders",
+            "Not synced: AGENTS.md",
+            "    alpha: Installed",
+        ],
+    );
+    assert_eq!(ran.out.matches("[fx").count(), 1, "one entry for the source, not one per type:\n{ran:?}");
+    assert!(!ran.out.contains("Plugins"), "a type neither found nor owned is not shown:\n{ran:?}");
+}
+
+#[test]
+fn remove_takes_away_every_type_of_a_source() {
+    let host = TestHost::new("cli-remove-source");
+    expect(&tss(&host, "settings types agents=off instructions=off plugins=off"), 0, &[]);
+    expect(&tss(&host, "check"), 0, &["Installed alpha"]);
+    assert_eq!(host.config().lane_ids("fx").len(), 4);
+    expect(&tss(&host, "remove fx-agents --uninstall-plugins"), 3, &["only for a source with plugins"]);
+    expect(&tss(&host, "remove fx-agents --delete-skills"), 0, &["Removed", "[fx]"]);
+    let cfg = host.config();
+    assert!(cfg.sources().is_empty() && cfg.repos().is_empty(), "every lane went with the source: {cfg:?}");
+    assert!(host.world.skill_names().is_empty(), "proven copies were deleted");
+}
+
+#[test]
+fn add_previews_every_type_and_saves_only_what_was_confirmed() {
     let host = TestHost::empty("cli-source-preview");
     host.remote.put(REPO, "caf\u{e9}/SKILL.md", "one");
+    host.remote.put(REPO, "ordinary.agent.md", "one");
+    host.remote.put(REPO, "tests/hidden.agent.md", "skipped");
+    host.remote.put(REPO, "AGENTS.md", "never");
     let before = host.world.snapshot();
     let preview = tss(&host, "add o/fixtures --preview");
-    expect(&preview, 0, &["Read-only preview", "Matched 1 skill:", "caf\\u{e9}", "Destination:", "Type: Skills"]);
+    expect(
+        &preview,
+        0,
+        &[
+            "Read-only preview of o/fixtures",
+            "(default branch)",
+            "Skills: Sync on",
+            "caf\\u{e9}",
+            "Destination:",
+            "Agents: Sync on",
+            "ordinary.agent.md: will sync",
+            "Skipped 1 by a folder rule",
+            "Instructions: Sync on",
+            "None found.",
+            "Never synced:",
+            "AGENTS.md",
+            "Nothing was saved or installed.",
+        ],
+    );
     assert!(preview.out.is_ascii());
     assert_eq!(host.world.snapshot(), before);
+    assert!(host.plugins.calls().is_empty(), "a preview never starts Copilot CLI");
+
     host.confirm_add.set(Some(false));
-    expect(&tss(&host, "add o/fixtures --type skills"), 0, &["Matched 1 skill:", "Cancelled. Nothing was saved or installed."]);
+    expect(&tss(&host, "add o/fixtures"), 0, &["Skills: Sync on", "Cancelled. Nothing was saved or installed."]);
     assert_eq!(host.world.snapshot(), before);
 
+    host.interactive.set(false);
+    expect(&tss(&host, "add o/fixtures"), 3, &["not a terminal", "--yes"]);
+    assert_eq!(host.world.snapshot(), before);
+    host.interactive.set(true);
+
     host.remote.set_truncated(REPO, true);
-    expect(&tss(&host, "add o/fixtures --type skills"), 2, &[]);
+    host.confirm_add.set(Some(true));
+    expect(&tss(&host, "add o/fixtures"), 2, &["Nothing was saved or installed."]);
     assert_eq!(host.world.snapshot(), before);
     host.remote.set_truncated(REPO, false);
+    expect(&tss(&host, "add o/fixtures --type agents"), 3, &["tss source REPO types"]);
     host.confirm_add.set(Some(true));
-    expect(&tss(&host, "add o/fixtures --type skills"), 0, &["Matched 1 skill:", "Added o/fixtures"]);
-    assert_eq!(host.config().repos[0].kind, SourceKind::Skills);
+    expect(&tss(&host, "add o/fixtures"), 0, &["Agents: Sync on", "Added o/fixtures as 'o-fixtures'."]);
+    let cfg = host.config();
+    assert_eq!(cfg.sources().len(), 1);
+    assert_eq!(cfg.lane_ids("o-fixtures").len(), 4, "one source fans out into a lane per type");
     assert!(host.world.skill_names().is_empty() && !host.world.state_file().exists());
 }
 
@@ -597,47 +766,49 @@ fn source_preview_rechecks_listing_before_saving() {
     });
     host.confirm_add.set(Some(true));
     let before = host.world.snapshot();
-    expect(&tss(&host, "add o/fixtures --type skills"), 2, &["Matched 1 skill:", "changed"]);
+    expect(&tss(&host, "add o/fixtures"), 2, &["first", "changed since the preview"]);
     assert_eq!(host.world.snapshot(), before);
 }
 
 #[test]
-fn source_preview_reports_only_the_selected_type_and_its_rejections() {
-    let host = TestHost::empty("cli-source-rejected");
-    host.remote.put(REPO, "ordinary.agent.md", "one");
-    host.remote.put(REPO, "CON.agent.md", "bad");
-    host.remote.put(REPO, "other.instructions.md", "other");
+fn add_refuses_to_save_when_the_settings_changed_while_it_asked() {
+    let host = TestHost::empty("cli-source-settings-changed");
+    host.remote.put(REPO, "first/SKILL.md", "one");
+    let mut other = Config::default();
+    other.add_source(SourceKind::Skills, &RepoSpec::parse("o/other").unwrap(), None, false);
+    // The first read is the one `add` previews with; the second is the reread just before saving.
+    *host.change_before_second_home_read.lock().unwrap() = Some(other.clone());
+    host.confirm_add.set(Some(true));
+    expect(&tss(&host, "add o/fixtures"), 2, &["The settings changed. Preview the source again."]);
+    assert_eq!(host.config(), other);
+}
+
+#[test]
+fn add_without_preview_or_yes_never_saves_from_a_script() {
+    let host = TestHost::empty("cli-source-script");
+    host.remote.put(REPO, "first/SKILL.md", "one");
+    host.interactive.set(false);
     let before = host.world.snapshot();
-    let ran = tss(&host, "add o/fixtures --type agents --preview");
-    expect(&ran, 2, &["Type: Agents", "Matched 1 agent:", "ordinary.agent.md", "Rejected:", "CON.agent.md", "Nothing was saved or installed"]);
-    assert!(!ran.out.contains("other.instructions.md"));
+    expect(&tss(&host, "add o/fixtures"), 3, &["Cannot ask for confirmation"]);
     assert_eq!(host.world.snapshot(), before);
+    assert!(host.remote.log().is_empty(), "refused before asking GitHub");
+    expect(&tss(&host, "add o/fixtures --preview"), 0, &["Nothing was saved or installed."]);
+    expect(&tss(&host, "add o/fixtures --yes"), 0, &["Added o/fixtures as 'o-fixtures'."]);
 }
 
 const PLUGIN_URL: &str = "https://github.com/o/fixtures/tree/main/pack";
 
 #[test]
-fn plugin_cli_add_error_points_to_a_named_branch_without_double_punctuation() {
-    let host = plugin_host("cli-plugin-named-branch");
-    let ran = tss(&host, "add --type plugins o/fixtures");
-    expect(&ran, 2, &["Plugins need a named branch, for example https://github.com/OWNER/NAME/tree/main. Nothing was saved or installed."]);
-    assert!(!ran.err.contains(".."), "{}", ran.err);
-    assert!(host.plugins.calls().is_empty());
-}
-
-#[test]
-fn plugin_cli_refuses_unsupported_branch_characters_before_preview_or_add() {
+fn add_of_a_branch_github_does_not_have_saves_nothing() {
     let host = plugin_host("cli-plugin-branch-chars");
-    host.confirm_add.set(Some(false));
     let before = host.world.snapshot();
     for branch in ["bad~ref", "caf\u{e9}"] {
-        for flag in ["", " --preview"] {
-            let ran = tss(&host, &format!("add --type plugins https://github.com/o/fixtures/tree/{branch}/pack{flag}"));
-            expect(&ran, 3, &["This branch name has characters the app will not pass to Copilot CLI: use letters, digits, '.', '_', '/', '+' or '-'."]);
+        for flag in [" --yes", " --preview"] {
+            let ran = tss(&host, &format!("add https://github.com/o/fixtures/tree/{branch}/pack{flag}"));
+            expect(&ran, 2, &["Could not read o/fixtures", "Nothing was saved or installed."]);
         }
     }
     assert!(host.plugins.calls().is_empty());
-    assert_eq!(host.remote.calls().tree, 0);
     assert_eq!(host.world.snapshot(), before);
 }
 
@@ -645,7 +816,21 @@ fn plugin_cli_refuses_unsupported_branch_characters_before_preview_or_add() {
 fn plugin_cli_preview_says_when_a_publisher_is_not_declared() {
     let host = plugin_host("cli-plugin-no-publisher");
     host.remote.put(REPO, "pack/alpha/plugin.json", r#"{"name":"alpha","version":"1.0.0"}"#);
-    expect(&tss(&host, &format!("add --type plugins {PLUGIN_URL} --preview")), 0, &["alpha 1.0.0, publisher not declared"]);
+    expect(&tss(&host, &format!("add {PLUGIN_URL} --preview")), 0, &["Publisher: not stated. Version: 1.0.0."]);
+}
+
+#[test]
+fn add_approves_the_previewed_plugins_only_when_asked() {
+    let plugins_lane = |host: &TestHost| host.config().sources()[0].lanes.id(SourceKind::Plugins).unwrap().to_string();
+
+    let host = plugin_host("cli-add-plugins-unapproved");
+    expect(&tss(&host, &format!("add {PLUGIN_URL} --yes")), 0, &["Its plugins wait for your approval: alpha."]);
+    assert!(host.world.state().plugin_sources().get(&plugins_lane(&host)).is_none_or(|record| record.approved.is_empty()));
+    assert!(host.plugins.calls().is_empty(), "adding without approval never starts Copilot CLI");
+
+    let host = plugin_host("cli-add-plugins-approved");
+    expect(&tss(&host, &format!("add {PLUGIN_URL} --approve-plugins --yes")), 0, &["Approved 1 plugin: alpha"]);
+    assert_eq!(host.world.state().plugin_sources()[&plugins_lane(&host)].approved, [("alpha".into(), Some("Review Team".into()))].into());
 }
 
 fn plugin_host(test: &str) -> TestHost {
@@ -659,14 +844,28 @@ fn plugin_host(test: &str) -> TestHost {
     host
 }
 
+/// A Plugins source saved and approved the way the app window does it; `tss add` approves through the location path.
+fn approved_plugin_source(host: &TestHost) -> String {
+    use tiny_skill_sync::engine::Engine;
+    let mut cfg = Config::default();
+    let id = cfg.add_source(SourceKind::Plugins, &RepoSpec::parse(PLUGIN_URL).unwrap(), None, false).id.clone();
+    host.save(&cfg);
+    let paths = host.source_paths(host.world.skills.clone());
+    let mut engine = Engine::new(paths, host.remote.client(), host.tokens.provider()).with_plugin_manager(host.plugins.manager());
+    let lane = cfg.find(&id).unwrap().clone();
+    let preview = engine.preview_source(&cfg, &lane, &std::sync::atomic::AtomicBool::new(false)).unwrap();
+    engine.approve_plugin_preview(&cfg, &id, &preview).unwrap();
+    id
+}
+
 #[test]
-fn plugin_cli_parses_typed_add_and_explicit_choices() {
+fn plugin_cli_parses_add_and_explicit_choices() {
     use cli::{AddSource, Command};
     use tiny_skill_sync::plugins::Choice;
     let parse = |words: &[&str]| cli::parse(&words.iter().map(|s| (*s).into()).collect::<Vec<_>>());
     assert_eq!(
-        parse(&["add", "--type", "plugins", PLUGIN_URL, "--preview"]),
-        Ok(Command::Add(AddSource { spec: PLUGIN_URL.into(), kind: Some(SourceKind::Plugins), preview: true, ..AddSource::default() }))
+        parse(&["add", PLUGIN_URL, "--approve-plugins", "--yes"]),
+        Ok(Command::Add(AddSource { spec: PLUGIN_URL.into(), approve_plugins: true, yes: true, ..AddSource::default() }))
     );
     assert_eq!(
         parse(&["resolve", "r", "alpha", "approve", "Review Team"]),
@@ -677,7 +876,10 @@ fn plugin_cli_parses_typed_add_and_explicit_choices() {
     {
         assert_eq!(parse(&["resolve", "r", "alpha", word]), Ok(Command::ResolvePlugin { repo: "r".into(), choice }));
     }
-    assert!(parse(&["remove", "r", "--delete-skills", "--uninstall-plugins"]).is_err());
+    assert_eq!(
+        parse(&["remove", "r", "--delete-skills", "--uninstall-plugins"]),
+        Ok(Command::Remove { repo: "r".into(), delete_skills: true, uninstall_plugins: true })
+    );
 }
 
 #[test]
@@ -693,7 +895,7 @@ fn plugin_cli_shared_sources_are_held_and_approval_must_name_the_publisher() {
         expect(&ran, 2, &["The plugin 'alpha' is published by 'Review Team'.", &format!("tss resolve {id} alpha approve \"Review Team\"")]);
         assert!(ran.out.is_ascii() && ran.err.is_ascii());
     }
-    assert!(host.world.state().plugin_sources()[&id].approved.is_empty());
+    assert!(host.world.state().plugin_sources().get(&id).is_none_or(|record| record.approved.is_empty()));
     assert!(host.plugins.calls().iter().all(|c| matches!(c, PluginCall::Home | PluginCall::List | PluginCall::Markets)));
 }
 
@@ -706,11 +908,11 @@ fn plugin_cli_choices_are_usage_errors_on_the_wrong_source_type() {
     expect(&tss(&host, "check fx"), 0, &["alpha"]);
     let before = host.world.snapshot();
     for (command, message) in [
-        ("resolve fx alpha forget".into(), "only for Plugins sources"),
-        ("resolve fx ALPHA forget".into(), "only for Plugins sources"),
+        ("resolve fx alpha forget".into(), "only for plugins, and plugins do not sync from 'fx'"),
+        ("resolve fx ALPHA forget".into(), "tss source fx types plugins=on"),
         (format!("resolve {id} ALPHA forget"), "Use the plugin name"),
         (format!("resolve {id} alpha keep"), "For Plugins, use approve, reinstall, uninstall or forget"),
-        ("remove fx --uninstall-plugins".into(), "only for a Plugins source"),
+        ("remove fx --uninstall-plugins".into(), "only for a source with plugins"),
     ] {
         expect(&tss(&host, &command), 3, &[message]);
         assert!(host.plugins.calls().is_empty());
@@ -723,8 +925,7 @@ fn plugin_cli_check_shows_an_existing_install_without_an_attention_exit_code() {
     use tiny_skill_sync::plugins::native::{MarketOrigin, NativeMarket, NativePlugin, NativeSnapshot};
 
     let host = plugin_host("cli-plugin-already-installed");
-    host.confirm_add.set(Some(true));
-    expect(&tss(&host, &format!("add --type plugins {PLUGIN_URL}")), 0, &["Added"]);
+    approved_plugin_source(&host);
     host.plugins.set_snapshot(NativeSnapshot {
         home: host.world.root.join("native"),
         markets: vec![NativeMarket {
@@ -755,20 +956,17 @@ fn plugin_cli_add_skips_ids_used_by_all_three_state_sections() {
     state.set_plugin_source(&native.id, record).unwrap();
     state.save(&host.world.state_file()).unwrap();
 
-    expect(&tss(&host, &format!("add --type plugins {PLUGIN_URL} --preview")), 0, &["[o-fixtures-4]", "Matched 1 plugin"]);
+    expect(&tss(&host, &format!("add {PLUGIN_URL} --preview")), 0, &["alpha (pack/alpha): will sync after you approve it"]);
     assert!(host.plugins.calls().is_empty());
     host.confirm_add.set(Some(true));
-    expect(&tss(&host, &format!("add --type plugins {PLUGIN_URL}")), 0, &["as 'o-fixtures-4'"]);
-    let saved = host.world.state();
-    assert_eq!(saved.repo("o-fixtures"), state.repo("o-fixtures"));
-    assert_eq!(saved.loose_sources(), state.loose_sources());
-    assert_eq!(saved.plugin_sources().get("o-fixtures-3"), state.plugin_sources().get("o-fixtures-3"));
-    assert!(saved.plugin_sources().contains_key("o-fixtures-4"));
-    assert_eq!(host.plugins.calls(), [PluginCall::Home]);
+    expect(&tss(&host, &format!("add {PLUGIN_URL}")), 0, &["as 'o-fixtures-4'", "Its plugins wait for your approval: alpha"]);
+    assert_eq!(host.world.state(), state, "saving a source records nothing until it is checked or approved");
+    assert!(host.config().find_source("o-fixtures-4").is_some());
+    assert!(host.plugins.calls().is_empty(), "adding without approval never starts Copilot CLI");
 }
 
 #[test]
-fn plugin_cli_preview_refuses_a_saved_id_used_by_a_skill_record() {
+fn plugin_cli_add_refuses_a_location_that_is_already_set_up() {
     use tiny_skill_sync::state::State;
 
     let host = plugin_host("cli-plugin-preview-conflict");
@@ -779,7 +977,9 @@ fn plugin_cli_preview_refuses_a_saved_id_used_by_a_skill_record() {
     state.repo_mut(&id).last_check = Some(T0);
     state.save(&host.world.state_file()).unwrap();
     let before = host.world.snapshot();
-    expect(&tss(&host, &format!("add --type plugins {PLUGIN_URL} --preview")), 2, &[&id, "already used"]);
+    expect(&tss(&host, &format!("add {PLUGIN_URL} --preview")), 0, &[&format!("This location is already set up as '{id}'."), "Nothing was saved"]);
+    host.confirm_add.set(Some(true));
+    expect(&tss(&host, &format!("add {PLUGIN_URL} --yes")), 3, &[&format!("Its ID is '{id}'.")]);
     assert!(host.plugins.calls().is_empty());
     assert_eq!(host.world.snapshot(), before);
 }
@@ -788,21 +988,18 @@ fn plugin_cli_preview_refuses_a_saved_id_used_by_a_skill_record() {
 fn plugin_cli_preview_is_read_only_without_copilot_and_shows_consent() {
     let host = plugin_host("cli-plugin-preview");
     let before = host.world.snapshot();
-    let ran = tss(&host, &format!("add --type plugins {PLUGIN_URL} --preview"));
+    let ran = tss(&host, &format!("add {PLUGIN_URL} --preview"));
     expect(
         &ran,
         0,
         &[
-            "Type: Plugins",
-            "Installs with: GitHub Copilot CLI",
-            "Marketplace: tools",
-            "Matched 1 plugin:",
-            "alpha 1.0.0, by Review Team",
-            "MCP servers",
-            "other: Hosted elsewhere; not handled",
+            "Branch: main\n",
+            "Folder: pack",
+            "Plugins: Sync on",
+            "alpha (pack/alpha): will sync after you approve it",
+            "Publisher: Review Team. Version: 1.0.0. Declares: MCP servers.",
             "Plugins can run programs on this PC.",
-            "new versions from main automatically",
-            "publisher changes, wait for your approval",
+            "Nothing was saved or installed.",
         ],
     );
     assert!(ran.out.is_ascii());
@@ -829,11 +1026,10 @@ fn plugin_cli_partial_uninstall_keeps_the_source_and_failed_record() {
     host.remote.put(REPO, "marketplace.json", r#"{"name":"tools","plugins":[{"name":"alpha","source":"pack/alpha"},{"name":"beta","source":"pack/beta"}]}"#);
     host.remote.put(REPO, "pack/beta/plugin.json", r#"{"name":"beta","version":"1.0.0"}"#);
     host.plugins.set_snapshot(snapshot.clone());
-    host.confirm_add.set(Some(true));
-    expect(&tss(&host, &format!("add --type plugins {PLUGIN_URL}")), 0, &["Added"]);
+    approved_plugin_source(&host);
     assert_eq!(host.plugins.calls(), [PluginCall::Home], "recording approval does not start Copilot");
     let cfg = host.config();
-    let id = &cfg.repos[0].id;
+    let id = &cfg.repos()[0].id;
     for name in ["alpha", "beta"] {
         snapshot.plugins.push(NativePlugin {
             name: name.into(),
@@ -861,7 +1057,7 @@ fn plugin_cli_partial_uninstall_keeps_the_source_and_failed_record() {
     let calls = host.plugins.calls();
     expect(&tss(&host, &format!("remove {id}")), 0, &["Plugins stay installed in Copilot."]);
     assert_eq!(host.plugins.calls(), calls);
-    assert!(host.config().repos.is_empty());
+    assert!(host.config().repos().is_empty());
 }
 
 #[test]
@@ -873,42 +1069,184 @@ fn source_ids_disambiguate_types_and_delete_skills_never_means_files() {
     let agents = cfg.add_source(SourceKind::Agents, &spec, None, false).id.clone();
     host.save(&cfg);
     let before = host.world.snapshot();
-    expect(&tss(&host, "resolve o/fixtures mine.agent.md keep"), 3, &["matches several", &skills, &agents]);
-    expect(&tss(&host, "remove o/fixtures --delete-skills"), 3, &["matches several", &skills, &agents]);
-    expect(&tss(&host, &format!("remove {agents} --delete-skills")), 3, &["only for a Skills source"]);
-    assert_eq!(cli::find_repo(&cfg, &agents).unwrap().kind, SourceKind::Agents);
+    expect(&tss(&host, "resolve o/fixtures mine.agent.md keep"), 3, &["Several sources match", &skills, &agents]);
+    expect(&tss(&host, "remove o/fixtures --delete-skills"), 3, &["Several sources match", &skills, &agents]);
+    expect(&tss(&host, &format!("remove {agents} --delete-skills")), 3, &["only for a source with skills"]);
+    assert_eq!(cli::find_source(&cfg, &agents).unwrap().lanes.id(SourceKind::Agents), Some(agents.as_str()));
     assert_eq!(host.world.snapshot(), before);
     assert!(host.remote.log().is_empty());
 }
 
 #[test]
-fn a_repository_whose_skills_are_in_a_subfolder_is_not_reported_as_fine() {
-    let host = TestHost::empty("cli-subfolder");
-    host.remote.seed_standard("o/fixtures");
-    expect(&tss(&host, "add o/fixtures"), 0, &[]);
+fn hand_written_sources_keep_their_lane_ids_after_a_check_records_items() {
+    use tiny_skill_sync::config::KINDS;
+    let ids = |cfg: &Config| {
+        let s = &cfg.sources()[0];
+        (s.id.clone(), KINDS.map(|k| s.lanes.id(k).map(str::to_owned)))
+    };
+    let mut drift = Vec::new();
+    for (label, source) in [("with-id", r#"{"id":"kit","repo":"o/fixtures"}"#), ("no-id", r#"{"repo":"o/fixtures"}"#)] {
+        let host = TestHost::empty(&format!("cli-hand-lanes-{label}"));
+        host.remote.put(REPO, "alpha/SKILL.md", "one\n");
+        host.remote.put(REPO, "helper.agent.md", "two\n");
+        std::fs::write(host.config_file(), format!(r#"{{"version":3,"sources":[{source}]}}"#)).unwrap();
+        let before = ids(&host.config());
 
-    // Added as a whole, it has no skills at the top: the check must say so, and say what to do about it.
+        expect(&tss(&host, "check"), 0, &["Installed alpha"]);
+        assert!(host.world.root.join("agents").join("helper.agent.md").exists(), "{label}: the agent was not installed");
+        let after = ids(&host.config());
+        let again = tss(&host, "check");
+        if after != before || again.code != 0 || again.out.contains("already provides") || again.out.contains("settings changed") {
+            drift.push(format!("{label}: before the check {before:?}, after it {after:?}; the next check: {again:?}"));
+        }
+    }
+    assert!(drift.is_empty(), "lane or source IDs of a hand-written source changed once a check recorded items under them:\n{}", drift.join("\n"));
+}
+
+#[test]
+fn turning_a_type_on_never_adopts_an_orphan_record_of_the_same_kind_from_another_repository() {
+    let host = TestHost::empty("cli-type-on-orphan");
+    host.remote.put("o/one", "old.agent.md", "old\n");
+    host.remote.put(REPO, "helper.agent.md", "two\n");
+    std::fs::write(host.config_file(), r#"{"version":3,"sources":[{"id":"tool","repo":"o/one","types":{"skills":false},"lanes":{"agents":"tool-agents"}}]}"#)
+        .unwrap();
+    expect(&tss(&host, "check"), 0, &[]);
+    let old = host.world.root.join("agents").join("old.agent.md");
+    assert!(old.exists(), "the first agent was not installed");
+
+    std::fs::write(
+        host.config_file(),
+        r#"{"version":3,"sources":[{"id":"tool","repo":"o/fixtures","types":{"agents":false},"lanes":{"agents":"tool-agents"}}]}"#,
+    )
+    .unwrap();
+    expect(&tss(&host, "source tool types agents=on"), 0, &["Saved."]);
+    let lane = host.config().sources()[0].lanes.id(SourceKind::Agents).map(str::to_owned);
+    assert_ne!(lane.as_deref(), Some("tool-agents"), "the lane kept the ID of an orphan record from another repository");
     let ran = tss(&host, "check");
-    expect(&ran, 1, &["[o-fixtures]: No skills found", "No skills were found at the top of o/fixtures", "https://github.com/o/fixtures/tree/main/skills"]);
-    assert!(ran.out.is_ascii(), "{ran:?}");
-    assert!(host.world.skill_names().is_empty());
-    expect(&tss(&host, "status"), 1, &["[o-fixtures]: No skills found", "No skills from it are installed."]);
-    // A check that GitHub answers with "not modified" still knows what the listing had in it.
-    expect(&tss(&host, "check"), 1, &["[o-fixtures]: No skills found"]);
+    assert_eq!(ran.code, 0, "{ran:?}");
+    assert!(host.world.root.join("agents").join("helper.agent.md").exists(), "the agent was not installed: {ran:?}");
+    assert_eq!(std::fs::read_to_string(&old).unwrap(), "old\n", "the orphan record's file was touched");
+}
 
-    // Doing what it says works.
-    expect(&tss(&host, "remove o-fixtures"), 0, &[]);
-    expect(&tss(&host, "add https://github.com/o/fixtures/tree/main/skills"), 0, &[]);
-    expect(&tss(&host, "check"), 0, &["Installed alpha"]);
+#[test]
+fn turning_a_type_on_never_attaches_its_lane_to_another_kinds_records() {
+    let host = TestHost::empty("cli-type-on-lane");
+    let instructions = host.world.root.join("instructions").join("rules.instructions.md");
+    host.remote.put("o/one", "rules.instructions.md", "rules\n");
+    host.remote.put(REPO, "helper.agent.md", "agent\n");
+    // An earlier source recorded instructions under the ID "z"...
+    let earlier = r#"{"version":3,"sources":[{"id":"s","repo":"o/one","lanes":{"skills":"s","agents":"s-a","instructions":"z","plugins":"s-p"}}]}"#;
+    std::fs::write(host.config_file(), earlier).unwrap();
+    expect(&tss(&host, "check"), 0, &[]);
+    assert!(instructions.exists(), "fixture: the instructions file was not installed");
+    let recorded = host.world.state().loose_sources()["z"].clone();
+    assert_eq!(recorded.binding().kind(), SourceKind::Instructions);
+    // ...and the settings that replace it (for example from another PC) keep "z" as an agents lane that is off.
+    let now = r#"{"version":3,"sources":[{"id":"kit","repo":"o/fixtures","types":{"agents":false},
+        "lanes":{"skills":"kit","agents":"z","instructions":"kit-i","plugins":"kit-p"}}]}"#;
+    std::fs::write(host.config_file(), now).unwrap();
+
+    expect(&tss(&host, "source kit types agents=on"), 0, &["Saved."]);
+    let agents_lane = host.config().find_source("kit").unwrap().lanes.id(SourceKind::Agents).unwrap().to_string();
+    let ran = tss(&host, "check");
+    let mut problems = Vec::new();
+    if agents_lane == "z" {
+        problems.push("the agents lane was turned on under 'z', the ID of a recorded instructions source".to_string());
+    }
+    if ran.code != 0 {
+        problems.push(format!("the next check failed: {ran:?}"));
+    }
+    if !host.world.root.join("agents").join("helper.agent.md").exists() {
+        problems.push("the agent was not installed".into());
+    }
+    if host.world.state().loose_sources().get("z") != Some(&recorded) || !instructions.exists() {
+        problems.push("the instructions record 'z' or its file changed".into());
+    }
+    assert!(problems.is_empty(), "turning agents on attached the lane to another kind's state record:\n{}", problems.join("\n"));
+}
+
+#[test]
+fn turning_a_type_on_globally_never_attaches_a_lane_to_another_kinds_records() {
+    let host = TestHost::empty("cli-global-type-on-lane");
+    let instructions = host.world.root.join("instructions").join("rules.instructions.md");
+    host.remote.put("o/one", "rules.instructions.md", "rules\n");
+    host.remote.put(REPO, "helper.agent.md", "agent\n");
+    // An earlier source recorded instructions under the ID "kit-agents"...
+    let earlier = r#"{"version":3,"sources":[{"id":"s","repo":"o/one","lanes":{"skills":"s","agents":"s-a","instructions":"kit-agents","plugins":"s-p"}}]}"#;
+    std::fs::write(host.config_file(), earlier).unwrap();
+    expect(&tss(&host, "check"), 0, &[]);
+    assert!(instructions.exists(), "fixture: the instructions file was not installed");
+    let recorded = host.world.state().loose_sources()["kit-agents"].clone();
+    assert_eq!(recorded.binding().kind(), SourceKind::Instructions);
+    // ...and the settings that replace it keep "kit-agents" as the agents lane of a source that follows the global
+    // default, which has agents off.
+    let now = r#"{"version":3,"global":{"types":{"agents":false}},"sources":[{"id":"kit","repo":"o/fixtures",
+        "lanes":{"skills":"kit","agents":"kit-agents","instructions":"kit-instructions","plugins":"kit-plugins"}}]}"#;
+    std::fs::write(host.config_file(), now).unwrap();
+
+    expect(&tss(&host, "settings types agents=on"), 0, &["Saved."]);
+    let agents_lane = host.config().find_source("kit").unwrap().lanes.id(SourceKind::Agents).unwrap().to_string();
+    let ran = tss(&host, "check");
+    let mut problems = Vec::new();
+    if agents_lane == "kit-agents" {
+        problems.push("the agents lane was turned on under 'kit-agents', the ID of a recorded instructions source".to_string());
+    }
+    if ran.code != 0 {
+        problems.push(format!("the next check failed: {ran:?}"));
+    }
+    if !host.world.root.join("agents").join("helper.agent.md").exists() {
+        problems.push("the agent was not installed".into());
+    }
+    if host.world.state().loose_sources().get("kit-agents") != Some(&recorded) || !instructions.exists() {
+        problems.push("the instructions record 'kit-agents' or its file changed".into());
+    }
+    assert!(problems.is_empty(), "turning agents on in the global settings attached a lane to another kind's state record:\n{}", problems.join("\n"));
+}
+
+#[test]
+fn a_repository_whose_skills_are_in_a_subfolder_installs_them_from_the_repository_root() {
+    let host = TestHost::empty("cli-subfolder");
+    expect(&tss(&host, "settings types agents=off instructions=off plugins=off"), 0, &["Agents: Sync off"]);
+    host.remote.seed_standard("o/fixtures");
+    expect(&tss(&host, "add o/fixtures --yes"), 0, &[]);
+
+    // Discovery is recursive: a source added as a whole finds the skills below its root.
+    let ran = tss(&host, "check");
+    expect(&ran, 0, &["Installed alpha"]);
+    assert!(!ran.out.contains("No skills found"), "{ran:?}");
+    assert!(ran.out.is_ascii(), "{ran:?}");
     assert_eq!(host.world.skill_names(), ["alpha", "beta", "gamma"]);
+    // A check that GitHub answers with "not modified" still knows what the listing had in it.
+    expect(&tss(&host, "check"), 0, &[]);
+    expect(&tss(&host, "status"), 0, &["[o-fixtures]"]);
+}
+
+#[test]
+fn a_source_that_holds_only_skills_says_nothing_about_the_other_types_it_looks_for() {
+    let host = TestHost::empty("cli-only-skills");
+    host.remote.seed_standard("o/fixtures");
+    expect(&tss(&host, "add https://github.com/o/fixtures/tree/main/skills --yes"), 0, &[]);
+
+    // Every type is on by default; a type the folder does not have is no problem while another type is there.
+    let ran = tss(&host, "check");
+    expect(&ran, 0, &["Installed alpha"]);
+    for quiet in ["No agents", "No instruction", "No plugins", "Nothing found"] {
+        assert!(!ran.out.contains(quiet), "'{quiet}' in:\n{ran:?}");
+    }
+    // A later process does not remember the empty types, only what the listing held.
+    let ran = tss(&host, "status");
+    expect(&ran, 0, &["Up to date", "Last check: just now"]);
+    assert!(!ran.out.contains("Not checked yet"), "{ran:?}");
+    expect(&tss(&host, "check"), 0, &[]);
 }
 
 #[test]
 fn a_repository_whose_only_skill_is_held_is_not_reported_as_empty() {
     let host = TestHost::empty("cli-held-only");
+    expect(&tss(&host, "settings types agents=off instructions=off plugins=off"), 0, &["Agents: Sync off"]);
     host.remote.put("o/one", "skills/mine/SKILL.md", "upstream\n");
     host.world.write("mine/SKILL.md", "my own\n");
-    expect(&tss(&host, "add https://github.com/o/one/tree/main/skills"), 0, &[]);
+    expect(&tss(&host, "add https://github.com/o/one/tree/main/skills --yes"), 0, &[]);
 
     let ran = tss(&host, "check");
     expect(&ran, 1, &["mine", "already exists"]);
@@ -922,8 +1260,9 @@ fn a_repository_whose_only_skill_is_held_is_not_reported_as_empty() {
 #[test]
 fn a_repository_whose_only_skill_is_refused_is_not_reported_as_empty() {
     let host = TestHost::empty("cli-refused-only");
+    expect(&tss(&host, "settings types agents=off instructions=off plugins=off"), 0, &["Agents: Sync off"]);
     host.remote.put("o/one", "skills/a\u{1b}b/SKILL.md", "x\n");
-    expect(&tss(&host, "add https://github.com/o/one/tree/main/skills"), 0, &[]);
+    expect(&tss(&host, "add https://github.com/o/one/tree/main/skills --yes"), 0, &[]);
 
     let ran = tss(&host, "check");
     expect(&ran, 1, &["a\\u{1b}b: Skipped: not safe to install"]);
@@ -940,7 +1279,7 @@ fn removing_a_repository_leaves_its_skills_unless_asked() {
     expect(&tss(&host, "check"), 0, &[]);
     let ran = tss(&host, "remove fx");
     expect(&ran, 0, &["Removed o/fixtures : skills [fx] from the settings.", "These skills stay installed and are now yours: alpha, beta, gamma"]);
-    assert!(host.config().repos.is_empty());
+    assert!(host.config().repos().is_empty());
     assert!(host.world.state().repo("fx").is_none());
     assert_eq!(host.world.skill_names(), ["alpha", "beta", "gamma"]);
     expect(&tss(&host, "status"), 0, &["No repositories are set up"]);
@@ -964,7 +1303,7 @@ fn skills_of_a_repository_gone_from_the_settings_can_be_let_go() {
     let ran = tss(&host, "status");
     assert!(!ran.out.contains("'fx'"), "{ran:?}");
     assert_eq!(host.world.skill_names(), ["alpha", "beta", "gamma"]);
-    expect(&tss(&host, "remove fx"), 3, &["no repository 'fx' is set up"]);
+    expect(&tss(&host, "remove fx"), 3, &["No source 'fx' is set up"]);
 }
 
 #[test]
@@ -972,7 +1311,7 @@ fn the_token_is_saved_shown_and_cleared() {
     let host = TestHost::new("cli-token");
     expect(&tss(&host, "token"), 0, &["Saved token: none.", "GitHub CLI: the GitHub CLI is not signed in.", "No repository sends the token."]);
     let mut cfg = standard_config();
-    cfg.repos[0].use_token = true;
+    cfg.update_lane_at(0, |r| r.use_token = true);
     host.save(&cfg);
     expect(&tss(&host, "token status"), 1, &["Repositories that send the token: fx", "tss token set"]);
 
@@ -1028,7 +1367,7 @@ fn a_repository_found_to_be_private_is_shown_as_sending_the_token() {
     expect(&tss(&host, "check"), 0, &[]);
 
     assert_eq!(host.world.skill_names(), ["alpha", "beta", "gamma"], "read with the token without being told");
-    assert!(!host.config().repos[0].use_token, "the settings are not changed");
+    assert!(!host.config().repos()[0].use_token, "the settings are not changed");
     expect(&tss(&host, "token status"), 0, &["Repositories that send the token: fx"]);
     expect(&tss(&host, "status"), 0, &["sends the GitHub token"]);
 }
@@ -1040,7 +1379,7 @@ fn a_bad_command_line_changes_nothing() {
     expect(&tss(&host, ""), 3, &["tss: no command was given", "Run 'tss help'"]);
     expect(&tss(&host, "frobnicate"), 3, &["unknown command 'frobnicate'"]);
     expect(&tss(&host, "check fx --force"), 3, &["'check' has no option --force"]);
-    expect(&tss(&host, "resolve nope alpha keep"), 3, &["no repository 'nope'"]);
+    expect(&tss(&host, "resolve nope alpha keep"), 3, &["No source 'nope'"]);
     assert_eq!(host.world.snapshot(), before);
     assert!(host.remote.log().is_empty());
     expect(&tss(&host, "help"), 0, &["Usage:", "Exit codes:"]);
@@ -1077,13 +1416,14 @@ fn portable_companions_select_and_update_shared_settings_without_changing_local_
     expect(&sources_only, 0, &["[shared] (disabled)", "Disabled: checked only when asked"]);
     assert!(!sources_only.out.contains("[fx]"), "local config was used:\n{sources_only:?}");
 
-    expect(&tss(&host, "add o/new --every 3h"), 0, &["Added o/new as 'o-new'."]);
+    host.remote.put("o/new", "one/SKILL.md", "one");
+    expect(&tss(&host, "add o/new --every 3h --yes"), 0, &["Added o/new as 'o-new'."]);
     let sources: serde_json::Value = serde_json::from_slice(&std::fs::read(executable_dir.join(SOURCES_FILE)).unwrap()).unwrap();
-    assert_eq!(sources["repos"].as_array().unwrap().len(), 2);
-    assert_eq!(sources["repos"][0]["id"], "shared");
-    assert_eq!(sources["repos"][0]["enabled"], false);
-    assert_eq!(sources["repos"][0]["interval"], "6h");
-    assert_eq!(sources["repos"][1]["id"], "o-new");
+    assert_eq!(sources["sources"].as_array().unwrap().len(), 2);
+    assert_eq!(sources["sources"][0]["id"], "shared");
+    assert_eq!(sources["sources"][0]["enabled"], false);
+    assert_eq!(sources["sources"][0]["interval"], "6h");
+    assert_eq!(sources["sources"][1]["id"], "o-new");
     assert_eq!(std::fs::read(host.config_file()).unwrap(), local_before, "portable commands must not mutate config.json");
 }
 
@@ -1093,8 +1433,8 @@ fn portable_export_omits_machine_local_skills_path_and_leaves_config_untouched()
     let mut local = standard_config();
     local.default_interval = tiny_skill_sync::interval::Interval::new(12, tiny_skill_sync::interval::Unit::Hour);
     local.skills_dir = Some(host.world.root.join("custom-skills").to_string_lossy().into_owned());
-    local.repos[0].enabled = false;
-    local.repos[0].interval = Some(tiny_skill_sync::interval::Interval::new(6, tiny_skill_sync::interval::Unit::Hour));
+    local.update_lane_at(0, |r| r.enabled = false);
+    local.update_lane_at(0, |r| r.interval = Some(tiny_skill_sync::interval::Interval::new(6, tiny_skill_sync::interval::Unit::Hour)));
     host.save(&local);
     let local_before = std::fs::read(host.config_file()).unwrap();
 
@@ -1106,8 +1446,8 @@ fn portable_export_omits_machine_local_skills_path_and_leaves_config_untouched()
     assert_eq!(settings["default_interval"], "12h");
     assert!(settings.get("skills_dir").is_none(), "{settings}");
     let sources: serde_json::Value = serde_json::from_slice(&std::fs::read(executable_dir.join(SOURCES_FILE)).unwrap()).unwrap();
-    assert_eq!(sources["repos"][0]["enabled"], false);
-    assert_eq!(sources["repos"][0]["interval"], "6h");
+    assert_eq!(sources["sources"][0]["enabled"], false);
+    assert_eq!(sources["sources"][0]["interval"], "6h");
     assert_eq!(std::fs::read(host.config_file()).unwrap(), local_before, "export must not mutate config.json");
 }
 
@@ -1128,6 +1468,34 @@ fn portable_export_refuses_to_overwrite_either_companion() {
         assert!(!executable_dir.join(other).exists(), "partial export was left behind");
         assert_eq!(std::fs::read(host.config_file()).unwrap(), local_before);
     }
+}
+
+/// Two machines share one portable folder. One machine's check holds the shared settings lock for a moment while it
+/// installs; the other's check waits for it rather than failing and backing off for minutes.
+#[test]
+fn a_check_waits_while_another_machine_briefly_holds_the_shared_settings_lock() {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Foundation::GENERIC_WRITE;
+    use windows_sys::Win32::Storage::FileSystem::{DELETE, FILE_FLAG_DELETE_ON_CLOSE};
+
+    let host = TestHost::new("cli-portable-lock-wait");
+    expect(&tss(&host, "portable"), 0, &["Exported shared settings and repositories"]);
+    let held = std::fs::OpenOptions::new()
+        .write(true)
+        .access_mode(GENERIC_WRITE | DELETE)
+        .create_new(true)
+        .share_mode(0)
+        .custom_flags(FILE_FLAG_DELETE_ON_CLOSE)
+        .open(host.world.root.join("exe").join(".tss-settings.lock"))
+        .unwrap();
+    let release = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        drop(held);
+    });
+    let ran = tss(&host, "check");
+    release.join().unwrap();
+    expect(&ran, 0, &["Installed alpha", "Installed beta", "Installed gamma"]);
+    assert_eq!(host.world.skill_names(), ["alpha", "beta", "gamma"]);
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -1168,8 +1536,12 @@ fn the_executable_runs_against_its_own_folders() {
     let ran = exe(&world, &dead, &["--version"]);
     expect(&ran, 0, &[&format!("tss {}", env!("CARGO_PKG_VERSION"))]);
     expect(&exe(&world, &dead, &["frobnicate"]), 3, &["unknown command"]);
-    expect(&exe(&world, &dead, &["add", "o/fixtures"]), 0, &["Added o/fixtures as 'o-fixtures'."]);
-    assert!(world.home.join(CONFIG_FILE).is_file());
+    expect(&exe(&world, &dead, &["add", "o/fixtures"]), 3, &["input is not a terminal", "--yes"]);
+    expect(&exe(&world, &dead, &["add", "o/fixtures", "--yes"]), 2, &["Could not read o/fixtures", "Nothing was saved or installed."]);
+    assert!(!world.home.join(CONFIG_FILE).exists());
+    let mut cfg = Config::default();
+    cfg.add_source(SourceKind::Skills, &RepoSpec::parse(REPO).unwrap(), None, false);
+    cfg.save(&world.home.join(CONFIG_FILE)).unwrap();
 
     let ran = exe(&world, &dead, &["status"]);
     expect(&ran, 0, &[&format!("Skills folder: {}", world.skills.display()), "Last check: never."]);

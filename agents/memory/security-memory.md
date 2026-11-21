@@ -55,6 +55,23 @@
 - Plugin tests use `FakePluginManager` (`World::plugin_engine`, the cli `TestHost`). `scripts\test.ps1` sets
   `TSS_TEST_ROOT`, so a real-manager launch in tests is refused unless COPILOT_HOME and COPILOT_CACHE_HOME are set.
 
+- Issue #8 lanes (reviewed 2026-11-21, uncommitted tree; static only):
+  - One branch-root listing per source (`engine\root.rs`). Truncation and a missing folder fail the source before any lane runs.
+  - `tree::lane_discovery` treats filtered/bundled items as `protected` and colliding/rejected items as `rejected`; both are evidence.
+  - Skills match those names with `reconcile::listed_as` (fold or `same_win_name`); leaves use `same_win_name`.
+  - Type-off lanes are absent from `cfg.repos()` but listed in `known_lanes`, so they are never orphans.
+  - Plugin capabilities = manifest keys + convention files (`catalog::HOOK/MCP/LSP_PATHS`) + default
+    agents/skills/commands folders (`inventory.rs` ~452). `catalog::Capabilities` is now read only by tests.
+  - Manifests: `root::check_budget` (size total + count <= MAX_SKILL_FILES) before downloads, and
+    `read_manifests` checks cancel + budget per file; the preview uses `DEFAULT_MAX_DOWNLOAD`.
+  - A bare source with plugins resolves the default branch and lists it by name. A poll is a conditional request at HEAD.
+  - `state.json` format 3 (`needs_format_3`: `lane_polls` or plugin roots). `lane_polls` is scheduling only:
+    filtered by `matches(lane)` and `!has_source_id`, pruned at load and sync, and never read for ownership.
+  - Lane IDs are derived from config only; `fresh_lane_ids` renames a lane that is turned on when its ID has foreign records.
+  - `seen::update` re-reads the file before merging and never overwrites a newer version. The file is display-only.
+  - File lanes cache confirmation in `RootListing::confirmed` (repo/branch/path/pin/tree ID), set only after success.
+  - `settings_write_lock_within`: CREATE_NEW + OPEN_REPARSE_POINT + delete-on-close; retry only waits.
+
 ## Baselines
 
 - 2026-11-20 relaunch review: `cargo test --lib only_a_tray_proven` and `cargo test --lib restarted` pass (debug);
