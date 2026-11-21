@@ -261,6 +261,33 @@ fn plugin_removed_from_github_is_held_even_if_the_marketplace_is_empty_and_unins
 }
 
 #[test]
+fn plugin_lifecycle_leaves_no_copies_in_the_skills_agents_or_instructions_folders() {
+    let mut f = Fixture::new("plugin-no-copies");
+    let (agents, instructions) = (f.world.root.join("agents"), f.world.root.join("instructions"));
+    for path in [f.world.skills.join("mine").join("SKILL.md"), agents.join("mine.agent.md"), instructions.join("mine.instructions.md")] {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, "written by hand\n").unwrap();
+    }
+    let outside_copilot = |f: &Fixture| {
+        let mut files = f.world.snapshot();
+        files.retain(|k, _| !["home", "native"].iter().any(|d| k == d || k.starts_with(&format!("{d}/"))));
+        files
+    };
+    let before = outside_copilot(&f);
+    f.install();
+    f.manifest("alpha", "2", "Team");
+    f.manager.set_snapshot(f.native(&[("alpha", "1", true)]));
+    f.manager.push(Call::Update("alpha@tools".into()), Reply::Done(Some(f.native(&[("alpha", "2", true)]))));
+    synced(&f.sync());
+    f.market(&[]);
+    assert!(matches!(f.sync().outcome, Outcome::NeedsAttention));
+    f.manager.push(Call::Uninstall("alpha@tools".into()), Reply::Done(Some(f.native(&[]))));
+    synced(&f.choose(Choice::Uninstall("alpha".into())));
+    assert_eq!(f.mutations().len(), 3, "install, update and uninstall all ran");
+    assert_eq!(outside_copilot(&f), before);
+}
+
+#[test]
 fn plugin_partial_install_records_only_verified_plugins_and_does_not_retry_in_this_check() {
     let mut f = Fixture::new("plugin-partial");
     f.market(&["alpha", "beta"]);
