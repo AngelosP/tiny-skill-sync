@@ -105,8 +105,9 @@ allows the same current-or-historical adoption checks.
    plugin rows include their declared details. Preview rows have no local status or repair actions, and links use the
    discovered GitHub paths. The **Check every**, **Keep in sync**, **What to sync** and folder-rule settings remain
    editable. **Keep in sync** starts off while you review. **What to sync** is open by default; content sections
-   start collapsed. **What to sync** can also collapse; its green indicators mean on and grey mean off, with adjacent
-   text spelling out each type's state. Type-section text says the detected count, whether syncing is off, and whether
+   start collapsed. **What to sync** can also collapse; its type icons are solid when on and dimmed when off, with
+   adjacent text spelling out each type's state. A collapsed type with something that needs you shows a warning after
+   its name. Type-section text says the detected count, whether syncing is off, and whether
    the section is open. Changing type choices or **Check every** reuses the preview; changing repository-specific
    inclusion or folder rules refreshes it.
    **Cancel** saves nothing and installs nothing. **Add and keep in sync** saves the source and starts its first check. When
@@ -436,7 +437,8 @@ number in `window.txt`). Nothing widens or narrows when you move the mouse over 
 - **What it holds,** grouped under **Skills**, **Agents**, **Instructions** and **Plugins**. Each type shows its
   detected count, including zero; a type that is off also says **Sync off**. Sections can be expanded or collapsed.
   Type-section text names the type, its detected count and expanded/collapsed state. **What to sync** also collapses;
-  its green on and grey off indicators are paired with adjacent text spelling out each type's state. Under each open
+  its type icons, solid when on and dimmed when off, are paired with adjacent text spelling out each type's state. A
+  collapsed type with something that needs you shows a warning after its name. Under each open
   group are the items, folder-rule skips and other
   unsynced items with their reasons. **Never synced** lists files such as `AGENTS.md`.
 - **Each item,** on one line with its state. Rest the mouse on the name or status badge to see the explanation
@@ -891,7 +893,8 @@ ended at 3.2 MiB of private memory. Each change reached the disk within one inte
   to.
 - The window opens at 980 by 680 at 100% scale (smaller if the screen has less room) and can be made as small as 640
   by 480. It has been tried only at 100% scale.
-- The window's controls are drawn by the app. Section text names the heading, count and expanded/collapsed state;
+- The window's controls are drawn by the app. Section text names the heading, count and expanded/collapsed state,
+  and whether a collapsed type needs your attention;
   section controls can be opened with Enter or Space. Most custom-drawn controls do not tell a screen reader what
   kind of control they are. A skill's icons are drawn inside its row, not separate Tab stops. Use Shift+F10 on the
   row to choose an action by name.

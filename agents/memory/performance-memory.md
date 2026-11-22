@@ -112,6 +112,11 @@
     poll 31.3 ms CPU, 0 I/O; idle 5/154; after a poll 9/345, 1.0/2.9 MiB; exe 1,707,520 against 1.70 MiB
     (75,059 bytes headroom). Bench now adds with `--yes` (bench.ps1:252), so the fixture source has all detected types,
     not skills only. Rows before and after are not like for like.
+- `bench-20261122-024320.md` (section headers, coordinator's run, all within budget): open to painted median 31.1 ms,
+  max 35.4; window working set 11.3 MiB; poll CPU 46.9 ms (3 ticks of 15.6 ms, about 3 ms under 50 ms); exe 1,738,752
+  bytes (43,827 bytes headroom under 1.70 MiB).
+- A section header measures its title only when `warn` is set (control.rs `draw_ctl`, `Look::Section`). The bench
+  fixture's 3 up-to-date skills probably never set it (not confirmed), so paint timing does not cover that branch.
 - No measurement exists of a Copilot CLI launch (wall time, CPU, memory) or of a plugin poll.
 
 ## Open proposals

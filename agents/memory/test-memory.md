@@ -60,6 +60,13 @@
   `gh api` on 403/429 the same way. Only scenarios that strip `gh` from the PATH (mixed, portable, the private step
   without sign-in) still need the anonymous quota.
 
+## Section headers (review, 2026-11-22)
+
+- Filters `section`, `what_to_sync`, `a_closed_type` (3+3+1 lib tests) cover `section_parts` and the header Looks; `--frozen` works.
+- `kind_badge` already returns no warning when `k.on` is false, so the `on &&` in `sections()` warn only matters in a draft
+  (`kind_is_on` uses draft settings); no test covers a draft-off type that needs attention.
+- The e2e attention check reopens Skills through `Expand-SourceSections`, so its widened regex runs live (e2e ui 262/262).
+
 ## Open proposals
 
 - CONTRIBUTING.md Tests: list the extra filters a Plugins change needs (copilot, proc runner, fake_manager), or prefix those tests `plugin_`.

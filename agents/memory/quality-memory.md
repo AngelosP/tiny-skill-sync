@@ -34,6 +34,7 @@
 - Issue #8: `Which::One(lane)` for a non-plugin lane still expands to the whole source (engine.rs `sync_in`). Round 2 scoped `confirm_mass_delete` to the named lane (root.rs `sync_source` `confirmed`; cli.rs `check` maps a lane-ID query to that lane). Check any new per-lane option the same way.
 - Issue #8 round 2: `state.json` format 3 (`needs_format_3`: `lane_polls` or plugin approval `roots`); `seen::update` re-reads before merging and never overwrites a newer file; `catalog::Capabilities` is computed but read only by tests (board reads `inventory::PluginCapabilities`).
 - Issue #8 lanes of one source run in order (skills, agents, instructions, plugins) after one shared root listing (src\engine\root.rs `sync_source`); a remote failure in a later lane stops only the lanes after it.
+- Section headers (`Look::Section { title, icon, open, marks, warn }`): layout is the pure `section_parts` (control.rs), with the title measured only when `warn`. The warning shows only on a closed type that is on (`kind_is_on`) and where `kind_badge(k).1` is true; the window text then ends in "collapsed. Needs your attention.", which e2e-lib `Expand-SourceSections` accepts. A live `Test-Painted` check over a whole header cannot prove one glyph inside it was drawn.
 
 ## Baselines
 

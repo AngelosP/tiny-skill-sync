@@ -52,6 +52,19 @@ Verified by reading code (2026-11-20, custom-agents design review):
 - Portable `Sources` has `deny_unknown_fields` (portable.rs:69) but `RepoConfig` (config.rs:180-182) and `RepoState`
   (state.rs:93-95) do not: older versions silently ignore new nested fields and drop them on save.
 
+Verified by reading code (2026-11-22, source-page section headers review):
+
+- `Look::Section { title, icon, open, marks, warn }` (control.rs:157) is built directly in `page.rs` (`what_to_sync`
+  ~1102, `sections` ~1203, `never_synced` ~1241). Its geometry is the pure `section_parts` (control.rs:538): chevron
+  x+4, icon x+28, title x+52 Font::Strong, marks right-aligned 22 each, warning after the title; the title is cut
+  before the warning is dropped. Paint measures the title only when `warn` is set. Same precedent as pure
+  `row_parts` (control.rs:497), which takes a measured width (`paint::measure(s, font, 0, dpi)`, DIPs).
+  `Ctl.layout` is a Row-only `OnceCell<RowParts>`; `set` replaces `look` without clearing it.
+- `board::preview_source_view` rows are always `Level::Ok` with no actions, so `page::kind_badge(k).1` is never true
+  in a draft preview.
+- `scripts/e2e-lib.ps1:974` `Expand-SourceSections` detects collapsed kind headers with the end-anchored
+  `', collapsed\.( Needs your attention\.)?$'`; any other suffix added to kind header text must be added there too.
+
 ## Baselines
 
 No review baseline recorded.

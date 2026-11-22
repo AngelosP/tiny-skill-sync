@@ -971,7 +971,7 @@ function Expand-SourceSections([IntPtr]$Window) {
     $ids = @($UiId.SectionWhat) + @(0..3 | ForEach-Object { $UiId.SectionKind + $_ }) + @($UiId.SectionNever)
     foreach ($id in $ids) {
         $text = Read-Ui $Window $UiPanel.Page $id
-        $collapsed = if ($id -eq $UiId.SectionWhat) { $text -match '^What to sync, collapsed\.' } else { $text -match ', collapsed\.$' }
+        $collapsed = if ($id -eq $UiId.SectionWhat) { $text -match '^What to sync, collapsed\.' } else { $text -match ', collapsed\.( Needs your attention\.)?$' }
         if ($null -eq $text -or -not $collapsed) { continue }
         Click-Ui $Window $UiPanel.Page $id
         [void](Wait-Live {

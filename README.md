@@ -36,9 +36,10 @@ Windows 10 or 11, x64. No runtime or installer is needed. The exes are not signe
 
 4. Click **Preview** to open the shared source page. It shows detected items and counts, including types with zero
    matches or syncing turned off. The **What to sync** settings, interval and folder rules remain editable; **Keep in
-   sync** starts off while you review. **What to sync** can also collapse; its green and grey indicators mean on and
-   off, and adjacent text spells out each type's state. The item sections can be collapsed, and preview rows have no
-   local status or repair actions. **Cancel** saves nothing and installs nothing. Choose **Add and keep in sync** to save the source
+   sync** starts off while you review. **What to sync** can also collapse; its type icons are solid when on and
+   dimmed when off, and adjacent text spells out each type's state. The item sections can be collapsed; a collapsed
+   type with something that needs you shows a warning after its name. Preview rows have no local status or repair
+   actions. **Cancel** saves nothing and installs nothing. Choose **Add and keep in sync** to save the source
    and start its first check; the default interval is one day. If approvable plugins were found, **Add and approve
    plugins** is a separate, explicit choice. Using the regular Add action leaves them waiting for approval.
 

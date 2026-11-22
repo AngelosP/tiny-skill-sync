@@ -34,6 +34,11 @@
 - Source entries in the nav (`Look::Source`) have no tooltip; type-icon labels exist only in the accessible name
   (`page::nav_name`). Item rows do have hover tips (`control::row_tool_move`).
 - Live UI shot names: 05e/05f/05g come in compact and wide pairs; 17-long-names-{narrow,narrow-items,wide}.
+- Section headers (`Look::Section`) draw chevron, icon (x+28), title (x+52), an optional warning after the title and
+  right-hand marks. `section_parts` cuts the title before the warning and drops the warning when it does not fit.
+  Shot 08c-collapsed-attention shows a collapsed Skills header with its warning; no shot shows What to sync collapsed.
+- Light-theme contrast on the page background: Text3 #8B8B8B is about 3.1:1 (What to sync's off marks rely on it
+  alone, with no tooltip); Warn #9D5D00 is about 4.7:1.
 
 ## Baselines
 

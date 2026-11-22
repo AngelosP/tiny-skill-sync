@@ -152,11 +152,14 @@ pub enum Look {
         ink: Role,
         selected: bool,
     },
-    /// A page section header. Its window text names the section and its expanded state.
+    /// A page section header: a chevron, an icon, the title, an optional warning after it, and marks at the right.
+    /// Its window text names the section and its expanded state.
     Section {
         title: String,
+        icon: char,
         open: bool,
         marks: Vec<(char, Role)>,
+        warn: bool,
     },
     /// A skill header. `disclosure` is its expanded state, or None for a flat row.
     Row {
@@ -522,6 +525,34 @@ fn row_parts([x, y, w, h]: Rect, name_w: i32, pill_w: i32, commands: &[RowCmd]) 
     RowParts { mark: [x + 16, y, 16, h], name, icons, pill, clipped_pill: pw != pill_w }
 }
 
+struct SectionParts {
+    chevron: Rect,
+    icon: Rect,
+    title: Rect,
+    warn: Option<Rect>,
+    marks: Vec<Rect>,
+}
+
+/// Where a section header draws its parts. The title is cut before the warning after it or the marks at the right
+/// move; without a warning the title takes all the room there is. A warning that cannot fit is left out.
+fn section_parts([x, y, w, h]: Rect, title_w: i32, warn: bool, n_marks: usize) -> SectionParts {
+    const MARK: i32 = 22;
+    const WARN: i32 = 16;
+    const LEFT: i32 = 52;
+    let marks_left = x + w - MARK * n_marks as i32;
+    let room = marks_left - 8 - (x + LEFT);
+    let warn = warn && room >= 6 + WARN;
+    let tw = if warn { (title_w + 2).min(room - 6 - WARN) } else { room.max(0) };
+    let title = [x + LEFT, y, tw, h];
+    SectionParts {
+        chevron: [x + 4, y, 20, h],
+        icon: [x + 28, y, 20, h],
+        title,
+        warn: warn.then_some([x + LEFT + tw + 6, y, WARN, h]),
+        marks: (0..n_marks).map(|i| [marks_left + MARK * i as i32, y, MARK, h]).collect(),
+    }
+}
+
 impl Ctl {
     fn row(&self, hwnd: HWND, dpi: u32) -> Option<&RowParts> {
         let Look::Row { glyph, commands, .. } = &self.look else { return None };
@@ -653,16 +684,21 @@ fn draw_ctl(hwnd: HWND) {
                 paint::line([left, top + 20, w - left + x - 8, 16], sub, Font::Caption, Role::Text2);
             }
         }
-        Look::Section { title, open, marks } => {
+        Look::Section { title, icon, open, marks, warn } => {
             if tint != Role::None {
                 paint::fill(c.at, 4, tint, Role::None);
             }
-            paint::glyph([x + 4, y, 20, h], if *open { glyph::CHEVRON_DOWN } else { glyph::CHEVRON_RIGHT }, 14, Role::Text2);
-            let marks_width = marks.len() as i32 * 22;
-            paint::line([x + 28, y, (w - 36 - marks_width).max(0), h], title, Font::Strong, Role::Text);
-            for (index, (mark, ink)) in marks.iter().enumerate() {
-                let at = x + w - marks_width + index as i32 * 22;
-                paint::glyph([at, y, 18, h], *mark, 14, *ink);
+            // Only a warning needs to know where the title ends.
+            let title_w = if *warn { paint::measure(title, Font::Strong, 0, dpi).0 } else { 0 };
+            let parts = section_parts(c.at, title_w, *warn, marks.len());
+            paint::glyph(parts.chevron, if *open { glyph::CHEVRON_DOWN } else { glyph::CHEVRON_RIGHT }, 14, Role::Text2);
+            paint::glyph(parts.icon, *icon, 16, Role::Text);
+            paint::line(parts.title, title, Font::Strong, Role::Text);
+            if let Some(at) = parts.warn {
+                paint::glyph(at, glyph::WARN, 14, Tone::Warn.ink());
+            }
+            for (&at, &(mark, ink)) in parts.marks.iter().zip(marks) {
+                paint::glyph(at, mark, 14, ink);
             }
         }
         Look::Row { tone, glyph, disclosure, commands } => {
@@ -1728,6 +1764,50 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn a_section_header_cuts_its_title_before_its_warning_or_its_marks() {
+        let title_w = 200;
+        for w in [600, 300, 200, 158, 120] {
+            for n in [0, 4] {
+                for warn in [false, true] {
+                    let at = [10, 20, w, 28];
+                    let p = section_parts(at, title_w, warn, n);
+                    let (right, case) = (10 + w, format!("{w} wide, {n} marks, warning {warn}"));
+                    assert_eq!((p.chevron[0], p.icon[0], p.title[0]), (14, 38, 62), "{case}");
+                    let marks_left = right - 22 * n as i32;
+                    let expected: Vec<Rect> = (0..n as i32).map(|i| [marks_left + 22 * i, 20, 22, 28]).collect();
+                    assert_eq!(p.marks, expected, "{case}: the marks are 22 wide at the right");
+                    let title_end = p.title[0] + p.title[2];
+                    assert!(p.title[2] >= 0 && (p.title[2] == 0 || title_end <= marks_left - 8), "{case}: the title {:?} runs into the marks", p.title);
+                    let room = marks_left - 8 - 62;
+                    if !warn {
+                        assert_eq!(p.warn, None, "{case}");
+                        assert_eq!(p.title[2], room.max(0), "{case}: without a warning the title takes all the room");
+                        continue;
+                    }
+                    if room < 22 {
+                        assert_eq!(p.warn, None, "{case}: a warning that cannot fit is left out");
+                        assert_eq!(p.title[2], room.max(0), "{case}: the title takes back the room of a warning left out");
+                        continue;
+                    }
+                    let mark = p.warn.unwrap_or_else(|| panic!("{case}: no warning"));
+                    assert_eq!(mark, [title_end + 6, 20, 16, 28], "{case}: the warning follows the title");
+                    assert!(mark[0] + mark[2] <= marks_left - 8, "{case}: the warning {mark:?} runs into the marks");
+                    assert!(mark[0] + mark[2] <= right, "{case}: the warning {mark:?} is outside the header");
+                    if room - 22 >= title_w + 2 {
+                        assert_eq!(p.title[2], title_w + 2, "{case}: a title that fits is whole");
+                    } else {
+                        assert_eq!(p.title[2], room - 22, "{case}: the title is cut first");
+                    }
+                }
+            }
+        }
+        let wide = section_parts([0, 0, 600, 28], title_w, true, 4);
+        assert_eq!((wide.title[2], wide.warn.map(|r| r[0])), (202, Some(260)));
+        let narrow = section_parts([0, 0, 200, 28], title_w, true, 4);
+        assert_eq!((narrow.title[2], narrow.warn), (30, Some([88, 0, 16, 28])), "cut to 200 - 52 - 8 - 88 - 22");
     }
 
     thread_local! {

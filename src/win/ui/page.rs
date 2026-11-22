@@ -1095,23 +1095,17 @@ fn preview_banner(o: &mut Out, draft: &SourceDraft, global: &GlobalSettings, x: 
 
 /// Which types the source syncs, whether it takes repository-specific items, and its folder rules.
 fn what_to_sync(o: &mut Out, p: &SourcePage, x: i32, y: i32, cw: i32) -> i32 {
-    let mark = o.s.decos.len();
     let open = section_open(p, SectionKey::WhatToSync, true);
-    let marks = KINDS
-        .into_iter()
-        .map(|kind| {
-            let on = type_enabled(p, kind);
-            (if on { glyph::OK } else { glyph::PAUSE }, if on { Role::Ok } else { Role::Text3 })
-        })
-        .collect::<Vec<_>>();
+    let marks = KINDS.into_iter().map(|kind| (kind_glyph(kind), if type_enabled(p, kind) { Role::Text } else { Role::Text3 })).collect::<Vec<_>>();
     let states =
         KINDS.into_iter().map(|kind| format!("{} {}", kind.heading(), if type_enabled(p, kind) { "on" } else { "off" })).collect::<Vec<_>>().join("; ");
-    section_header(o, id::SECTION_WHAT, [x + 8, y + 8, cw - 16, 32], format!("What to sync, {}. {states}", expanded_text(open)), "What to sync", open, marks);
+    let look = Look::Section { title: "What to sync".to_string(), icon: glyph::SYNC, open, marks, warn: false };
+    o.item(id::SECTION_WHAT, [x, y, cw, 28], format!("What to sync, {}. {states}", expanded_text(open)), look, true);
     if !open {
-        o.card(mark, [x, y, cw, 48]);
-        return y + 48;
+        return y + 32;
     }
-    let mut ly = y + 48;
+    let (mark, top) = (o.s.decos.len(), y + 32);
+    let mut ly = top + 8;
     let mut rows = KINDS
         .into_iter()
         .enumerate()
@@ -1174,7 +1168,7 @@ fn what_to_sync(o: &mut Out, p: &SourcePage, x: i32, y: i32, cw: i32) -> i32 {
         o.button(b, x + 52, ly + 28 + dh + 8, 32);
         ly + 28 + dh + 8 + 32 + 12
     };
-    o.card(mark, [x, y, cw, bottom - y]);
+    o.card(mark, [x, top, cw, bottom - top]);
     bottom
 }
 
@@ -1204,15 +1198,10 @@ fn sections(o: &mut Out, p: &SourcePage, x: i32, mut y: i32, cw: i32) -> i32 {
         let on = kind_is_on(p, k);
         let count = if on { detected.to_string() } else { format!("{detected} · Sync off") };
         let heading = format!("{} ({count})", k.kind.heading());
-        section_header(
-            o,
-            id::SECTION_KIND + kind_index(k.kind) as i32,
-            [x, y, cw, 28],
-            format!("{heading}, {}.", expanded_text(open)),
-            &heading,
-            open,
-            Vec::new(),
-        );
+        let warn = !open && on && kind_badge(k).1;
+        let text = if warn { format!("{heading}, collapsed. Needs your attention.") } else { format!("{heading}, {}.", expanded_text(open)) };
+        let look = Look::Section { title: heading, icon: kind_glyph(k.kind), open, marks: Vec::new(), warn };
+        o.item(id::SECTION_KIND + kind_index(k.kind) as i32, [x, y, cw, 28], text, look, true);
         y += 32;
         let first = index;
         index += k.rows.len();
@@ -1248,7 +1237,8 @@ fn never_synced(o: &mut Out, p: &SourcePage, x: i32, mut y: i32, cw: i32) -> i32
     let open = section_open(p, SectionKey::NeverSynced, false);
     let count = v.notes.len() + v.more_notes as usize;
     let heading = format!("Never synced ({count})");
-    section_header(o, id::SECTION_NEVER, [x, y, cw, 28], format!("{heading}, {}.", expanded_text(open)), &heading, open, Vec::new());
+    let text = format!("{heading}, {}.", expanded_text(open));
+    o.item(id::SECTION_NEVER, [x, y, cw, 28], text, Look::Section { title: heading, icon: glyph::INFO, open, marks: Vec::new(), warn: false }, true);
     y += 32;
     if !open {
         return y;
@@ -1269,10 +1259,6 @@ fn section_open(p: &SourcePage, key: SectionKey, default: bool) -> bool {
 
 fn expanded_text(open: bool) -> &'static str {
     if open { "expanded" } else { "collapsed" }
-}
-
-fn section_header(o: &mut Out, id: i32, at: Rect, accessible: String, title: &str, open: bool, marks: Vec<(char, Role)>) {
-    o.item(id, at, accessible, Look::Section { title: title.to_owned(), open, marks }, true);
 }
 
 fn type_enabled(p: &SourcePage, kind: SourceKind) -> bool {
@@ -2203,7 +2189,6 @@ pub(super) mod tests {
     }
 
     fn page_of(v: &SourceView, s: &SourceConfig, toggled: &HashSet<String>, w: i32) -> Surface {
-        let global = GlobalSettings::default();
         let sections = [
             (SectionKey::WhatToSync, true),
             (SectionKey::Kind(SourceKind::Skills), true),
@@ -2213,11 +2198,13 @@ pub(super) mod tests {
             (SectionKey::NeverSynced, true),
         ]
         .into();
-        source_page(
-            &SourcePage { view: v, source: s, global: &global, default: DEFAULT_INTERVAL, now: NOW, toggled, draft: None, sections: &sections },
-            w,
-            &fit,
-        )
+        page_with(v, s, toggled, &sections, w)
+    }
+
+    /// A source's page with only the sections in `sections` opened or closed; the others keep their defaults.
+    fn page_with(v: &SourceView, s: &SourceConfig, toggled: &HashSet<String>, sections: &HashMap<SectionKey, bool>, w: i32) -> Surface {
+        let global = GlobalSettings::default();
+        source_page(&SourcePage { view: v, source: s, global: &global, default: DEFAULT_INTERVAL, now: NOW, toggled, draft: None, sections }, w, &fit)
     }
 
     fn preview_page(draft: &SourceDraft, w: i32, measure: Fit) -> Surface {
@@ -2588,6 +2575,87 @@ pub(super) mod tests {
         assert!(parse_folders("x, x").is_err());
         folder_rules("tests", "examples").unwrap().apply(&mut cfg);
         assert_eq!(folder_rules_text(&cfg), "Also skips: tests. Never skips: examples.");
+    }
+
+    #[test]
+    fn what_to_sync_has_a_type_section_header_outside_its_card_with_the_type_icons() {
+        let mut v = four_types();
+        v.notes.push(crate::inventory::SummaryNote { kind: None, path: "AGENTS.md".into(), reason: "it is never synced".into() });
+        let mut cfg = source_cfg("o/a");
+        cfg.types.set(SourceKind::Agents, false);
+        let marks = vec![(glyph::SKILL, Role::Text), (glyph::AGENT, Role::Text3), (glyph::INSTRUCTION, Role::Text), (glyph::PLUGIN, Role::Text)];
+        for w in [344, 900] {
+            for open in [false, true] {
+                let s = page_with(&v, &cfg, &HashSet::new(), &HashMap::from([(SectionKey::WhatToSync, open)]), w);
+                fits_in(&s, w);
+                let (head, skills) = (item(&s, id::SECTION_WHAT), item(&s, id::SECTION_KIND));
+                let [x, y, hw, hh] = head.at;
+                assert_eq!([x, hw, hh], [PAD_X, w - 2 * PAD_X, 28], "at {w}: the header is not where a type header is");
+                assert_eq!((skills.at[0], skills.at[2], skills.at[3]), (x, hw, hh));
+                let state = if open { "expanded" } else { "collapsed" };
+                assert_eq!(head.text, format!("What to sync, {state}. Skills on; Agents off; Instructions on; Plugins on"));
+                assert_eq!(head.look, Look::Section { title: "What to sync".into(), icon: glyph::SYNC, open, marks: marks.clone(), warn: false });
+                for (i, kind) in KINDS.into_iter().enumerate() {
+                    let look = &item(&s, id::SECTION_KIND + i as i32).look;
+                    assert!(matches!(look, Look::Section { icon, .. } if *icon == kind_glyph(kind)), "{kind:?} has no icon: {look:?}");
+                }
+                assert!(matches!(item(&s, id::SECTION_NEVER).look, Look::Section { icon: glyph::INFO, warn: false, .. }));
+                let cards: Vec<Rect> = s
+                    .decos
+                    .iter()
+                    .filter_map(|d| match d {
+                        Deco::Fill { at, fill: Role::Card, .. } => Some(*at),
+                        _ => None,
+                    })
+                    .collect();
+                let on_header = |[cx, cy, cw, ch]: Rect| cx < x + hw && x < cx + cw && cy < y + hh && y < cy + ch;
+                assert!(!cards.iter().any(|&c| on_header(c)), "at {w}: the header is drawn on a card: {cards:?}");
+                if !open {
+                    assert_eq!(skills.at[1], y + 32 + GAP, "at {w}: a closed What to sync is spaced like a type section");
+                    assert!(!s.items.iter().any(|i| [id::SOURCE_TYPE, id::REPO_ITEMS, id::FOLDER_RULES].contains(&i.id)));
+                    continue;
+                }
+                let card = [x, y + 32, hw, skills.at[1] - GAP - (y + 32)];
+                assert!(cards.contains(&card), "at {w}: no card {card:?} under the header in {cards:?}");
+                let drawn = s.decos.iter().filter_map(|d| match d {
+                    Deco::Glyph { at, .. } | Deco::Text { at, .. } => Some(at[1]),
+                    Deco::Fill { .. } => None,
+                });
+                let first = s.items.iter().map(|i| i.at[1]).chain(drawn).filter(|&t| t > y && t < card[1] + card[3]).min();
+                assert_eq!(first, Some(y + if w == 900 { 40 } else { 48 }), "at {w}: the card's contents start 8 below its top");
+            }
+        }
+    }
+
+    #[test]
+    fn a_closed_type_that_needs_attention_warns_after_its_title() {
+        let mut v = four_types();
+        v.kinds[0].rows.push(edited("y"));
+        v.kinds[2].rows.push(edited("z"));
+        v.notes.push(crate::inventory::SummaryNote { kind: None, path: "AGENTS.md".into(), reason: "it is never synced".into() });
+        let cfg = source_cfg("o/a");
+        let heads = |sections: HashMap<SectionKey, bool>| {
+            let s = page_with(&v, &cfg, &HashSet::new(), &sections, 720);
+            fits_in(&s, 720);
+            [id::SECTION_WHAT, id::SECTION_KIND, id::SECTION_KIND + 1, id::SECTION_KIND + 2, id::SECTION_KIND + 3, id::SECTION_NEVER].map(|n| {
+                let i = item(&s, n);
+                let Look::Section { warn, .. } = i.look else { panic!("{n} is not a section header") };
+                (i.text.clone(), warn)
+            })
+        };
+        let plugins_open = heads(HashMap::from([(SectionKey::Kind(SourceKind::Plugins), true)]));
+        let expected = [
+            ("What to sync, expanded. Skills on; Agents on; Instructions on; Plugins on", false),
+            ("Skills (3), collapsed. Needs your attention.", true),
+            ("Agents (1), collapsed.", false),
+            ("Instructions (2 · Sync off), collapsed.", false),
+            ("Plugins (1), expanded.", false),
+            ("Never synced (1), collapsed.", false),
+        ];
+        assert_eq!(plugins_open, expected.map(|(t, w)| (t.to_string(), w)), "only a closed type that is on and needs you warns");
+        let skills_open = heads(HashMap::from([(SectionKey::Kind(SourceKind::Skills), true)]));
+        assert_eq!((skills_open[1].0.as_str(), skills_open[1].1), ("Skills (3), expanded.", false));
+        assert_eq!((skills_open[4].0.as_str(), skills_open[4].1), ("Plugins (1), collapsed. Needs your attention.", true));
     }
 
     /// Where a text between two heights is, whether it wraps, and its font, from the decorations or the controls.

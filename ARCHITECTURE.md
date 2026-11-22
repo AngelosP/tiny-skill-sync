@@ -697,7 +697,8 @@ everything they show.
   row it took 125 ms. The controls of a page never overlap: they are sibling windows that do not clip each other, so a
   control that paints again by itself (under the mouse, on a click) would draw over the part of a neighbour it covers.
   The `page.rs` tests and the e2e layout check enforce this. A skill row draws its action icons after the measured
-  name, sharing their rectangles with hit testing. The focused row also offers a native menu with the command names.
+  name, sharing their rectangles with hit testing. A section header likewise draws its warning after its measured
+  title (the pure `section_parts` in `control.rs`). The focused row also offers a native menu with the command names.
   After the popup returns, the window looks up the repository and skill again before acting: a refresh can reorder
   the rows or remove a command while the menu is open. Keyboard focus returns by skill identity rather than by the
   old row index.
@@ -715,9 +716,11 @@ everything they show.
   repair actions. The worker packages each discovery with its page projection in an immutable snapshot; the window
   reuses that projection for type, interval and enabled edits. Repository-specific-item inclusion and folder-rule edits
   trigger a new discovery, retaining the old snapshot while it refreshes. Keep in sync starts off; the main Add action
-  saves the source and starts its check, while plugin approval remains a separate explicit choice. Type sections show
-  detected counts, including zero and Sync off, and their section text spells out the count, type state and
-  expanded/collapsed state.
+  saves the source and starts its check, while plugin approval remains a separate explicit choice. Each section header
+  shows a chevron, an icon, then its title. Type sections show detected counts, including zero and Sync off, and
+  their section text spells out the count, type state and expanded/collapsed state. A collapsed type that is on and
+  has something needing the user (an item needing attention or a plugin awaiting approval, as on its chip in the
+  sources list) shows a warning after its title, and its section text adds "Needs your attention."
 - **`window.rs`** is the main window: the band at the top, the repositories down the left, the page on the right.
   "Show changes" turns the whole window into the differences of one skill until Back (or Esc); the worker reads them
   with `engine::diff`, which only reads, and `diff.rs` lines them up from this PC (`−`) to GitHub (`+`), so they read

@@ -2354,6 +2354,23 @@ function Test-Ui {
         [void][TssLive]::Repaint((Get-Ui $win $UiPanel.Page $edited.Id))
         $again = Save-Shot $win '08b-skill-row-repainted'
         Test-Unchanged $pic $again $win 'an edited skill whose row painted again' @($UiPanel.Page, ($edited.Id + 2)) 'the Show changes button'
+        # A collapsed type that needs the user says so after its title; opening it again brings back the row as it was.
+        # Expand-SourceSections reopens it, so the regex it uses for a collapsed header must accept that warning.
+        Click-Ui $win $UiPanel.Page $UiId.SectionKind
+        $needsYou = Wait-Maybe {
+            $t = Read-Ui $win $UiPanel.Page $UiId.SectionKind
+            if ($t -match '^Skills \(\d+\), collapsed\. Needs your attention\.$' -and $null -eq (Read-Ui $win $UiPanel.Page $edited.Id)) { $t }
+        } 5
+        Check 'collapsing Skills while a skill needs attention says so on its header' ($null -ne $needsYou) (Read-Ui $win $UiPanel.Page $UiId.SectionKind)
+        Show-PageControl $win $UiId.SectionKind
+        $pic = Save-Shot $win '08c-collapsed-attention'
+        Test-Painted $pic $win 'a collapsed Skills header' (,@($UiPanel.Page, $UiId.SectionKind))
+        Expand-SourceSections $win
+        $skillsBack = Wait-Maybe {
+            $t = Read-Ui $win $UiPanel.Page $UiId.SectionKind
+            if ($t -match '^Skills \(\d+\), expanded\.$' -and (Read-Ui $win $UiPanel.Page ($edited.Id + 2)) -eq 'Show changes') { $t }
+        } 5
+        Check 'reopening Skills drops the warning and shows the edited skill with its choices again' ($null -ne $skillsBack) (Read-Ui $win $UiPanel.Page $UiId.SectionKind)
 
         # ---- Show changes, and back
         # Meanwhile GitHub gives alpha a library of 32 reference files and removes its guide; the edit holds that update.
