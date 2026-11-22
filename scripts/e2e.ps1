@@ -2886,9 +2886,8 @@ function Test-Plugins {
             $null -eq (Get-Config $c) -and (& $emptyHomes))
         if ($preview.Code -ne 0) { throw 'Cannot continue without a valid plugin preview.' }
 
-        # The window's preview reads anonymously. Wait for the public view once; subsequent reads use the token.
-        $core = (Invoke-RestMethod -UseBasicParsing -Uri 'https://api.github.com/rate_limit' -Headers @{'User-Agent' = 'tss-e2e'}).resources.core
-        if ($core.remaining -lt 6) { throw "GitHub anonymous rate limit: $($core.remaining) requests left; not retrying." }
+        # The window's preview reads anonymously (with the token once that limit is used up). Wait for the public view
+        # once; subsequent reads use the token.
         [void](Wait-Live { (Get-PublicCommit $c.Repo $c.Ref) -eq $pin } 'the public plugin fixture commit' 65 6000)
         $marketBlob = (Get-UpstreamFiles $c.Repo $pin)['marketplace.json'].Id
         [void](Wait-Live { (Get-PublicFiles $c.Repo $c.Ref '')['marketplace.json'] -eq $marketBlob } 'the public plugin fixture listing' 65 6000)

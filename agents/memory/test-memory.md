@@ -53,11 +53,12 @@
   Mutants killed: `root.rs` per-lane confirm, `cli.rs` F rule, `fresh_lane_ids` foreign-record check.
 - Issue #8 UX tests (`issue8_` in `page.rs`, `control.rs`, `board.rs`) check the pure Surface and Board: the hero and tray
   tooltip when every type is off, What to sync layout at 344/420/560/900 px, the Edit-first empty preview, the source tooltip.
-- The ui e2e uses most of the anonymous 60 requests/hour by itself. In a rate-limited run, checks that look local-only
-  can fail too (08:46 ui run: two repo-specific switch checks failed, then passed on the rerun after the reset). Rerun
-  after the reset before triaging. Only scenarios that strip `gh` from the PATH (mixed, portable, the private step
-  without sign-in) or poll `Get-PublicCommit`/`Get-PublicFiles` (unmanaged, stale, plugins, ui, mixed) need the
-  anonymous quota; the app falls back to the `gh` token when the anonymous limit is reached.
+- The ui e2e uses most of the anonymous 60 requests/hour by itself. When the limit is used up, the app falls back to the
+  `gh` token and its checks get slower; a lane turned back on shows its last "Up to date" while its new check runs, and
+  settings edits are refused until it ends, so a scenario must wait for the `job-check` mark before the next edit (this
+  was the repo-specific switch failures in rate-limited ui runs). `Get-PublicCommit`/`Get-PublicFiles` fall back to
+  `gh api` on 403/429 the same way. Only scenarios that strip `gh` from the PATH (mixed, portable, the private step
+  without sign-in) still need the anonymous quota.
 
 ## Open proposals
 

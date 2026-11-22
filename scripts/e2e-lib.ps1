@@ -693,7 +693,12 @@ function Get-UpstreamFiles([string]$Repo, [string]$Ref, [string]$Path = '') {
 function Get-PublicFiles([string]$Repo, [string]$Ref, [string]$Path) {
     $spec = [uri]::EscapeDataString("${Ref}:")
     $headers = @{ 'Accept' = 'application/vnd.github+json'; 'X-GitHub-Api-Version' = '2022-11-28'; 'User-Agent' = 'tss-e2e' }
-    $tree = Invoke-RestMethod -UseBasicParsing -Headers $headers -Uri "https://api.github.com/repos/$Repo/git/trees/${spec}?recursive=1"
+    try {
+        $tree = Invoke-RestMethod -UseBasicParsing -Headers $headers -Uri "https://api.github.com/repos/$Repo/git/trees/${spec}?recursive=1"
+    } catch {
+        if (-not (Test-RateLimited $_)) { throw }
+        $tree = Invoke-Gh @('api', "repos/$Repo/git/trees/${spec}?recursive=1") | ConvertFrom-Json
+    }
     if ($tree.truncated) { throw 'the listing is truncated' }
     $prefix = if ($Path) { $Path.Trim('/') + '/' } else { '' }
     $map = [ordered]@{}
@@ -708,8 +713,22 @@ function Get-PublicFiles([string]$Repo, [string]$Ref, [string]$Path) {
 # listing above, since GitHub's servers keep each answer on its own).
 function Get-PublicCommit([string]$Repo, [string]$Ref) {
     $headers = @{ 'Accept' = 'application/vnd.github.sha'; 'X-GitHub-Api-Version' = '2022-11-28'; 'User-Agent' = 'tss-e2e' }
-    $r = Invoke-WebRequest -UseBasicParsing -Headers $headers -Uri "https://api.github.com/repos/$Repo/commits/$([uri]::EscapeDataString($Ref))"
-    [Text.Encoding]::ASCII.GetString($r.RawContentStream.ToArray()).Trim().ToLowerInvariant()
+    $address = "repos/$Repo/commits/$([uri]::EscapeDataString($Ref))"
+    try {
+        $r = Invoke-WebRequest -UseBasicParsing -Headers $headers -Uri "https://api.github.com/$address"
+        $sha = [Text.Encoding]::ASCII.GetString($r.RawContentStream.ToArray())
+    } catch {
+        if (-not (Test-RateLimited $_)) { throw }
+        $sha = Invoke-Gh @('api', $address, '-H', 'Accept: application/vnd.github.sha')
+    }
+    $sha.Trim().ToLowerInvariant()
+}
+
+# Once the 60 requests an hour without a token are used up, GitHub answers 403 or 429. The app then asks again with the
+# token (engine.rs, ask_github) and so sees the signed-in view; the public-view helpers above do the same through gh.
+function Test-RateLimited([Management.Automation.ErrorRecord]$Failure) {
+    $response = $Failure.Exception.Response
+    $null -ne $response -and @(403, 429) -contains [int]$response.StatusCode
 }
 
 # Which files a check installs from a listing of the folder: every immediate child folder that has a SKILL.md at
