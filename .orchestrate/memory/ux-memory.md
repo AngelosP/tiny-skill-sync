@@ -19,8 +19,17 @@
 - The control layer has no `WM_GETOBJECT`/UIA provider (none in `src\win`): assistive tech gets only each control's
   window text. Paragraphs are not Tab stops, so text shown only in a paragraph is not heard while tabbing. Row text is
   `name\ntag\nfacts\nexplanation` (`RowText` in `src\win\ui\control.rs`). GUIDE "Limitations" documents this.
-- Ask dialogs grow 36 DIP per radio choice (`page::ask`); `place()` in `src\win\ui\mod.rs` clamps position, not
-  height, to the work area. Ask for a small-work-area screenshot when choices are added.
+- Ask dialogs are a fixed `ASK_W` 468 DIP; `text` is a wrapped Body para 420 DIP wide; each radio choice adds 36 DIP
+  (`page::ask`). `dialogs::fitted_size` (2026-11-22) clamps the client height to the work area and widens the dialog
+  by a scroll bar when it must scroll. Ask for a small-work-area screenshot when choices are added.
+- Settings rows (`page::setting`): a `Desc::Text` is measured with `fit` at its width and drawn as a WRAP para, so the
+  card grows; controls stack under the text when under 160 DIP would remain beside them. `Desc::Path` is one 18-DIP
+  line (path ellipsis). Titles are ONE_LINE decos. Narrowest Settings width is about 343 DIP (640 window, list 268,
+  page 360, minus scroll bar). `paint::measure` and `paint::text` use the same DT_WORDBREAK|DT_EDITCONTROL flags.
+- e2e `ui` matches the token description only by its second sentence; shot `02c-settings-startup-token` shows that
+  row. No e2e shot shows Settings at 640 wide. Never save a token to see the saved variant (shared credential).
+- App-update rate limit text is "GitHub has limited update requests. Try again later." (`release.rs`), kept even when
+  the token retry fails, so a user cannot tell whether a token was tried.
 - Plugin choices (Approve, Reinstall, Uninstall, Forget) dispatch with no confirmation (`window.rs` `skill()`); only
   "Delete them" asks. Plugin row status words and details live in `board.rs` `plugin_row`, shared by tray and `tss`.
 - `-Filter cli` runs the lib `cli` tests and only `tests\cli.rs` tests whose names contain "cli".
@@ -48,8 +57,12 @@
 
 - 2026-11-20, uncommitted issue #7 F on 893cebe: `scripts\dev.ps1 test -Quick -Filter page` 36 passed;
   `-Filter board` 54 passed; `-Filter cli` 17 passed (12 lib, 5 tests\cli.rs). All 0 failed.
+- 2026-11-22, uncommitted app-update token retry: `-Filter every_page_fits_a_narrow_and_a_wide_window` 1 passed,
+  646 filtered out (647 lib tests). The cargo test binaries ran on this PC that day.
 
 ## Open proposals
 
 - Plugin rows: explain Removed from GitHub (Uninstall vs Forget), Turned off in Copilot and Removed in Copilot in
   `plugin_row` details; confirm Uninstall; put the approve warning in row text (proposed 2026-11-20, issue #7 F).
+- App-update rate limit: when no token could be found, add how to get one (as skill checks do); visually check
+  Settings at 640 wide and the Save a GitHub token dialog once fresh exes can run (proposed 2026-11-22).

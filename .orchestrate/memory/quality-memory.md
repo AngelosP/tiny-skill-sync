@@ -37,6 +37,13 @@
 - Section headers (`Look::Section { title, icon, open, marks, warn }`): layout is the pure `section_parts` (control.rs), with the title measured only when `warn`. The warning shows only on a closed type that is on (`kind_is_on`) and where `kind_badge(k).1` is true; the window text then ends in "collapsed. Needs your attention.", which e2e-lib `Expand-SourceSections` accepts. A live `Test-Painted` check over a whole header cannot prove one glyph inside it was drawn.
 - Header band (2026-11-22): roles Band/BandEnd/BandEdge in theme.rs; the gradient is drawn in page.rs `backdrop`/`diff_backdrop`, never in a panel. Two bars judge the same colours: theme.rs requires a summed RGB gap ≥ 30 to Bg and Layer at 17 samples, e2e `Test-Band` ≥ 24 (a dither tolerance). Keep them consistent when retuning the palette.
 - e2e-lib `Open-Repo` discards `Wait-Live`'s result (fixed 2026-11-22); before that every call printed a stray `True`.
+- App-release token fallback (uncommitted at HEAD 1417633, 2026-11-22):
+  - `release::metadata_at` retries a `limited` anonymous answer once through `TokenProvider`, only while more than `TOKEN_LOOKUP_BUDGET` (GH_TIMEOUT + 2 s) remains. Any retry failure returns the original error.
+  - `release_hash::request_headers` accepts a bearer only for https `api.github.com:443` with a printable-ASCII token, and wipes the header after the send. `release_hash::get` always connects with TLS on port 443, whatever the URL says.
+  - The retry answer gets the same validation as the anonymous one; a validation error on the retry maps to the original anonymous error.
+- `proc::gh_token` worst case: 5 s wait, plus the 1 s reader deadline (proc.rs:183), plus 2 x 100 ms (proc.rs:270). `run_capture` passes a fresh AtomicBool, so a lookup cannot be cancelled.
+- The engine's `ask_github` also retries with the token on any RateLimited or NotFound, but it returns the retry's error.
+- scripts\test.ps1 runs `cargo fmt --check`, then `cargo clippy --all-targets -- -D warnings`. Only the default lint groups apply (no pedantic).
 ## Baselines
 
 - `cargo test --lib win::proc` with TSS_NO_APP_UPDATES=1 and TSS_NO_SAVED_TOKEN=1: 9 passed.
@@ -52,6 +59,11 @@
   - `plugin`: 82 passed (38 + 3 + 11 + 29 + 1).
   - `copilot`: 17. `add_source`: 4. `question_height`: 1. `format`: 4.
 - Re-check of fix round 1: `cargo test --lib restart` 6 passed; `a_restarted_tray_says_so_when_its_first_look_is_done` and `a_restarted_tray_is_told_apart_from_one_the_user_or_windows_started` each 1 passed. The PowerShell wrapper reported exit code 1 although each test reported ok; treat the exit status as unverified.
+
+- Token fallback review (2026-11-22, run at the repo root):
+  - `cargo fmt --check`: exit 0, no output.
+  - `git --no-pager diff --check` on the 6 changed paths: exit 0.
+  - Clippy was not run: Application Control blocks it on this PC.
 
 ## Open proposals
 

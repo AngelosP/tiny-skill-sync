@@ -72,6 +72,25 @@
   - File lanes cache confirmation in `RootListing::confirmed` (repo/branch/path/pin/tree ID), set only after success.
   - `settings_write_lock_within`: CREATE_NEW + OPEN_REPARSE_POINT + delete-on-close; retry only waits.
 
+- App-update token fallback (reviewed 2026-11-22, uncommitted tree):
+  - `release::metadata_at` always sends anonymously first. It calls `TokenProvider::token()` only when
+    `response_error(..).limited` holds (429, or 403 with remaining 0, retry-after, or reset without remaining) and
+    more than `TOKEN_LOOKUP_BUDGET` (GH_TIMEOUT + 2 s) remains. It retries the same `MetadataUrl` once. Any retry
+    failure returns the original anonymous `ReleaseError`.
+  - `MetadataUrl` and `DownloadUrl` have private fields, so only `release` builds them.
+    `ReleaseRequest::Download` carries no bearer.
+  - `release_hash::request_headers` refuses a bearer unless the request is secure, the host is `api.github.com`,
+    the port is 443 and the token is non-empty `is_ascii_graphic`. It builds the UTF-16 header at exact capacity and
+    wipes it after a synchronous `WinHttpSendRequest` (`WinHttpOpen` flags 0).
+  - The release transport sets NO_PROXY, DISABLE_REDIRECTS|AUTHENTICATION|COOKIES, AUTOLOGON HIGH, a null client
+    cert and no global pooling, and never captures error bodies. `http_error` maps every error to fixed text.
+  - `Updates::system()` hard-codes `Official::new(SystemTokens)`, not the host's `tokens()`.
+  - `TSS_NO_APP_UPDATES` stops `Updates::run` before any network. test.ps1, the common.ps1 sandbox and e2e set it.
+  - The skill engine was already anonymous-first with a token retry (`engine.rs` `request_tree`). The skill
+    `http.rs` checks only CR/LF in a token and allows https or loopback.
+  - Token copies that were never wiped (pre-existing): `cred::decode_blob` intermediates, the `proc::read_some`
+    buffer and stdout Vec, and WinHTTP's internal copy of the header.
+
 ## Baselines
 
 - 2026-11-20 relaunch review: `cargo test --lib only_a_tray_proven` and `cargo test --lib restarted` pass (debug);
@@ -83,6 +102,8 @@
   - `-Filter proc`: 12 passed, including the grandchild kill test.
   - The `win::copilot` lookup and `first_error` tests match neither filter (use `-Filter copilot`).
   - No live e2e, real Copilot CLI run or advisory scan.
+- 2026-11-22 token fallback review: `scripts\dev.ps1 test -Quick -Filter release_hash` passed 2 lib tests (exit 0).
+  The `release::tests` retry tests were inspected but not run by security.
 
 ## Open proposals
 

@@ -75,6 +75,18 @@
 - Live bar: e2e `Test-Band` (summed gap ≥ 24) in the ui scenario's light and dark restart pass, wide and 640-DIP-narrow
   Show changes (shots 18*, 19*). e2e ui baseline after the band: 302 checks, 0 failed.
 
+## App-update token fallback (review, 2026-11-22, uncommitted)
+
+- `-Filter release` matches `release::tests` (22), `win::release_hash::tests` (2) plus 4 unrelated lib tests, 1 cli and
+  1 engine_plugins test: 30 passed. `-Filter updater`: 12 lib tests. Lib total 642, integration 367 (CONTRIBUTING says 991/624).
+- release tests inject `NoLookup` (panics on lookup) or `Lookup(closure)`; `script_with_bearer` asserts URL, limit and bearer
+  per request. `Updates` tests use `FeedDouble`, never `Official`. Every script sets `TSS_NO_APP_UPDATES=1`.
+  `release_hash::request_headers` takes the `ReleaseRequest`, with unit tests per request kind; the ignored owner-run
+  `live_metadata_bearer_reaches_github` proves the bearer reaches GitHub despite WINHTTP_DISABLE_AUTHENTICATION (passed
+  2026-11-22). A boundary test pins `TOKEN_LOOKUP_BUDGET` (exactly the budget: no lookup; 1 ms more: one retry).
+- Nested `powershell -File scripts\dev.ps1 test ... 2>&1` exits 1 on success; read "All checks passed." and the result lines.
+  `CARGO_NET_OFFLINE=true` with the runner worked (already built; nothing fetched).
+
 ## Open proposals
 
 - CONTRIBUTING.md Tests: list the extra filters a Plugins change needs (copilot, proc runner, fake_manager), or prefix those tests `plugin_`.
