@@ -209,10 +209,12 @@ pub struct Item {
     pub enabled: bool,
 }
 
-/// What a panel draws itself, behind its controls.
+/// What a panel draws itself, behind its controls. A gradient is shaded from `from` at its left edge to `to` at its
+/// right.
 #[derive(Clone, PartialEq, Debug)]
 pub enum Deco {
     Fill { at: Rect, radius: i32, fill: Role, border: Role },
+    Gradient { at: Rect, from: Role, to: Role },
     Glyph { at: Rect, ch: char, size: u8, ink: Role },
     Text { at: Rect, text: String, font: Font, ink: Role, flags: u32 },
 }
@@ -659,6 +661,7 @@ fn draw_ctl(hwnd: HWND) {
             for part in parts {
                 match part {
                     Deco::Fill { at, radius, fill, border } => paint::fill(shift(*at), *radius, *fill, *border),
+                    Deco::Gradient { at, from, to } => paint::gradient(shift(*at), *from, *to),
                     Deco::Glyph { at, ch, size, ink } => paint::glyph(shift(*at), *ch, *size, *ink),
                     Deco::Text { at, text, font, ink, flags } => paint::text(shift(*at), text, *font, *ink, *flags),
                 }
@@ -1395,12 +1398,13 @@ fn draw_panel(hwnd: HWND) {
 /// Draws decorations into the canvas at its current origin, skipping those outside what is being painted.
 pub fn draw(decos: &[Deco]) {
     for deco in decos {
-        let (Deco::Fill { at, .. } | Deco::Glyph { at, .. } | Deco::Text { at, .. }) = deco;
+        let (Deco::Fill { at, .. } | Deco::Gradient { at, .. } | Deco::Glyph { at, .. } | Deco::Text { at, .. }) = deco;
         if !paint::visible(*at) {
             continue;
         }
         match deco {
             Deco::Fill { at, radius, fill, border } => paint::fill(*at, *radius, *fill, *border),
+            Deco::Gradient { at, from, to } => paint::gradient(*at, *from, *to),
             Deco::Glyph { at, ch, size, ink } => paint::glyph(*at, *ch, *size, *ink),
             Deco::Text { at, text, font, ink, flags } => paint::text(*at, text, *font, *ink, *flags),
         }

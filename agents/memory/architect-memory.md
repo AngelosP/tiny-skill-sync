@@ -65,6 +65,19 @@ Verified by reading code (2026-11-22, source-page section headers review):
 - `scripts/e2e-lib.ps1:974` `Expand-SourceSections` detects collapsed kind headers with the end-anchored
   `', collapsed\.( Needs your attention\.)?$'`; any other suffix added to kind header text must be added there too.
 
+Verified by reading code (2026-11-22, header band review):
+
+- Window background: `window::draw_bg` (window.rs:606) fills `Role::Bg` then `page::backdrop` (main) or
+  `page::diff_backdrop`; every panel is `Role::None`, so `draw_panel` -> `under()` -> `WM_PAINTBG` -> `draw_bg` for each
+  control's canvas, with `paint` origin shifted to window-absolute pixels (control.rs:281). Per-pixel effects must key
+  on `x + c.ox`, `y + c.oy` and interpolate over the unclipped rect (`edges`, paint.rs:301), or repaints seam.
+- `Deco` is matched exhaustively at control.rs:661 (Source parts), 1398 (irrefutable or-pattern), 1403; page.rs tests
+  2621, 3344. `Role` palettes are positional arrays sized `Role::None as usize` (theme.rs:56-89); `theme::color` reads
+  env/registry/HC, so pure tests must index LIGHT/DARK directly. theme.rs has no test module.
+- Geometry assumptions: `HERO_H` (page.rs:36) used by window.rs:500-507,613 and page tests 2738, 3252, 3451; `DIFF_TOP`
+  (page.rs:1702) private, test 3293; hero mark literal [24,8,40,40] in test 2398. Min window 640x480 (window.rs:55).
+- e2e never sets `TSS_THEME`; `New-LiveStartInfo` (common.ps1:100) passes the parent env, so shots follow the machine.
+
 ## Baselines
 
 No review baseline recorded.

@@ -705,10 +705,16 @@ everything they show.
 - **`paint.rs`** draws each paint into one off-screen bitmap and copies it to the screen at once, so nothing flickers.
   Rounded boxes are anti-aliased by hand (GDI cannot); text is drawn by GDI with ClearType. Positions are in DIPs and
   become pixels at the window's DPI. A control has no background of its own: it asks its parent to draw what is under
-  it into the same bitmap (`WM_PAINTBG`), so its corners blend with the card beneath.
+  it into the same bitmap (`WM_PAINTBG`), so its corners blend with the card beneath. A gradient fill
+  (`Deco::Gradient`, used by the header band) blends two colours from left to right and hides the steps between them
+  with a 4 by 4 dither. The dither is keyed to the window's pixels, not the bitmap's, so a control or panel that
+  paints again by itself draws exactly the pixels that were there.
 - **`theme.rs`** holds the Windows 11 light and dark colours and the high contrast colours. It follows the app mode the
   user chose in Windows (`AppsUseLightTheme`); `TSS_THEME=dark` or `light` overrides it, for screenshots. The title bar
-  and menus are asked to match through DWM and uxtheme, both loaded only when a window opens.
+  and menus are asked to match through DWM and uxtheme, both loaded only when a window opens. The title bar keeps the
+  window background (`Bg`), and the header band under it differs: `Band` and `BandEnd` are the two ends of its soft,
+  accent-tinted gradient and `BandEdge` is the line along its bottom, so the window reads as title bar, band, content.
+  In high contrast the band is the Window colour with a WindowText line.
 - **`page.rs`** builds every page as a `Surface` from what the app knows. It calls no Windows function (text is
   measured through a `Fit` the window passes in), so every layout and sentence is tested without a screen.
 - A saved source and an unsaved location preview use the same source-page renderer. Preview settings remain editable,
@@ -721,7 +727,11 @@ everything they show.
   their section text spells out the count, type state and expanded/collapsed state. A collapsed type that is on and
   has something needing the user (an item needing attention or a plugin awaiting approval, as on its chip in the
   sources list) shows a warning after its title, and its section text adds "Needs your attention."
-- **`window.rs`** is the main window: the band at the top, the repositories down the left, the page on the right.
+- **`window.rs`** is the main window: the header band at the top, the repositories down the left, the page on the
+  right. The band is 72 DIPs high (`HERO_H` in `page.rs`) with its contents centred; it is drawn in the window's
+  background layer (`page::backdrop`, through the shared `page::band`), not by a control, and it heads the diff view
+  too (`page::diff_backdrop`), behind Back, the skill's name, the line under it and the choices, with the cards 12
+  DIPs below it.
   "Show changes" turns the whole window into the differences of one skill until Back (or Esc); the worker reads them
   with `engine::diff`, which only reads, and `diff.rs` lines them up from this PC (`−`) to GitHub (`+`), so they read
   as what taking GitHub's version would do. Only upstream's files and the files the record says this repository put
@@ -762,8 +772,11 @@ A window procedure can be entered again while it runs (a control notifies its pa
 it). So the UI state lives in thread-local `RefCell`s borrowed only with `try_borrow_mut`, and no borrow is held across a
 call that runs a message loop (a question, the tray menu, `DestroyWindow`).
 
-The band at the top says how everything is in one title, the worst first: a problem of the app, sources that can't be
-read, items that need you, sources that need you, the first check still to come, or all up to date. The line under it
+The band at the top holds the status circle, a title, the line under it and **Sync now**, on the hero panel. The
+band itself, a gradient with a hairline along its bottom, is part of the backdrop under that panel and under the diff
+view's header, so both views start with the same band. Its title says how everything is in one line, the worst
+first: a problem of the app, sources that can't be read, items that need you, sources that need you, the first check
+still to come, or all up to date. The line under it
 says where, when the last check was, and when the next one is (`page::hero_of`). It counts sources, not lanes: it
 takes the snapshot's `SourceView`s, so the four types of one source count once, and it says "items" instead of
 "skills" when more than one type is present (`board::item_nouns`). When every type found is off, nothing is counted

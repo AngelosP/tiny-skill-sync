@@ -52,6 +52,11 @@ pub enum Role {
     DialogFoot,
     DotWarn,
     DotGlyph,
+    /// The band across the top of the window: a gradient from `Band` at its left to `BandEnd` at its right, with a
+    /// `BandEdge` line at its foot.
+    Band,
+    BandEnd,
+    BandEdge,
     None,
 }
 
@@ -63,7 +68,8 @@ const LIGHT: [u32; COUNT] = [
     0xFFF3F3F3, 0xFFF9F9F9, 0x0F000000, 0xFFFFFFFF, 0x13000000, 0x12000000, 0xFF1A1A1A, 0xFF5D5D5D, 0xFF8B8B8B,
     0xFF005FB8, 0xFF005FB8, 0xFFFFFFFF, 0xFFFDFDFD, 0x14000000, 0x2E000000, 0x09000000, 0x0E000000,
     0xFF0F7B0F, 0xFFDFF6DD, 0xFF9D5D00, 0xFFFFF4CE, 0xFFC42B1C, 0xFFFDE7E9, 0xFF6B6B6B, 0x0F000000,
-    0xFFE7F3E7, 0xFFD3EAD3, 0xFFFCEBEA, 0xFFF6D5D2, 0xFFF2F5F9, 0xFFF3F3F3, 0xFFC17F00, 0xFFFFFFFF,
+    0xFFE7F3E7, 0xFFD3EAD3, 0xFFFCEBEA, 0xFFF6D5D2, 0xFFF2F5F9, 0xFFF3F3F3, 0xFFB07300, 0xFFFFFFFF,
+    0xFFD3E4FA, 0xFFE1EAF7, 0xFFC5D6EA,
 ];
 
 #[rustfmt::skip]
@@ -72,6 +78,7 @@ const DARK: [u32; COUNT] = [
     0xFF60CDFF, 0xFF99EBFF, 0xFF000000, 0xFF353535, 0x12FFFFFF, 0x1AFFFFFF, 0x0DFFFFFF, 0x14FFFFFF,
     0xFF6CCB5F, 0xFF393D1B, 0xFFFCE100, 0xFF433519, 0xFFFF99A4, 0xFF442726, 0xFFA8A8A8, 0x14FFFFFF,
     0xFF213226, 0xFF2A4231, 0xFF3B2528, 0xFF4F2E33, 0xFF2A2F36, 0xFF202020, 0xFFFCE100, 0xFF000000,
+    0xFF1B3150, 0xFF1B2639, 0xFF33445A,
 ];
 
 // The system colour indexes high contrast uses.
@@ -91,6 +98,7 @@ const CONTRAST: [u8; COUNT] = [
     HIGHLIGHT, HOT_LIGHT, HIGHLIGHT_TEXT, WINDOW, WINDOW_TEXT, WINDOW_TEXT, CLEAR, CLEAR,
     WINDOW_TEXT, WINDOW, WINDOW_TEXT, WINDOW, WINDOW_TEXT, WINDOW, WINDOW_TEXT, CLEAR,
     WINDOW, WINDOW, WINDOW, WINDOW, WINDOW, WINDOW, WINDOW_TEXT, WINDOW,
+    WINDOW, WINDOW, WINDOW_TEXT,
 ];
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -211,7 +219,8 @@ fn proc_of(dll: &str, name: *const u8) -> *const c_void {
 type SetAttribute = unsafe extern "system" fn(HWND, u32, *const c_void, u32) -> i32;
 
 /// Makes a window's frame match: a dark title bar in dark mode, rounded corners, and a caption the colour of the
-/// window, so the title bar and the window read as one surface (Windows 11; older versions ignore what they lack).
+/// window's background (`Bg`), so the title bar matches the window's edges and the band under it stands out from both
+/// (Windows 11; older versions ignore what they lack).
 pub fn frame(hwnd: HWND) {
     let f = proc_of("dwmapi.dll", c"DwmSetWindowAttribute".as_ptr().cast());
     if f.is_null() {
@@ -246,5 +255,73 @@ pub fn menus() {
         // 2 forces dark, 3 forces light.
         set(if dark() && !contrast() { 2 } else { 3 });
         flush();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::win::ui::paint::Tone;
+
+    /// The WCAG relative luminance of a colour.
+    fn luminance_of(c: u32) -> f64 {
+        let linear = |shift: u32| {
+            let v = f64::from((c >> shift) & 0xFF) / 255.0;
+            if v <= 0.04045 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) }
+        };
+        0.2126 * linear(16) + 0.7152 * linear(8) + 0.0722 * linear(0)
+    }
+
+    fn contrast_of(a: u32, b: u32) -> f64 {
+        let (a, b) = (luminance_of(a), luminance_of(b));
+        (a.max(b) + 0.05) / (a.min(b) + 0.05)
+    }
+
+    /// At least one channel differs by 10 or more.
+    fn apart(a: u32, b: u32) -> bool {
+        [16, 8, 0].into_iter().any(|s| ((a >> s) & 0xFF).abs_diff((b >> s) & 0xFF) >= 10)
+    }
+
+    /// The red, green and blue differences added up.
+    fn distance(a: u32, b: u32) -> u32 {
+        [16, 8, 0].into_iter().map(|s| ((a >> s) & 0xFF).abs_diff((b >> s) & 0xFF)).sum()
+    }
+
+    // The palettes are read directly: `color` follows the Windows settings of the machine running the tests.
+    #[test]
+    fn the_band_stands_out_from_the_title_bar_and_the_page_and_its_text_stays_readable_across_it() {
+        let dots = [Tone::Ok, Tone::Warn, Tone::Err].map(Tone::dot);
+        for (mode, palette) in [("light", &LIGHT), ("dark", &DARK)] {
+            let of = |role: Role| palette[role as usize];
+            let (from, to, edge) = (of(Role::Band), of(Role::BandEnd), of(Role::BandEdge));
+            for c in [from, to, edge] {
+                assert_eq!(c >> 24, 0xFF, "{mode}: the band is opaque: {c:08X}");
+            }
+            for dot in dots {
+                let ratio = contrast_of(of(Role::DotGlyph), of(dot));
+                assert!(ratio >= 3.0, "{mode}: the mark on a {dot:?} circle has a contrast of {ratio:.2}");
+            }
+            for i in 0..=16 {
+                let mix = |s: u32| {
+                    let (a, z) = (((from >> s) & 0xFF) as i32, ((to >> s) & 0xFF) as i32);
+                    ((a + (z - a) * i / 16) as u32) << s
+                };
+                let band = 0xFF00_0000 | mix(16) | mix(8) | mix(0);
+                for role in [Role::Bg, Role::Layer] {
+                    let gap = distance(band, of(role));
+                    assert!(gap >= 30, "{mode}: the band at {i}/16 ({band:08X}) is only {gap} from {role:?} ({:08X})", of(role));
+                }
+                assert!(apart(band, edge), "{mode}: the band at {i}/16 ({band:08X}) hides its edge ({edge:08X})");
+                for ink in [Role::Text, Role::Text2] {
+                    let ratio = contrast_of(of(ink), band);
+                    assert!(ratio >= 4.5, "{mode}: {ink:?} on the band at {i}/16 ({band:08X}) has a contrast of {ratio:.2}");
+                }
+                for dot in dots {
+                    let ratio = contrast_of(of(dot), band);
+                    assert!(ratio >= 3.0, "{mode}: a {dot:?} circle on the band at {i}/16 ({band:08X}) has a contrast of {ratio:.2}");
+                }
+            }
+        }
+        assert_ne!(CONTRAST[Role::BandEdge as usize], CONTRAST[Role::Band as usize], "high contrast: the band's edge is drawn");
     }
 }

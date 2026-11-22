@@ -35,7 +35,8 @@
 - Issue #8 round 2: `state.json` format 3 (`needs_format_3`: `lane_polls` or plugin approval `roots`); `seen::update` re-reads before merging and never overwrites a newer file; `catalog::Capabilities` is computed but read only by tests (board reads `inventory::PluginCapabilities`).
 - Issue #8 lanes of one source run in order (skills, agents, instructions, plugins) after one shared root listing (src\engine\root.rs `sync_source`); a remote failure in a later lane stops only the lanes after it.
 - Section headers (`Look::Section { title, icon, open, marks, warn }`): layout is the pure `section_parts` (control.rs), with the title measured only when `warn`. The warning shows only on a closed type that is on (`kind_is_on`) and where `kind_badge(k).1` is true; the window text then ends in "collapsed. Needs your attention.", which e2e-lib `Expand-SourceSections` accepts. A live `Test-Painted` check over a whole header cannot prove one glyph inside it was drawn.
-
+- Header band (2026-11-22): roles Band/BandEnd/BandEdge in theme.rs; the gradient is drawn in page.rs `backdrop`/`diff_backdrop`, never in a panel. Two bars judge the same colours: theme.rs requires a summed RGB gap ≥ 30 to Bg and Layer at 17 samples, e2e `Test-Band` ≥ 24 (a dither tolerance). Keep them consistent when retuning the palette.
+- e2e-lib `Open-Repo` discards `Wait-Live`'s result (fixed 2026-11-22); before that every call printed a stray `True`.
 ## Baselines
 
 - `cargo test --lib win::proc` with TSS_NO_APP_UPDATES=1 and TSS_NO_SAVED_TOKEN=1: 9 passed.

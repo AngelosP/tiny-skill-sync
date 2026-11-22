@@ -33,7 +33,7 @@ pub const NAV_W: i32 = 248;
 pub const MIN_LIST_W: i32 = 160;
 const MIN_PAGE_W: i32 = 360;
 const SPLITTER_W: i32 = 12;
-pub const HERO_H: i32 = 66;
+pub const HERO_H: i32 = 72;
 pub const SYNC_NOW: &str = "Sync now";
 pub const SYNC_TIP: &str = "Checks every enabled source now. Items you edited or deleted are never replaced without asking.";
 pub const CUSTOM: &str = "Custom…";
@@ -410,18 +410,24 @@ pub fn hero_of(sources: &[SourceView], problem: Option<&str>, status: &str, news
     hero(Tone::Ok, glyph::OK, format!("All {many} are up to date"), sub(head))
 }
 
+/// The top of something `h` high, centred in the band.
+fn in_band(h: i32) -> i32 {
+    (HERO_H - h) / 2
+}
+
 pub fn hero(h: &Hero, can_sync: bool, w: i32, fit: Fit) -> Surface {
     let mut o = Out::new(fit);
     // A status is marked as in the list (a filled dot); the calm states (Off) stay quiet.
     let (fill, ink) = if h.tone == Tone::Off { (h.tone.bg(), h.tone.ink()) } else { (h.tone.dot(), Role::DotGlyph) };
-    o.fill([24, 8, 40, 40], 20, fill, Role::None);
-    o.glyph([24, 8, 40, 40], h.glyph, 18, ink);
+    let mark = [24, in_band(40), 40, 40];
+    o.fill(mark, 20, fill, Role::None);
+    o.glyph(mark, h.glyph, 18, ink);
     let bw = o.button_width(SYNC_NOW, Some(glyph::SYNC));
     let bx = w - PAD_X - bw;
-    o.button(Btn { enabled: can_sync, ..btn(id::SYNC, SYNC_NOW, Kind::Accent, Some(glyph::SYNC)) }, bx, 12, 32);
-    let tw = (bx - 16 - 78).max(0);
-    o.label(id::HERO_TITLE, [78, 6, tw, 28], &h.title, Font::Title, Role::Text);
-    o.label(id::HERO_SUB, [78, 34, tw, 16], &h.sub, Font::Caption, Role::Text2);
+    o.button(Btn { enabled: can_sync, ..btn(id::SYNC, SYNC_NOW, Kind::Accent, Some(glyph::SYNC)) }, bx, in_band(32), 32);
+    let (tw, top) = ((bx - 16 - 78).max(0), in_band(28 + 16));
+    o.label(id::HERO_TITLE, [78, top, tw, 28], &h.title, Font::Title, Role::Text);
+    o.label(id::HERO_SUB, [78, top + 28, tw, 16], &h.sub, Font::Caption, Role::Text2);
     o.done(HERO_H)
 }
 
@@ -1686,9 +1692,25 @@ pub fn splitter(w: i32, h: i32) -> Surface {
     Surface { items: vec![item], ..Surface::default() }
 }
 
-/// The raised layer under the hero and to the right of the splitter.
+/// The band across the top of both views, behind the hero or the diff header: a soft shade of the accent's hue and
+/// one hairline at its foot, the only line between it and what is below.
+pub fn band(w: i32) -> [Deco; 2] {
+    [
+        Deco::Gradient { at: [0, 0, w, HERO_H], from: Role::Band, to: Role::BandEnd },
+        Deco::Fill { at: [0, HERO_H - 1, w, 1], radius: 0, fill: Role::BandEdge, border: Role::None },
+    ]
+}
+
+const LAYER_RADIUS: i32 = 8;
+
+/// The raised layer to the right of the splitter, then the band. The layer starts under the band, so the band hides
+/// its rounded top corner and its top border.
 pub fn backdrop(page_x: i32, w: i32, h: i32) -> Vec<Deco> {
-    vec![Deco::Fill { at: [page_x, HERO_H, w - page_x + 20, h - HERO_H + 20], radius: 8, fill: Role::Layer, border: Role::LayerBorder }]
+    let top = HERO_H - 2 * LAYER_RADIUS;
+    let layer = Deco::Fill { at: [page_x, top, w - page_x + 20, h - top + 20], radius: LAYER_RADIUS, fill: Role::Layer, border: Role::LayerBorder };
+    let mut out = vec![layer];
+    out.extend(band(w));
+    out
 }
 
 /// The diff header and the list and comparison below it, each with a card that starts in the header.
@@ -1699,7 +1721,7 @@ pub struct DiffLayout {
     pub split: SplitLayout,
 }
 
-const DIFF_TOP: i32 = 70;
+const DIFF_TOP: i32 = HERO_H + 12;
 const CARD_HEAD: i32 = 41;
 
 pub fn diff_layout(w: i32, h: i32, preferred: i32) -> DiffLayout {
@@ -1712,6 +1734,7 @@ pub fn diff_layout(w: i32, h: i32, preferred: i32) -> DiffLayout {
 
 pub fn diff_backdrop(l: &DiffLayout, w: i32, h: i32) -> Vec<Deco> {
     let mut out = vec![Deco::Fill { at: [-20, 0, w + 40, h + 20], radius: 0, fill: Role::Layer, border: Role::None }];
+    out.extend(band(w));
     for card in [l.files_card, l.code_card] {
         out.push(Deco::Fill { at: card, radius: 6, fill: Role::Card, border: Role::CardBorder });
         out.push(Deco::Fill { at: [card[0] + 1, DIFF_TOP + CARD_HEAD - 1, card[2] - 2, 1], radius: 0, fill: Role::Divider, border: Role::None });
@@ -1793,11 +1816,11 @@ pub fn diff_sub(v: &DiffView) -> String {
 pub fn diff_head(v: &DiffView, l: &DiffLayout, fit: Fit) -> Surface {
     let w = l.head[2];
     let mut o = Out::new(fit);
-    o.item(id::BACK, [12, 10, 32, 32], "Back", Look::Button { kind: Kind::Icon, glyph: Some(glyph::BACK) }, true);
     // From the right: the first choice, which takes GitHub's version, ends the row. A Preview changes nothing, so it
     // offers none.
     let actions: &[Action] = if !v.preview && matches!(v.report, Report::Ready(_)) { &v.actions } else { &[] };
     let mut right = w - 20;
+    let mut choices = Vec::new();
     for (k, action) in actions.iter().enumerate() {
         if *action == Action::RemoveThem {
             continue;
@@ -1809,18 +1832,31 @@ pub fn diff_head(v: &DiffView, l: &DiffLayout, fit: Fit) -> Surface {
             break;
         }
         right -= bw;
-        o.button(b, right, 10, 32);
+        choices.push((b, right));
         right -= 8;
     }
     let room = (right - 8 - 56).max(0);
+    let sub = diff_sub(v);
+    // The title and the sentence under it sit centred together beside the buttons. A sentence too long for that space
+    // goes under the buttons instead, across the band, and the row above it moves up.
+    let (row, top, sub_at) = if o.width(&sub, Font::Caption) <= room {
+        let top = in_band(28 + 16);
+        (in_band(32), top, [56, top + 28, room, 16])
+    } else {
+        (8, 10, [56, 44, (w - 80).max(0), 16])
+    };
+    o.item(id::BACK, [12, row, 32, 32], "Back", Look::Button { kind: Kind::Icon, glyph: Some(glyph::BACK) }, true);
+    for (b, x) in choices {
+        o.button(b, x, row, 32);
+    }
     let repo = format!("{}: {} [{}]", v.source.kind.heading(), printable(&v.source.label()), printable(&v.source.id));
     let skill = printable(&v.skill).into_owned();
     let repo_w = (o.width(&repo, Font::Title) + 2).min(room / 2);
-    o.text([56, 12, repo_w, 28], repo, Font::Title, Role::Text2, ONE_LINE);
-    o.glyph([56 + repo_w + 8, 12, 12, 28], glyph::CHEVRON_RIGHT, 12, Role::Text2);
+    o.text([56, top, repo_w, 28], repo, Font::Title, Role::Text2, ONE_LINE);
+    o.glyph([56 + repo_w + 8, top, 12, 28], glyph::CHEVRON_RIGHT, 12, Role::Text2);
     let sx = 56 + repo_w + 28;
-    o.label(id::TITLE, [sx, 12, (right - 8 - sx).max(0), 28], skill, Font::Title, Role::Text);
-    o.label(id::SUB, [56, 42, (w - 56 - 24).max(0), 20], diff_sub(v), Font::Caption, Role::Text2);
+    o.label(id::TITLE, [sx, top, (right - 8 - sx).max(0), 28], skill, Font::Title, Role::Text);
+    o.label(id::SUB, sub_at, sub, Font::Caption, Role::Text2);
     let files = v.files();
     if !files.is_empty() {
         let count = match (v.preview, files.len()) {
@@ -2109,7 +2145,18 @@ pub(super) mod tests {
 
     /// 7 DIPs a character, wrapped by characters.
     pub(in crate::win::ui) fn fit(text: &str, font: Font, width: i32) -> (i32, i32) {
-        let w = text.chars().count() as i32 * 7;
+        fit_by(7, text, font, width)
+    }
+
+    /// Like `fit`, but a caption is 6 DIPs a character. Measured in its real font (Segoe UI Variable Text at 12 px),
+    /// the longest sentence under the diff view's title is 497 DIPs for 87 characters, under 5.8 a character; 7 would
+    /// make every such sentence look too long for the window.
+    fn caption_fit(text: &str, font: Font, width: i32) -> (i32, i32) {
+        fit_by(if font == Font::Caption { 6 } else { 7 }, text, font, width)
+    }
+
+    fn fit_by(per: i32, text: &str, font: Font, width: i32) -> (i32, i32) {
+        let w = text.chars().count() as i32 * per;
         let lh = line_height(font);
         if width <= 0 { (w, lh) } else { (w.min(width), ((w + width - 1) / width).max(1) * lh) }
     }
@@ -2396,12 +2443,130 @@ pub(super) mod tests {
 
     #[test]
     fn the_top_mark_has_the_colours_of_the_marks_in_the_list() {
-        let mark = [24, 8, 40, 40];
+        let mark = [24, 16, 40, 40];
         for tone in [Tone::Ok, Tone::Warn, Tone::Err] {
             let s = hero(&Hero { tone, glyph: glyph::OK, title: "Title".to_string(), sub: String::new() }, true, 800, &fit);
             assert!(s.decos.contains(&Deco::Fill { at: mark, radius: 20, fill: tone.dot(), border: Role::None }), "{tone:?}: {:?}", s.decos);
             assert!(s.decos.contains(&Deco::Glyph { at: mark, ch: glyph::OK, size: 18, ink: Role::DotGlyph }), "{tone:?}: {:?}", s.decos);
         }
+    }
+
+    #[test]
+    fn the_band_covers_the_top_of_both_views_with_one_line_under_it() {
+        for w in [640, 980, 1400] {
+            let main = backdrop(split_layout(w, HERO_H, 480 - HERO_H, NAV_W).page[0], w, 480);
+            let diff = diff_backdrop(&diff_layout(w, 480, NAV_W), w, 480);
+            for (view, decos) in [("main", &main), ("diff", &diff)] {
+                let find = |wanted: &Deco| decos.iter().position(|d| d == wanted);
+                let shade = find(&Deco::Gradient { at: [0, 0, w, HERO_H], from: Role::Band, to: Role::BandEnd });
+                let line = find(&Deco::Fill { at: [0, HERO_H - 1, w, 1], radius: 0, fill: Role::BandEdge, border: Role::None });
+                let layer = decos.iter().position(|d| matches!(d, Deco::Fill { fill: Role::Layer, .. }));
+                let (Some(layer), Some(shade), Some(line)) = (layer, shade, line) else { panic!("{view} at {w}: no band in {decos:?}") };
+                assert!(layer < shade && shade < line, "{view} at {w}: the layer, then the band, then its line: {decos:?}");
+                assert_eq!(decos.iter().filter(|d| matches!(d, Deco::Fill { fill: Role::BandEdge, .. })).count(), 1, "{view} at {w}");
+                for (k, d) in decos.iter().enumerate() {
+                    let Deco::Fill { at, radius, border, .. } = d else { continue };
+                    if k < shade && (*border != Role::None || *radius > 0) {
+                        assert!(at[1] + radius < HERO_H - 1, "{view} at {w}: the band hides the top edge and corners of {d:?}");
+                    }
+                    if k > line {
+                        assert!(at[1] > HERO_H, "{view} at {w}: {d:?} is drawn on the band or against its line");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_hero_and_the_diff_header_sit_centred_in_the_band() {
+        let in_the_band = |s: &Surface, w: i32, what: &str| {
+            fits_in(s, w);
+            for i in &s.items {
+                assert!(i.at[1] >= 0 && i.at[1] + i.at[3] < HERO_H, "{what} at {w}: {} ({:?}) at {:?} is not in the band", i.id, i.text, i.at);
+            }
+        };
+        let centred = |top: i32, bottom: i32| top == HERO_H - bottom;
+        let h = Hero {
+            tone: Tone::Warn,
+            glyph: glyph::WARN,
+            title: "3 skills need your attention".to_string(),
+            sub: "In o/a · checked 2 minutes ago · next check in 1 hour".to_string(),
+        };
+        for w in [640, 980, 1400] {
+            let s = hero(&h, true, w, &fit);
+            in_the_band(&s, w, "the hero");
+            let (title, sub, sync) = (item(&s, id::HERO_TITLE), item(&s, id::HERO_SUB), item(&s, id::SYNC));
+            assert_eq!([title.at[1], sub.at[1], sub.at[1] + sub.at[3], sync.at[1]], [14, 42, 58, 20], "at {w}");
+            assert!(centred(title.at[1], sub.at[1] + sub.at[3]) && centred(sync.at[1], sync.at[1] + sync.at[3]), "at {w}");
+            let mark = [24, 16, 40, 40];
+            assert!(s.decos.iter().any(|d| matches!(d, Deco::Fill { at, .. } if *at == mark)) && centred(mark[1], mark[1] + mark[3]));
+
+            let l = diff_layout(w, 480, NAV_W);
+            assert!(l.files_card[1] > HERO_H && l.code_card[1] > HERO_H, "at {w}: the cards start below the band");
+            let choices = diff_of("a\n", "b\n");
+            let preview = DiffView { preview: true, ..choices.clone() };
+            for (what, v) in [("the diff header", &choices), ("the preview header", &preview)] {
+                let s = diff_head(v, &l, &caption_fit);
+                in_the_band(&s, w, what);
+                let row: Vec<&Item> = s.items.iter().filter(|i| i.id == id::BACK || matches!(hit(i.id), Hit::DiffAction(_))).collect();
+                assert_eq!(row.len(), if v.preview { 1 } else { 3 }, "{what} at {w}: Back and the choices");
+                let (title, sub) = (item(&s, id::TITLE), item(&s, id::SUB));
+                if !v.preview && w == 640 {
+                    // The sentence is too long to go beside two choices, so it goes under them.
+                    assert!(row.iter().all(|i| [i.at[1], i.at[3]] == [8, 32]), "{what} at {w}: not on one row at the top: {row:?}");
+                    assert_eq!((title.at[1], sub.at), (10, [56, 44, w - 80, 16]), "{what} at {w}");
+                } else {
+                    let on_row = |i: &&Item| [i.at[1], i.at[3]] == [20, 32] && centred(i.at[1], i.at[1] + i.at[3]);
+                    assert!(row.iter().all(on_row), "{what} at {w}: not on one centred row: {row:?}");
+                    assert_eq!([title.at[1], sub.at[1], sub.at[1] + sub.at[3]], [14, 42, 58], "{what} at {w}");
+                    assert!(centred(title.at[1], sub.at[1] + sub.at[3]), "{what} at {w}");
+                }
+                for d in &s.decos {
+                    let [_, y, _, dh] = deco_at(d);
+                    assert!(y == title.at[1] && dh == title.at[3] || y >= DIFF_TOP, "{what} at {w}: {d:?} is beside the title or in a card's header");
+                }
+            }
+        }
+    }
+
+    // At 640 wide the sentence beside two choices had room for about half of itself, so "Nothing changes until you
+    // choose" was cut off.
+    #[test]
+    fn the_diff_header_shows_its_whole_sentence_beside_or_under_the_choices() {
+        let base = diff_of("a\n", "b\n");
+        let Report::Ready(found) = &base.report else { unreachable!() };
+        let ready = |on_github, here, files: &[FileChange]| Report::Ready(DiffReport { on_github, here, files: files.to_vec() });
+        let reports = [
+            Report::Loading,
+            Report::Failed("GitHub could not be reached".to_string()),
+            ready(true, true, &[]),
+            ready(true, false, &found.files),
+            ready(false, true, &found.files),
+            ready(true, true, &found.files),
+        ];
+        let agents = RepoConfig { kind: SourceKind::Agents, ..base.source.clone() };
+        let (mut sentences, mut tops) = (std::collections::BTreeSet::new(), std::collections::BTreeSet::new());
+        for report in &reports {
+            for source in [&base.source, &agents] {
+                for preview in [false, true] {
+                    let v = DiffView { source: source.clone(), preview, report: report.clone(), ..base.clone() };
+                    for w in [640, 980, 1400] {
+                        let s = diff_head(&v, &diff_layout(w, 480, NAV_W), &caption_fit);
+                        fits_in(&s, w);
+                        for i in &s.items {
+                            assert!(i.at[1] >= 0 && i.at[1] + i.at[3] < HERO_H, "{} ({:?}) at {:?} is not in the band at {w}", i.id, i.text, i.at);
+                        }
+                        let sub = item(&s, id::SUB);
+                        let needed = caption_fit(&sub.text, Font::Caption, 0).0;
+                        assert!(needed <= sub.at[2], "at {w}, {:?} needs {needed} but has {:?}", sub.text, sub.at);
+                        sentences.insert(sub.text.clone());
+                        tops.insert(sub.at[1]);
+                    }
+                }
+            }
+        }
+        assert_eq!(sentences.len(), 10, "every sentence the header can show: {sentences:?}");
+        assert_eq!(tops.into_iter().collect::<Vec<_>>(), [42, 44], "both the centred and the stacked header");
     }
 
     /// A source with all four types: three skills, an agent, instructions that do not sync and a plugin to approve.
@@ -2619,7 +2784,7 @@ pub(super) mod tests {
                 assert!(cards.contains(&card), "at {w}: no card {card:?} under the header in {cards:?}");
                 let drawn = s.decos.iter().filter_map(|d| match d {
                     Deco::Glyph { at, .. } | Deco::Text { at, .. } => Some(at[1]),
-                    Deco::Fill { .. } => None,
+                    Deco::Fill { .. } | Deco::Gradient { .. } => None,
                 });
                 let first = s.items.iter().map(|i| i.at[1]).chain(drawn).filter(|&t| t > y && t < card[1] + card[3]).min();
                 assert_eq!(first, Some(y + if w == 900 { 40 } else { 48 }), "at {w}: the card's contents start 8 below its top");
@@ -3341,7 +3506,7 @@ pub(super) mod tests {
 
     fn deco_at(d: &Deco) -> Rect {
         match d {
-            Deco::Fill { at, .. } | Deco::Glyph { at, .. } | Deco::Text { at, .. } => *at,
+            Deco::Fill { at, .. } | Deco::Gradient { at, .. } | Deco::Glyph { at, .. } | Deco::Text { at, .. } => *at,
         }
     }
 

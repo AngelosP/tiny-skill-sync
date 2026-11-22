@@ -400,7 +400,11 @@ update, the tray starts its new version with `--restarted` (or `--restarted-open
 
 ## The window
 
-The band across the top says how everything is in one sentence ("All skills are up to date", "1 skill needs your
+A softly tinted band runs across the top of the window, under the title bar, with a thin line along its bottom (in
+high contrast it takes the window colour and a text-coloured line). The same band heads **Show changes** and
+**Preview**.
+
+The band says how everything is in one sentence ("All skills are up to date", "1 skill needs your
 attention", "1 source can't be read"); when your sources hold more than one type, it says "items" ("All items are up
 to date"). It counts sources, so one source that syncs several types counts once. When every type found is switched
 off, it says "Nothing is being synced" ("Sync is off for every type found") rather than calling anything up to date. The line under it counts the items
@@ -474,7 +478,8 @@ number in `window.txt`). Nothing widens or narrows when you move the mouse over 
     file and scroll positions stay put.
   - The chosen file's lines are on the right: `+` on green for a line only on GitHub, `−` on red for a line only on this
     PC, with three lines around each change. Long unchanged stretches are folded.
-  - The skill's choices are at the top. **Back** (or Esc) returns.
+  - The skill's choices are at the top. In a narrow window, the line under the skill's name moves below them.
+    **Back** (or Esc) returns.
   - If local or upstream evidence changed since **Show changes**, the app does not replace the copy. Open
     **Show changes** again and confirm only after reviewing the new comparison. If a local file cannot be verified,
     the app leaves it alone.

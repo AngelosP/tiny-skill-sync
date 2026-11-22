@@ -67,6 +67,14 @@
   (`kind_is_on` uses draft settings); no test covers a draft-off type that needs attention.
 - The e2e attention check reopens Skills through `Expand-SourceSections`, so its widened regex runs live (e2e ui 262/262).
 
+## Header band (review, 2026-11-22)
+
+- Unit bar: theme.rs `the_band_stands_out_from_the_title_bar_...` (summed gap ≥ 30 to Bg and Layer, Text/Text2 ≥ 4.5:1,
+  status circles ≥ 3:1, high-contrast edge differs); page.rs `the_diff_header_shows_its_whole_sentence_beside_or_under_the_choices`
+  measures captions at 6 DIP per character (the shared 7-per-character `Fit` overstates Segoe UI, which is under 5.8).
+- Live bar: e2e `Test-Band` (summed gap ≥ 24) in the ui scenario's light and dark restart pass, wide and 640-DIP-narrow
+  Show changes (shots 18*, 19*). e2e ui baseline after the band: 302 checks, 0 failed.
+
 ## Open proposals
 
 - CONTRIBUTING.md Tests: list the extra filters a Plugins change needs (copilot, proc runner, fake_manager), or prefix those tests `plugin_`.

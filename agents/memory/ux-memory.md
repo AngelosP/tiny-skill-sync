@@ -39,6 +39,10 @@
   Shot 08c-collapsed-attention shows a collapsed Skills header with its warning; no shot shows What to sync collapsed.
 - Light-theme contrast on the page background: Text3 #8B8B8B is about 3.1:1 (What to sync's off marks rely on it
   alone, with no tooltip); Warn #9D5D00 is about 4.7:1.
+- Header band (2026-11-22, `HERO_H` 72 in page.rs): light #D3E4FA→#E1EAF7, dark #1B3150→#1B2639, edge line BandEdge;
+  light DotWarn is #B07300 (3.07:1 on the band). `diff_head` stacks its sentence under the buttons at y 44 when it does
+  not fit beside them; a long Failed reason can still be cut at 640 DIP (one line, no tooltip). Focus rings use
+  Role::Text (`control.rs` about line 799). Shots 18-band-light to 19c-band-dark-changes-narrow.
 
 ## Baselines
 

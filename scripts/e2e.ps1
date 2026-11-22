@@ -1482,6 +1482,52 @@ function Test-Unchanged($Before, $After, [IntPtr]$Window, [string]$State, [objec
     Check "${State}: $What looks the same as before" ($n -eq 0) $(if ($n -lt 0) { 'the two pictures are not the same size' } else { "$n pixels of $($Part[0])/$($Part[1]) changed" })
 }
 
+# The band at the top stands apart from the content: a free spot in the band and one in the content just below its
+# edge must differ by at least 24, summed over red, green and blue. The spot in the band is between a control (a pair
+# of a panel and an id) and the next control to its right on that panel (or the panel's edge), level with the middle
+# of the control; the one in the content is 6 DIP below the band. $Band is the band's top and bottom on the screen,
+# read from the hero panel. Each spot is 4 DIP square and must be flat (no colour in it varies by more than 12, which a
+# dithered gradient never does), so it shows the background and not a control.
+function Test-Band($Shot, [IntPtr]$Window, [string]$State, [int[]]$Band, [object[]]$Left) {
+    $what = "${State}: the band at the top is a different colour from the content below it"
+    if (-not $Shot) { Check "${State}: a picture of the window was taken" $false; return }
+    if (-not $Shot.Screen) { Check $what $false 'obstructed'; return }
+    $l = Find-Ui $Window $Left[0] $Left[1]
+    if ($l -eq [IntPtr]::Zero) { Check $what $false "no control $($Left[1]) on panel $($Left[0])"; return }
+    $panel = [TssLive]::GetDlgItem($Window, $Left[0])
+    $w = [int[]](([TssLive]::Bounds($Window)) -split ',')
+    $lb = [int[]](([TssLive]::Bounds($l)) -split ',')
+    $right = ([int[]](([TssLive]::Bounds($panel)) -split ','))[2]
+    foreach ($o in @(Get-Layout $panel | Where-Object { $_.Shown -and $_.Handle -ne $l })) {
+        $ob = [int[]](([TssLive]::Bounds($o.Handle)) -split ',')
+        if ($ob[0] -ge $lb[2] -and $ob[0] -lt $right -and $ob[1] -lt $lb[3] -and $ob[3] -gt $lb[1]) { $right = $ob[0] }
+    }
+    $dpi = [int][TssLive]::GetDpiForWindow($Window)
+    $size = [math]::Max(2, [int](4 * $dpi / 96))
+    $x = [int][math]::Floor(($lb[2] + $right) / 2)
+    $y = [int][math]::Floor(($lb[1] + $lb[3]) / 2)
+    if ($right - $lb[2] -lt $size + 2 -or $y - $size -lt $Band[0] -or $y + $size -gt $Band[1] - 1) {
+        Check $what $false "no free spot in the band: $($right - $lb[2]) px between the control and the next, band $($Band[0])-$($Band[1]), control middle $y"
+        return
+    }
+    $spots = @(
+        [pscustomobject]@{ Name = 'band'; X = $x; Y = $y },
+        [pscustomobject]@{ Name = 'content'; X = $x; Y = $Band[1] + [int][math]::Round(6 * $dpi / 96) }
+    )
+    foreach ($s in $spots) {
+        $px = $s.X - $w[0] - [int][math]::Floor($size / 2)
+        $py = $s.Y - $w[1] - [int][math]::Floor($size / 2)
+        $s | Add-Member -NotePropertyName Rgb -NotePropertyValue ([TssLive]::Mean($Shot.Path, $px, $py, $size, $size))
+        $s | Add-Member -NotePropertyName Varies -NotePropertyValue ([TssLive]::Contrast($Shot.Path, $px, $py, $size, $size))
+        $s | Add-Member -NotePropertyName At -NotePropertyValue "$px,$py"
+    }
+    $apart = 0
+    for ($k = 0; $k -lt 3; $k++) { $apart += [math]::Abs($spots[0].Rgb[$k] - $spots[1].Rgb[$k]) }
+    $flat = @($spots | Where-Object { $_.Varies -lt 0 -or $_.Varies -gt 12 -or $_.Rgb[0] -lt 0 }).Count -eq 0
+    $seen = (@($spots | ForEach-Object { "$($_.Name) rgb($($_.Rgb -join ',')) at $($_.At), varies by $($_.Varies)" }) -join '; ') + "; apart by $apart"
+    Check $what ($flat -and $apart -ge 24) $seen
+}
+
 # Each part of the window shown is inside it and none is over another; inside each part, every control that can be
 # used is inside it from left to right (the pages scroll, so up and down is not checked), and no control, whether Tab
 # visits it or not, is over another. Controls are sibling windows that do not clip each other, so one that paints again
@@ -2637,6 +2683,73 @@ function Test-Ui {
         Check 'the app showed no error box' ($box -eq [IntPtr]::Zero)
         Send-LiveCommand $tray $CMD_QUIT
         Check 'Quit ends the app' ($tray.WaitForExit(5000))
+
+        # ---- the band at the top, in the light and the dark theme
+        # The pictures above follow this PC's theme; TSS_THEME sets each theme in turn. The band at the top of the window
+        # and of Show changes must stand apart from the content below it in both. High contrast overrides TSS_THEME and
+        # draws the band in the window colour, so then only the pictures and the painting are checked.
+        $highContrast = [System.Windows.Forms.SystemInformation]::HighContrast
+        if ($highContrast) { Note 'high contrast is on, so the band has the window colour and its colour is not checked' }
+        foreach ($theme in @(@('light', '18'), @('dark', '19'))) {
+            $mode = $theme[0]
+            Stop-LiveTray $tray
+            $started = Get-MarkCount $c.Report 'job-startup'
+            $tray = Start-Tray $c @{ TSS_THEME = $mode }
+            $up = Wait-Maybe { (Get-MarkCount $c.Report 'job-startup') -gt $started } 30
+            Check "the $mode theme: the app starts" ($null -ne $up) "job-startup marks: $(Get-MarkCount $c.Report 'job-startup'), $started before"
+            $win = Open-Window $tray
+            [void][TssLive]::SetWindowPos($win, [IntPtr](-1), 0, 0, 0, 0, 0x13)
+            $first = @(Read-Nav $win | Where-Object { $_.Folder -eq 'skills' })
+            Open-Repo $win $(if ($first.Count) { $first[0].Index } else { 0 })
+            Wait-Settled $c
+            $again = Wait-Maybe { @(Read-Nav $win | Where-Object { $_.Folder -eq 'skills' -and $_.Sub -eq 'Needs attention (1)' }).Count -eq 1 } 20
+            Check "the $mode theme: the edited skill needs attention again" ($null -ne $again) (Show-Nav $win)
+            $heroBox = [int[]](([TssLive]::Bounds([TssLive]::GetDlgItem($win, $UiPanel.Hero))) -split ',')
+            $band = @($heroBox[1], $heroBox[3])
+            Note "the $mode theme: the band is $($heroBox[3] - $heroBox[1]) px high at $([TssLive]::GetDpiForWindow($win)) dpi"
+            $pic = Save-Shot $win "$($theme[1])-band-$mode"
+            Test-Painted $pic $win "the $mode theme" @(@($UiPanel.Hero, $UiId.HeroTitle), @($UiPanel.Hero, $UiId.Sync))
+            Test-Layout $win "the $mode theme"
+            if (-not $highContrast) { Test-Band $pic $win "the $mode theme" $band @($UiPanel.Hero, $UiId.HeroTitle) }
+
+            # Show changes heads its view with the same band, as tall as the hero panel.
+            $show = Wait-Maybe { @(@(Read-Skills $win | Where-Object { $_.Name -eq 'alpha' }) | ForEach-Object { $_.Buttons } | Where-Object { $_.Text -eq 'Show changes' })[0] } 10
+            Check "the $mode theme: the edited skill still offers Show changes" ($null -ne $show)
+            if ($null -eq $show) { continue }
+            Click-Ui $win $UiPanel.Page $show.Id
+            $file = Wait-Maybe { $t = Read-Ui $win $UiPanel.Files $UiId.File; if ($t) { $t } } 15
+            $inDiff = $null -ne $file -and [TssLive]::Shown([TssLive]::GetDlgItem($win, $UiPanel.Head))
+            Check "the $mode theme: Show changes opens" $inDiff
+            if (-not $inDiff) { continue }
+            $pic = Save-Shot $win "$($theme[1])b-band-$mode-changes"
+            Test-Painted $pic $win "Show changes in the $mode theme" @(@($UiPanel.Head, $UiId.Back), @($UiPanel.Head, $UiId.Title), @($UiPanel.Head, $UiId.DiffAction), @($UiPanel.Files, $UiId.File))
+            Test-Layout $win "Show changes in the $mode theme"
+            if (-not $highContrast) { Test-Band $pic $win "Show changes in the $mode theme" $band @($UiPanel.Head, $UiId.Title) }
+
+            # The narrowest window the app allows, where the line under the title has the least room. The band does not
+            # move, so the band measured above still holds. The window then goes back to its size, which it saves, so
+            # the next theme opens as wide as this one did.
+            $dpi = [int][TssLive]::GetDpiForWindow($win)
+            $wide = [int[]](([TssLive]::Bounds($win)) -split ',')
+            [void][TssLive]::SetWindowPos($win, [IntPtr]::Zero, 0, 0, [int](640 * $dpi / 96), $wide[3] - $wide[1], 0x16)
+            [void][TssLive]::PostMessageW($win, $WM_EXITSIZEMOVE, [IntPtr]::Zero, [IntPtr]::Zero)
+            Start-Sleep -Milliseconds 600
+            $narrow = "a narrow Show changes in the $mode theme"
+            Note "${narrow}: client $([math]::Floor([int]((([TssLive]::Client($win)) -split ',')[0]) * 96 / $dpi)) DIP wide"
+            $pic = Save-Shot $win "$($theme[1])c-band-$mode-changes-narrow"
+            Test-Painted $pic $win $narrow @(@($UiPanel.Head, $UiId.Back), @($UiPanel.Head, $UiId.Title), @($UiPanel.Head, $UiId.Sub))
+            Test-Layout $win $narrow
+            if (-not $highContrast) { Test-Band $pic $win $narrow $band @($UiPanel.Head, $UiId.Title) }
+            [void][TssLive]::SetWindowPos($win, [IntPtr]::Zero, 0, 0, $wide[2] - $wide[0], $wide[3] - $wide[1], 0x16)
+            [void][TssLive]::PostMessageW($win, $WM_EXITSIZEMOVE, [IntPtr]::Zero, [IntPtr]::Zero)
+            $restored = Wait-Maybe {
+                $now = [int]((([TssLive]::Client($win)) -split ',')[0])
+                $saved = (Read-WindowSizeFile $c) -split ' '
+                if ([TssLive]::Bounds($win) -eq ($wide -join ',') -and [math]::Abs([int]$saved[0] - [math]::Floor($now * 96 / $dpi)) -le 1) { $true }
+            } 5
+            Check "the $mode theme: the window goes back to its size after the narrow picture, and saves it" ($null -ne $restored) "window $([TssLive]::Bounds($win)), was $($wide -join ','); window.txt: $(Read-WindowSizeFile $c)"
+        }
+        Stop-LiveTray $tray
     } finally {
         if (-not $Keep) { try { Remove-StartupKeys $keys } catch { Note "could not delete $($keys.Root): $_" } }
         Close-Env $c

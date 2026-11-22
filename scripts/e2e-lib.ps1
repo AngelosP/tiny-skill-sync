@@ -184,6 +184,24 @@ public static class TssLive {
         }
     }
 
+    // The average colour of a part of a picture, as { R, G, B }: what a dithered fill looks like from a step back.
+    // { -1, -1, -1 } when the part is outside the picture.
+    public static int[] Mean(string path, int x, int y, int w, int h) {
+        using (Bitmap bmp = new Bitmap(path)) {
+            long[] sum = new long[3];
+            long n = 0;
+            for (int j = Math.Max(0, y); j < Math.Min(bmp.Height, y + h); j++) {
+                for (int i = Math.Max(0, x); i < Math.Min(bmp.Width, x + w); i++) {
+                    Color c = bmp.GetPixel(i, j);
+                    sum[0] += c.R; sum[1] += c.G; sum[2] += c.B;
+                    n++;
+                }
+            }
+            if (n == 0) return new int[] { -1, -1, -1 };
+            return new int[] { (int)(sum[0] / n), (int)(sum[1] / n), (int)(sum[2] / n) };
+        }
+    }
+
     // How many pixels of a part differ between two pictures of the same window by more than 16 in any one colour, or
     // -1 when the pictures are not the same size.
     public static int Differ(string pathA, string pathB, int x, int y, int w, int h) {
@@ -1032,7 +1050,7 @@ function Read-Skills([IntPtr]$Window) {
 # Shows the page of the repository at this place in the list, and waits until it shows.
 function Open-Repo([IntPtr]$Window, [int]$Index = 0) {
     Click-Ui $Window $UiPanel.Nav ($UiId.NavRepo + $Index)
-    Wait-Live { if ((Find-Ui $Window $UiPanel.Page $UiId.Title) -ne [IntPtr]::Zero) { $true } } 'the page of the repository' 10 100
+    [void](Wait-Live { if ((Find-Ui $Window $UiPanel.Page $UiId.Title) -ne [IntPtr]::Zero) { $true } } 'the page of the repository' 10 100)
     Start-Sleep -Milliseconds 300
 }
 
