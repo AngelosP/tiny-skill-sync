@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::time::Instant;
 
 use crate::config::{Paths, UpdatePrefs, UpdateTiming};
+use crate::github::SystemTokens;
 use crate::interval::now_secs;
 use crate::release::{Feed, Offer, Official, ReleaseError, VerifiedPair, Version};
 use crate::replacement::{self, VerifiedTray};
@@ -154,7 +155,7 @@ pub(crate) struct Updates {
 impl Updates {
     pub fn system() -> Self {
         Self {
-            feed: Box::new(Official::default()),
+            feed: Box::new(Official::new(SystemTokens)),
             files: Box::new(Disk),
             pending: None,
             transactions: Transactions::default(),
@@ -356,7 +357,7 @@ impl Updates {
     }
 }
 
-/// Manual CLI actions never obtain the skill token or open the skill ownership record. They never restart a tray.
+/// Manual CLI actions share the tray's metadata fallback. They never open the skill ownership record or restart a tray.
 pub fn manual(home: &Path, dir: &Path, skills: &Path, action: Action) -> Result<String, String> {
     let mut updates = Updates::system();
     let message =

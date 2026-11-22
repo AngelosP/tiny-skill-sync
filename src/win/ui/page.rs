@@ -1445,9 +1445,11 @@ fn setting(o: &mut Out, x: i32, y: i32, cw: i32, mark: char, title: &str, desc: 
 
 pub fn token_text(saved: bool) -> &'static str {
     if saved {
-        "Used automatically when a repository can’t be read without it. Your token is saved in Windows Credential Manager on this PC."
+        "Used automatically when a repository can’t be read without it, or when GitHub limits app update checks. \
+         Your token is saved in Windows Credential Manager on this PC."
     } else {
-        "Used automatically when a repository can’t be read without it. No token is saved, so your GitHub CLI sign-in is used if you have one."
+        "Used automatically when a repository can’t be read without it, or when GitHub limits app update checks. \
+         No token is saved, so your GitHub CLI sign-in is used if you have one."
     }
 }
 

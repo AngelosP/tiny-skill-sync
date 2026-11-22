@@ -9,9 +9,11 @@ use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 
+use crate::github::TokenProvider;
 use crate::interval::{add_months, format_utc, now_secs};
+use crate::secret::Secret;
 use crate::win::http::{HttpError, Response, Url};
-use crate::win::release_hash;
+use crate::win::{proc, release_hash};
 
 const LATEST: &str = "https://api.github.com/repos/AngelosP/tiny-skill-sync/releases/latest";
 const BY_TAG: &str = "https://api.github.com/repos/AngelosP/tiny-skill-sync/releases/tags";
@@ -21,6 +23,8 @@ const MAX_METADATA: usize = 256 * 1024;
 const MAX_EXE: usize = 8 * 1024 * 1024;
 const MAX_REDIRECTS: usize = 2;
 const OPERATION_TIMEOUT: Duration = Duration::from_secs(90);
+// Allow for process setup and pipe cleanup as well as gh's wait.
+const TOKEN_LOOKUP_BUDGET: Duration = proc::GH_TIMEOUT.saturating_add(Duration::from_secs(2));
 const END_OF_YEAR_9999: i64 = 253_402_300_799;
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
@@ -168,17 +172,47 @@ pub trait Feed {
 }
 
 type Reply = Result<(Response, Vec<u8>), HttpError>;
-/// The transport accepts only destinations selected here; it cannot be pointed at an arbitrary HTTPS server.
-pub(crate) struct ReleaseUrl(Url);
+// Only this module can construct destinations. A download URL cannot be used with a bearer.
+pub(crate) struct MetadataUrl(Url);
+pub(crate) struct DownloadUrl(Url);
 
-impl ReleaseUrl {
-    pub(crate) fn url(&self) -> &Url {
-        &self.0
+#[cfg(test)]
+impl MetadataUrl {
+    pub(crate) fn fixture(address: &str) -> Self {
+        Self(Url::parse(address).unwrap())
     }
 }
 
-// No bearer, credentials, base URL, proxy, referrer or arbitrary header input.
-type Get<'a> = dyn Fn(&ReleaseUrl, usize, &Attempt<'_>) -> Reply + 'a;
+#[cfg(test)]
+impl DownloadUrl {
+    pub(crate) fn fixture(address: &str) -> Self {
+        Self(Url::parse(address).unwrap())
+    }
+}
+
+/// No configurable base URL, proxy, referrer or arbitrary headers.
+pub(crate) enum ReleaseRequest<'a> {
+    Metadata { url: &'a MetadataUrl, bearer: Option<&'a Secret> },
+    Download(&'a DownloadUrl),
+}
+
+impl ReleaseRequest<'_> {
+    pub(crate) fn url(&self) -> &Url {
+        match self {
+            Self::Metadata { url, .. } => &url.0,
+            Self::Download(url) => &url.0,
+        }
+    }
+
+    pub(crate) fn bearer(&self) -> Option<&Secret> {
+        match self {
+            Self::Metadata { bearer, .. } => *bearer,
+            Self::Download(_) => None,
+        }
+    }
+}
+
+type Get<'a> = dyn Fn(ReleaseRequest<'_>, usize, &Attempt<'_>) -> Reply + 'a;
 
 pub(crate) struct Attempt<'a> {
     deadline: Instant,
@@ -200,16 +234,30 @@ impl Attempt<'_> {
     }
 }
 
-#[derive(Default)]
-pub struct Official {}
+#[cfg(test)]
+impl<'a> Attempt<'a> {
+    pub(crate) fn with_timeout(cancel: &'a AtomicBool, timeout: Duration) -> Self {
+        Self { deadline: Instant::now() + timeout, cancel, clock: &Instant::now, receipt_time: &now_secs }
+    }
+}
 
-impl Feed for Official {
+pub struct Official<T: TokenProvider> {
+    tokens: T,
+}
+
+impl<T: TokenProvider> Official<T> {
+    pub fn new(tokens: T) -> Self {
+        Self { tokens }
+    }
+}
+
+impl<T: TokenProvider> Feed for Official<T> {
     fn check(&self, installed: Version, _now: i64, cancel: &AtomicBool) -> Result<Option<Offer>, ReleaseError> {
-        check_at(&release_hash::get, installed, cancel, &Instant::now, &now_secs)
+        check_at(&release_hash::get, &self.tokens, installed, cancel, &Instant::now, &now_secs)
     }
 
     fn originals(&self, offer: &Offer, installed: Version, _now: i64, cancel: &AtomicBool) -> Result<Offer, ReleaseError> {
-        originals_at(&release_hash::get, offer, installed, cancel, &Instant::now, &now_secs)
+        originals_at(&release_hash::get, &self.tokens, offer, installed, cancel, &Instant::now, &now_secs)
     }
 
     fn fetch(&self, offer: &Offer, _now: i64, cancel: &AtomicBool) -> Result<VerifiedPair, ReleaseError> {
@@ -275,7 +323,12 @@ fn http_date(s: &str, now: i64) -> Option<i64> {
     (weekday == if long_weekday { name } else { &name[..3] }).then_some(at)
 }
 
-fn response_error(r: &Response, now: i64) -> ReleaseError {
+struct ResponseFailure {
+    error: ReleaseError,
+    limited: bool,
+}
+
+fn response_error(r: &Response, now: i64) -> ResponseFailure {
     let header = |name| one_header(r, name).ok().flatten();
     let retry = header("retry-after").and_then(|v| if let Some(delta) = decimal(v) { now.checked_add(delta) } else { http_date(v, now) });
     let reset = header("x-ratelimit-reset").and_then(decimal);
@@ -283,16 +336,17 @@ fn response_error(r: &Response, now: i64) -> ReleaseError {
     let usable = |at: &i64| *at >= now && *at <= END_OF_YEAR_9999;
     let remaining = header("x-ratelimit-remaining");
     let limited = r.status == 429 || (r.status == 403 && (remaining == Some("0") || retry.is_some() || (remaining.is_none() && reset.is_some())));
-    if limited {
+    let error = if limited {
         ReleaseError { message: "GitHub has limited update requests. Try again later.".into(), retry_at: retry.filter(usable).or_else(|| reset.filter(usable)) }
     } else {
         ReleaseError { message: format!("The update server returned HTTP {}.", r.status), retry_at: if r.status == 503 { retry.filter(usable) } else { None } }
-    }
+    };
+    ResponseFailure { error, limited }
 }
 
-fn read(get: &Get<'_>, url: &ReleaseUrl, limit: usize, work: &Attempt<'_>) -> Result<(Response, Vec<u8>), ReleaseError> {
+fn read(get: &Get<'_>, request: ReleaseRequest<'_>, limit: usize, work: &Attempt<'_>) -> Result<(Response, Vec<u8>), ReleaseError> {
     work.running()?;
-    let reply = get(url, limit, work);
+    let reply = get(request, limit, work);
     work.running()?;
     let (r, bytes) = reply.map_err(http_error)?;
     if r.status == 200 {
@@ -349,38 +403,67 @@ fn parse_digest(value: &str) -> Option<[u8; 32]> {
     Some(out)
 }
 
-fn metadata_at(get: &Get<'_>, url: &str, work: &Attempt<'_>) -> Result<WireRelease, ReleaseError> {
-    let (r, body) = read(get, &ReleaseUrl(Url::parse(url).expect("fixed HTTPS API and numeric version")), MAX_METADATA, work)?;
-    if r.status != 200 {
-        return Err(response_error(&r, (work.receipt_time)())); // Metadata redirects are never followed, not even to a CDN.
+fn metadata_at<T>(
+    get: &Get<'_>,
+    tokens: &dyn TokenProvider,
+    url: &str,
+    work: &Attempt<'_>,
+    validate: impl FnOnce(WireRelease) -> Result<T, ReleaseError>,
+) -> Result<T, ReleaseError> {
+    let validate_body = |body: &[u8]| {
+        let listing = serde_json::from_slice(body).map_err(|_| error("GitHub sent incomplete or invalid release details."))?;
+        work.running()?;
+        validate(listing)
+    };
+    let url = MetadataUrl(Url::parse(url).expect("fixed HTTPS API and numeric version"));
+    let (r, body) = read(get, ReleaseRequest::Metadata { url: &url, bearer: None }, MAX_METADATA, work)?;
+    if r.status == 200 {
+        return validate_body(&body);
     }
-    let listing: WireRelease = serde_json::from_slice(&body).map_err(|_| error("GitHub sent incomplete or invalid release details."))?;
-    work.running()?;
-    Ok(listing)
+    // Metadata redirects are never followed, not even to another API endpoint.
+    let ResponseFailure { error: original, limited } = response_error(&r, (work.receipt_time)());
+    if !limited || !work.remaining().is_ok_and(|remaining| remaining > TOKEN_LOOKUP_BUDGET) {
+        return Err(original);
+    }
+    let retry = {
+        let Ok(bearer) = tokens.token() else { return Err(original) };
+        // read checks the same attempt again before sending, including cancellation during lookup.
+        read(get, ReleaseRequest::Metadata { url: &url, bearer: Some(&bearer) }, MAX_METADATA, work)
+    };
+    match retry {
+        Ok((r, body)) if r.status == 200 => validate_body(&body).map_err(|_| original),
+        _ => Err(original),
+    }
 }
 
 fn check_at(
     get: &Get<'_>,
+    tokens: &dyn TokenProvider,
     installed: Version,
     cancel: &AtomicBool,
     clock: &dyn Fn() -> Instant,
     receipt_time: &dyn Fn() -> i64,
 ) -> Result<Option<Offer>, ReleaseError> {
     let work = Attempt { deadline: clock() + OPERATION_TIMEOUT, cancel, clock, receipt_time };
-    let listing = metadata_at(get, LATEST, &work)?;
-    if listing.draft || listing.prerelease {
-        return Ok(None);
-    }
-    let version =
-        listing.tag_name.strip_prefix('v').and_then(|v| v.parse::<Version>().ok()).ok_or_else(|| error("The release tag is not a stable vX.Y.Z version."))?;
-    if version <= installed {
-        return Ok(None);
-    }
-    checked_assets(listing, version, true, &work).map(Some)
+    metadata_at(get, tokens, LATEST, &work, |listing| {
+        if listing.draft || listing.prerelease {
+            return Ok(None);
+        }
+        let version = listing
+            .tag_name
+            .strip_prefix('v')
+            .and_then(|v| v.parse::<Version>().ok())
+            .ok_or_else(|| error("The release tag is not a stable vX.Y.Z version."))?;
+        if version <= installed {
+            return Ok(None);
+        }
+        checked_assets(listing, version, true, &work).map(Some)
+    })
 }
 
 fn originals_at(
     get: &Get<'_>,
+    tokens: &dyn TokenProvider,
     offer: &Offer,
     installed: Version,
     cancel: &AtomicBool,
@@ -392,11 +475,12 @@ fn originals_at(
     }
     let work = Attempt { deadline: offer.deadline, cancel, clock, receipt_time };
     let tag = format!("v{installed}");
-    let listing = metadata_at(get, &format!("{BY_TAG}/{tag}"), &work)?;
-    if listing.tag_name != tag || listing.prerelease || listing.draft {
-        return Err(error("GitHub did not return the exact installed stable release."));
-    }
-    checked_assets(listing, installed, false, &work)
+    metadata_at(get, tokens, &format!("{BY_TAG}/{tag}"), &work, |listing| {
+        if listing.tag_name != tag || listing.prerelease || listing.draft {
+            return Err(error("GitHub did not return the exact installed stable release."));
+        }
+        checked_assets(listing, installed, false, &work)
+    })
 }
 
 fn checked_assets(listing: WireRelease, version: Version, update: bool, work: &Attempt<'_>) -> Result<Offer, ReleaseError> {
@@ -417,7 +501,7 @@ fn checked_assets(listing: WireRelease, version: Version, update: bool, work: &A
     Ok(Offer { version, source_version: version, assets: [tray, cli], deadline: work.deadline, update })
 }
 
-fn cdn_location(location: &str) -> Result<ReleaseUrl, ReleaseError> {
+fn cdn_location(location: &str) -> Result<DownloadUrl, ReleaseError> {
     let bad = || error("The release download was redirected to an unapproved address.");
     if location.len() > 8192 || !location.bytes().all(|b| (b'!'..=b'~').contains(&b)) || location.contains(['\\', '#']) {
         return Err(bad());
@@ -440,14 +524,14 @@ fn cdn_location(location: &str) -> Result<ReleaseUrl, ReleaseError> {
             return Err(bad());
         }
     }
-    Url::parse(location).map(ReleaseUrl).map_err(|_| bad())
+    Url::parse(location).map(DownloadUrl).map_err(|_| bad())
 }
 
 fn fetch_file(get: &Get<'_>, offer: &Offer, index: usize, work: &Attempt<'_>) -> Result<VerifiedFile, ReleaseError> {
     let asset = offer.assets[index];
-    let mut url = ReleaseUrl(Url::parse(&download_url(offer.source_version, index)).expect("fixed HTTPS prefix and numeric version"));
+    let mut url = DownloadUrl(Url::parse(&download_url(offer.source_version, index)).expect("fixed HTTPS prefix and numeric version"));
     for hops in 0..=MAX_REDIRECTS {
-        let (r, bytes) = read(get, &url, asset.size, work)?;
+        let (r, bytes) = read(get, ReleaseRequest::Download(&url), asset.size, work)?;
         match r.status {
             200 => {
                 if bytes.len() != asset.size {
@@ -463,7 +547,7 @@ fn fetch_file(get: &Get<'_>, offer: &Offer, index: usize, work: &Attempt<'_>) ->
                 let location = one_header(&r, "location")?.ok_or_else(|| error("The download redirect has no destination."))?;
                 url = cdn_location(location)?;
             }
-            _ => return Err(response_error(&r, (work.receipt_time)())),
+            _ => return Err(response_error(&r, (work.receipt_time)()).error),
         }
     }
     unreachable!("last response returns without following a redirect")
@@ -492,6 +576,7 @@ fn fetch_at(
 mod tests {
     use std::cell::{Cell, RefCell};
     use std::collections::VecDeque;
+    use std::sync::atomic::AtomicUsize;
 
     use serde_json::{Value, json};
 
@@ -499,14 +584,40 @@ mod tests {
     use crate::hash::hex;
 
     const API: &str = "https://api.github.com/repos/AngelosP/tiny-skill-sync/releases/latest";
+    const TAG_API: &str = "https://api.github.com/repos/AngelosP/tiny-skill-sync/releases/tags/v1.9.9";
+    const FIXTURE_BEARER: &str = "fixture-bearer";
     const BASE: &str = "https://github.com/AngelosP/tiny-skill-sync/releases/download/v1.10.0";
     const CDN: &str = "https://release-assets.githubusercontent.com/download/id?signature=do-not-show";
     const TRAY: &[u8] = b"tray fixture";
     const CLI: &[u8] = b"command line fixture";
     const NOW: i64 = 10_000;
 
+    struct NoLookup;
+
+    impl TokenProvider for NoLookup {
+        fn token(&self) -> Result<Secret, String> {
+            panic!("the token should not be looked up")
+        }
+    }
+
+    struct Lookup<F>(F);
+
+    impl<F: Fn() -> Result<Secret, String> + Send + Sync> TokenProvider for Lookup<F> {
+        fn token(&self) -> Result<Secret, String> {
+            (self.0)()
+        }
+    }
+
+    fn fixture_bearer() -> Result<Secret, String> {
+        Ok(Secret::new(FIXTURE_BEARER))
+    }
+
+    fn no_token() -> Result<Secret, String> {
+        Err("No fixture token was found.".into())
+    }
+
     fn check(get: &Get<'_>, installed: Version, now: i64, cancel: &AtomicBool) -> Result<Option<Offer>, ReleaseError> {
-        check_at(get, installed, cancel, &Instant::now, &|| now)
+        check_at(get, &NoLookup, installed, cancel, &Instant::now, &|| now)
     }
 
     fn fetch(get: &Get<'_>, offer: &Offer, now: i64, cancel: &AtomicBool) -> Result<VerifiedPair, ReleaseError> {
@@ -539,14 +650,33 @@ mod tests {
         Ok((Response { status, headers: headers.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(), error_body: vec![] }, bytes.to_vec()))
     }
 
-    fn script(steps: Vec<(String, usize, Reply)>) -> impl Fn(&ReleaseUrl, usize, &Attempt<'_>) -> Reply {
+    fn script(steps: Vec<(String, usize, Reply)>) -> impl Fn(ReleaseRequest<'_>, usize, &Attempt<'_>) -> Reply {
+        script_with_bearer(steps.into_iter().map(|(url, limit, reply)| (url, limit, false, reply)).collect())
+    }
+
+    fn script_with_bearer(steps: Vec<(String, usize, bool, Reply)>) -> impl Fn(ReleaseRequest<'_>, usize, &Attempt<'_>) -> Reply {
         let steps = RefCell::new(VecDeque::from(steps));
-        move |url, limit, _| {
-            let (expected, budget, result) = steps.borrow_mut().pop_front().expect("an unexpected request was made");
-            assert_eq!(url.url().to_string(), expected);
+        move |request, limit, _| {
+            let (expected, budget, authenticated, result) = steps.borrow_mut().pop_front().expect("an unexpected request was made");
+            assert_eq!(request.url().to_string(), expected);
             assert_eq!(limit, budget);
+            assert_eq!(request.bearer().is_some(), authenticated, "wrong authorization for the request");
+            assert_eq!(matches!(request, ReleaseRequest::Metadata { .. }), expected.starts_with("https://api.github.com/"));
+            assert!(request.bearer().is_none_or(|token| token.expose() == FIXTURE_BEARER));
             result
         }
+    }
+
+    fn limited_reply() -> Reply {
+        response(429, &[("retry-after", "30")], b"untrusted first response")
+    }
+
+    fn original_limit() -> ReleaseError {
+        ReleaseError { message: "GitHub has limited update requests. Try again later.".into(), retry_at: Some(NOW + 30) }
+    }
+
+    fn metadata_retry(url: &str, first: Reply, retry: Reply) -> impl Fn(ReleaseRequest<'_>, usize, &Attempt<'_>) -> Reply {
+        script_with_bearer(vec![(url.into(), MAX_METADATA, false, first), (url.into(), MAX_METADATA, true, retry)])
     }
 
     fn check_reply(reply: Reply, installed: &str) -> Result<Option<Offer>, ReleaseError> {
@@ -559,6 +689,205 @@ mod tests {
 
     fn offer() -> Offer {
         listing(&metadata(), "1.9.9").unwrap().unwrap()
+    }
+
+    #[test]
+    fn latest_metadata_retries_a_rate_limit() {
+        for (status, headers) in
+            [(429, vec![]), (403, vec![("x-ratelimit-remaining", "0")]), (403, vec![("retry-after", "30")]), (403, vec![("x-ratelimit-reset", "12000")])]
+        {
+            let lookups = AtomicUsize::new(0);
+            let tokens = Lookup(|| {
+                lookups.fetch_add(1, Ordering::Relaxed);
+                fixture_bearer()
+            });
+            let retry = response(200, &[], &serde_json::to_vec(&metadata()).unwrap());
+            let scripted = metadata_retry(API, response(status, &headers, b""), retry);
+            let get = |request: ReleaseRequest<'_>, limit, work: &Attempt<'_>| {
+                assert_eq!(lookups.load(Ordering::Relaxed), usize::from(request.bearer().is_some()));
+                scripted(request, limit, work)
+            };
+            let found = check_at(&get, &tokens, "1.9.9".parse().unwrap(), &AtomicBool::new(false), &Instant::now, &|| NOW).unwrap().unwrap();
+            assert_eq!(found.version.to_string(), "1.10.0");
+            assert_eq!(found.assets, offer().assets);
+        }
+    }
+
+    #[test]
+    fn installed_tag_retry_does_not_authorize_downloads_or_their_redirects() {
+        let get = script_with_bearer(vec![
+            (TAG_API.into(), MAX_METADATA, false, limited_reply()),
+            (TAG_API.into(), MAX_METADATA, true, response(200, &[], &serde_json::to_vec(&old_metadata()).unwrap())),
+            (format!("{BASE}/tiny-skill-sync.exe"), TRAY.len(), false, response(302, &[("location", CDN)], b"")),
+            (CDN.into(), TRAY.len(), false, response(200, &[], TRAY)),
+            (format!("{BASE}/tss.exe"), CLI.len(), false, response(200, &[], CLI)),
+        ]);
+        let installed = "1.9.9".parse().unwrap();
+        let target = offer();
+        let cancel = AtomicBool::new(false);
+        let old = originals_at(&get, &Lookup(fixture_bearer), &target, installed, &cancel, &Instant::now, &|| NOW).unwrap();
+        assert_eq!(old.version, installed);
+        assert_eq!(old.assets, target.assets);
+        let pair = fetch(&get, &target, NOW, &cancel).unwrap();
+        assert!(pair.matches(&target));
+    }
+
+    #[test]
+    fn only_a_rate_limit_prompts_token_lookup() {
+        let installed = "1.9.9".parse().unwrap();
+        let target = offer(); // Successful anonymous metadata uses a panicking provider, too.
+        let cancel = AtomicBool::new(false);
+        for (status, headers, retry_at) in [
+            (404, vec![], None),
+            (403, vec![], None),
+            (403, vec![("x-ratelimit-remaining", "5"), ("x-ratelimit-reset", "12000")], None),
+            (503, vec![("retry-after", "40")], Some(NOW + 40)),
+            (302, vec![("location", TAG_API)], None),
+        ] {
+            let get = script(vec![(API.into(), MAX_METADATA, response(status, &headers, b""))]);
+            let expected = ReleaseError { message: format!("The update server returned HTTP {status}."), retry_at };
+            assert_eq!(check(&get, installed, NOW, &cancel).unwrap_err(), expected);
+            let get = script(vec![(TAG_API.into(), MAX_METADATA, response(status, &headers, b""))]);
+            assert_eq!(originals_at(&get, &NoLookup, &target, installed, &cancel, &Instant::now, &|| NOW).unwrap_err(), expected);
+        }
+    }
+
+    #[test]
+    fn missing_tokens_and_lookup_errors_keep_the_anonymous_error() {
+        for detail in ["No fixture token was found.", "A provider failed with private details."] {
+            let lookups = AtomicUsize::new(0);
+            let tokens = Lookup(|| {
+                lookups.fetch_add(1, Ordering::Relaxed);
+                Err(detail.into())
+            });
+            let get = script(vec![(API.into(), MAX_METADATA, limited_reply())]);
+            let e = check_at(&get, &tokens, "1.9.9".parse().unwrap(), &AtomicBool::new(false), &Instant::now, &|| NOW).unwrap_err();
+            assert_eq!(e, original_limit());
+            assert_eq!(lookups.load(Ordering::Relaxed), 1);
+        }
+    }
+
+    #[test]
+    fn a_failed_authenticated_retry_keeps_the_anonymous_error_and_never_tries_again() {
+        let mut bad = metadata();
+        bad["assets"][0]["digest"] = Value::Null;
+        for retry in [
+            response(401, &[], b"untrusted response"),
+            response(403, &[("x-ratelimit-remaining", "0")], b""),
+            response(404, &[], b""),
+            response(429, &[("retry-after", "600")], b""),
+            response(503, &[("retry-after", "600")], b""),
+            response(302, &[("location", TAG_API)], b""),
+            Err(HttpError::Timeout),
+            Err(HttpError::InsecureToken),
+            response(200, &[], b"not JSON"),
+            response(200, &[], &serde_json::to_vec(&bad).unwrap()),
+        ] {
+            let calls = Cell::new(0);
+            let scripted = metadata_retry(API, limited_reply(), retry);
+            let get = |request: ReleaseRequest<'_>, limit, work: &Attempt<'_>| {
+                calls.set(calls.get() + 1);
+                scripted(request, limit, work)
+            };
+            let e = check_at(&get, &Lookup(fixture_bearer), "1.9.9".parse().unwrap(), &AtomicBool::new(false), &Instant::now, &|| NOW).unwrap_err();
+            assert_eq!(e, original_limit());
+            assert_eq!(calls.get(), 2);
+        }
+    }
+
+    #[test]
+    fn latest_retry_skips_asset_checks_when_the_release_is_not_newer() {
+        let mut same = metadata();
+        same["assets"] = json!([]);
+        let installed = "1.10.0".parse().unwrap();
+        let cancel = AtomicBool::new(false);
+        let get = metadata_retry(API, limited_reply(), response(200, &[], &serde_json::to_vec(&same).unwrap()));
+        assert_eq!(check_at(&get, &Lookup(fixture_bearer), installed, &cancel, &Instant::now, &|| NOW), Ok(None));
+    }
+
+    #[test]
+    fn latest_retry_offers_neither_a_draft_nor_a_prerelease() {
+        let installed = "1.9.9".parse().unwrap();
+        let cancel = AtomicBool::new(false);
+        for flag in ["draft", "prerelease"] {
+            let mut unstable = metadata();
+            unstable[flag] = true.into();
+            let get = metadata_retry(API, limited_reply(), response(200, &[], &serde_json::to_vec(&unstable).unwrap()));
+            assert_eq!(check_at(&get, &Lookup(fixture_bearer), installed, &cancel, &Instant::now, &|| NOW), Ok(None), "{flag}");
+        }
+    }
+
+    #[test]
+    fn no_token_lookup_starts_when_cancelled_or_with_too_little_time_for_gh() {
+        let start = Instant::now();
+        for cancel_first in [true, false] {
+            let cancel = AtomicBool::new(false);
+            let elapsed = Cell::new(Duration::ZERO);
+            let clock = || start + elapsed.get();
+            let receipt = || {
+                if cancel_first {
+                    cancel.store(true, Ordering::Relaxed);
+                } else {
+                    elapsed.set(OPERATION_TIMEOUT - proc::GH_TIMEOUT + Duration::from_secs(1));
+                }
+                NOW
+            };
+            let get = script(vec![(API.into(), MAX_METADATA, limited_reply())]);
+            assert_eq!(check_at(&get, &NoLookup, "1.9.9".parse().unwrap(), &cancel, &clock, &receipt).unwrap_err(), original_limit());
+        }
+    }
+
+    #[test]
+    fn token_lookup_requires_more_than_its_budget() {
+        let start = Instant::now();
+        let installed = "1.9.9".parse().unwrap();
+        let cancel = AtomicBool::new(false);
+        for (remaining, expected_retries) in [(TOKEN_LOOKUP_BUDGET, 0), (TOKEN_LOOKUP_BUDGET + Duration::from_millis(1), 1)] {
+            let elapsed = Cell::new(Duration::ZERO);
+            let clock = || start + elapsed.get();
+            let lookups = AtomicUsize::new(0);
+            let tokens = Lookup(|| {
+                lookups.fetch_add(1, Ordering::Relaxed);
+                fixture_bearer()
+            });
+            let requests = Cell::new(0);
+            let retry = response(200, &[], &serde_json::to_vec(&metadata()).unwrap());
+            let scripted = metadata_retry(API, limited_reply(), retry);
+            let get = |request: ReleaseRequest<'_>, limit, work: &Attempt<'_>| {
+                requests.set(requests.get() + 1);
+                elapsed.set(OPERATION_TIMEOUT - remaining);
+                scripted(request, limit, work)
+            };
+            let result = check_at(&get, &tokens, installed, &cancel, &clock, &|| NOW);
+            assert_eq!(lookups.load(Ordering::Relaxed), expected_retries, "remaining time: {remaining:?}");
+            assert_eq!(requests.get(), 1 + expected_retries);
+            if expected_retries == 0 {
+                assert_eq!(result, Err(original_limit()));
+            } else {
+                assert!(result.unwrap().is_some());
+            }
+        }
+    }
+
+    #[test]
+    fn no_authenticated_request_starts_if_lookup_is_cancelled_or_spends_the_budget() {
+        let start = Instant::now();
+        for cancel_lookup in [true, false] {
+            let cancel = AtomicBool::new(false);
+            let expired = AtomicBool::new(false);
+            let clock = || if expired.load(Ordering::Relaxed) { start + OPERATION_TIMEOUT } else { start };
+            let tokens = Lookup(|| {
+                if cancel_lookup {
+                    cancel.store(true, Ordering::Relaxed);
+                } else {
+                    expired.store(true, Ordering::Relaxed);
+                }
+                fixture_bearer()
+            });
+            let get = script(vec![(API.into(), MAX_METADATA, limited_reply())]);
+            assert_eq!(check_at(&get, &tokens, "1.9.9".parse().unwrap(), &cancel, &clock, &|| NOW).unwrap_err(), original_limit());
+            assert!(cancel.load(Ordering::Relaxed) || expired.load(Ordering::Relaxed));
+        }
     }
 
     #[test]
@@ -671,7 +1000,7 @@ mod tests {
         let clock = || start + elapsed.get();
         let calls = Cell::new(0);
         let cancel = AtomicBool::new(false);
-        let get = |_: &ReleaseUrl, _: usize, work: &Attempt<'_>| {
+        let get = |_: ReleaseRequest<'_>, _: usize, work: &Attempt<'_>| {
             let call = calls.get();
             calls.set(call + 1);
             assert_eq!(work.remaining()?, OPERATION_TIMEOUT - elapsed.get());
@@ -686,13 +1015,13 @@ mod tests {
             }
         };
         let installed = "1.9.9".parse().unwrap();
-        let offer = check_at(&get, installed, &cancel, &clock, &|| NOW).unwrap().unwrap();
-        originals_at(&get, &offer, installed, &cancel, &clock, &|| NOW).unwrap();
+        let offer = check_at(&get, &NoLookup, installed, &cancel, &clock, &|| NOW).unwrap().unwrap();
+        originals_at(&get, &NoLookup, &offer, installed, &cancel, &clock, &|| NOW).unwrap();
         assert_eq!(fetch_at(&get, &offer, &cancel, &clock, &|| NOW).unwrap_err(), http_error(HttpError::Timeout));
         assert_eq!(calls.get(), 5);
         // Retrying an expired offer cannot restart the budget or send even the first asset request.
         assert_eq!(fetch_at(&get, &offer, &cancel, &clock, &|| NOW).unwrap_err(), http_error(HttpError::Timeout));
-        assert_eq!(originals_at(&get, &offer, installed, &cancel, &clock, &|| NOW).unwrap_err(), http_error(HttpError::Timeout));
+        assert_eq!(originals_at(&get, &NoLookup, &offer, installed, &cancel, &clock, &|| NOW).unwrap_err(), http_error(HttpError::Timeout));
         assert_eq!(calls.get(), 5);
     }
 
@@ -702,12 +1031,8 @@ mod tests {
         let installed = "1.9.9".parse().unwrap();
         let cancel = AtomicBool::new(false);
         let load = |value: &Value| {
-            let get = script(vec![(
-                "https://api.github.com/repos/AngelosP/tiny-skill-sync/releases/tags/v1.9.9".into(),
-                MAX_METADATA,
-                response(200, &[], &serde_json::to_vec(value).unwrap()),
-            )]);
-            originals_at(&get, &target, installed, &cancel, &Instant::now, &|| NOW)
+            let get = script(vec![(TAG_API.into(), MAX_METADATA, response(200, &[], &serde_json::to_vec(value).unwrap()))]);
+            originals_at(&get, &NoLookup, &target, installed, &cancel, &Instant::now, &|| NOW)
         };
         let originals = load(&old_metadata()).unwrap();
         assert_eq!(originals.version, installed);
@@ -728,8 +1053,11 @@ mod tests {
         let mut unsigned = old_metadata();
         unsigned["assets"][0].as_object_mut().unwrap().remove("digest");
         assert!(load(&unsigned).is_err());
+        let latest = metadata();
+        let get = metadata_retry(TAG_API, limited_reply(), response(200, &[], &serde_json::to_vec(&latest).unwrap()));
+        assert_eq!(originals_at(&get, &Lookup(fixture_bearer), &target, installed, &cancel, &Instant::now, &|| NOW), Err(original_limit()));
         // A no-offer check does nothing beyond the single latest-metadata request (script rejects another).
-        assert!(listing(&metadata(), "1.10.0").unwrap().is_none());
+        assert!(listing(&latest, "1.10.0").unwrap().is_none());
     }
 
     #[test]
@@ -737,14 +1065,15 @@ mod tests {
         let elapsed = Cell::new(0);
         let receipt = || NOW + elapsed.get();
         let cancel = AtomicBool::new(false);
-        let delayed_rate_limit = |_: &ReleaseUrl, _: usize, _: &Attempt<'_>| {
+        let delayed_rate_limit = |_: ReleaseRequest<'_>, _: usize, _: &Attempt<'_>| {
             elapsed.set(elapsed.get() + 12);
             response(429, &[("retry-after", "30")], b"")
         };
         let installed = "1.9.9".parse().unwrap();
         let target = offer();
-        assert_eq!(check_at(&delayed_rate_limit, installed, &cancel, &Instant::now, &receipt).unwrap_err().retry_at, Some(NOW + 42));
-        assert_eq!(originals_at(&delayed_rate_limit, &target, installed, &cancel, &Instant::now, &receipt).unwrap_err().retry_at, Some(NOW + 54));
+        let tokens = Lookup(no_token);
+        assert_eq!(check_at(&delayed_rate_limit, &tokens, installed, &cancel, &Instant::now, &receipt).unwrap_err().retry_at, Some(NOW + 42));
+        assert_eq!(originals_at(&delayed_rate_limit, &tokens, &target, installed, &cancel, &Instant::now, &receipt).unwrap_err().retry_at, Some(NOW + 54));
         assert_eq!(fetch_at(&delayed_rate_limit, &target, &cancel, &Instant::now, &receipt).unwrap_err().retry_at, Some(NOW + 66));
     }
 
@@ -826,7 +1155,7 @@ mod tests {
         assert!(check(&script(vec![]), "1.0.0".parse().unwrap(), NOW, &cancel).is_err());
         let cancel = AtomicBool::new(false);
         let calls = Cell::new(0);
-        let stop = |_: &ReleaseUrl, _: usize, work: &Attempt<'_>| {
+        let stop = |_: ReleaseRequest<'_>, _: usize, work: &Attempt<'_>| {
             calls.set(calls.get() + 1);
             work.cancel.store(true, Ordering::Relaxed);
             response(200, &[], TRAY)
@@ -851,7 +1180,8 @@ mod tests {
         ] {
             let mut reply = response(status, &headers, b"").unwrap();
             reply.0.error_body = CDN.as_bytes().to_vec();
-            let e = check_reply(Ok(reply), "0.0.1").unwrap_err();
+            let get = script(vec![(API.into(), MAX_METADATA, Ok(reply))]);
+            let e = check_at(&get, &Lookup(no_token), "0.0.1".parse().unwrap(), &AtomicBool::new(false), &Instant::now, &|| NOW).unwrap_err();
             assert_eq!(e.retry_at, until);
             assert!(!e.message.contains("do-not-show"));
         }

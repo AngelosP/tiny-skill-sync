@@ -62,7 +62,7 @@ case by case. Code that talks to Windows is kept in `src\win\`.
 | `hash` | SHA-1 and Git blob hashes, in plain Rust. | yes |
 | `cli` | `tss`. | uses engine |
 | `win::fs` | File facts `std` does not give: file id, USN, volume, links; one-handle folder listing. | Windows |
-| `win::http` | A small blocking HTTP client on WinHTTP. The only networking code. | Windows |
+| `win::http`, `win::release_hash` | Separate WinHTTP clients for skill checks and app releases. | Windows |
 | `win::cred` | The token in Windows Credential Manager. | Windows |
 | `win::proc` | Starts other programs with `CreateProcessW` (not `std::process`, which costs the tray exe about 60 KB): `gh auth token` for the GitHub CLI's token, File Explorer, and the tray an app update installed. | Windows |
 | `win::clip` | Puts text on the clipboard (Copy path, Copy GitHub link). | Windows |
@@ -544,8 +544,16 @@ tests in `tests\downtime.rs`.
 
 `release` asks the official latest stable release endpoint. When installing, it also reads the installed tag's
 official metadata: both existing files must match that tag, and **both** downloaded sizes and SHA-256 digests
-must match the new tag. Metadata, redirects and both downloads share a 90-second deadline. The skill client's
-redirect and token rules do not change. It distinguishes the running build from the pair on disk.
+must match the new tag. The updater distinguishes the running build from the pair on disk.
+
+Each metadata request starts without a token. Only after GitHub limits it does the updater retry the same URL
+once, using the token saved in Windows Credential Manager or, if none is saved, `gh auth token`. The bearer is
+sent only to `https://api.github.com` on port 443. Metadata redirects are rejected; downloads and their allowed
+redirects never carry a token. Both answers go through the same validation: for the latest release, a draft,
+prerelease or version that is not newer yields no offer, and only a newer stable release needs asset checks.
+If the retry is unavailable or fails, the updater keeps the original rate-limit error and wait time. Metadata,
+token lookup, redirects and both downloads share a 90-second deadline. The skill client's redirect and token
+rules do not change.
 
 `update_clock` lives in the machine-local settings home, separate from preferences, skill timestamps and the
 ownership record. The tray uses the earlier app or skill deadline on the **existing** timer. A release request,

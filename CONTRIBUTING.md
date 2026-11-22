@@ -51,8 +51,8 @@ scripts\dev.ps1 test
 ```
 
 This runs `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings` and `cargo test --no-fail-fast`. All three
-must pass. There are 991 tests (624 in the library, 367 integration tests); the whole gate takes about 40 seconds when
-the code is already built.
+must pass. There are 1,014 tests (647 in the library, including one ignored live check, and 367 integration tests);
+the whole gate takes about 40 seconds when the code is already built.
 
 If the change can affect speed, memory or disk use (startup, verification, the poll, the tray, the window),
 also run `scripts\dev.ps1 bench` and check that every row is still within budget.
@@ -83,8 +83,10 @@ an SMB share once found a bug the local NTFS runs could not. Without `-Root`, th
 (`C:\Users\RUNNER~1\...`), and the app refuses such an alias for an Agents or Instructions folder. To try that case here,
 pass `-Root` a short name, for example the one `cmd /c for %I in ("FOLDER") do @echo %~sI` prints.
 
-**Live GitHub.** The tests never talk to GitHub. To try the real client, use `scripts\dev.ps1 dry-run -Repo ...` or the
-sandbox (`scripts\dev.ps1 tss add ...` then `tss check`), and for everything the tests cannot see, the live runs below.
+**Live GitHub.** The regular tests never talk to GitHub. To try the real client, use `scripts\dev.ps1 dry-run -Repo ...`
+or the sandbox (`scripts\dev.ps1 tss add ...` then `tss check`), and for everything the tests cannot see, the live runs below.
+
+Owner-run live check: in one PowerShell session set `$env:TSS_LIVE_RELEASE_BEARER = (gh auth token)`, run `cargo test --lib live_metadata_bearer_reaches_github -- --ignored`, then `Remove-Item Env:TSS_LIVE_RELEASE_BEARER`. Never echo the variable.
 
 **App updater tests.** Keep a throwaway folder for the two executables as well as separate settings and skills
 folders. Test release discovery with a fake transport and replacement with inert payloads. Do not start a program

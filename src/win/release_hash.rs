@@ -1,4 +1,4 @@
-//! Primitives for checking an official release. The release transport has no credential inputs, cookies,
+//! Primitives for checking an official release. Only GitHub API metadata can carry a bearer. No cookies,
 //! automatic logon, OS proxy discovery, automatic redirects or connection pool shared with skill requests.
 
 use std::ffi::c_void;
@@ -16,7 +16,7 @@ use windows_sys::Win32::Networking::WinHttp::{
 
 use super::http::{HttpError, Response, parse_raw_headers};
 use super::wide;
-use crate::release::{Attempt, ReleaseUrl};
+use crate::release::{Attempt, ReleaseRequest};
 
 struct Handle(*mut c_void);
 
@@ -68,7 +68,27 @@ fn remaining_ms(work: &Attempt<'_>) -> Result<i32, HttpError> {
     if ms == 0 { Err(HttpError::Timeout) } else { Ok(ms.min(i32::MAX as u128) as i32) }
 }
 
-pub(crate) fn get(target: &ReleaseUrl, limit: usize, work: &Attempt<'_>) -> Result<(Response, Vec<u8>), HttpError> {
+fn request_headers(target: &ReleaseRequest<'_>) -> Result<Vec<u16>, HttpError> {
+    let url = target.url();
+    let api = url.host == "api.github.com";
+    let base = if api {
+        "Accept: application/vnd.github+json\r\nX-GitHub-Api-Version: 2022-11-28\r\nAccept-Encoding: identity\r\n"
+    } else {
+        "Accept: application/octet-stream\r\nAccept-Encoding: identity\r\n"
+    };
+    let Some(bearer) = target.bearer() else { return Ok(wide(base)) };
+    let token = bearer.expose();
+    if !url.secure || !api || url.port != 443 || token.is_empty() || !token.bytes().all(|b| b.is_ascii_graphic()) {
+        return Err(HttpError::InsecureToken);
+    }
+    const AUTH: &str = "Authorization: Bearer ";
+    // Build the one encoded copy directly, without allocating a token-bearing String.
+    let mut header = Vec::with_capacity(base.len() + AUTH.len() + token.len() + 3);
+    header.extend(base.bytes().chain(AUTH.bytes()).chain(token.bytes()).chain(*b"\r\n\0").map(u16::from));
+    Ok(header)
+}
+
+pub(crate) fn get(target: ReleaseRequest<'_>, limit: usize, work: &Attempt<'_>) -> Result<(Response, Vec<u8>), HttpError> {
     let url = target.url();
     debug_assert!(url.secure && url.port == 443);
     work.remaining()?;
@@ -96,11 +116,6 @@ pub(crate) fn get(target: &ReleaseUrl, limit: usize, work: &Attempt<'_>) -> Resu
     if unsafe { WinHttpSetOption(request.0, WINHTTP_OPTION_CLIENT_CERT_CONTEXT, null(), 0) } == 0 {
         return Err(os_error("WinHttpSetOption"));
     }
-    let header = wide(if url.host == "api.github.com" {
-        "Accept: application/vnd.github+json\r\nX-GitHub-Api-Version: 2022-11-28\r\nAccept-Encoding: identity\r\n"
-    } else {
-        "Accept: application/octet-stream\r\nAccept-Encoding: identity\r\n"
-    });
     // Sending can involve name resolution, connect/TLS and the actual send. No automatic retry across addresses.
     request.set(WINHTTP_OPTION_CONNECT_RETRIES, 1)?;
     let ms = remaining_ms(work)? / 4;
@@ -110,8 +125,17 @@ pub(crate) fn get(target: &ReleaseUrl, limit: usize, work: &Attempt<'_>) -> Resu
     if unsafe { WinHttpSetTimeouts(request.0, ms.min(10_000), ms.min(10_000), ms.min(15_000), ms.min(15_000)) } == 0 {
         return Err(os_error("WinHttpSetTimeouts"));
     }
-    if unsafe { WinHttpSendRequest(request.0, header.as_ptr(), (header.len() - 1) as u32, null(), 0, 0, 0) } == 0 {
-        return Err(os_error("WinHttpSendRequest"));
+    {
+        let mut header = request_headers(&target)?;
+        let ok = unsafe { WinHttpSendRequest(request.0, header.as_ptr(), (header.len() - 1) as u32, null(), 0, 0, 0) } != 0;
+        let failed = (!ok).then(|| os_error("WinHttpSendRequest"));
+        // The buffer may contain a bearer; volatile writes keep the wipe from being optimized out.
+        for unit in &mut header {
+            unsafe { std::ptr::write_volatile(unit, 0) };
+        }
+        if let Some(e) = failed {
+            return Err(e);
+        }
     }
     let ms = remaining_ms(work)?.min(15_000) as u32;
     request.set(WINHTTP_OPTION_RECEIVE_RESPONSE_TIMEOUT, ms)?;
@@ -234,5 +258,87 @@ fn compress(state: &mut [u32; 8], block: &[u8]) {
     }
     for (slot, word) in state.iter_mut().zip([a, b, c, d, e, f, g, h]) {
         *slot = slot.wrapping_add(word);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::AtomicBool;
+    use std::time::Duration;
+
+    use super::*;
+    use crate::release::{DownloadUrl, MetadataUrl};
+    use crate::secret::Secret;
+
+    const API: &str = "https://api.github.com/repos/AngelosP/tiny-skill-sync/releases/latest";
+    const DOWNLOAD: &str = "https://github.com/AngelosP/tiny-skill-sync/releases/download/v1.0.0/tss.exe";
+    const CDN: &str = "https://release-assets.githubusercontent.com/download/id";
+
+    fn authorization_lines(header: &str) -> impl Iterator<Item = &str> {
+        header.lines().filter(|line| line.split_once(':').is_some_and(|(name, _)| name.eq_ignore_ascii_case("Authorization")))
+    }
+
+    #[test]
+    fn metadata_request_with_bearer_has_exactly_one_authorization_header() {
+        let url = MetadataUrl::fixture(API);
+        let bearer = Secret::new("fixture-bearer");
+        let header = request_headers(&ReleaseRequest::Metadata { url: &url, bearer: Some(&bearer) }).unwrap();
+        assert_eq!(authorization_lines(&String::from_utf16(&header).unwrap()).count(), 1);
+        assert!(header.ends_with(&wide("\r\nAuthorization: Bearer fixture-bearer\r\n")));
+    }
+
+    #[test]
+    fn bearer_headers_require_the_exact_https_api_origin() {
+        let bearer = Secret::new("fixture-bearer");
+        for address in [
+            DOWNLOAD,
+            CDN,
+            "https://api.github.com.example/releases/latest",
+            "https://api.github.com./releases/latest",
+            "http://api.github.com:443/releases/latest",
+            "https://api.github.com:444/releases/latest",
+            "http://127.0.0.1:443/releases/latest",
+            "https://localhost/releases/latest",
+        ] {
+            let url = MetadataUrl::fixture(address);
+            let request = ReleaseRequest::Metadata { url: &url, bearer: Some(&bearer) };
+            assert!(matches!(request_headers(&request), Err(HttpError::InsecureToken)), "{address}");
+        }
+    }
+
+    #[test]
+    fn unsafe_bearers_are_rejected() {
+        let api = MetadataUrl::fixture(API);
+        for bad in ["", "contains space", "line\rbreak", "line\nbreak", "\t", "a\0b", "\u{007f}", "\u{00e9}"] {
+            let bearer = Secret::new(bad);
+            let request = ReleaseRequest::Metadata { url: &api, bearer: Some(&bearer) };
+            assert!(matches!(request_headers(&request), Err(HttpError::InsecureToken)));
+        }
+    }
+
+    #[test]
+    fn anonymous_metadata_and_downloads_have_no_authorization_header() {
+        let api = MetadataUrl::fixture(API);
+        let download = DownloadUrl::fixture(DOWNLOAD);
+        let cdn = DownloadUrl::fixture(CDN);
+        for request in [ReleaseRequest::Metadata { url: &api, bearer: None }, ReleaseRequest::Download(&download), ReleaseRequest::Download(&cdn)] {
+            let header = request_headers(&request).unwrap();
+            assert!(authorization_lines(&String::from_utf16(&header).unwrap()).next().is_none());
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn live_metadata_bearer_reaches_github() {
+        let value = std::env::var("TSS_LIVE_RELEASE_BEARER").unwrap_or_else(|_| panic!("TSS_LIVE_RELEASE_BEARER is unset or not valid Unicode"));
+        let bearer = Secret::new(value);
+        let url = MetadataUrl::fixture(API);
+        let cancel = AtomicBool::new(false);
+        let work = Attempt::with_timeout(&cancel, Duration::from_secs(30));
+        let request = ReleaseRequest::Metadata { url: &url, bearer: Some(&bearer) };
+        let (response, _) = get(request, 256 * 1024, &work).unwrap_or_else(|_| panic!("The metadata request failed before returning a response"));
+        assert_eq!(response.status, 200);
+        let limit = response.header("x-ratelimit-limit").expect("GitHub did not send x-ratelimit-limit");
+        assert!(limit != "60", "GitHub used the anonymous rate limit");
     }
 }

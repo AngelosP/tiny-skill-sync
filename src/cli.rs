@@ -165,7 +165,7 @@ pub trait Host {
     }
     /// Reads the version of the installed tray and CLI pair, not the build running this command.
     fn installed_app_version(&self, directory: &Path) -> Result<String, String>;
-    /// Explicit app release operation, separate from the skills engine and its credential sources.
+    /// Explicit app release operation, separate from the skills engine and its state.
     fn manual_app_update(&self, paths: &Paths, directory: &Path, action: AppAction) -> Result<String, String>;
     fn remote(&self) -> Result<Box<dyn Remote>, String>;
     fn tokens(&self) -> Box<dyn TokenProvider>;

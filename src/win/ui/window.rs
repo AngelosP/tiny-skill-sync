@@ -1414,8 +1414,8 @@ fn diff_action(hwnd: HWND, index: usize) {
 fn save_token(hwnd: HWND) {
     let question = Ask {
         heading: "Save a GitHub token".to_string(),
-        text: "It is kept in Windows Credential Manager and used automatically when a repository can’t be read without it. \
-               Read access to contents is enough."
+        text: "It is kept in Windows Credential Manager and used automatically when a repository can’t be read without it, \
+               or when GitHub limits app update checks. Read access to contents is enough."
             .to_string(),
         field: Some(Field::Secret { label: "Token".to_string(), hint: "Paste a personal access token. It is hidden as you type.".to_string() }),
         ok: "Save".to_string(),

@@ -142,9 +142,15 @@ or stops at once, the old one keeps running and says why.
 yourself. In Quit mode the worker holds both verified files until you explicitly choose **Quit**, and the tray
 stays closed afterwards. Closing Settings is not Quit, and signing out does not install a pending update.
 
-The updater does not use a skill token or a configurable release feed. Both standalone files must have the expected
-sizes and SHA-256 digests from GitHub before either is replaced. The installed pair must also match both digests
-in its own official release: a custom build, edited file, or tag without standalone digests is left alone. These
+The updater uses only the official release feed. It asks GitHub for release details without a token first. If GitHub
+limits that request, the updater can retry it once with your token: the one saved in Windows Credential Manager or,
+if none is saved, the GitHub CLI's (`gh auth token`). The token is only used for release details; downloads are
+always anonymous.
+If the retry is unavailable or fails, the updater reports the original rate limit and installs nothing.
+
+Both standalone files must have the expected sizes and SHA-256 digests from GitHub before either is replaced.
+The installed pair must also match both digests in its own official release: a custom build, edited file, or tag
+without standalone digests is left alone. These
 checks detect changes; the programs are not publisher-signed. An unavailable share, access error or busy folder
 is a failure, not an update. A lock on a share protects one folder; it cannot lock another PC's separate OneDrive
 replica. Use a single writer and wait for both files to sync before using another PC. Live SMB and OneDrive
@@ -546,6 +552,9 @@ request to a repository, even the first, add it with `tss add --use-token` (or s
 The token is read when a check needs it. It is never written to the settings, the state or any message. Sending a token
 also raises GitHub's rate limit: without one, every program on your network shares 60 requests an hour.
 
+The app's update check uses the same token only to retry release details once after GitHub limits the request
+without a token; downloads never carry it. Any token works for this.
+
 ## The command line
 
 `tss` does the same work as the tray, one command at a time, with the same safety rules. Run `tss help` for the details.
@@ -874,8 +883,9 @@ ended at 3.2 MiB of private memory. Each change reached the disk within one inte
   is on again and the source is checked.
 - A change of display scale while the app runs is followed by the tray icon (it is drawn again at the taskbar's new
   size) but has not been tried on a real scale change.
-- Skill checks use the Windows proxy settings (not tested behind a proxy). The anonymous app-release check
-  connects directly to GitHub; if the network requires a proxy, use the manual ZIP upgrade instead.
+- Skill checks use the Windows proxy settings (not tested behind a proxy). The app-release check, including its
+  token retry and downloads, connects directly to GitHub; if the network requires a proxy, use the manual ZIP
+  upgrade instead.
 - A short network failure turns the icon red until the next successful check.
 - `gh` is found only on the `PATH`; with several `gh` accounts, the active one is used.
 - When Windows long paths are off, a folder you add inside a skill whose path is longer than 260 characters cannot be
