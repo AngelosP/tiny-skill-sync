@@ -728,15 +728,28 @@ everything they show.
   uxtheme, both loaded only when a window opens. The title bar keeps the window background (`Bg`).
   Every colour that depends on the accent is worked out once per look (`palette`): accent buttons, switches and links
   (`Accent`, `AccentText`), the band's sky (`Band`) and picture (`Print`), its title, caption and bottom line
-  (`BandText`, `BandCaption`, `BandEdge`), and the type icons (`BandMark`). Each starts from the shade that suits it
-  and moves a step at a time only as far as it must: words 4.6:1 on every part of the band, buttons 3:1 and links
-  4.5:1 on every page and under a hovered or selected row, the status dots 3:1 on the sky, the icons 7:1 on their
+  (`BandText`, `BandCaption`, `BandEdge`), the type icons (`BandMark`), the band's status disc ring (`BandDotRing`),
+  the band's main button (`BandButton`, `BandButtonText`) and the check-dot (`DotOk`, `DotOkInk`, `DotOkEdge`). Each
+  starts from the shade that suits it and moves a step at a time only as far as it must: words 4.6:1 on every part of
+  the band, buttons 3:1 and links 4.5:1 on every page and under a hovered or selected row, the icons 7:1 on their
   discs (so the sky itself leaves room for 7:1 in black or white), the sky and the bottom line apart from the page, the
-  farthest hill apart from every shade of the sky's fade, and each other hill apart from the one behind it. A pale or
-  very dark accent can make a hill turn the other way to stay apart. **Sync now** and the diff header's primary choice are
-  accent buttons whose focus ring is drawn in their lettering (`Kind::BandAccent`), which reads on the button wherever
-  the band puts it. In high contrast nothing is worked out: buttons use Highlight and HighlightText, and the band is
-  Window with a WindowText line, without the picture or the icons.
+  farthest hill apart from every shade of the sky's fade, and each other hill apart from the one behind it. In light
+  mode the sky is a saturated mid-tone: the first shade along the accent's path (the lightest first) that is far
+  enough from white (`RICH`) and still meets the word, icon and page rules; the five hills then deepen in even
+  steps from the sky's low colour to the darkest shade that words still read on, and the title stays dark. Dark mode
+  keeps the same word, icon and page rules, but no longer holds the sky 3:1 from the status dots, since the ring does
+  that job. A soft disc cannot be 3:1 on both the pages and a mid-tone sky, so the band's status disc has a ring
+  (`BandDotRing`, drawn as the disc's border) that stays 3:1 from the sky and its fade, and the disc itself can be
+  soft. A pale or very dark accent can make a hill turn the other way to stay apart. The check-dot is a soft
+  mid-green disc (a muted sage in dark mode) with a thin edge: its check reads 3:1 on the disc, and the disc or its
+  edge reads 3:1 on the pages and under hovered or selected rows (`Tone::dot`, `dot_ink`, `dot_edge`; `paint::dot`
+  draws the edge and the ink). `Role::Ok` stays the ink for words that say "ok", not for the dot. **Sync now** and the
+  diff header's primary choice are accent buttons whose focus ring is drawn in their lettering (`Kind::BandAccent`),
+  which reads on the button wherever the band puts it. They use their own roles rather than `Accent`: a deep fill in
+  light mode and a pale fill in dark mode, lettering 4.5:1 on the fill, and the fill 3:1 from every layer of the band
+  at rest, hovered and pressed. Buttons on the pages still use `Accent` and `OnAccent`. In high contrast nothing is
+  worked out: buttons (the band's too) use Highlight and HighlightText, the ring is the band's colour so it does not
+  show, and the band is Window with a WindowText line, without the picture or the icons.
 - **`page.rs`** builds every page as a `Surface` from what the app knows. It calls no Windows function (text is
   measured through a `Fit` the window passes in), so every layout and sentence is tested without a screen.
 - A saved source and an unsaved location preview use the same source-page renderer. Preview settings remain editable,
@@ -794,29 +807,39 @@ A window procedure can be entered again while it runs (a control notifies its pa
 it). So the UI state lives in thread-local `RefCell`s borrowed only with `try_borrow_mut`, and no borrow is held across a
 call that runs a message loop (a question, the tray menu, `DestroyWindow`).
 
-The band at the top holds the status circle, a title, the line under it and **Sync now**, on the hero panel. The
+The band at the top holds the status circle (`page::hero`), a title, the line under it and **Sync now**, on the hero
+panel. The circle is the list's dot for its tone (`Tone::dot`): the check-dot for Ok, the Warn and Err dots, and the
+Off tone's own pair of colours. It is drawn with the ring `BandDotRing` as its border. The
 band itself, including the picture and bottom line, is part of the backdrop under that panel and under the diff
 view's header, so both views start with the same band. Four discs of sky set into the middle hill, just under its top,
-hold the icons
-of the four types, in the list's order (`page::stations`). They sit at fixed points, so they never move as the text
-changes, and they show only when all four keep 12 DIPs clear of the measured title, the line under it and the
-buttons; otherwise none shows. They are decorations of the panel, not controls, so labels repaint over them. The
-band's title says how everything is in one line, the worst
-first: a problem of the app, sources that can't be read, items that need you, sources that need you, the first check
-still to come, or all up to date. The line under it
-says where, when the last check was, and when the next one is (`page::hero_of`). It counts sources, not lanes: it
-takes the snapshot's `SourceView`s, so the four types of one source count once, and it says "items" instead of
-"skills" when more than one type is present (`board::item_nouns`). When every type found is off, nothing is counted
-as up to date: it says "Nothing is being synced" in the calm tone. While the app works, or
-just after it told you something, that line says so instead. After a check you asked for, it is `summary` in `app.rs`:
-a failed check puts the reason first, and a check that found nothing new says "Checked: nothing new on GitHub" unless
-all is well. Each sentence names only the types of the lanes it is about (`item_nouns` over the lanes that need you,
-found nothing, or changed), so a source whose skills alone changed says "skills were updated". Each skill header
-paints only its name, actions and status: an "Up to date" row uses the source list's green check-dot; other statuses keep
-their badges. Its window text also carries the
-explanation (`Row.text`, `board.rs`) and known facts for the row tooltip, whether open or closed; hovering an
-action shows that action's tooltip instead. A source entry in the list on the left uses the same tooltip for its whole
-window text (`page::nav_name`), which its painted lines may cut short. `page::source_entry` keeps entries at two lines (50 DIPs): the repository, then measured type badges and status. Badges that cannot fit are replaced by a "+N" count with a warning if any hidden type needs attention. The full location, types and status remain in the window text and tooltip.
+hold the icons of the four types, in the list's order (`page::stations`). They sit at fixed points, so they never move
+as the text changes, and they show only when all four keep 12 DIPs clear of the measured title, the line under it and
+the buttons; otherwise none shows. They are decorations of the panel, not controls, so labels repaint over them. The
+band's title says how everything is in one line, the worst first: a problem of the app, sources that can't be read,
+items that need you, sources that need you, the first check still to come, or all up to date. The line under it says
+where, when the last check was, and when the next one is (`page::hero_of`). It counts sources, not lanes: it takes the
+snapshot's `SourceView`s, so the four types of one source count once, and it says "items" instead of "skills" when
+more than one type is present (`board::item_nouns`). When every type found is off, nothing is counted as up to date:
+it says "Nothing is being synced" in the calm tone. While the app works, or just after it told you something, that
+line says so instead. After a check you asked for, it is `summary` in `app.rs`: a failed check puts the reason first,
+and a check that found nothing new says "Checked: nothing new on GitHub" unless all is well. Each sentence names only
+the types of the lanes it is about (`item_nouns` over the lanes that need you, found nothing, or changed), so a source
+whose skills alone changed says "skills were updated". Each skill header paints only its name, actions and status
+(`control::row_status`): a synced row, "Up to date" or "Installed" with the check as its mark, draws the source list's
+check-dot and no word; other statuses keep their word in a pill. Plugin rows reuse these two tags, so they follow the
+same rule. The tooltip of a check-dot row starts with its tag, since the dot has no word, and the row's window text
+still says the tag. Its window text also carries the explanation (`Row.text`, `board.rs`) and known facts for the row
+tooltip, whether open or closed; hovering an action shows that action's tooltip instead. A source entry in the list on
+the left uses the same tooltip for its whole window text (`page::nav_name`), which its painted lines may cut short.
+`page::source_entry` keeps every entry at two lines, 56 DIPs high
+(`ENTRY_H`). Line 1 is the repository in strong type with its owner dimmed in front ("owner/"); the owner shortens,
+then goes, and the repository is cut last. Line 2 is small rounded count chips, one per type (icon and count): a chip
+whose type needs the user is amber with a warning sign, and a type that does not sync has no fill and is muted. Chips
+that cannot fit become a "+N" chip, amber when a hidden type needs the user. The status text at the right of line 2
+shows only when the source is not simply up to date (the check-dot says that); it keeps its whole width and the chips
+give way to it. The status mark is centred vertically, and the selected entry keeps its accent bar. Hover and
+selection are drawn by one routine shared with the Add source, Activity and Settings rows. The full location, types
+and status remain in the window text and tooltip.
 Only attention/error rows with resolution choices expand. Routine commands remain beside the name even while
 those choices are open. The facts (`Row.facts`) come from the record after every job
 (`engine::facts`, which reads nothing from disk) and are worded by `board::facts_text`; a plain row ("Up to date",

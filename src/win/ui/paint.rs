@@ -72,10 +72,26 @@ impl Tone {
 
     pub fn dot(self) -> Role {
         match self {
-            Tone::Ok => Role::Ok,
+            Tone::Ok => Role::DotOk,
             Tone::Warn => Role::DotWarn,
             Tone::Err => Role::Err,
             Tone::Off => Role::Off,
+        }
+    }
+
+    /// The mark on the dot.
+    pub fn dot_ink(self) -> Role {
+        match self {
+            Tone::Ok => Role::DotOkInk,
+            _ => Role::DotGlyph,
+        }
+    }
+
+    /// The thin edge around the dot; only the check-dot has one.
+    pub fn dot_edge(self) -> Role {
+        match self {
+            Tone::Ok => Role::DotOkEdge,
+            _ => Role::None,
         }
     }
 }
@@ -553,12 +569,13 @@ pub fn pill(x: i32, y: i32, text: &str, tone: Tone, glyph: Option<char>, dpi: u3
 
 /// A filled circle with a status mark in it, `size` DIPs across.
 pub fn dot(at: Rect, tone: Tone) {
-    fill(at, at[2] / 2, tone.dot(), Role::None);
+    fill(at, at[2] / 2, tone.dot(), tone.dot_edge());
+    let ink = tone.dot_ink();
     match tone {
-        Tone::Warn => text(at, "!", Font::Bang, Role::DotGlyph, DT_SINGLELINE | DT_VCENTER | DT_CENTER),
-        Tone::Ok => glyph(at, glyph::OK, 9, Role::DotGlyph),
-        Tone::Err => glyph(at, glyph::ERR, 9, Role::DotGlyph),
-        Tone::Off => glyph(at, glyph::PAUSE, 9, Role::DotGlyph),
+        Tone::Warn => text(at, "!", Font::Bang, ink, DT_SINGLELINE | DT_VCENTER | DT_CENTER),
+        Tone::Ok => glyph(at, glyph::OK, 9, ink),
+        Tone::Err => glyph(at, glyph::ERR, 9, ink),
+        Tone::Off => glyph(at, glyph::PAUSE, 9, ink),
     }
 }
 

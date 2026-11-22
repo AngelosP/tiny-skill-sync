@@ -1623,7 +1623,13 @@ $splitPanel = 107
 $splitId = 304
 
 function Read-WindowSizeFile($c) {
-    try { [IO.File]::ReadAllText((Join-Path $c.Home 'window.txt')).Trim() } catch { '' }
+    # ReadAllText shares only for reading, so a poll that overlaps the app's write would make that write fail
+    $stream = $null
+    try {
+        $stream = [IO.File]::Open((Join-Path $c.Home 'window.txt'), [IO.FileMode]::Open, [IO.FileAccess]::Read, ([IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete))
+        $reader = New-Object IO.StreamReader($stream)
+        $reader.ReadToEnd().Trim()
+    } catch { '' } finally { if ($null -ne $stream) { $stream.Dispose() } }
 }
 
 function Test-ListSplitter($c, [IntPtr]$Window, [switch]$Diff) {
@@ -2168,7 +2174,7 @@ function Test-Ui {
         $sourceBox = [int[]](([TssLive]::Bounds((Get-Ui $win $UiPanel.Nav $UiId.NavRepo))) -split ',')
         $sourceDpi = [int][TssLive]::GetDpiForWindow($win)
         Check 'the source list entry uses two lines at this display scale' (
-            [math]::Abs(($sourceBox[3] - $sourceBox[1]) - 50 * $sourceDpi / 96) -le 1
+            [math]::Abs(($sourceBox[3] - $sourceBox[1]) - 56 * $sourceDpi / 96) -le 1
         ) "$($sourceBox[3] - $sourceBox[1]) px at $sourceDpi dpi"
         Test-Painted $pic $win 'a repository added' @(@($UiPanel.Hero, $UiId.HeroTitle), @($UiPanel.Hero, $UiId.Sync), @($UiPanel.Nav, $UiId.NavRepo), @($UiPanel.Nav, $UiId.NavSettings), @($UiPanel.Page, $UiId.Title), @($UiPanel.Page, $UiId.Every), @($UiPanel.Page, $UiId.Skill))
         Test-Layout $win 'a repository added'
@@ -2670,7 +2676,7 @@ function Test-Ui {
                 Check 'the long source''s skill is installed' (Test-Path -LiteralPath (Join-Path $c.Skills "$longSkill\SKILL.md"))
                 if ($null -eq $two) { throw 'the long source has no row, so its window sizes can not be looked at' }
                 $rowHeights = @(0, 1 | ForEach-Object { $r = [int[]]([TssLive]::Bounds((Get-Ui $win $UiPanel.Nav ($UiId.NavRepo + $_))) -split ','); $r[3] - $r[1] })
-                Check 'both rows have one line of type icons, so they are the same height' ($rowHeights[0] -gt 0 -and $rowHeights[0] -eq $rowHeights[1]) ($rowHeights -join ', ')
+                Check 'both rows have one line of type chips, so they are the same height' ($rowHeights[0] -gt 0 -and $rowHeights[0] -eq $rowHeights[1]) ($rowHeights -join ', ')
                 Wait-Settled $c
                 $dpi = [int][TssLive]::GetDpiForWindow($win)
                 foreach ($size in @(@('narrow', 640, 560), @('wide', [math]::Min(1400, [int]($area.Width * 96 / $dpi) - 40), [math]::Min(860, [int]($area.Height * 96 / $dpi) - 40)))) {

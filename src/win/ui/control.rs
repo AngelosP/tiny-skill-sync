@@ -121,7 +121,8 @@ const NEAR: i32 = 1200;
 pub enum Kind {
     Standard,
     Accent,
-    /// The accent button on the header band: its focus ring is drawn in its lettering, which reads on its fill.
+    /// The accent button on the header band: it has the band's own fill and lettering, and its focus ring is drawn in that
+    /// lettering, which reads on its fill.
     BandAccent,
     /// No fill until hovered, and only an icon.
     Icon,
@@ -133,7 +134,9 @@ impl Kind {
     /// Fill, border and lettering before the hover or press tint.
     pub(super) fn colors(self, enabled: bool) -> (Role, Role, Role) {
         match self {
-            Self::Accent | Self::BandAccent if enabled => (Role::Accent, Role::None, Role::OnAccent),
+            Self::Accent if enabled => (Role::Accent, Role::None, Role::OnAccent),
+            // The edge repeats the fill: it draws the rounded corners a little fuller than no edge (as `Accent` has) does.
+            Self::BandAccent if enabled => (Role::BandButton, Role::BandButton, Role::BandButtonText),
             Self::Standard | Self::Accent | Self::BandAccent => (Role::Ctl, Role::CtlBorder, if enabled { Role::Text } else { Role::Text3 }),
             Self::Icon => (Role::None, Role::None, if enabled { Role::Text } else { Role::Text3 }),
             Self::Link => (Role::None, Role::None, if enabled { Role::AccentText } else { Role::Text3 }),
@@ -465,13 +468,16 @@ impl<'a> RowText<'a> {
         }
     }
 
-    fn tip(&self) -> String {
-        match (self.explanation.trim(), self.facts.trim()) {
-            ("", "") => self.tag.into(),
+    /// What hovering over the row's body says. The check-dot has no word of its own, so when it is shown the tag leads.
+    fn tip(&self, status: RowStatus) -> String {
+        let details = match (self.explanation.trim(), self.facts.trim()) {
+            ("", "") => return self.tag.into(),
             ("", facts) => facts.into(),
             (explanation, "") => explanation.into(),
             (explanation, facts) => format!("{explanation}\n{facts}"),
-        }
+        };
+        let said = details.lines().next() == Some(self.tag);
+        if status == RowStatus::Check && !self.tag.is_empty() && !said { format!("{}\n{details}", self.tag) } else { details }
     }
 }
 
@@ -515,8 +521,10 @@ enum RowStatus {
     Pill,
 }
 
+/// Whatever is in sync, whether it was installed or only found up to date, shows the check-dot that marks a source in
+/// the list; every other state keeps its word.
 fn row_status(tag: &str, mark: Option<char>) -> RowStatus {
-    if tag == crate::board::UP_TO_DATE_TAG && mark == Some(glyph::OK) { RowStatus::Check } else { RowStatus::Pill }
+    if matches!(tag, crate::board::UP_TO_DATE_TAG | crate::board::INSTALLED_TAG) && mark == Some(glyph::OK) { RowStatus::Check } else { RowStatus::Pill }
 }
 
 fn row_status_width(tag: &str, mark: Option<char>, dpi: u32) -> i32 {
@@ -623,6 +631,63 @@ pub fn two_lines(first: &str, second: &str) -> String {
     if second.is_empty() { first.to_string() } else { format!("{first}\n{second}") }
 }
 
+/// The ink of a focus ring: the lettering of the band's accent button, which reads on its fill, and the text colour
+/// everywhere else.
+fn focus_ink(look: &Look, enabled: bool) -> Role {
+    if enabled && matches!(look, Look::Button { kind: Kind::BandAccent, .. }) { Role::BandButtonText } else { Role::Text }
+}
+
+/// What a list entry stands on: a light tint under the pointer, and when it is the page shown the selection's tint with
+/// an accent bar at its edge. The sources and the rows under them share it.
+fn draw_entry_back([x, y, w, h]: Rect, selected: bool, tint: Role) {
+    paint::fill([x, y, w, h], 4, if selected { Role::Sel } else { tint }, Role::None);
+    if selected {
+        let bar = (h * 2 / 5).max(16);
+        paint::fill([x, y + (h - bar) / 2, 3, bar], 2, Role::Accent, Role::None);
+    }
+}
+
+/// The status mark at the left of a list entry, centred on its height.
+fn draw_mark([x, y, _, h]: Rect, mark: &Mark) {
+    match mark {
+        Mark::Dot(tone) => paint::dot([x + 12, y + (h - 16) / 2, 16, 16], *tone),
+        Mark::Glyph(ch, role) => paint::glyph([x + 12, y, 16, h], *ch, 16, *role),
+    }
+}
+
+/// A source's entry in the list: the background the rows under it have, the mark, then what the page laid out
+/// relative to the entry's corner.
+fn draw_source(at: Rect, mark: &Mark, selected: bool, tint: Role, parts: &[Deco]) {
+    let [x, y, ..] = at;
+    draw_entry_back(at, selected, tint);
+    draw_mark(at, mark);
+    let shift = |[px, py, pw, ph]: Rect| [x + px, y + py, pw, ph];
+    for part in parts {
+        match part {
+            Deco::Fill { at, radius, fill, border } => paint::fill(shift(*at), *radius, *fill, *border),
+            Deco::BandPrint { at } => paint::band_print(shift(*at)),
+            Deco::Glyph { at, ch, size, ink } => paint::glyph(shift(*at), *ch, *size, *ink),
+            Deco::Text { at, text, font, ink, flags } => paint::text(shift(*at), text, *font, *ink, *flags),
+        }
+    }
+}
+
+/// A row of the navigation: the mark, its text and, when the text has two lines, the second one smaller.
+fn draw_nav(at: Rect, mark: &Mark, ink: Role, selected: bool, tint: Role, text: &str) {
+    let [x, y, w, h] = at;
+    let (text, sub) = lines(text);
+    draw_entry_back(at, selected, tint);
+    draw_mark(at, mark);
+    let left = x + 40;
+    if sub.is_empty() {
+        paint::line([left, y, w - left + x - 8, h], text, Font::Body, ink);
+    } else {
+        let top = y + (h - 36) / 2;
+        paint::line([left, top, w - left + x - 8, 20], text, Font::Body, ink);
+        paint::line([left, top + 20, w - left + x - 8, 16], sub, Font::Caption, Role::Text2);
+    }
+}
+
 fn draw_ctl(hwnd: HWND) {
     let Some(cell) = ctl_of(hwnd) else { return };
     let Ok(c) = cell.try_borrow() else { return };
@@ -673,46 +738,8 @@ fn draw_ctl(hwnd: HWND) {
                 paint::line([left + gw, y, tw + 2, h], &text, font, ink);
             }
         }
-        Look::Source { mark, selected, parts } => {
-            let bg = if *selected { Role::Sel } else { tint };
-            paint::fill(c.at, 4, bg, Role::None);
-            if *selected {
-                paint::fill([x, y + (h - 16) / 2, 3, 16], 2, Role::Accent, Role::None);
-            }
-            match mark {
-                Mark::Dot(tone) => paint::dot([x + 12, y + 8, 16, 16], *tone),
-                Mark::Glyph(ch, role) => paint::glyph([x + 12, y + 6, 16, 20], *ch, 16, *role),
-            }
-            let shift = |[px, py, pw, ph]: Rect| [x + px, y + py, pw, ph];
-            for part in parts {
-                match part {
-                    Deco::Fill { at, radius, fill, border } => paint::fill(shift(*at), *radius, *fill, *border),
-                    Deco::BandPrint { at } => paint::band_print(shift(*at)),
-                    Deco::Glyph { at, ch, size, ink } => paint::glyph(shift(*at), *ch, *size, *ink),
-                    Deco::Text { at, text, font, ink, flags } => paint::text(shift(*at), text, *font, *ink, *flags),
-                }
-            }
-        }
-        Look::Nav { mark, ink, selected } => {
-            let (text, sub) = lines(&text);
-            let bg = if *selected { Role::Sel } else { tint };
-            paint::fill(c.at, 4, bg, Role::None);
-            if *selected {
-                paint::fill([x, y + (h - 16) / 2, 3, 16], 2, Role::Accent, Role::None);
-            }
-            match mark {
-                Mark::Dot(tone) => paint::dot([x + 12, y + (h - 16) / 2, 16, 16], *tone),
-                Mark::Glyph(ch, role) => paint::glyph([x + 12, y, 16, h], *ch, 16, *role),
-            }
-            let left = x + 40;
-            if sub.is_empty() {
-                paint::line([left, y, w - left + x - 8, h], text, Font::Body, *ink);
-            } else {
-                let top = y + (h - 36) / 2;
-                paint::line([left, top, w - left + x - 8, 20], text, Font::Body, *ink);
-                paint::line([left, top + 20, w - left + x - 8, 16], sub, Font::Caption, Role::Text2);
-            }
-        }
+        Look::Source { mark, selected, parts } => draw_source(c.at, mark, *selected, tint, parts),
+        Look::Nav { mark, ink, selected } => draw_nav(c.at, mark, *ink, *selected, tint, &text),
         Look::Section { title, icon, open, marks, warn } => {
             if tint != Role::None {
                 paint::fill(c.at, 4, tint, Role::None);
@@ -824,7 +851,7 @@ fn draw_ctl(hwnd: HWND) {
     }
     if !matches!(c.look, Look::Splitter) && focus_shown(hwnd) {
         let radius = if matches!(c.look, Look::Toggle { .. } | Look::Row { .. }) { 4 } else { 5 };
-        let ink = if enabled && matches!(c.look, Look::Button { kind: Kind::BandAccent, .. }) { Role::OnAccent } else { Role::Text };
+        let ink = focus_ink(&c.look, enabled);
         paint::fill(c.at, radius, Role::None, ink);
         paint::fill([x + 1, y + 1, w - 2, h - 2], radius - 1, Role::None, ink);
     }
@@ -1562,7 +1589,13 @@ fn row_tool_move(hwnd: HWND, c: &mut Ctl, wp: WPARAM, lp: LPARAM) {
         }
         // Native tools must not overlap. The disclosure spans the row height; command
         // slots form one contiguous band, with body space above and below it.
-        let body = RowText::parse(&text_of(hwnd)).tip();
+        let text = text_of(hwnd);
+        let row = RowText::parse(&text);
+        let status = match &c.look {
+            Look::Row { glyph, .. } => row_status(row.tag, *glyph),
+            _ => RowStatus::Pill,
+        };
+        let body = row.tip(status);
         let [mut left, y, w, h] = c.at;
         let right = left + w;
         if let Some((_, [x, _, width, _])) = disclosure {
@@ -1765,17 +1798,73 @@ mod tests {
     }
 
     #[test]
-    fn up_to_date_rows_use_the_source_list_checkmark() {
+    fn synced_rows_use_the_check_dot_and_every_other_state_keeps_its_label() {
         let dpi = 96;
-        let check_width = row_status_width("Up to date", Some(glyph::OK), dpi);
-        assert_eq!(row_status("Up to date", Some(glyph::OK)), RowStatus::Check);
-        assert_eq!(row_status("Installed", Some(glyph::OK)), RowStatus::Pill);
-        assert_eq!(check_width, 16);
+        for tag in [crate::board::UP_TO_DATE_TAG, crate::board::INSTALLED_TAG] {
+            assert_eq!(row_status(tag, Some(glyph::OK)), RowStatus::Check, "{tag}");
+            assert_eq!(row_status_width(tag, Some(glyph::OK), dpi), 16, "{tag}");
+            assert_eq!(row_status(tag, None), RowStatus::Pill, "{tag} without its mark is a label");
+        }
+        for (tag, mark) in [
+            ("Edited on this PC", glyph::EDIT),
+            ("Deleted on this PC", glyph::DELETE),
+            ("Update available", glyph::WARN),
+            ("Needs your approval", glyph::WARN),
+            ("Failed", glyph::ERR),
+        ] {
+            assert_eq!(row_status(tag, Some(mark)), RowStatus::Pill, "{tag}");
+            assert_eq!(row_status_width(tag, Some(mark), dpi), paint::pill_width(tag, Some(mark), dpi), "{tag}");
+        }
+        assert_eq!(row_status("Sync off", None), RowStatus::Pill);
 
         let at = [0, 0, 500, 42];
-        let parts = row_parts(at, paint::measure("alpha", Font::Body, 0, dpi).0, check_width, &[RowCmd::Open, RowCmd::Preview]);
+        let parts = row_parts(at, paint::measure("alpha", Font::Body, 0, dpi).0, 16, &[RowCmd::Open, RowCmd::Preview]);
         assert_eq!(parts.pill[2], 16);
         assert!(client_rect(at, parts.icons.last().unwrap().1, dpi).right <= client_rect(at, parts.pill, dpi).left);
+    }
+
+    #[test]
+    fn a_check_dot_row_says_its_tag_in_the_tip_and_a_label_row_does_not_repeat_it() {
+        let tip = |text: &str, status| RowText::parse(text).tip(status);
+        let facts = "alpha\nUp to date\nVersion 1a2b3c4 · 3 files, 12 KB\n";
+        assert_eq!(tip(facts, RowStatus::Check), "Up to date\nVersion 1a2b3c4 · 3 files, 12 KB");
+        assert_eq!(tip(facts, RowStatus::Pill), "Version 1a2b3c4 · 3 files, 12 KB", "a label is on the row already");
+        let installed = "alpha\nInstalled\n\nInstalled";
+        assert_eq!(tip(installed, RowStatus::Check), "Installed", "the sentence is the tag: nothing is said twice");
+        let plugin = "alpha\nInstalled\nVersion 2\nInstalled in Copilot from this source.";
+        assert_eq!(tip(plugin, RowStatus::Check), "Installed\nInstalled in Copilot from this source.\nVersion 2");
+        assert_eq!(tip("alpha\nUp to date", RowStatus::Check), "Up to date");
+        assert_eq!(tip("alpha\n\nVersion 2", RowStatus::Check), "Version 2", "no tag, nothing to lead with");
+    }
+
+    #[test]
+    fn the_band_button_has_the_bands_own_colours_and_focus_ring() {
+        let band = Look::Button { kind: Kind::BandAccent, glyph: None };
+        assert_eq!(Kind::BandAccent.colors(true), (Role::BandButton, Role::BandButton, Role::BandButtonText));
+        assert_eq!(focus_ink(&band, true), Role::BandButtonText);
+        assert_eq!(Kind::BandAccent.colors(false), Kind::Standard.colors(false), "disabled, it is a plain button");
+        assert_eq!(focus_ink(&band, false), Role::Text);
+        assert_eq!(Kind::Accent.colors(true), (Role::Accent, Role::None, Role::OnAccent));
+        assert_eq!(focus_ink(&Look::Button { kind: Kind::Accent, glyph: None }, true), Role::Text);
+    }
+
+    #[test]
+    fn a_list_entry_centres_its_mark_whatever_its_height_and_dpi() {
+        let paper = 0xFF00FF;
+        for dpi in [96, 144, 192] {
+            let s = |v| scale(v, dpi);
+            for h in [36, 56] {
+                let (w, mark_x) = (200, 12);
+                assert!(paint::begin(dpi, s(w), s(h), 0, 0));
+                paint::fill_argb([0, 0, w, h], 0, 0xFF00_0000 | paper, 0);
+                draw_source([0, 0, w, h], &Mark::Dot(Tone::Err), false, Role::None, &[]);
+                let pixels = paint::pixels();
+                let drawn: Vec<i32> = (0..s(h)).filter(|&y| (s(mark_x)..s(mark_x + 16)).any(|x| pixels[(y * s(w) + x) as usize] != paper)).collect();
+                paint::release();
+                let (first, last) = (*drawn.first().expect("a mark"), *drawn.last().unwrap());
+                assert!(first.abs_diff(s(h) - 1 - last) <= 1, "{first} px above and {} below, in {h} DIPs at {dpi} DPI", s(h) - 1 - last);
+            }
+        }
     }
 
     #[test]

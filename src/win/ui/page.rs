@@ -427,10 +427,11 @@ fn in_band(h: i32) -> i32 {
 
 pub fn hero(h: &Hero, can_sync: bool, w: i32, fit: Fit) -> Surface {
     let mut o = Out::new(fit);
-    // A status is marked as in the list (a filled dot); the calm states (Off) stay quiet.
-    let (fill, ink) = if h.tone == Tone::Off { (h.tone.bg(), h.tone.ink()) } else { (h.tone.dot(), Role::DotGlyph) };
+    // A status is marked as in the list: the same dot, with a ring that sets it off from the band. The calm states
+    // (Off) keep their own pair of colours.
+    let (fill, ink) = if h.tone == Tone::Off { (h.tone.bg(), h.tone.ink()) } else { (h.tone.dot(), h.tone.dot_ink()) };
     let mark = [24, in_band(40), 40, 40];
-    o.fill(mark, 20, fill, Role::None);
+    o.fill(mark, 20, fill, Role::BandDotRing);
     o.glyph(mark, h.glyph, 18, ink);
     let bw = o.button_width(SYNC_NOW, Some(glyph::SYNC));
     let bx = w - PAD_X - bw;
@@ -497,61 +498,185 @@ pub fn nav_name(v: &SourceView) -> String {
     text
 }
 
-/// Where the text of a source's entry starts, from its left edge.
+/// Where the text of a source's entry starts, from its left edge, and how far from the right edge it stops.
 const ENTRY_LEFT: i32 = 40;
+const ENTRY_RIGHT: i32 = 8;
+/// The one height of every source's entry: the repository, and under it the types and the status.
+const ENTRY_H: i32 = 56;
+const TITLE_TOP: i32 = 5;
+const TITLE_H: i32 = 20;
+const CHIP_TOP: i32 = 27;
+const CHIP_H: i32 = 20;
+const CHIP_GAP: i32 = 4;
+const CHIP_PAD: i32 = 6;
+const CHIP_ICON: i32 = 12;
+/// The least room, with the space after it, that a shortened owner has; with less the owner goes and the repository
+/// gets the room.
+const MIN_OWNER: i32 = 48;
 
-/// Two lines: the repository, then type counts and status. Overflow and the location stay in `nav_name`.
-pub fn source_entry(v: &SourceView, w: i32, fit: Fit) -> (i32, Vec<Deco>) {
-    let line = |at, text: String, font, ink| Deco::Text { at, text, font, ink, flags: ONE_LINE };
-    let mut parts = vec![line([ENTRY_LEFT, 6, w - ENTRY_LEFT - 8, 20], printable(&v.repo).into_owned(), Font::Body, Role::Text)];
-    let status = printable(&v.status).into_owned();
-    if v.kinds.is_empty() {
-        parts.push(line([ENTRY_LEFT, 26, w - ENTRY_LEFT - 8, 18], status, Font::Caption, Role::Text2));
-        return (50, parts);
+/// How a type's chip looks on the second line of an entry.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ChipLook {
+    On,
+    /// Something in this type needs the user.
+    Warn,
+    /// The type does not sync: no fill, and fainter.
+    Off,
+}
+
+/// One type on the second line: its icon and count, or the "+2" that stands for the ones with no room.
+struct Chip {
+    icon: Option<char>,
+    label: String,
+    label_w: i32,
+    look: ChipLook,
+    width: i32,
+}
+
+impl Chip {
+    fn new(icon: Option<char>, label: String, look: ChipLook, fit: Fit) -> Self {
+        let label_w = fit(&label, Font::Caption, 0).0 + 2;
+        let width = 2 * CHIP_PAD + icon.map_or(0, |_| CHIP_ICON + 3) + label_w + if look == ChipLook::Warn { 3 + CHIP_ICON } else { 0 };
+        Self { icon, label, label_w, look, width }
     }
-    let (x, tw) = (12, w - 20);
-    let badges: Vec<_> = v
+
+    fn draw(self, x: i32, parts: &mut Vec<Deco>) {
+        let (fill, border, icon_ink, ink) = match self.look {
+            ChipLook::On => (Role::Ctl, Role::CtlBorder, Role::Text2, Role::Text),
+            ChipLook::Warn => (Role::WarnBg, Role::CtlBorder, Role::Warn, Role::Warn),
+            ChipLook::Off => (Role::None, Role::None, Role::Text3, Role::Text3),
+        };
+        if fill != Role::None {
+            parts.push(Deco::Fill { at: [x, CHIP_TOP, self.width, CHIP_H], radius: CHIP_H / 2, fill, border });
+        }
+        let mut left = x + CHIP_PAD;
+        if let Some(ch) = self.icon {
+            parts.push(Deco::Glyph { at: [left, CHIP_TOP, CHIP_ICON, CHIP_H], ch, size: 12, ink: icon_ink });
+            left += CHIP_ICON + 3;
+        }
+        parts.push(Deco::Text { at: [left, CHIP_TOP, self.label_w, CHIP_H], text: self.label, font: Font::Caption, ink, flags: ONE_LINE });
+        if self.look == ChipLook::Warn {
+            parts.push(Deco::Glyph { at: [left + self.label_w + 3, CHIP_TOP, CHIP_ICON, CHIP_H], ch: glyph::WARN, size: 12, ink });
+        }
+    }
+}
+
+/// The first line of an entry: the repository in strong type, and in front of it its owner, dimmed. The owner gives way
+/// first: it is cut to the start of it that leaves the repository its room and one space, and ends in an ellipsis, then
+/// it goes; the repository is cut last. The owner is cut here, not by the painter, so the space after the letters that
+/// are drawn is the only gap there is.
+fn entry_title(parts: &mut Vec<Deco>, repo: &str, top: i32, room: i32, fit: Fit) {
+    let line = |x, width, text: &str, font, ink| Deco::Text { at: [ENTRY_LEFT + x, top, width, TITLE_H], text: text.to_string(), font, ink, flags: ONE_LINE };
+    let Some((owner, name)) = repo.split_once('/').filter(|(owner, name)| !owner.is_empty() && !name.is_empty()) else {
+        parts.push(line(0, room, repo, Font::Strong, Role::Text));
+        return;
+    };
+    let name_w = fit(name, Font::Strong, 0).0 + 1;
+    let slashed = format!("{owner}/");
+    let slashed_w = fit(&slashed, Font::Body, 0).0 + 1;
+    if slashed_w + name_w <= room {
+        parts.push(line(0, slashed_w, &slashed, Font::Body, Role::Text2));
+        parts.push(line(slashed_w, room - slashed_w, name, Font::Strong, Role::Text));
+        return;
+    }
+    let space = fit(" ", Font::Body, 0).0;
+    let owner_room = room - name_w;
+    let cut = if owner_room >= MIN_OWNER { shortened(owner, owner_room - space, fit) } else { None };
+    match cut {
+        Some((cut, cut_w)) => {
+            parts.push(line(0, cut_w + 1, &cut, Font::Body, Role::Text2));
+            parts.push(line(cut_w + space, room - cut_w - space, name, Font::Strong, Role::Text));
+        }
+        None => parts.push(line(0, room, name, Font::Strong, Role::Text)),
+    }
+}
+
+/// The longest start of an owner's name that, with an ellipsis after it, is at most `width` wide, and how wide that is.
+/// None when no start of it fits.
+fn shortened(owner: &str, width: i32, fit: Fit) -> Option<(String, i32)> {
+    let starts: Vec<&str> = owner.char_indices().skip(1).map(|(end, _)| &owner[..end]).collect();
+    let dotted = |start: &str| format!("{start}…");
+    let fitting = starts.partition_point(|&start| fit(&dotted(start), Font::Body, 0).0 <= width);
+    let cut = dotted(starts[fitting.checked_sub(1)?]);
+    let cut_w = fit(&cut, Font::Body, 0).0;
+    Some((cut, cut_w))
+}
+
+/// The second line of an entry: a chip for each type, as many as fit, and the status at the right. The status keeps its
+/// whole width and the chips give way to it: first those that are off, then those as they should be, last those that
+/// need the user. A "+2" chip stands for the types with no room (it warns when one of them does).
+fn entry_detail(parts: &mut Vec<Deco>, v: &SourceView, status: Option<(String, Role)>, room: i32, fit: Fit) {
+    let chips: Vec<Chip> = v
         .kinds
         .iter()
         .map(|k| {
             let (label, warn) = kind_badge(k);
-            let lw = fit(&label, Font::Caption, 0).0 + 2;
-            (label, warn, lw, 16 + lw + if warn { 14 } else { 0 })
+            let look = match (k.on, warn) {
+                (false, _) => ChipLook::Off,
+                (true, true) => ChipLook::Warn,
+                (true, false) => ChipLook::On,
+            };
+            Chip::new(Some(kind_glyph(k.kind)), label, look, fit)
         })
         .collect();
-    let badges_width = badges.iter().map(|b| b.3 + 4).sum::<i32>() - 4;
-    let sw = (fit(&status, Font::Caption, 0).0 + 2).min((tw - badges_width - 8).max(64.min(tw / 3)));
-    let end = w - 8 - sw - 8;
-    let mut cx = x;
-    for (i, (label, warn, lw, chip)) in badges.iter().enumerate() {
-        let remaining = &badges[i + 1..];
-        let rest_width = remaining.iter().map(|b| b.3 + 4).sum::<i32>();
-        let overflow = |count: usize, warning: bool| {
-            let text = format!("+{count}");
-            let width = fit(&text, Font::Caption, 0).0 + 2 + if warning { 14 } else { 0 };
-            (text, width)
-        };
-        let reserve = if remaining.is_empty() { 0 } else { 4 + overflow(remaining.len(), remaining.iter().any(|b| b.1)).1 };
-        if cx + chip + rest_width > end && cx + chip + reserve > end {
-            let warning = badges[i..].iter().any(|b| b.1);
-            let (text, width) = overflow(badges.len() - i, warning);
-            if warning {
-                parts.push(Deco::Glyph { at: [cx, 26, 12, 18], ch: glyph::WARN, size: 12, ink: Tone::Warn.ink() });
-            }
-            let offset = if warning { 14 } else { 0 };
-            parts.push(line([cx + offset, 26, width - offset, 18], text, Font::Caption, Role::Text2));
-            break;
+    let mut order: Vec<usize> = (0..chips.len()).collect();
+    order.sort_by_key(|&i| match chips[i].look {
+        ChipLook::Warn => 0,
+        ChipLook::On => 1,
+        ChipLook::Off => 2,
+    });
+    let status_w = status.as_ref().map_or(0, |(text, _)| (fit(text, Font::Caption, 0).0 + 2).min(room));
+    let limit = if status_w > 0 { room - status_w - CHIP_GAP } else { room };
+    let more = |kept: usize| {
+        let look = if order[kept..].iter().any(|&i| chips[i].look == ChipLook::Warn) { ChipLook::Warn } else { ChipLook::On };
+        Chip::new(None, format!("+{}", order.len() - kept), look, fit)
+    };
+    let width = |kept: usize| {
+        let shown = order[..kept].iter().map(|&i| chips[i].width).sum::<i32>() + CHIP_GAP * (kept as i32 - 1).max(0);
+        match kept {
+            0 => more(0).width,
+            k if k == order.len() => shown,
+            _ => shown + CHIP_GAP + more(kept).width,
         }
-        let ink = if v.kinds[i].on { Role::Text } else { Role::Text3 };
-        parts.push(Deco::Glyph { at: [cx, 26, 14, 18], ch: kind_glyph(v.kinds[i].kind), size: 12, ink });
-        parts.push(line([cx + 16, 26, *lw, 18], label.clone(), Font::Caption, Role::Text2));
-        if *warn {
-            parts.push(Deco::Glyph { at: [cx + 16 + lw + 2, 26, 12, 18], ch: glyph::WARN, size: 12, ink: Tone::Warn.ink() });
+    };
+    let kept = if chips.is_empty() { None } else { (0..=chips.len()).rev().find(|&kept| width(kept) <= limit) };
+    if let Some(kept) = kept {
+        let rest = (kept < chips.len()).then(|| more(kept));
+        let shown = &order[..kept];
+        let mut x = ENTRY_LEFT;
+        for chip in chips.into_iter().enumerate().filter(|(i, _)| shown.contains(i)).map(|(_, chip)| chip).chain(rest) {
+            let next = x + chip.width + CHIP_GAP;
+            chip.draw(x, parts);
+            x = next;
         }
-        cx += chip + 4;
     }
-    parts.push(Deco::Text { at: [w - 8 - sw, 26, sw, 18], text: status, font: Font::Caption, ink: Role::Text2, flags: ONE_LINE | DT_RIGHT });
-    (50, parts)
+    if let Some((text, ink)) = status {
+        let (at, flags) = if kept.is_some() {
+            ([ENTRY_LEFT + room - status_w, CHIP_TOP, status_w, CHIP_H], ONE_LINE | DT_RIGHT)
+        } else {
+            ([ENTRY_LEFT, CHIP_TOP, room, CHIP_H], ONE_LINE)
+        };
+        parts.push(Deco::Text { at, text, font: Font::Caption, ink, flags });
+    }
+}
+
+/// Two lines: the repository, then a chip for each type and, unless the source is simply up to date, its status (that
+/// is what the dot is for). Overflow and the location stay in `nav_name`.
+pub fn source_entry(v: &SourceView, w: i32, fit: Fit) -> (i32, Vec<Deco>) {
+    let room = (w - ENTRY_LEFT - ENTRY_RIGHT).max(0);
+    let status = (v.status != board::UP_TO_DATE_TAG).then(|| {
+        let ink = match v.level {
+            Level::Ok => Role::Text2,
+            Level::Attention => Role::Warn,
+            Level::Error => Role::Err,
+        };
+        (printable(&v.status).into_owned(), ink)
+    });
+    let mut parts = Vec::new();
+    let top = if status.is_some() || !v.kinds.is_empty() { TITLE_TOP } else { (ENTRY_H - TITLE_H) / 2 };
+    entry_title(&mut parts, &printable(&v.repo), top, room, fit);
+    entry_detail(&mut parts, v, status, room, fit);
+    (ENTRY_H, parts)
 }
 
 /// The list on the left: the sources, Add source, and at the bottom Activity and Settings.
@@ -2505,13 +2630,17 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn the_top_mark_has_the_colours_of_the_marks_in_the_list() {
+    fn the_top_mark_has_the_colours_of_the_marks_in_the_list_and_a_ring_on_the_band() {
         let mark = [24, 16, 40, 40];
+        let top = |tone| hero(&Hero { tone, glyph: glyph::OK, title: "Title".to_string(), sub: String::new() }, true, 800, &fit);
         for tone in [Tone::Ok, Tone::Warn, Tone::Err] {
-            let s = hero(&Hero { tone, glyph: glyph::OK, title: "Title".to_string(), sub: String::new() }, true, 800, &fit);
-            assert!(s.decos.contains(&Deco::Fill { at: mark, radius: 20, fill: tone.dot(), border: Role::None }), "{tone:?}: {:?}", s.decos);
-            assert!(s.decos.contains(&Deco::Glyph { at: mark, ch: glyph::OK, size: 18, ink: Role::DotGlyph }), "{tone:?}: {:?}", s.decos);
+            let s = top(tone);
+            assert!(s.decos.contains(&Deco::Fill { at: mark, radius: 20, fill: tone.dot(), border: Role::BandDotRing }), "{tone:?}: {:?}", s.decos);
+            assert!(s.decos.contains(&Deco::Glyph { at: mark, ch: glyph::OK, size: 18, ink: tone.dot_ink() }), "{tone:?}: {:?}", s.decos);
         }
+        let calm = top(Tone::Off);
+        assert!(calm.decos.contains(&Deco::Fill { at: mark, radius: 20, fill: Tone::Off.bg(), border: Role::BandDotRing }), "{:?}", calm.decos);
+        assert!(calm.decos.contains(&Deco::Glyph { at: mark, ch: glyph::OK, size: 18, ink: Tone::Off.ink() }), "{:?}", calm.decos);
     }
 
     #[test]
@@ -2738,17 +2867,54 @@ pub(super) mod tests {
         )
     }
 
+    /// A list of one source at width `w`, as `caption_fit` measures it: that source's entry, and what it draws.
+    fn entry_in_list(v: &SourceView, w: i32) -> (Item, Vec<Deco>) {
+        let s = nav(std::slice::from_ref(v), &Page::Activity, w, 600, &caption_fit);
+        let entry = item(&s, id::NAV_REPO).clone();
+        let Look::Source { parts, .. } = &entry.look else { panic!("{:?}", entry.look) };
+        let parts = parts.clone();
+        (entry, parts)
+    }
+
+    /// What an entry draws is inside it. The only things that share a place are a chip and what is written on it; no
+    /// text or icon touches another, and no chip another chip.
+    fn assert_entry_is_tidy(entry: &Item, parts: &[Deco], at: &str) {
+        let [_, _, w, h] = entry.at;
+        let apart = |a: Rect, b: Rect| a[0] + a[2] <= b[0] || b[0] + b[2] <= a[0] || a[1] + a[3] <= b[1] || b[1] + b[3] <= a[1];
+        let within = |a: Rect, b: Rect| a[0] >= b[0] && a[1] >= b[1] && a[0] + a[2] <= b[0] + b[2] && a[1] + a[3] <= b[1] + b[3];
+        for (k, d) in parts.iter().enumerate() {
+            let a = deco_at(d);
+            assert!(a[2] > 0 && a[3] > 0 && within(a, [0, 0, w, h]), "{d:?} is outside the {w}x{h} entry at {at}");
+            for e in &parts[k + 1..] {
+                let b = deco_at(e);
+                let fine = match (d, e) {
+                    (Deco::Fill { .. }, Deco::Fill { .. }) => apart(a, b),
+                    (Deco::Fill { .. }, _) => apart(a, b) || within(b, a),
+                    (_, Deco::Fill { .. }) => apart(a, b) || within(a, b),
+                    _ => apart(a, b),
+                };
+                assert!(fine, "{d:?} and {e:?} collide at {at}");
+            }
+        }
+    }
+
+    /// The first line of an entry: the owner's text when it is shown, and the repository's.
+    fn title_of(parts: &[Deco]) -> (Option<&Deco>, &Deco) {
+        let find = |font: Font| parts.iter().find(|d| matches!(d, Deco::Text { font: f, .. } if *f == font));
+        (find(Font::Body), find(Font::Strong).expect("the repository"))
+    }
+
     #[test]
-    fn the_list_has_one_entry_per_source_with_a_labelled_icon_per_type() {
+    fn the_list_has_one_entry_per_source_with_a_chip_per_type() {
         let v = four_types();
         assert_eq!(nav_name(&v), "o/a, main, skills. Skills 3, Agents 1, Instructions: Sync off, Plugins 1 (needs approval). Up to date");
         let page = Page::Repo("o/a".to_string());
         for w in [NAV_W, 400] {
-            let s = nav(std::slice::from_ref(&v), &page, w, 600, &fit);
+            let s = nav(std::slice::from_ref(&v), &page, w, 600, &caption_fit);
             fits_in(&s, w);
             let entry = item(&s, id::NAV_REPO);
-            assert_eq!(entry.at[3], 50, "a source uses only two text lines");
-            assert_eq!(entry.text, nav_name(&v), "the window text spells out what the icons show");
+            assert_eq!(entry.at[3], ENTRY_H, "a source uses only two text lines");
+            assert_eq!(entry.text, nav_name(&v), "the window text spells out what the chips show");
             let Look::Source { selected: true, parts, .. } = &entry.look else { panic!("{:?}", entry.look) };
             let icons: Vec<(char, Rect)> = parts
                 .iter()
@@ -2761,23 +2927,15 @@ pub(super) mod tests {
             let labels: Vec<&str> = parts
                 .iter()
                 .filter_map(|d| match d {
-                    Deco::Text { text, font: Font::Caption, .. } if ["3", "1", "off"].contains(&text.as_str()) => Some(text.as_str()),
+                    Deco::Text { text, font: Font::Caption, .. } => Some(text.as_str()),
                     _ => None,
                 })
                 .collect();
-            assert_eq!(labels, ["3", "1", "off", "1"]);
+            assert_eq!(labels, ["3", "1", "off", "1"], "a source that is up to date says nothing else on its second line");
             assert_eq!(parts.iter().filter(|d| matches!(d, Deco::Glyph { ch: glyph::WARN, .. })).count(), 1, "the plugin to approve is marked");
-            // Each badge and the status keep their own space on the second line.
-            let [_, _, ew, eh] = entry.at;
-            for (k, a) in parts.iter().map(deco_at).enumerate() {
-                assert!(a[0] >= 0 && a[1] >= 0 && a[0] + a[2] <= ew && a[1] + a[3] <= eh, "{a:?} is outside {ew}x{eh}");
-                for b in parts.iter().skip(k + 1).map(deco_at) {
-                    let apart = a[0] + a[2] <= b[0] || b[0] + b[2] <= a[0] || a[1] + a[3] <= b[1] || b[1] + b[3] <= a[1];
-                    assert!(apart, "{a:?} overlaps {b:?} at {w}");
-                }
-            }
+            assert_entry_is_tidy(entry, parts, &w.to_string());
             let lines: HashSet<i32> = icons.iter().map(|i| i.1[1]).collect();
-            assert_eq!(lines.len(), 1, "the icons never wrap ({w}): {icons:?}");
+            assert_eq!(lines.len(), 1, "the chips never wrap ({w}): {icons:?}");
             assert!(!parts.iter().any(|d| matches!(d, Deco::Text { text, .. } if text.contains("main") || text.contains("skills"))));
             assert!(item(&s, id::NAV_ADD).at[1] > entry.at[1] + entry.at[3], "rows never overlap");
         }
@@ -2792,7 +2950,7 @@ pub(super) mod tests {
         assert_eq!(nav_name(&fresh), "o/b, default branch, whole repository. Not checked yet");
         let s = nav(std::slice::from_ref(&fresh), &Page::Activity, NAV_W, 600, &fit);
         let Look::Source { parts, selected: false, .. } = &item(&s, id::NAV_REPO).look else { panic!() };
-        assert!(!parts.iter().any(|d| matches!(d, Deco::Glyph { .. })), "no icons before the first listing");
+        assert!(!parts.iter().any(|d| matches!(d, Deco::Glyph { .. } | Deco::Fill { .. })), "no chips before the first listing");
         assert!(parts.iter().any(|d| matches!(d, Deco::Text { text, .. } if text == "Not checked yet")));
         assert_eq!(item(&s, id::NAV_ADD).text, "Add source");
     }
@@ -2800,31 +2958,249 @@ pub(super) mod tests {
     #[test]
     fn narrow_source_entries_keep_two_lines_and_expose_overflow_in_the_full_label() {
         for wide_counts in [false, true] {
-            let mut v = four_types();
-            v.repo = "owner/a-very-long-repository-name".into();
-            v.status = "Some items need your attention".into();
-            if wide_counts {
-                for k in &mut v.kinds {
-                    k.found = Some(u32::MAX);
-                }
-            }
-            for w in MIN_LIST_W..=400 {
-                let s = nav(std::slice::from_ref(&v), &Page::Activity, w, 600, &fit);
-                let entry = item(&s, id::NAV_REPO);
-                assert_eq!(entry.at[3], 50);
-                assert_eq!(entry.text, nav_name(&v), "no information is lost from the tooltip or accessible name");
-                let Look::Source { parts, .. } = &entry.look else { panic!() };
-                assert!(parts.iter().any(|d| matches!(d, Deco::Text { text, .. } if text == &v.status)));
-                if w == MIN_LIST_W {
-                    assert!(parts.iter().any(|d| matches!(d, Deco::Text { text, .. } if text.starts_with('+'))), "hidden types are signposted");
-                    assert!(parts.iter().any(|d| matches!(d, Deco::Glyph { ch: glyph::WARN, .. })), "overflow never hides a warning");
-                }
-                for (i, a) in parts.iter().map(deco_at).enumerate() {
-                    assert!(a[0] >= 0 && a[1] >= 0 && a[2] > 0 && a[0] + a[2] <= entry.at[2] && a[1] + a[3] <= entry.at[3], "{a:?} at {w}");
-                    for b in parts.iter().skip(i + 1).map(deco_at) {
-                        assert!(a[0] + a[2] <= b[0] || b[0] + b[2] <= a[0] || a[1] + a[3] <= b[1] || b[1] + b[3] <= a[1], "{a:?} overlaps {b:?} at {w}");
+            for status in ["Disabled", "Needs attention (2)"] {
+                let mut v = SourceView { status: status.into(), repo: "owner/a-very-long-repository-name".into(), ..four_types() };
+                if wide_counts {
+                    for k in &mut v.kinds {
+                        k.found = Some(u32::MAX);
                     }
                 }
+                let needed = caption_fit(status, Font::Caption, 0).0;
+                for w in MIN_LIST_W..=400 {
+                    let (entry, parts) = entry_in_list(&v, w);
+                    assert_eq!(entry.at[3], ENTRY_H);
+                    assert_eq!(entry.text, nav_name(&v), "no information is lost from the tooltip or accessible name");
+                    assert_entry_is_tidy(&entry, &parts, &format!("{w} wide with {status:?}"));
+                    let chips = parts.iter().any(|d| matches!(d, Deco::Fill { .. }));
+                    let said = parts.iter().find(|d| matches!(d, Deco::Text { text, .. } if text == status)).expect("the status is shown");
+                    if chips {
+                        assert!(deco_at(said)[2] >= needed, "the chips give way to the status at {w}: {said:?}");
+                        assert!(parts.iter().any(|d| matches!(d, Deco::Glyph { ch: glyph::WARN, .. })), "overflow never hides a warning at {w}");
+                    }
+                    if w == MIN_LIST_W && status == "Disabled" {
+                        assert!(parts.iter().any(|d| matches!(d, Deco::Text { text, .. } if text.starts_with('+'))), "hidden types are signposted");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn an_entry_names_the_repository_in_strong_type_and_its_owner_gives_way_first() {
+        let named = |repo: &str| skills_view(repo, vec![ok("x")]);
+        let (_, parts) = entry_in_list(&named("owner/repository"), 400);
+        let (owner, name) = title_of(&parts);
+        let owner = owner.expect("an owner");
+        assert_eq!((deco_text(owner).as_str(), deco_text(name).as_str()), ("owner/", "repository"));
+        assert!(matches!(owner, Deco::Text { ink: Role::Text2, .. }), "the owner is dimmed");
+        assert!(matches!(name, Deco::Text { ink: Role::Text, .. }), "the repository has the full ink");
+        assert_eq!(deco_at(owner)[0] + deco_at(owner)[2], deco_at(name)[0], "the repository follows its owner");
+        assert_eq!(deco_at(owner)[1], deco_at(name)[1]);
+
+        // The room is for the repository first: the owner shortens, then goes, and only then is the repository cut.
+        let long = named("organization/a-long-repository-name");
+        let name_w = caption_fit("a-long-repository-name", Font::Strong, 0).0;
+        let owner_w = caption_fit("organization/", Font::Body, 0).0;
+        let mut owners = Vec::new();
+        for w in MIN_LIST_W..=400 {
+            let (_, parts) = entry_in_list(&long, w);
+            let (owner, name) = title_of(&parts);
+            let shown = owner.map_or(0, |o| deco_at(o)[2]);
+            if owner.is_some() {
+                assert!(deco_at(name)[2] >= name_w, "at {w} the repository is cut while its owner is shown");
+                assert!(shown >= owner_w || w - 16 - ENTRY_LEFT - ENTRY_RIGHT - name_w >= MIN_OWNER, "at {w} the owner has too little room to be shown");
+            } else {
+                assert_eq!(deco_text(name), "a-long-repository-name");
+                assert_eq!(deco_at(name), [ENTRY_LEFT, TITLE_TOP, w - 16 - ENTRY_LEFT - ENTRY_RIGHT, TITLE_H], "the repository has the whole line");
+            }
+            owners.push(shown);
+        }
+        assert!(owners.windows(2).all(|pair| pair[0] <= pair[1]), "a wider list never shows less of the owner: {owners:?}");
+        assert_eq!(owners[0], 0, "the narrowest list shows the repository alone");
+        assert!(owners.iter().any(|&shown| shown > 0 && shown < owner_w), "the owner shortens before it goes");
+        assert!(owners.last().is_some_and(|&shown| shown >= owner_w), "and a wide list shows all of it");
+
+        for plain in ["monorepo", "/x", "o/"] {
+            let (_, parts) = entry_in_list(&named(plain), 400);
+            let (owner, name) = title_of(&parts);
+            assert!(owner.is_none(), "{plain:?} has no owner to show");
+            assert_eq!(deco_text(name), plain);
+            assert!(matches!(name, Deco::Text { font: Font::Strong, ink: Role::Text, .. }));
+        }
+        let (_, parts) = entry_in_list(&named("ow\u{202e}ner/re\u{202e}po"), 400);
+        assert!(parts.iter().all(|d| !deco_text(d).contains('\u{202e}')), "the text is made printable");
+    }
+
+    /// The owner's text is cut here, not by the painter, which would leave a gap of its own size after the letters.
+    #[test]
+    fn a_shortened_owner_is_cut_by_the_page_and_the_repository_follows_it_by_one_space() {
+        let repo = skills_view("organization/a-long-repository-name", vec![ok("x")]);
+        for per in [5, 7, 9] {
+            // As in a real font, a space is narrower than a letter and a bold letter is wider, so measuring the wrong
+            // one shows.
+            let by = |text: &str, font: Font, width: i32| {
+                let letter = if font == Font::Strong { per + 2 } else { per };
+                let w: i32 = text.chars().map(|c| if c == ' ' { per / 2 } else { letter }).sum();
+                let lh = line_height(font);
+                if width <= 0 { (w, lh) } else { (w.min(width), ((w + width - 1) / width).max(1) * lh) }
+            };
+            let (space, name_w) = (by(" ", Font::Body, 0).0, by("a-long-repository-name", Font::Strong, 0).0 + 1);
+            let (mut whole, mut cut, mut dropped) = (0, 0, 0);
+            for w in MIN_LIST_W..=520 {
+                let room = w - 16 - ENTRY_LEFT - ENTRY_RIGHT;
+                let s = nav(std::slice::from_ref(&repo), &Page::Activity, w, 600, &by);
+                let Look::Source { parts, .. } = &item(&s, id::NAV_REPO).look else { panic!() };
+                let (owner, name) = title_of(parts);
+                let case = format!("{per} DIPs a letter, {w} wide");
+                let want = {
+                    let width = |text: &str| by(text, Font::Body, 0).0;
+                    let owner_room = room - name_w;
+                    let fits_whole = width("organization/") + 1 + name_w <= room;
+                    let shortened = (1..12).rev().map(|kept| format!("{}…", &"organization"[..kept])).find(|cut| width(cut) <= owner_room - space);
+                    if fits_whole {
+                        Some("organization/".to_string())
+                    } else if owner_room >= MIN_OWNER {
+                        shortened
+                    } else {
+                        None
+                    }
+                };
+                let Some(owner) = owner else {
+                    assert_eq!(want, None, "an owner that fits is shown: {case}");
+                    assert_eq!(deco_at(name), [ENTRY_LEFT, TITLE_TOP, room, TITLE_H], "the repository has the whole line: {case}");
+                    dropped += 1;
+                    continue;
+                };
+                let (text, [x, _, box_w, _]) = (deco_text(owner), deco_at(owner));
+                let drawn = by(&text, Font::Body, 0).0;
+                assert_eq!(box_w, drawn + 1, "{text:?} needs {drawn} and its box is {box_w}, so the painter cuts it, or leaves a gap, at {case}");
+                assert_eq!(Some(&text), want.as_ref(), "{case}");
+                let [name_x, _, name_room, _] = deco_at(name);
+                assert_eq!(name_x + name_room, ENTRY_LEFT + room, "the repository has what is left of the line: {case}");
+                assert!(name_room >= name_w, "the repository is whole: {case}");
+                assert!([owner, name].iter().all(|d| matches!(d, Deco::Text { flags, .. } if *flags == ONE_LINE)), "the title is one line: {case}");
+                if text.ends_with('/') {
+                    whole += 1;
+                    assert_eq!(name_x, x + box_w, "the slash is what separates the repository from its owner: {case}");
+                } else {
+                    cut += 1;
+                    assert_eq!(name_x, x + drawn + space, "the repository starts one space after the letters that are drawn: {case}");
+                }
+            }
+            assert!(whole > 0 && cut > 0 && dropped > 0, "every case is met ({per} DIPs a letter): {whole} whole, {cut} cut, {dropped} dropped");
+        }
+    }
+
+    #[test]
+    fn every_source_entry_has_one_height_whatever_it_shows() {
+        let fresh = SourceView { last_check: None, status: "Not checked yet".to_string(), ..source_view("o/fresh", Vec::new()) };
+        let paused = SourceView { enabled: false, status: "Disabled".to_string(), ..four_types() };
+        let long = skills_view("AngelosP/tiny-skill-sync-fixtures-with-a-long-name", vec![ok("x")]);
+        let sources = [four_types(), fresh, unreadable_source("o/broken"), paused, skills_view("monorepo", vec![ok("x")]), long];
+        for w in [MIN_LIST_W, NAV_W, 400] {
+            let s = nav(&sources, &Page::Activity, w, 600, &caption_fit);
+            fits_in(&s, w);
+            let entries: Vec<&Item> = s.items.iter().filter(|i| matches!(i.look, Look::Source { .. })).collect();
+            assert_eq!(entries.len(), sources.len());
+            assert!(entries.iter().all(|e| e.at[3] == ENTRY_H), "at {w}: {:?}", entries.iter().map(|e| e.at[3]).collect::<Vec<_>>());
+            for (pair, v) in entries.windows(2).zip(&sources) {
+                assert_eq!(pair[1].at[1], pair[0].at[1] + ENTRY_H + 2, "{} is followed by the next entry", v.repo);
+            }
+            let last = entries.last().expect("entries");
+            assert!(item(&s, id::NAV_ADD).at[1] >= last.at[1] + last.at[3], "Add source is under the last entry");
+        }
+    }
+
+    #[test]
+    fn a_type_that_needs_the_user_has_a_warm_chip_that_is_kept_before_the_calm_ones() {
+        let (_, parts) = entry_in_list(&four_types(), 400);
+        let fills: Vec<(Role, Role)> = parts
+            .iter()
+            .filter_map(|d| match d {
+                Deco::Fill { fill, border, .. } => Some((*fill, *border)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            fills,
+            [(Role::Ctl, Role::CtlBorder), (Role::Ctl, Role::CtlBorder), (Role::WarnBg, Role::CtlBorder)],
+            "skills and agents, then the plugin to approve; instructions that are off have no chip"
+        );
+        let warm: Vec<char> = parts
+            .iter()
+            .filter_map(|d| match d {
+                Deco::Glyph { ch, ink: Role::Warn, .. } => Some(*ch),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(warm, [glyph::PLUGIN, glyph::WARN], "the plugin's icon and the sign share the warm ink");
+        assert!(parts.iter().any(|d| matches!(d, Deco::Text { text, ink: Role::Warn, .. } if text == "1")));
+        assert!(parts.iter().any(|d| matches!(d, Deco::Text { text, ink: Role::Text3, .. } if text == "off")), "a type that is off is muted");
+        assert!(parts.iter().any(|d| matches!(d, Deco::Glyph { ch, ink: Role::Text3, .. } if *ch == glyph::INSTRUCTION)));
+
+        // With little room the types that need the user stay, and the others are counted in a chip of their own.
+        let v = SourceView { status: "Disabled".to_string(), ..four_types() };
+        let mut hidden = 0;
+        for w in MIN_LIST_W..=400 {
+            let (entry, parts) = entry_in_list(&v, w);
+            assert_entry_is_tidy(&entry, &parts, &w.to_string());
+            let warm_chip = parts.iter().any(|d| matches!(d, Deco::Glyph { ch, ink: Role::Warn, .. } if *ch == glyph::PLUGIN));
+            if warm_chip {
+                continue;
+            }
+            hidden += 1;
+            let fills: Vec<Role> = parts.iter().filter_map(|d| if let Deco::Fill { fill, .. } = d { Some(*fill) } else { None }).collect();
+            assert_eq!(fills, [Role::WarnBg], "at {w} no calm chip is kept in front of the warning, which the count carries");
+            assert!(parts.iter().any(|d| matches!(d, Deco::Text { text, .. } if text == "+4")));
+            assert!(parts.iter().any(|d| matches!(d, Deco::Glyph { ch: glyph::WARN, .. })));
+        }
+        assert!(hidden > 0, "the narrowest list has no room for the plugin's chip beside the status");
+    }
+
+    #[test]
+    fn a_source_that_is_up_to_date_has_no_status_text_and_every_other_state_says_so() {
+        let healthy = skills_view("o/a", vec![ok("x")]);
+        for w in [MIN_LIST_W, NAV_W, 400] {
+            let (_, parts) = entry_in_list(&healthy, w);
+            let words: Vec<String> = parts.iter().map(deco_text).filter(|t| !t.is_empty()).collect();
+            assert_eq!(words, ["o/", "a", "1"], "only the repository and the count are written, the dot says the rest ({w})");
+        }
+        for (status, level, ink) in [
+            ("Needs attention (2)", Level::Attention, Role::Warn),
+            ("Not found", Level::Error, Role::Err),
+            ("Not checked yet", Level::Ok, Role::Text2),
+            ("Disabled", Level::Ok, Role::Text2),
+            ("Changes pending", Level::Ok, Role::Text2),
+        ] {
+            let v = SourceView { status: status.to_string(), level, ..healthy.clone() };
+            let (_, parts) = entry_in_list(&v, 400);
+            let said = parts.iter().find(|d| deco_text(d) == status).unwrap_or_else(|| panic!("{status:?} is not said"));
+            assert!(matches!(said, Deco::Text { font: Font::Caption, ink: i, .. } if *i == ink), "{status:?}: {said:?}");
+        }
+    }
+
+    #[test]
+    fn source_marks_use_the_soft_check_dot_only_when_synced() {
+        let synced = skills_view("o/a", vec![ok("x")]);
+        let mark_of = |v: &SourceView| {
+            let (entry, _) = entry_in_list(v, NAV_W);
+            let Look::Source { mark, .. } = &entry.look else { panic!("{:?}", entry.look) };
+            *mark
+        };
+        let enabled = [
+            ("checked and fine", synced.clone(), Mark::Dot(Tone::Ok)),
+            ("asking for attention", SourceView { level: Level::Attention, ..synced.clone() }, Mark::Dot(Tone::Warn)),
+            ("in error", SourceView { level: Level::Error, ..synced.clone() }, Mark::Dot(Tone::Err)),
+            ("not checked yet", SourceView { last_check: None, ..synced.clone() }, Mark::Glyph(glyph::SYNC, Role::Text2)),
+            ("in error on its first check", SourceView { level: Level::Error, last_check: None, ..synced.clone() }, Mark::Dot(Tone::Err)),
+        ];
+        for (state, v, want) in enabled {
+            assert_eq!(mark_of(&v), want, "an enabled source that is {state}");
+        }
+        for level in [Level::Ok, Level::Attention, Level::Error] {
+            for last_check in [Some(NOW - 120), None] {
+                let paused = SourceView { enabled: false, level, last_check, ..synced.clone() };
+                assert_eq!(mark_of(&paused), Mark::Dot(Tone::Off), "a paused source at {level:?}, last checked {last_check:?}, has the calm dot");
             }
         }
     }

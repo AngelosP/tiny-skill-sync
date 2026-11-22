@@ -51,7 +51,7 @@ scripts\dev.ps1 test
 ```
 
 This runs `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings` and `cargo test --no-fail-fast`. All three
-must pass. There are 1,014 tests (647 in the library, including one ignored live check, and 367 integration tests);
+must pass. There are 1,041 tests (674 in the library, including one ignored live check, and 367 integration tests);
 the whole gate takes about 40 seconds when the code is already built.
 
 If the change can affect speed, memory or disk use (startup, verification, the poll, the tray, the window),
