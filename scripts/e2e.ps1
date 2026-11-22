@@ -2192,9 +2192,12 @@ function Test-Ui {
         Test-Painted $pic $win 'a type turned off' @(@($UiPanel.Nav, $UiId.NavRepo), @($UiPanel.Page, $UiId.SourceType), @($UiPanel.Page, $UiId.Skill))
         Test-Layout $win 'a type turned off'
         Test-TabOrder $win 'a type turned off'
+        # A lane turned back on shows its last check's "Up to date" while its new check runs, and settings cannot be
+        # changed until that check ends; it is slow when the anonymous limit is used up and it falls back to the token.
+        $checks = Get-MarkCount $c.Report 'job-check'
         Choose-Ui $win $UiPanel.Page $UiId.SourceType 'Default (On)'
         $cfg = Wait-Maybe { $x = Get-Config $c; if ($x -and -not ($x.sources[0].types -and $x.sources[0].types.PSObject.Properties['skills'])) { $x } } 8
-        $back = Wait-Maybe { $n = @(Read-Nav $win); if ($n.Count -eq 1 -and $n[0].Kinds -eq 'Skills 3' -and $n[0].Sub -eq 'Up to date') { $true } } 30
+        $back = Wait-Maybe { $n = @(Read-Nav $win); if ($n.Count -eq 1 -and $n[0].Kinds -eq 'Skills 3' -and $n[0].Sub -eq 'Up to date' -and (Get-MarkCount $c.Report 'job-check') -gt $checks) { $true } } 30
         Check 'choosing "Default (On)" again follows Settings, and the skills are up to date again' ($null -ne $cfg -and $null -ne $back) (Show-Nav $win)
 
         # ---- repository-specific items and folder rules of one source
@@ -2272,9 +2275,10 @@ function Test-Ui {
         $cfg = Wait-Maybe { $x = Get-Config $c; if ($x -and $x.global -and $x.global.types -and $x.global.types.skills -eq $false) { $x } } 8
         $nav = Wait-Maybe { $n = @(Read-Nav $win); if ($n.Count -eq 1 -and $n[0].Kinds -eq 'Skills: Sync off') { $n[0] } } 15
         Check 'turning "Sync skills by default" off is saved, and the source that follows it stops syncing its skills' ($null -ne $cfg -and $null -ne $nav -and -not (Get-Checked $win $UiPanel.Page $UiId.GlobalType)) (Show-Nav $win)
+        $checks = Get-MarkCount $c.Report 'job-check'
         Click-Ui $win $UiPanel.Page $UiId.GlobalType
         $cfg = Wait-Maybe { $x = Get-Config $c; if ($x -and -not ($x.global -and $x.global.types -and $x.global.types.PSObject.Properties['skills'])) { $x } } 8
-        $back = Wait-Maybe { $n = @(Read-Nav $win); if ($n.Count -eq 1 -and $n[0].Kinds -eq 'Skills 3' -and $n[0].Sub -eq 'Up to date') { $true } } 30
+        $back = Wait-Maybe { $n = @(Read-Nav $win); if ($n.Count -eq 1 -and $n[0].Kinds -eq 'Skills 3' -and $n[0].Sub -eq 'Up to date' -and (Get-MarkCount $c.Report 'job-check') -gt $checks) { $true } } 30
         Check 'turning it on again is saved, and the skills are up to date again' ($null -ne $cfg -and $null -ne $back -and (Get-Checked $win $UiPanel.Page $UiId.GlobalType)) (Show-Nav $win)
         Click-Ui $win $UiPanel.Page $UiId.GlobalRepoItems
         $cfg = Wait-Maybe { $x = Get-Config $c; if ($x -and $x.global -and $x.global.include_repo_items -eq $true) { $x } } 8
