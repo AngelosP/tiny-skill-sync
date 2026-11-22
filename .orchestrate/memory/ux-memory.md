@@ -40,18 +40,27 @@
   ("Default ...") are both cut; screenshots 05e/05g/17-long-names-narrow-items show it.
 - `board::item_nouns` falls back to Skills for an empty iterator, so `page::hero_of` says "All skills are up to date /
   0 skills" when every detected type is off (07c shot).
-- Source entries in the nav (`Look::Source`) have no tooltip; type-icon labels exist only in the accessible name
-  (`page::nav_name`). Item rows do have hover tips (`control::row_tool_move`).
-- Live UI shot names: 05e/05f/05g come in compact and wide pairs; 17-long-names-{narrow,narrow-items,wide}.
+- A source entry in the nav (`Look::Source`) has one tooltip over the whole entry (`control::source_tool_move`, also at
+  HEAD). It holds the entry's window text, which is also its accessible name: `page::nav_name` (owner/repo, folder and
+  branch, what each chip means). Item rows have hover tips of their own (`control::row_tool_move`).
+- Source entries (UI polish, 2026-11-22): `page::source_entry` is two lines at `ENTRY_H` 56 DIP with the owner dimmed
+  and the repo strong. The owner gives way first (`entry_title`/`shortened`, `MIN_OWNER` 48 DIP), so long same-named
+  repos can look alike in the list until the splitter is widened; the full text stays in the tooltip and accessible name.
+  The e2e fixture repo names are so long that no live shot shows the owner; the pure `entry_title` tests are the evidence.
+- Live UI shot names: 05e/05f/05g come in compact and wide pairs (`05g-{wide,compact}-flat-row-tab-focused`);
+  17-long-names-{narrow,narrow-items,wide}. List the shots folder before using a glob: one glob missed 05g.
 - Section headers (`Look::Section`) draw chevron, icon (x+28), title (x+52), an optional warning after the title and
   right-hand marks. `section_parts` cuts the title before the warning and drops the warning when it does not fit.
   Shot 08c-collapsed-attention shows a collapsed Skills header with its warning; no shot shows What to sync collapsed.
 - Light-theme contrast on the page background: Text3 #8B8B8B is about 3.1:1 (What to sync's off marks rely on it
   alone, with no tooltip); Warn #9D5D00 is about 4.7:1.
-- Header band (2026-11-22, `HERO_H` 72 in page.rs): light #D3E4FA→#E1EAF7, dark #1B3150→#1B2639, edge line BandEdge;
-  light DotWarn is #B07300 (3.07:1 on the band). `diff_head` stacks its sentence under the buttons at y 44 when it does
-  not fit beside them; a long Failed reason can still be cut at 640 DIP (one line, no tooltip). Focus rings use
-  Role::Text (`control.rs` about line 799). Shots 18-band-light to 19c-band-dark-changes-narrow.
+- Header band (`HERO_H` 72 in page.rs): sky, hills and edge are derived from the system accent per look (`theme.rs`
+  `palette`). A light sky must be at least `RICH` (150, summed RGB distance) from white so it never reads as a wash.
+  The status disc has its own ring (`BandDotRing`, 3:1 against page and sky) and the Sync now button its own
+  `BandButton`/`BandButtonText` roles, with a focus ring in the lettering colour (`control::focus_ink`); other focus
+  rings use Role::Text. Colours follow the accent, so judge the shots 18-band-light to 19c-band-dark-changes-narrow
+  rather than quoting hex. `diff_head` stacks its sentence under the buttons at y 44 when it does not fit beside them;
+  a long Failed reason can still be cut at 640 DIP (one line, no tooltip).
 
 ## Baselines
 

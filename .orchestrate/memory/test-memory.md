@@ -87,6 +87,30 @@
 - Nested `powershell -File scripts\dev.ps1 test ... 2>&1` exits 1 on success; read "All checks passed." and the result lines.
   `CARGO_NET_OFFLINE=true` with the runner worked (already built; nothing fetched).
 
+## UI polish (review, 2026-11-22)
+
+- New unit bar in theme.rs: `entry_chip_inks_and_text_read_on_every_entry_background` (light, dark, forced high contrast),
+  `the_warning_and_error_inks_read_on_every_page_tint_and_fill` (Warn and Err at least 4.6:1 on every page, tint and own
+  fill, light and dark) and `the_focus_ring_stays_visible_on_every_entry_background`. page.rs
+  `source_marks_use_the_soft_check_dot_only_when_synced` pins `source_mark`. `each_look` skips high contrast: test that
+  look with `set(Some(Look { mode: Mode::Contrast, .. }))` and restore the saved look.
+- Light `Warn` is `#905500` (was `#9D5D00`) and `Err` `#BD291B` (was `#C42B1C`), changed at the source so the words clear
+  4.6:1 on a hovered or selected entry. Declined by design, with the light numbers: off-chip `Text3` 2.7 to 2.8:1 (an
+  inactive control; the tooltip and accessible name carry the meaning), chip outline and fill 1.0 to 1.7:1, chip icon 6.47
+  against the 7.0 aim, and the focus ring over the accent bar (as at HEAD).
+- Live bar: e2e ui 306 checks, 0 failed (entry height `56 * dpi / 96`, a "type chips" label). `Read-WindowSizeFile` opens
+  window.txt with `FileShare ReadWrite|Delete` because the app rewrites it while the script reads. The "choosing 12 hours
+  in 'Check every'" check has an 8 s `Wait-Maybe` and failed once in four full runs (the worker's save queues behind a
+  running check); 30 s like its siblings would settle it.
+- Final gate: fmt and clippy clean (local clippy 0.1.100 matches CI), library 673 passed + 1 ignored, integration 367
+  (app 49, cli 63, downtime 23, engine_failures 29, engine_lanes 28, engine_lifecycle 41, engine_plugins 43,
+  engine_sources 9, engine_sync 57, http 21, plugin_manager 1, source_preview 3), 0 failed. CONTRIBUTING's count is 1,041.
+- Smart App Control blocks random fresh exes (os error 4551). In the gate it hit `app`, `cli` and `engine_sources`: touch
+  `src\lib.rs` and rerun only those with `cargo test --no-fail-fast --test NAME`. For the bench and e2e the verdict is per
+  file hash: touch `src\bin\tss.rs`, `cargo build --release --bin tss` until `tss.exe --version` runs, then use
+  `dev.ps1 bench -SkipBuild` and `dev.ps1 e2e -Only ui -SkipBuild`. Never probe the tray exe with `--version`: it ignores
+  the flag and starts the tray (use throwaway TSS_ and COPILOT_ paths and stop only that PID).
+
 ## Open proposals
 
 - CONTRIBUTING.md Tests: list the extra filters a Plugins change needs (copilot, proc runner, fake_manager), or prefix those tests `plugin_`.

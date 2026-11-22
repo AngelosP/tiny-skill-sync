@@ -91,6 +91,17 @@
 - Splitter: drag saves `window.txt` once at the end (window.rs:547); each arrow key reads and writes it on the UI
   thread (window.rs:566-571). Every drag move re-lays out hero, nav and page. A list timer was removed; no new timer.
 
+### UI polish (source entries, header band, soft dot; inspection of the uncommitted tree on 555ca17, 2026-11-22)
+
+- `theme::palette` runs once per look: `derived` caches it with `get_or_insert_with` (theme.rs:252; `palette` at 375).
+  Its colour step search is bounded (about 121 colours per search, about 1,000 `lum` calls), well under 1 ms.
+- A source entry's layout costs about 8 to 13 `measure` calls (`page::source_entry`); `shortened` finds the owner's cut
+  with `partition_point`. The nav layout reruns on every `WM_SIZE` and is linear in the sources (about 10 ms at 200
+  sources: an estimate, not measured).
+- The diff creates no GDI object per paint and adds no timer, idle wake-up or file I/O.
+- Measured in the final bench (`bench-20261122-150051.md`, all rows within budget): open to painted median 33.0 ms,
+  max 37.4; not measured: resize time with 50 to 200 sources.
+
 ## Baselines
 
 - `bench-20261119-225701.md`: tray 7.9 ms median; idle threads/handles 5/149; after poll 9/340; exe 1,168,384 bytes.
@@ -115,6 +126,10 @@
 - `bench-20261122-024320.md` (section headers, coordinator's run, all within budget): open to painted median 31.1 ms,
   max 35.4; window working set 11.3 MiB; poll CPU 46.9 ms (3 ticks of 15.6 ms, about 3 ms under 50 ms); exe 1,738,752
   bytes (43,827 bytes headroom under 1.70 MiB).
+- `bench-20261122-150051.md` (UI polish, coordinator's run on the final release pair, all within budget): tray 8.1 ms
+  median; open to painted 33.0 ms median, max 37.4; window 11.4 MiB; poll CPU 46.9 ms (3 ticks); idle 5/154, after a poll
+  9/345; exe 1,769,472 bytes (13,107 bytes headroom under 1.70 MiB), tss.exe 1,484,800. The exe grew 30,720 bytes since
+  the section headers.
 - A section header measures its title only when `warn` is set (control.rs `draw_ctl`, `Look::Section`). The bench
   fixture's 3 up-to-date skills probably never set it (not confirmed), so paint timing does not cover that branch.
 - No measurement exists of a Copilot CLI launch (wall time, CPU, memory) or of a plugin poll.
