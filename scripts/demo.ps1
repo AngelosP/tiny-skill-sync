@@ -116,6 +116,11 @@ try {
     Save-DemoScene $ask '01-add' 'Add a GitHub skills folder' 'One setup. No more copying each new version by hand.' `
         (Get-Ui $ask $AskPanel $AskId.Ok) 'Public fixture data only. No sign-in needed by the app.'
     Click-Ui $ask $AskPanel $AskId.Ok
+    [void](Wait-Live {
+        (Read-Ui $win $UiPanel.Page $UiId.ConfirmSource) -eq 'Add and keep in sync'
+    } 'the shared source preview' 60)
+    Assert-Demo (-not (Get-Checked $win $UiPanel.Page $UiId.Enabled)) 'the preview starts with Keep in sync off'
+    Click-Ui $win $UiPanel.Page $UiId.ConfirmSource
     $offer = Wait-Live {
         $h = Find-Ask $tray
         if ($h -ne [IntPtr]::Zero -and (Read-Ui $h $AskPanel $AskId.Heading) -eq 'Start with Windows?') { $h }

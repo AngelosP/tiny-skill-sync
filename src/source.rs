@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use crate::config::RepoConfig;
 use crate::pathsafe;
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase", try_from = "String")]
 pub enum SourceKind {
     #[default]

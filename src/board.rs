@@ -159,6 +159,8 @@ pub struct Row {
     pub facts: Option<SkillFacts>,
     /// GitHub lists it, so there is something to link to.
     pub listed: bool,
+    /// The exact branch-root path discovered in the preview, when this row came from one.
+    pub remote_path: Option<String>,
     /// A local check found no folder, even if the status describes an upstream change or a failed check.
     pub folder_missing: bool,
     pub plugin: Option<PluginDetails>,
@@ -169,11 +171,13 @@ pub struct PluginDetails {
     pub version: Option<String>,
     pub publisher: Option<String>,
     pub path: Option<String>,
+    pub capabilities: Option<String>,
 }
 
 impl PluginDetails {
     pub(crate) fn facts(&self) -> String {
-        format!("Version: {}. Publisher: {}.", self.version.as_deref().unwrap_or("not known"), self.publisher.as_deref().unwrap_or("not declared"))
+        let facts = format!("Version: {}. Publisher: {}.", self.version.as_deref().unwrap_or("not known"), self.publisher.as_deref().unwrap_or("not declared"));
+        self.capabilities.as_ref().map_or(facts.clone(), |capabilities| format!("{facts} Declares: {capabilities}."))
     }
 }
 
@@ -258,11 +262,94 @@ pub struct SourceView {
     pub level: Level,
     pub last_check: Option<UnixSecs>,
     pub private: bool,
+    /// Items found by the last complete listing, as skills, agents, instructions and plugins.
+    pub detected: Option<[u32; 4]>,
     /// The types the last listing found or the record owns, in the order skills, agents, instructions, plugins.
     pub kinds: Vec<KindView>,
     /// Files the last listing had that are never synced, such as AGENTS.md.
     pub notes: Vec<SummaryNote>,
     pub more_notes: u32,
+}
+
+/// Project a read-only discovery into the same row model used by saved sources. Preview rows deliberately carry no
+/// local facts or actions; the page mode decides which GitHub-only actions to expose.
+pub fn preview_source_view(preview: &LocationPreview) -> SourceView {
+    use crate::inventory::{Item, PluginDetails as InventoryPlugin, Status as InventoryStatus};
+
+    fn row(name: &str, path: &str, status: &InventoryStatus, plugin: Option<&InventoryPlugin>) -> Option<Row> {
+        if matches!(status, InventoryStatus::Bundled { .. }) {
+            return None;
+        }
+        let text = match status {
+            InventoryStatus::Installable => String::new(),
+            InventoryStatus::Filtered(_) => format!("Skipped by folder rules: {}", status.reason().unwrap_or_default()),
+            other => format!("Not synced: {}", other.reason().unwrap_or_default()),
+        };
+        Some(Row {
+            name: name.to_owned(),
+            text,
+            tag: "Preview",
+            level: Level::Ok,
+            actions: Vec::new(),
+            facts: None,
+            listed: true,
+            remote_path: Some(path.to_owned()),
+            folder_missing: false,
+            plugin: plugin.map(|details| PluginDetails {
+                version: details.version.clone(),
+                publisher: details.publisher.clone(),
+                path: Some(path.to_owned()),
+                capabilities: Some(plugin_capabilities(details)),
+            }),
+        })
+    }
+
+    fn rows<'a, T>(items: &'a [Item<T>], plugin: impl Fn(&'a T) -> Option<&'a InventoryPlugin>) -> Vec<Row> {
+        items.iter().filter_map(|item| row(&item.install_name, &item.path, &item.status, plugin(&item.data))).collect()
+    }
+
+    let summary = preview.inventory.summary();
+    let kinds = KINDS
+        .into_iter()
+        .enumerate()
+        .map(|(index, kind)| {
+            let rows = match kind {
+                SourceKind::Skills => rows(&preview.inventory.skills, |_| None),
+                SourceKind::Agents => rows(&preview.inventory.agents, |_| None),
+                SourceKind::Instructions => rows(&preview.inventory.instructions, |_| None),
+                SourceKind::Plugins => rows(&preview.inventory.plugins, Some),
+            };
+            KindView {
+                kind,
+                lane: preview.source.lanes.id(kind).unwrap_or_default().to_owned(),
+                on: preview.types.enabled(kind),
+                found: Some(summary.installable[index]),
+                filtered: summary.filtered[index],
+                notes: summary.notes.iter().filter(|note| note.kind == Some(kind)).cloned().collect(),
+                rows,
+                status: String::new(),
+                level: Level::Ok,
+            }
+        })
+        .collect();
+    SourceView {
+        id: preview.source.id.clone(),
+        label: source_label(&preview.source),
+        repo: preview.source.repo.clone(),
+        branch: preview.source.branch.clone(),
+        seen_branch: Some(preview.branch.clone()),
+        folder: preview.source.path.clone(),
+        enabled: preview.source.enabled,
+        status: String::new(),
+        detail: preview.inventory.marketplace_problem.clone(),
+        level: Level::Ok,
+        last_check: None,
+        private: preview.source.use_token,
+        detected: Some(summary.found),
+        kinds,
+        notes: summary.notes.into_iter().filter(|note| note.kind.is_none()).collect(),
+        more_notes: summary.more_notes,
+    }
 }
 
 impl SourceView {
@@ -536,6 +623,7 @@ impl SkillBoard {
             actions: shown.actions,
             facts: None,
             listed,
+            remote_path: None,
             folder_missing,
             plugin: None,
         }
@@ -806,8 +894,9 @@ fn plugin_row(report: &PluginReport) -> Row {
         actions,
         facts: None,
         listed: report.path.is_some(),
+        remote_path: None,
         folder_missing: false,
-        plugin: Some(PluginDetails { version: report.version.clone(), publisher: report.publisher.clone(), path: report.path.clone() }),
+        plugin: Some(PluginDetails { version: report.version.clone(), publisher: report.publisher.clone(), path: report.path.clone(), capabilities: None }),
     }
 }
 
@@ -824,8 +913,14 @@ pub(crate) fn recorded_plugin_rows(record: &PluginSourceState) -> Vec<Row> {
             actions: Vec::new(),
             facts: None,
             listed: false,
+            remote_path: None,
             folder_missing: false,
-            plugin: Some(PluginDetails { version: installed.version.clone(), publisher: record.approved.get(name).cloned().flatten(), path: None }),
+            plugin: Some(PluginDetails {
+                version: installed.version.clone(),
+                publisher: record.approved.get(name).cloned().flatten(),
+                path: None,
+                capabilities: None,
+            }),
         })
         .collect()
 }
@@ -1211,6 +1306,7 @@ impl Board {
             level,
             last_check,
             private,
+            detected: seen.map(|s| s.summary.found),
             kinds,
             notes: seen.map(|s| s.summary.notes.iter().filter(|n| n.kind.is_none()).cloned().collect()).unwrap_or_default(),
             more_notes: seen.map_or(0, |s| s.summary.more_notes),
@@ -1445,6 +1541,71 @@ fn cut(text: &str, max_units: usize) -> String {
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
+
+    #[test]
+    fn preview_source_view_keeps_detected_counts_and_exact_remote_paths_without_local_status() {
+        use crate::inventory::{FilterReason, Inventory, Item, PluginCapabilities, PluginDetails as InventoryPlugin, Status};
+        use crate::sources::{Lanes, Types};
+
+        let lanes = Lanes::default()
+            .with(SourceKind::Skills, "tools".into())
+            .with(SourceKind::Agents, "tools-agents".into())
+            .with(SourceKind::Instructions, "tools-instructions".into())
+            .with(SourceKind::Plugins, "tools-plugins".into());
+        let source = SourceConfig {
+            id: "tools".into(),
+            repo: "team/tools".into(),
+            branch: "main".into(),
+            path: "catalog".into(),
+            enabled: false,
+            lanes,
+            ..SourceConfig::default()
+        };
+        let mut inventory = Inventory::default();
+        inventory.skills.push(Item { path: "catalog/nested/skill".into(), install_name: "skill".into(), status: Status::Installable, data: Vec::new() });
+        inventory.agents.push(Item {
+            path: "catalog/agents/review.agent.md".into(),
+            install_name: "review.agent.md".into(),
+            status: Status::Filtered(FilterReason::IgnoredFolder("agents".into())),
+            data: None,
+        });
+        inventory.plugins.push(Item {
+            path: "catalog/plugins/a/plugin".into(),
+            install_name: "a".into(),
+            status: Status::Installable,
+            data: InventoryPlugin {
+                capabilities: PluginCapabilities { hooks: true, skills: true, ..PluginCapabilities::default() },
+                ..InventoryPlugin::default()
+            },
+        });
+        inventory.not_synced.push(crate::inventory::NotSynced { path: "catalog/AGENTS.md".into(), reason: "never synced" });
+        let preview = LocationPreview {
+            source,
+            branch: "main".into(),
+            follows_default: false,
+            types: Types { skills: false, ..Types::default() },
+            inventory,
+            destinations: Vec::new(),
+        };
+
+        let view = preview_source_view(&preview);
+        assert_eq!(view.detected, Some([1, 1, 0, 1]));
+        assert_eq!(view.kinds.len(), 4, "zero-count types stay in the shared page model");
+        assert!(!view.kinds[0].on);
+        assert_eq!(view.kinds[2].found, Some(0));
+        let skill = &view.kinds[0].rows[0];
+        assert_eq!(skill.remote_path.as_deref(), Some("catalog/nested/skill"));
+        assert!(skill.facts.is_none() && skill.actions.is_empty());
+        let agent = &view.kinds[1].rows[0];
+        assert_eq!(agent.remote_path.as_deref(), Some("catalog/agents/review.agent.md"));
+        assert!(agent.text.contains("ignored folder"));
+        let plugin = &view.kinds[3].rows[0];
+        assert_eq!(plugin.remote_path.as_deref(), Some("catalog/plugins/a/plugin"));
+        assert_eq!(plugin.plugin.as_ref().and_then(|details| details.capabilities.as_deref()), Some("hooks, skills"));
+        assert_eq!(view.notes[0].path, "catalog/AGENTS.md");
+        assert!(!view.enabled);
+        assert_eq!(view.last_check, None);
+    }
 
     #[test]
     fn plugin_rows_keep_tags_and_explain_each_status() {

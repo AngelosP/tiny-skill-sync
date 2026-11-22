@@ -485,6 +485,7 @@ $UiId = @{
     DefaultEvery = 320; OpenSkills = 321; OpenBackups = 322; Startup = 325; StartupText = 413
     AppHeading = 420; AppStatus = 421; AppCheck = 422; AppInstall = 423; AppAuto = 424; AppEvery = 425; AppWhen = 426
     Title = 400; Private = 401; Sub = 402; InfoLead = 403; InfoText = 404; SkillsDir = 410; TokenText = 411; Empty = 412
+    SectionWhat = 470; SectionKind = 471; SectionNever = 475
     Back = 330; DiffAction = 333; Note = 100000; File = 200000; Gap = 300000
     # Plus 16 per skill: 0 row ("name`ntag"), 1 explanation, 8 facts; 2 Show changes, 4 to 7 repair choices.
     # Everyday actions are drawn inside the row, not separate child windows.
@@ -946,13 +947,56 @@ function Read-Nav([IntPtr]$Window) {
     }
 }
 
-# The skills on a repository's page, top to bottom. Only repair buttons depend on disclosure; collect all
-# child buttons (including obsolete everyday ids) so an unexpected extra button is observable.
+# Opens the shared source-page sections so row checks do not depend on their saved collapse state.
+function Expand-SourceSections([IntPtr]$Window) {
+    $ids = @($UiId.SectionWhat) + @(0..3 | ForEach-Object { $UiId.SectionKind + $_ }) + @($UiId.SectionNever)
+    foreach ($id in $ids) {
+        $text = Read-Ui $Window $UiPanel.Page $id
+        $collapsed = if ($id -eq $UiId.SectionWhat) { $text -match '^What to sync, collapsed\.' } else { $text -match ', collapsed\.$' }
+        if ($null -eq $text -or -not $collapsed) { continue }
+        Click-Ui $Window $UiPanel.Page $id
+        [void](Wait-Live {
+            $state = Read-Ui $Window $UiPanel.Page $id
+            $expanded = $state -and $state -match ', expanded\.'
+            if ($id -eq $UiId.SectionWhat) {
+                $expanded -and (Find-Ui $Window $UiPanel.Page $UiId.SourceType) -ne [IntPtr]::Zero -and
+                    (Find-Ui $Window $UiPanel.Page $UiId.RepoItems) -ne [IntPtr]::Zero
+            } else {
+                $expanded
+            }
+        } "source section $id to expand" 5 50)
+    }
+}
+
+# All text on the shared source page, including its accessible section headings and item rows.
+function Read-SourcePage([IntPtr]$Window) {
+    Expand-SourceSections $Window
+    Read-Panel $Window $UiPanel.Page
+}
+
+function Test-SourceSettingsEditable([IntPtr]$Window) {
+    $panel = [TssLive]::GetDlgItem($Window, $UiPanel.Page)
+    $controls = @(Get-Layout $panel)
+    $ids = @($UiId.Every, $UiId.Enabled, $UiId.RepoItems, $UiId.FolderRules) + @(0..3 | ForEach-Object { $UiId.SourceType + $_ })
+    foreach ($id in $ids) {
+        $control = @($controls | Where-Object Id -eq $id)
+        if ($control.Count -ne 1 -or -not $control[0].On) { return $false }
+    }
+    $true
+}
+
+# The rows on a source page, top to bottom. Collapsed sections leave gaps in their row ids, so enumerate the
+# controls that exist rather than stopping at the first missing row. Only repair buttons depend on row disclosure.
 function Read-Skills([IntPtr]$Window) {
-    for ($j = 0; ; $j++) {
-        $base = $UiId.Skill + $UiId.SkillStride * $j
+    Expand-SourceSections $Window
+    $page = [TssLive]::GetDlgItem($Window, $UiPanel.Page)
+    $rows = @(Get-Layout $page | Where-Object {
+        $_.Id -ge $UiId.Skill -and (($_.Id - $UiId.Skill) % $UiId.SkillStride) -eq 0
+    } | Sort-Object Id)
+    foreach ($control in $rows) {
+        $base = $control.Id
         $row = Read-Ui $Window $UiPanel.Page $base
-        if ($null -eq $row) { break }
+        if ($null -eq $row) { continue }
         $parts = $row -split '\r?\n', 4 # Keep empty fields and all remaining lines of explanation.
         if ($parts.Count -ne 4) { throw "Skill row $base is missing native text fields." }
         $buttons = @(foreach ($k in @(2..7) + @(9..12)) {
@@ -960,7 +1004,7 @@ function Read-Skills([IntPtr]$Window) {
                 if ($null -ne $t) { [pscustomobject]@{ Id = $base + $k; Text = $t } }
             })
         [pscustomobject]@{
-            Index = $j; Id = $base; Name = $parts[0]; Tag = $parts[1]
+            Index = [int](($base - $UiId.Skill) / $UiId.SkillStride); Id = $base; Name = $parts[0]; Tag = $parts[1]
             Facts = $parts[2]; Detail = $parts[3]; Buttons = $buttons
         }
     }

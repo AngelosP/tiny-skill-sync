@@ -7,7 +7,7 @@
 //! loop) or a notification sent back from inside a change never finds the state borrowed by them.
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::mem::zeroed;
 use std::path::PathBuf;
@@ -35,7 +35,7 @@ use super::paint::{self, Font, Rect, glyph};
 use super::shell::{self, Snapshot};
 use super::theme::{self, Role};
 use super::{bench, local_time, open_folder, place, register_class, scale, sentence, text_of, tray, trim_memory};
-use crate::app::{DraftStage, Job};
+use crate::app::{DraftStage, Job, SourceDraft};
 use crate::autostart::{Keys, Startup};
 use crate::board::{APP_NAME, Action, Row, SourceView, source_label};
 use crate::config::{Config, Paths, RepoConfig, UpdatePrefs};
@@ -121,6 +121,7 @@ struct Win {
 thread_local! {
     static WINDOW: Cell<HWND> = const { Cell::new(null_mut()) };
     static STATE: RefCell<Option<Win>> = const { RefCell::new(None) };
+    static SECTION_STATE: RefCell<HashMap<String, HashMap<page::SectionKey, bool>>> = RefCell::new(HashMap::new());
     static REFRESH_POSTED: Cell<bool> = const { Cell::new(false) };
     /// What the window draws behind the panels; kept apart from the state, so painting never needs to borrow it.
     static DIFF_MODE: Cell<bool> = const { Cell::new(false) };
@@ -151,6 +152,57 @@ fn with_state<R>(f: impl FnOnce(&mut Win) -> R) -> Option<R> {
         let mut state = s.try_borrow_mut().ok()?;
         state.as_mut().map(f)
     })
+}
+
+fn draft_section_key(ticket: u64) -> String {
+    format!("draft:{ticket}")
+}
+
+fn section_choices(source: &str) -> HashMap<page::SectionKey, bool> {
+    SECTION_STATE.with(|state| state.borrow().get(source).cloned().unwrap_or_default())
+}
+
+fn section_default(section: page::SectionKey) -> bool {
+    matches!(section, page::SectionKey::WhatToSync)
+}
+
+fn section_key_from_control(id: i32) -> Option<page::SectionKey> {
+    if id == page::id::SECTION_WHAT {
+        return Some(page::SectionKey::WhatToSync);
+    }
+    if id == page::id::SECTION_NEVER {
+        return Some(page::SectionKey::NeverSynced);
+    }
+    [SourceKind::Skills, SourceKind::Agents, SourceKind::Instructions, SourceKind::Plugins]
+        .into_iter()
+        .enumerate()
+        .find_map(|(index, kind)| (id == page::id::SECTION_KIND + index as i32).then_some(page::SectionKey::Kind(kind)))
+}
+
+fn toggle_section(hwnd: HWND, section: page::SectionKey) {
+    let source = with_state(|st| match (&st.page, st.snap.as_ref()) {
+        (Some(Page::Repo(id)), _) => Some(id.clone()),
+        (Some(Page::Add), Some(snap)) => snap.draft.as_ref().map(|draft| draft_section_key(draft.input.ticket)),
+        _ => None,
+    })
+    .flatten();
+    let Some(source) = source else { return };
+    SECTION_STATE.with(|state| {
+        let mut state = state.borrow_mut();
+        let choices = state.entry(source).or_default();
+        let current = choices.get(&section).copied().unwrap_or_else(|| section_default(section));
+        choices.insert(section, !current);
+    });
+    render(hwnd);
+}
+
+fn transfer_sections(from: &str, to: &str) {
+    SECTION_STATE.with(|state| {
+        let mut state = state.borrow_mut();
+        if let Some(from) = state.remove(from) {
+            state.entry(to.to_owned()).or_default().extend(from);
+        }
+    });
 }
 
 fn dpi_of(hwnd: HWND) -> u32 {
@@ -372,6 +424,14 @@ fn update(hwnd: HWND) {
         }
         let snap = snap?;
         if snap.draft.is_none() {
+            let completed = st.snap.as_ref().and_then(|old| old.draft.as_ref()).filter(|draft| matches!(draft.stage, DraftStage::Saving)).and_then(|draft| {
+                let lane = st.adding.as_deref()?;
+                let source = snap.sources.iter().find(|view| view.id == lane || view.kinds.iter().any(|kind| kind.lane == lane))?;
+                Some((draft_section_key(draft.input.ticket), source.id.clone()))
+            });
+            if let Some((from, to)) = completed {
+                transfer_sections(&from, &to);
+            }
             st.add_form = None;
             if st.snap.as_ref().is_some_and(|s| s.draft.is_some()) {
                 st.retry_add_form = None;
@@ -459,13 +519,24 @@ fn page_of(st: &Win, snap: &Snapshot, w: i32, fit: Fit) -> Surface {
     match &st.page {
         Some(Page::Repo(shown)) => match (snap.sources.iter().find(|v| v.id == *shown), snap.cfg.find_source(shown)) {
             (Some(view), Some(source)) => {
-                let p = SourcePage { view, source, global: snap.cfg.global(), default, now: snap.now, toggled: &st.toggled };
+                let sections = section_choices(shown);
+                let p = SourcePage { view, source, global: snap.cfg.global(), default, now: snap.now, toggled: &st.toggled, draft: None, sections: &sections };
                 page::source_page(&p, w, fit)
             }
             _ => page::welcome(w, fit),
         },
         Some(Page::Activity) => page::activity_page(&snap.notes, &local_time, w, fit),
-        Some(Page::Add) => snap.draft.as_ref().map_or_else(|| page::welcome(w, fit), |draft| page::source_preview(draft, &snap.skills_dir, w, fit)),
+        Some(Page::Add) => snap.draft.as_ref().map_or_else(
+            || page::welcome(w, fit),
+            |draft| {
+                let sections = section_choices(&draft_section_key(draft.input.ticket));
+                page::source_preview(
+                    &page::PreviewPage { draft, global: snap.cfg.global(), default, now: snap.now, toggled: &st.toggled, sections: &sections },
+                    w,
+                    fit,
+                )
+            },
+        ),
         Some(Page::Settings) => {
             let skills_dir = snap.skills_dir.display().to_string();
             let startup = match &st.startup {
@@ -672,20 +743,42 @@ fn add_question(default: Interval, form: &AddForm) -> Ask {
 }
 
 fn add(hwnd: HWND, initial: AddForm) {
-    if shell::saving_source() {
-        return;
-    }
-    let Some(default) = with_state(|st| st.snap.as_ref().map(|s| s.cfg.default_interval)).flatten() else { return };
-    let question = add_question(default, &initial);
-    let Some(reply) = dialogs::ask(hwnd, question) else {
+    let Some(form) = ask_add_form(hwnd, &initial) else { return };
+    preview_source(hwnd, form);
+}
+
+fn edit_add(hwnd: HWND, initial: AddForm) {
+    let Some(ticket) = current_draft().map(|draft| draft.input.ticket) else { return };
+    let Some(form) = ask_add_form(hwnd, &initial) else { return };
+    if current_draft().is_none_or(|draft| draft.input.ticket != ticket) {
+        shell::tell("The preview changed. Choose the address again.".to_string());
         update(hwnd);
         return;
+    }
+    edit_draft_location(hwnd, form);
+}
+
+fn ask_add_form(hwnd: HWND, initial: &AddForm) -> Option<AddForm> {
+    if shell::saving_source() {
+        return None;
+    }
+    let default = with_state(|st| st.snap.as_ref().map(|s| s.cfg.default_interval)).flatten()?;
+    let question = add_question(default, initial);
+    let Some(reply) = dialogs::ask(hwnd, question) else {
+        update(hwnd);
+        return None;
     };
     if hwnd != window() {
-        return;
+        return None;
     }
-    let Ok(every) = page::parse_every(&reply.combo) else { return };
-    preview_source(hwnd, AddForm { address: reply.text, every });
+    match page::parse_every(&reply.combo) {
+        Ok(every) => Some(AddForm { address: reply.text, every }),
+        Err(error) => {
+            shell::tell(format!("Check every: {error}"));
+            update(hwnd);
+            None
+        }
+    }
 }
 
 fn preview_source(hwnd: HWND, form: AddForm) {
@@ -709,10 +802,27 @@ fn current_add_form() -> Option<AddForm> {
             return None;
         }
         let draft = st.snap.as_ref()?.draft.as_ref()?;
-        let (ticket, form) = st.add_form.as_ref()?;
-        (*ticket == draft.input.ticket).then(|| form.clone())
+        Some(AddForm { address: draft.input.text.clone(), every: draft.settings.interval })
     })
     .flatten()
+}
+
+fn current_draft() -> Option<SourceDraft> {
+    with_state(|st| (st.page == Some(Page::Add)).then(|| st.snap.as_ref()?.draft.clone()).flatten()).flatten()
+}
+
+fn edit_draft_location(hwnd: HWND, form: AddForm) {
+    let Some(ticket) = current_draft().map(|draft| draft.input.ticket) else { return };
+    match shell::edit_draft_location(ticket, &form.address, form.every) {
+        Ok(()) => {
+            with_state(|st| {
+                st.add_form = Some((ticket, form.clone()));
+                st.retry_add_form = Some(form);
+            });
+        }
+        Err(error) => shell::tell(sentence(&error)),
+    }
+    update(hwnd);
 }
 
 /// Offers once per machine to start with Windows, when the first repository was just added.
@@ -756,6 +866,7 @@ fn offer_startup(hwnd: HWND) {
 /// Check every, of the repository shown or (`default`) in Settings: an entry was chosen.
 fn every(hwnd: HWND, combo: HWND, default: bool) {
     let source = shown_source(|s, _| s.clone());
+    let draft = (!default).then(current_draft).flatten();
     let mut text = text_of(combo);
     if text == CUSTOM {
         match custom_interval(hwnd, default) {
@@ -777,6 +888,14 @@ fn every(hwnd: HWND, combo: HWND, default: bool) {
                 });
             }
             Err(e) => shell::tell(format!("Default check interval: {e}")),
+        }
+    } else if let Some(draft) = draft {
+        match page::parse_every(&text) {
+            Ok(every) if current_draft().is_some_and(|current| current.input.ticket == draft.input.ticket) => {
+                let _ = shell::edit_draft(draft.input.ticket, |settings| settings.interval = every);
+            }
+            Ok(_) => shell::tell("This preview is no longer current.".to_string()),
+            Err(error) => shell::tell(format!("Check every: {error}")),
         }
     } else if let Some(source) = source.filter(|s| shown_source(|now, _| now == s) == Some(true)) {
         match page::parse_every(&text) {
@@ -822,6 +941,11 @@ fn custom_interval(hwnd: HWND, default: bool) -> Option<String> {
 /// Keep in sync was switched.
 fn set_enabled(toggle: HWND) {
     let on = unsafe { SendMessageW(toggle, BM_GETCHECK, 0, 0) } != 0;
+    if let Some(draft) = current_draft() {
+        let _ = shell::edit_draft(draft.input.ticket, |settings| settings.enabled = on);
+        refresh();
+        return;
+    }
     let Some(source) = shown_source(|s, _| s.clone()) else { return };
     let _ = shell::edit_config(|cfg| {
         let changed = source_mut(cfg, &source)?.enabled != on;
@@ -833,6 +957,13 @@ fn set_enabled(toggle: HWND) {
 
 /// A "What to sync" choice on a source's page: a type, or repository-specific items.
 fn source_choice(hwnd: HWND, n: i32, combo: HWND) {
+    if let Some(draft) = current_draft() {
+        if let Some(edit) = page::source_choice(n, control::combo_value(&text_of(combo))) {
+            let _ = shell::edit_draft(draft.input.ticket, |settings| edit.apply(settings));
+        }
+        update(hwnd);
+        return;
+    }
     let Some(source) = shown_source(|s, _| s.id.clone()) else { return };
     if let Some(edit) = page::source_choice(n, control::combo_value(&text_of(combo))) {
         let _ = shell::edit_source(&source, |s| edit.apply(s));
@@ -869,6 +1000,25 @@ fn folders_question(heading: &str, text: &str, initial: &[String]) -> Ask {
 
 /// Folder rules on a source's page: the folders it also skips and the ones it never skips.
 fn folder_rules(hwnd: HWND) {
+    if let Some(draft) = current_draft() {
+        let source = draft.settings.clone();
+        let also = "Folders with these names are skipped in this source, as well as the ignored folders in Settings.";
+        let Some(add) = ask_folders(hwnd, "Also skip these folders", also, &source.ignore_add) else { return };
+        let never = "Folders with these names are searched in this source, even when Settings ignores them.";
+        let Some(allow) = ask_folders(hwnd, "Never skip these folders", never, &source.ignore_allow) else { return };
+        if current_draft().is_none_or(|current| current.input.ticket != draft.input.ticket || current.settings != source) {
+            shell::tell("The preview changed. Choose the folder rules again.".to_string());
+        } else {
+            match page::folder_rules(&add, &allow) {
+                Ok(edit) => {
+                    let _ = shell::edit_draft(draft.input.ticket, |settings| edit.apply(settings));
+                }
+                Err(why) => shell::tell(why),
+            }
+        }
+        update(hwnd);
+        return;
+    }
     let Some(source) = shown_source(|s, _| s.clone()) else { return };
     let also = "Folders with these names are skipped in this source, as well as the ignored folders in Settings.";
     let Some(add) = ask_folders(hwnd, "Also skip these folders", also, &source.ignore_add) else { return };
@@ -1001,6 +1151,10 @@ fn remove(hwnd: HWND, source: &SourceConfig) {
 }
 
 fn row_command(hwnd: HWND, button: HWND, index: usize, code: u32) {
+    if current_draft().is_some() {
+        preview_row_command(hwnd, button, index, code);
+        return;
+    }
     let Some((repo, name, commands)) = shown_source(|s, v| {
         let (k, row) = page::row_at(v, index)?;
         let lane = page::lane_config(s, k.kind, &k.lane);
@@ -1026,6 +1180,44 @@ fn row_command(hwnd: HWND, button: HWND, index: usize, code: u32) {
     if let Some((index, part)) = target {
         skill(hwnd, index, part);
     }
+}
+
+fn preview_row_command(hwnd: HWND, button: HWND, index: usize, code: u32) {
+    let Some(draft) = current_draft() else { return };
+    let Some((kind, name, path, lane, commands)) = preview_row_target(&draft, index) else { return };
+    let cmd = if code == control::ROW_MENU && !commands.is_empty() {
+        let labels: Vec<_> = commands.iter().map(|cmd| cmd.label()).collect();
+        control::menu(button, &labels, None, false).map(|i| commands[i])
+    } else {
+        RowCmd::from_code(code)
+    };
+    let Some(cmd @ (RowCmd::CopyLink | RowCmd::OnGitHub)) = cmd else { return };
+    let Some(current) = current_draft()
+        .filter(|current| current.input.ticket == draft.input.ticket && current.input.request == draft.input.request && current.settings == draft.settings)
+    else {
+        return;
+    };
+    let Some((now_kind, now_name, now_path, now_lane, now_commands)) = preview_row_target(&current, index) else { return };
+    if now_kind != kind || now_name != name || now_path != path || now_lane != lane || !now_commands.contains(&cmd) {
+        return;
+    }
+    match crate::github::web_url_path(&lane, &path) {
+        Some(url) if cmd == RowCmd::CopyLink => copy(hwnd, url.as_ref()),
+        Some(url) => open_url(&url),
+        None => shell::tell(format!("{} can’t be opened on GitHub.", printable(&name))),
+    }
+}
+
+fn preview_row_target(draft: &SourceDraft, index: usize) -> Option<(SourceKind, String, String, RepoConfig, Vec<RowCmd>)> {
+    let snapshot = match &draft.stage {
+        DraftStage::Reviewed(preview) => Some(preview),
+        _ => draft.previous_preview.as_ref(),
+    }?;
+    let (kind, row) = page::row_at(snapshot.view(), index)?;
+    let path = row.remote_path.clone()?;
+    let lane = page::lane_config(&draft.settings, kind.kind, &kind.lane);
+    crate::github::web_url_path(&lane, &path)?;
+    Some((kind.kind, row.name.clone(), path, lane, vec![RowCmd::CopyLink, RowCmd::OnGitHub]))
 }
 
 /// The row, on the source's page as it is now, that a command chosen for the row `name` of `lane` goes to.
@@ -1338,6 +1530,12 @@ fn on_command(hwnd: HWND, wp: WPARAM, lp: LPARAM) {
         }
         return;
     }
+    if code == BN_CLICKED {
+        if let Some(section) = section_key_from_control(n) {
+            toggle_section(hwnd, section);
+            return;
+        }
+    }
     match (page::hit(n), code) {
         (Hit::Other(id::EVERY), CBN_SELENDOK) => every(hwnd, ctl, false),
         (Hit::Other(id::DEFAULT_EVERY), CBN_SELENDOK) => every(hwnd, ctl, true),
@@ -1371,22 +1569,26 @@ fn on_command(hwnd: HWND, wp: WPARAM, lp: LPARAM) {
                 shell::want(Job::Check(None));
             }
             id::NAV_ADD | id::WELCOME_ADD => add(hwnd, with_state(|st| st.retry_add_form.clone().unwrap_or_default()).unwrap_or_default()),
-            id::RETRY_SOURCE | id::EDIT_SOURCE => {
-                if let Some(form) = current_add_form() {
-                    if n == id::EDIT_SOURCE {
-                        add(hwnd, form);
-                    } else {
-                        preview_source(hwnd, form);
+            id::RETRY_SOURCE => {
+                if let Some(draft) = current_draft() {
+                    if let Err(error) = shell::retry_source(draft.input.ticket) {
+                        shell::tell(sentence(&error));
                     }
+                    update(hwnd);
+                }
+            }
+            id::EDIT_SOURCE => {
+                if let Some(form) = current_add_form() {
+                    edit_add(hwnd, form);
                 }
             }
             id::CONFIRM_SOURCE | id::APPROVE_SOURCE => {
                 let reviewed = with_state(|st| {
                     let draft = st.snap.as_ref()?.draft.as_ref().filter(|_| st.page == Some(Page::Add))?;
                     let DraftStage::Reviewed(preview) = &draft.stage else { return None };
-                    let lanes = &preview.source.lanes;
+                    let lanes = &preview.location().source.lanes;
                     let lane = [SourceKind::Skills, SourceKind::Agents, SourceKind::Instructions, SourceKind::Plugins].into_iter().find_map(|k| lanes.id(k));
-                    Some((draft.input.ticket, lane.unwrap_or(&preview.source.id).to_owned()))
+                    Some((draft.input.ticket, lane.unwrap_or(&preview.location().source.id).to_owned()))
                 })
                 .flatten();
                 if let Some((ticket, lane)) = reviewed {

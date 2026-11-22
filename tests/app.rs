@@ -184,19 +184,172 @@ fn source_preview_dismissal_failure_and_late_answers_cannot_save() {
     let ticket = app.preview_location("o/new", None).unwrap();
     run_next(&mut app, &mut s.engine, T0);
     let DraftStage::Reviewed(preview) = &app.draft().unwrap().stage else { panic!("expected a finished preview") };
-    assert_eq!((preview.source.repo.as_str(), preview.branch.as_str(), preview.follows_default), ("o/new", "main", true));
-    assert_eq!(preview.inventory.skills[0].install_name, "alpha");
-    let mut empty = (**preview).clone();
+    assert_eq!((preview.location().source.repo.as_str(), preview.location().branch.as_str(), preview.location().follows_default), ("o/new", "main", true));
+    assert_eq!(preview.location().inventory.skills[0].install_name, "alpha");
+    let mut empty = preview.location().clone();
     empty.inventory.skills.clear();
     app.dismiss_source();
     assert!(app.confirm_source(ticket, false).is_err());
 
     let ticket = app.preview_location("o/new", None).unwrap();
-    answer(&mut app, Ok(Answer::SourcePreview(empty.into())), None, T0);
+    answer(&mut app, Ok(Answer::SourcePreview(std::sync::Arc::new(app::PreviewSnapshot::new(empty)))), None, T0);
     assert!(matches!(app.draft().unwrap().stage, DraftStage::Reviewed(_)));
     assert!(app.confirm_source(ticket, false).is_err(), "nothing would sync");
     assert!(app.is_idle());
     assert_eq!(s.w.snapshot(), before);
+}
+
+#[test]
+fn draft_settings_are_local_until_save_and_location_edits_keep_them() {
+    let mut s = Setup::fresh("app-edit-source-preview");
+    let mut app = started(&mut s);
+    s.remote.put("o/new", "alpha/SKILL.md", "one");
+    s.remote.put("o/other", "beta/SKILL.md", "two");
+
+    let ticket = app.preview_location("o/new", None).unwrap();
+    run_next(&mut app, &mut s.engine, T0);
+    let interval = Interval::parse("6h").unwrap();
+    assert!(
+        app.edit_draft(ticket, |settings| {
+            settings.types.skills = Some(false);
+            settings.interval = Some(interval);
+        },)
+            .unwrap()
+    );
+    assert!(app.queued().is_empty(), "type and interval changes use the complete preview already in memory");
+    assert!(matches!(app.draft().unwrap().stage, DraftStage::Reviewed(_)), "the edited settings keep the preview available");
+    assert!(!app.draft().unwrap().settings.effective_types(app.cfg().global()).skills);
+    assert_eq!(app.draft().unwrap().settings.interval, Some(interval));
+    assert!(app.confirm_source(ticket, false).is_err(), "a source with every available type off cannot be added");
+
+    app.edit_draft(ticket, |settings| settings.types.skills = Some(true)).unwrap();
+    app.edit_draft_location(ticket, "o/other", Some(interval)).unwrap();
+    let Job::PreviewSource(input) = app.queued().front().unwrap() else { panic!("changing location must discover the new source") };
+    assert_eq!(input.text, "o/other");
+    assert_eq!(input.settings.interval, Some(interval));
+    assert_eq!(input.settings.types.skills, Some(true));
+    run_next(&mut app, &mut s.engine, T0);
+    let DraftStage::Reviewed(preview) = &app.draft().unwrap().stage else { panic!("the new location should preview") };
+    assert_eq!(preview.location().source.repo, "o/other");
+    assert!(app.confirm_source(ticket, false).is_ok());
+    let Some(Job::SaveSource(_, _, settings, approve_plugins)) = app.queued().front() else { panic!("Add should queue a save") };
+    assert_eq!(settings.interval, Some(interval));
+    assert_eq!(settings.types.skills, Some(true));
+    assert!(!approve_plugins, "plugin approval remains a separate explicit choice");
+}
+
+#[test]
+fn repo_item_and_folder_rule_edits_rediscover_the_draft_preview() {
+    let mut s = Setup::fresh("app-preview-repo-items");
+    let mut app = started(&mut s);
+    s.remote.put("o/new", ".github/agents/review.agent.md", "review");
+    s.remote.put("o/new", "drafts/SKILL.md", "draft");
+
+    let ticket = app.preview_location("o/new", None).unwrap();
+    run_next(&mut app, &mut s.engine, T0);
+    let DraftStage::Reviewed(preview) = &app.draft().unwrap().stage else { panic!("expected a finished preview") };
+    assert!(matches!(preview.location().inventory.agents[0].status, tiny_skill_sync::inventory::Status::Filtered(_)));
+
+    assert!(app.edit_draft(ticket, |settings| settings.include_repo_items = Some(true)).unwrap());
+    let Some(Job::PreviewSource(input)) = app.queued().front() else {
+        panic!("including repository-specific items must refresh inventory and save revalidation");
+    };
+    assert_eq!(input.settings.include_repo_items, Some(true));
+
+    run_next(&mut app, &mut s.engine, T0);
+    let DraftStage::Reviewed(preview) = &app.draft().unwrap().stage else { panic!("expected a refreshed preview") };
+    assert_eq!(preview.location().inventory.agents[0].status, tiny_skill_sync::inventory::Status::Installable);
+    assert_eq!(preview.location().inventory.skills[0].status, tiny_skill_sync::inventory::Status::Installable);
+
+    assert!(app.edit_draft(ticket, |settings| settings.ignore_add = vec!["drafts".into()]).unwrap());
+    assert!(matches!(app.queued().front(), Some(Job::PreviewSource(_))), "folder rules must also refresh inventory and save revalidation");
+    run_next(&mut app, &mut s.engine, T0);
+    let DraftStage::Reviewed(preview) = &app.draft().unwrap().stage else { panic!("expected a folder-rule refresh") };
+    assert!(matches!(preview.location().inventory.skills[0].status, tiny_skill_sync::inventory::Status::Filtered(_)));
+}
+
+#[test]
+fn preview_snapshot_reused_for_local_edits() {
+    let mut s = Setup::fresh("app-preview-local-edits");
+    let mut app = started(&mut s);
+    s.remote.put("o/new", "alpha/SKILL.md", "one");
+
+    let ticket = app.preview_location("o/new", None).unwrap();
+    run_next(&mut app, &mut s.engine, T0);
+    let reviewed = match &app.draft().unwrap().stage {
+        DraftStage::Reviewed(preview) => preview.clone(),
+        other => panic!("expected a reviewed preview, got {other:?}"),
+    };
+
+    app.edit_draft(ticket, |settings| settings.types.skills = Some(false)).unwrap();
+    let current = match &app.draft().unwrap().stage {
+        DraftStage::Reviewed(preview) => preview,
+        other => panic!("local edits should keep the reviewed preview, got {other:?}"),
+    };
+    assert!(std::sync::Arc::ptr_eq(&reviewed, current), "editing settings must reuse the immutable preview snapshot");
+    app.edit_draft(ticket, |settings| settings.interval = Some(Interval::parse("6h").unwrap())).unwrap();
+    let current = match &app.draft().unwrap().stage {
+        DraftStage::Reviewed(preview) => preview,
+        other => panic!("local edits should keep the reviewed preview, got {other:?}"),
+    };
+    assert!(std::sync::Arc::ptr_eq(&reviewed, current), "every non-rediscovering edit must retain the same snapshot");
+}
+
+#[test]
+fn preview_snapshot_is_retained_exactly_through_refresh_and_failure() {
+    let mut s = Setup::fresh("app-preview-stale-snapshot");
+    let mut app = started(&mut s);
+    s.remote.put("o/new", "alpha/SKILL.md", "one");
+
+    let ticket = app.preview_location("o/new", None).unwrap();
+    run_next(&mut app, &mut s.engine, T0);
+    let reviewed = match &app.draft().unwrap().stage {
+        DraftStage::Reviewed(preview) => preview.clone(),
+        other => panic!("expected a reviewed preview, got {other:?}"),
+    };
+    app.retry_source(ticket).unwrap();
+    let during_refresh = app.draft().unwrap().previous_preview.as_ref().unwrap();
+    assert!(std::sync::Arc::ptr_eq(&reviewed, during_refresh), "refresh should retain the exact previous snapshot");
+
+    answer(&mut app, broken(), None, T0);
+    let draft = app.draft().unwrap();
+    assert!(matches!(draft.stage, DraftStage::Failed(_)));
+    let after_failure = draft.previous_preview.as_ref().unwrap();
+    assert!(std::sync::Arc::ptr_eq(&reviewed, after_failure), "failure should retain the exact stale snapshot");
+}
+
+#[test]
+fn same_ticket_stale_preview_answer_keeps_the_newer_loading_request() {
+    let mut s = Setup::fresh("app-preview-stale-answer");
+    let mut app = started(&mut s);
+    s.remote.put("o/new", "alpha/SKILL.md", "one");
+
+    let ticket = app.preview_location("o/new", None).unwrap();
+    run_next(&mut app, &mut s.engine, T0);
+    let reviewed = match &app.draft().unwrap().stage {
+        DraftStage::Reviewed(preview) => preview.clone(),
+        other => panic!("expected a reviewed preview, got {other:?}"),
+    };
+
+    app.retry_source(ticket).unwrap();
+    let stale_order = app.next_order().expect("the retry should start");
+    let Job::PreviewSource(stale_input) = &stale_order.job else { panic!("expected a preview retry") };
+    let stale_done = app::perform(&mut s.engine, &stale_order, &cancel_flag());
+
+    app.retry_source(ticket).unwrap();
+    let latest_input = app.draft().unwrap().input.clone();
+    assert!(latest_input.request > stale_input.request);
+    assert!(matches!(app.draft().unwrap().stage, DraftStage::Loading));
+    assert!(std::sync::Arc::ptr_eq(app.draft().unwrap().previous_preview.as_ref().unwrap(), &reviewed));
+    let Some(Job::PreviewSource(queued_input)) = app.queued().front() else { panic!("the newest retry should be queued") };
+    assert!(std::sync::Arc::ptr_eq(queued_input, &latest_input));
+
+    app.finish(stale_done, T0);
+    let draft = app.draft().unwrap();
+    assert!(matches!(draft.stage, DraftStage::Loading));
+    assert!(std::sync::Arc::ptr_eq(&draft.input, &latest_input));
+    assert!(std::sync::Arc::ptr_eq(draft.previous_preview.as_ref().unwrap(), &reviewed));
+    assert!(matches!(app.queued().front(), Some(Job::PreviewSource(input)) if std::sync::Arc::ptr_eq(input, &latest_input)));
 }
 
 /// An app with local settings in a file, on a fake GitHub with a marketplace plugin and a skill in `o/fixtures`.
@@ -241,11 +394,19 @@ fn plugin_app_approves_the_reviewed_plugins_only_after_saving() {
     run_next(&mut app, &mut engine, T0);
     let DraftStage::Reviewed(preview) = &app.draft().unwrap().stage else { panic!("expected a completed preview") };
     let preview = preview.clone();
-    let id = preview.source.id.clone();
-    let plugins = preview.source.lanes.id(SourceKind::Plugins).unwrap().to_owned();
-    let skills = preview.source.lanes.id(SourceKind::Skills).unwrap().to_owned();
+    let id = preview.location().source.id.clone();
+    let plugins = preview.location().source.lanes.id(SourceKind::Plugins).unwrap().to_owned();
+    let skills = preview.location().source.lanes.id(SourceKind::Skills).unwrap().to_owned();
     app.confirm_source(ticket, true).unwrap();
-    assert!(matches!(app.queued().front(), Some(Job::SaveSource(_, reviewed, true)) if std::sync::Arc::ptr_eq(reviewed, &preview)));
+    assert!(matches!(
+        app.queued().front(),
+        Some(Job::SaveSource(_, reviewed, settings, true))
+            if std::sync::Arc::ptr_eq(reviewed, &preview)
+                && reviewed.location().source.id == id
+                && !reviewed.location().source.enabled
+                && reviewed.location().inventory == preview.location().inventory
+                && settings.enabled
+    ));
     run_next(&mut app, &mut engine, T0);
     assert!(Config::load_sources(&file).unwrap().find_source(&id).is_some());
     assert_eq!(w.state().plugin_sources()[&plugins].approved, [("alpha".into(), Some("Review Team".into()))].into());
@@ -259,10 +420,10 @@ fn plugin_app_adds_without_approval_and_never_asks_copilot() {
     let ticket = app.preview_location(REPO, None).unwrap();
     run_next(&mut app, &mut engine, T0);
     let DraftStage::Reviewed(preview) = &app.draft().unwrap().stage else { panic!("expected a completed preview") };
-    let id = preview.source.id.clone();
+    let id = preview.location().source.id.clone();
     app.confirm_source(ticket, false).unwrap();
     let (job, _) = run_next(&mut app, &mut engine, T0);
-    assert!(matches!(job, Job::SaveSource(_, _, false)));
+    assert!(matches!(job, Job::SaveSource(_, _, _, false)));
     let saved = Config::load_sources(&file).unwrap();
     assert!(saved.find_source(&id).is_some());
     assert!(manager.calls().is_empty(), "adding without approval never launches Copilot CLI");
@@ -317,9 +478,9 @@ fn plugin_app_add_reserves_fresh_ids_and_refuses_one_taken_before_saving() {
         let DraftStage::Reviewed(preview) = &app.draft().unwrap().stage else { panic!("expected a finished preview") };
         let ids: Vec<String> = [SourceKind::Skills, SourceKind::Agents, SourceKind::Instructions, SourceKind::Plugins]
             .into_iter()
-            .filter_map(|kind| preview.source.lanes.id(kind).map(str::to_owned))
+            .filter_map(|kind| preview.location().source.lanes.id(kind).map(str::to_owned))
             .collect();
-        (preview.source.id.clone(), ids)
+        (preview.location().source.id.clone(), ids)
     };
     let ticket = app.preview_location(REPO, None).unwrap();
     run_next(&mut app, &mut engine, T0);
@@ -400,7 +561,7 @@ fn source_preview_portable_save_must_finish_before_a_check_is_queued() {
         run_next(&mut app, &mut s.engine, T0);
         assert_eq!(s.w.snapshot(), before, "the preview changed a file");
         let DraftStage::Reviewed(preview) = &app.draft().unwrap().stage else { panic!("expected a finished preview") };
-        let skills = preview.source.lanes.id(SourceKind::Skills).unwrap().to_owned();
+        let skills = preview.location().source.lanes.id(SourceKind::Skills).unwrap().to_owned();
         app.confirm_source(ticket, false).unwrap();
         assert!(matches!(app.queued().as_slices(), ([Job::SaveSource(..)], [])));
         assert_eq!(app.cfg(), &shared);
@@ -438,7 +599,7 @@ fn dismissing_a_source_during_portable_save_keeps_the_save_and_following_check()
     let ticket = app.preview_location("o/new", Some(Interval::parse("6h").unwrap())).unwrap();
     run_next(&mut app, &mut s.engine, T0);
     let DraftStage::Reviewed(preview) = &app.draft().unwrap().stage else { panic!("expected a finished preview") };
-    let (id, skills) = (preview.source.id.clone(), preview.source.lanes.id(SourceKind::Skills).unwrap().to_owned());
+    let (id, skills) = (preview.location().source.id.clone(), preview.location().source.lanes.id(SourceKind::Skills).unwrap().to_owned());
     app.confirm_source(ticket, false).unwrap();
     let order = app.next_order().unwrap();
     assert!(matches!(order.job, Job::SaveSource(..)));
@@ -493,9 +654,9 @@ fn removing_by_any_lane_id_lets_go_of_the_whole_source() {
     let ticket = app.preview_location(REPO, None).unwrap();
     run_next(&mut app, &mut engine, T0);
     let DraftStage::Reviewed(preview) = &app.draft().unwrap().stage else { panic!("expected a finished preview") };
-    let id = preview.source.id.clone();
-    let plugins = preview.source.lanes.id(SourceKind::Plugins).unwrap().to_owned();
-    let skills = preview.source.lanes.id(SourceKind::Skills).unwrap().to_owned();
+    let id = preview.location().source.id.clone();
+    let plugins = preview.location().source.lanes.id(SourceKind::Plugins).unwrap().to_owned();
+    let skills = preview.location().source.lanes.id(SourceKind::Skills).unwrap().to_owned();
     app.confirm_source(ticket, false).unwrap();
     run(&mut app, &mut engine, T0);
     assert_eq!(w.skill_names(), ["beta"]);

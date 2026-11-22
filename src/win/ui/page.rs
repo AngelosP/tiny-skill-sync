@@ -5,7 +5,7 @@
 //! hide what is around it. Which repository, skill or file a control is for is said by its id (see [`hit`]), never by
 //! its text.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use windows_sys::Win32::Graphics::Gdi::{DT_CENTER, DT_EDITCONTROL, DT_END_ELLIPSIS, DT_PATH_ELLIPSIS, DT_RIGHT, DT_SINGLELINE, DT_VCENTER, DT_WORDBREAK};
 
@@ -13,7 +13,7 @@ use super::control::{Deco, Item, Kind, Look, Mark, RowCmd, Surface, two_lines};
 use super::paint::{Font, Rect, Tone, glyph};
 use super::sentence;
 use super::theme::Role;
-use crate::app::{DraftStage, SourceDraft, duplicate_source_message};
+use crate::app::{DraftStage, SourceDraft, duplicate_source_message, preview_syncs_for_settings};
 use crate::autostart::{Startup, Via};
 use crate::board::{self, Action, Board, KindView, Level, Row, SourceView, ago, repo_name};
 use crate::config::{Config, RepoConfig, UpdateInterval, UpdatePrefs, UpdateTiming};
@@ -111,6 +111,10 @@ pub mod id {
     pub const APP_WHEN: i32 = 426;
     pub const APP_TIMING_TEXT: i32 = 427;
     pub const APP_STATUS_HELP: i32 = 428;
+    pub const PREVIEW_NOTE_TEXT: i32 = 429;
+    pub const SECTION_WHAT: i32 = 470;
+    pub const SECTION_KIND: i32 = 471;
+    pub const SECTION_NEVER: i32 = 475;
     /// Plus the index of the repository in the settings.
     pub const NAV_REPO: i32 = 1_000;
     pub const NOTE: i32 = 100_000;
@@ -193,6 +197,13 @@ pub enum Page {
 /// The page to show now: the one shown while it is still there, else the first source that needs the user, else the
 /// first source. `None` is the welcome page, for when there are none. A lane ID (from a check, the tray or a source
 /// just added) shows its source.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum SectionKey {
+    WhatToSync,
+    Kind(SourceKind),
+    NeverSynced,
+}
+
 pub fn settle(shown: Option<Page>, sources: &[SourceView], cfg: &Config) -> Option<Page> {
     let source_of = |id: &str| cfg.find_source(id).map(|s| s.id.as_str()).filter(|sid| sources.iter().any(|v| v.id == *sid));
     match shown {
@@ -557,6 +568,19 @@ pub fn source_sub(view: &SourceView, now: UnixSecs) -> String {
     }
 }
 
+fn preview_sub(view: &SourceView, source: &SourceConfig) -> String {
+    let folder = if source.path.is_empty() { "the whole repository".to_string() } else { format!("the {} folder", printable(&source.path)) };
+    let branch = match branch_text(view) {
+        b if b == "default branch" => "the default branch".to_string(),
+        b => b,
+    };
+    if source.use_token {
+        format!("{} on {branch} · read with your GitHub sign-in · not checked yet", sentence(&folder))
+    } else {
+        format!("{} on {branch} · not checked yet", sentence(&folder))
+    }
+}
+
 /// The forms of location the Add source question takes.
 pub const LOCATION_FORMS: &str = "Enter owner/name, the GitHub address of a repository, or the address of a branch or folder in it (…/tree/branch/folder). The app finds the skills, agents, instruction files and plugins in it.";
 
@@ -570,57 +594,48 @@ pub fn location_hint(text: &str) -> Result<String, String> {
     })
 }
 
-/// The Add source page for a draft. `skills_dir` is where skills would go.
-pub fn source_preview(draft: &SourceDraft, skills_dir: &std::path::Path, w: i32, fit: Fit) -> Surface {
-    let mut o = Out::new(fit);
-    let sub = match &draft.stage {
-        DraftStage::Reviewed(preview) => format!("{} [{}]", printable(&board::source_label(&preview.source)), printable(&preview.source.id)),
-        DraftStage::AlreadySetUp(_) => String::new(),
-        _ => printable(draft.input.text.trim()).into_owned(),
+/// Inputs for rendering an unsaved location in the same page as saved sources.
+pub struct PreviewPage<'a> {
+    pub draft: &'a SourceDraft,
+    pub global: &'a GlobalSettings,
+    pub default: Interval,
+    pub now: UnixSecs,
+    pub toggled: &'a HashSet<String>,
+    pub sections: &'a HashMap<SectionKey, bool>,
+}
+
+/// Render an unsaved location. The draft's settings are authoritative; its preview contributes only remote facts and GitHub paths.
+pub fn source_preview(p: &PreviewPage, w: i32, fit: Fit) -> Surface {
+    let draft = p.draft;
+    let source = &draft.settings;
+    let snapshot = match &draft.stage {
+        DraftStage::Reviewed(preview) => Some(preview),
+        _ => draft.previous_preview.as_ref(),
     };
-    let mut y = o.head(w, "Add source", &sub);
-    // (body, can save, plugins that would be approved)
-    let (body, can_save, plugins) = match &draft.stage {
-        DraftStage::Loading => ("Reading the source. Nothing has been saved or installed.".into(), false, false),
-        DraftStage::AlreadySetUp(id) => (printable(&duplicate_source_message(id)).into_owned(), false, false),
-        DraftStage::Failed(why) => (printable(why).into_owned(), false, false),
-        DraftStage::Saving => ("Checking the preview again and saving the source…".into(), false, false),
-        DraftStage::Reviewed(preview) => {
-            let syncs = KINDS.iter().any(|&kind| board::preview_syncs(preview, kind));
-            let plugins = !board::previewed_plugins(preview).is_empty();
-            let note = if !syncs {
-                "Nothing here would sync. Check the branch and folder, or edit the location."
-            } else if plugins {
-                "Nothing has been saved or installed. Add without approving plugins to sync the files only; GitHub Copilot CLI installs the plugins above only after you approve them."
-            } else {
-                "Nothing has been saved or installed. Add this source to save it and start its first check."
-            };
-            (format!("{}\n\n{note}", board::preview_lines(preview, skills_dir).join("\n")), syncs, plugins)
-        }
+    let empty_view = SourceView {
+        id: source.id.clone(),
+        label: String::new(),
+        repo: String::new(),
+        branch: source.branch.clone(),
+        seen_branch: None,
+        folder: String::new(),
+        enabled: source.enabled,
+        status: String::new(),
+        detail: None,
+        level: Level::Ok,
+        last_check: None,
+        private: source.use_token,
+        detected: None,
+        kinds: Vec::new(),
+        notes: Vec::new(),
+        more_notes: 0,
     };
-    let cw = w - 2 * PAD_X;
-    y += o.para(id::INFO_TEXT, [PAD_X, y, cw], wrap_report(body, cw, Font::Body, fit), Font::Body, Role::Text) + GAP;
-    let mut buttons = Vec::new();
-    if can_save && plugins {
-        buttons.push(btn(id::CONFIRM_SOURCE, "Add without approving plugins", Kind::Accent, None));
-        buttons.push(btn(id::APPROVE_SOURCE, "Add and approve these plugins", Kind::Standard, None));
-    } else if can_save {
-        buttons.push(btn(id::CONFIRM_SOURCE, "Add and check", Kind::Accent, None));
-    } else if matches!(draft.stage, DraftStage::Reviewed(_)) {
-        // Nothing here would sync, so editing the location is the way on.
-        buttons.push(btn(id::EDIT_SOURCE, "Edit", Kind::Accent, None));
-        buttons.push(btn(id::RETRY_SOURCE, "Retry", Kind::Standard, None));
-    } else if matches!(draft.stage, DraftStage::Failed(_) | DraftStage::AlreadySetUp(_)) {
-        if !matches!(draft.stage, DraftStage::AlreadySetUp(_)) {
-            buttons.push(btn(id::RETRY_SOURCE, "Retry", Kind::Accent, None));
-        }
-        buttons.push(btn(id::EDIT_SOURCE, "Edit", Kind::Standard, None));
-    }
-    if !matches!(draft.stage, DraftStage::Saving) {
-        buttons.push(btn(id::CANCEL_SOURCE, "Cancel", Kind::Standard, None));
-    }
-    let bottom = o.flow(PAD_X, y, w - PAD_X, 32, buttons);
-    o.done(bottom + 16)
+    let view = snapshot.map_or(&empty_view, |snapshot| snapshot.view());
+    source_page(
+        &SourcePage { view, source, global: p.global, default: p.default, now: p.now, toggled: p.toggled, draft: Some(draft), sections: p.sections },
+        w,
+        fit,
+    )
 }
 
 const KINDS: [SourceKind; 4] = [SourceKind::Skills, SourceKind::Agents, SourceKind::Instructions, SourceKind::Plugins];
@@ -876,6 +891,10 @@ pub struct SourcePage<'a> {
     pub now: UnixSecs,
     /// The rows the user opened or closed, by [`toggle_key`].
     pub toggled: &'a HashSet<String>,
+    /// An unsaved draft uses this page's shared renderer and has only GitHub-safe row commands.
+    pub draft: Option<&'a SourceDraft>,
+    /// Manual expansion choices, stored separately from source settings.
+    pub sections: &'a HashMap<SectionKey, bool>,
 }
 
 pub fn source_page(p: &SourcePage, w: i32, fit: Fit) -> Surface {
@@ -883,25 +902,44 @@ pub fn source_page(p: &SourcePage, w: i32, fit: Fit) -> Surface {
     let (x, cw) = (PAD_X, w - 2 * PAD_X);
     let right = x + cw;
     let mut y = PAD_TOP;
-    o.item(id::MORE, [right - 32, y, 32, 32], "More", Look::Button { kind: Kind::Icon, glyph: Some(glyph::MORE) }, true);
-    let room = right - 32 - 8 - x;
-    let title = printable(&p.view.repo).into_owned();
+    let preview = p.draft.is_some();
+    if !preview {
+        o.item(id::MORE, [right - 32, y, 32, 32], "More", Look::Button { kind: Kind::Icon, glyph: Some(glyph::MORE) }, true);
+    }
+    let room = right - if preview { 0 } else { 32 + 8 } - x;
+    let title =
+        p.draft.map_or_else(|| p.view.repo.clone(), |draft| if p.source.repo.is_empty() { draft_repo(&draft.input.text) } else { p.source.repo.clone() });
+    let private = p.draft.map_or(p.view.private, |_| p.source.use_token);
     let pill_w = o.width("Private", Font::CaptionStrong) + 18 + 16;
-    let title_w = (o.width(&title, Font::Title) + 2).min(room - if p.view.private { pill_w + 10 } else { 0 }).max(0);
+    let title = printable(&title).into_owned();
+    let title_w = (o.width(&title, Font::Title) + 2).min(room - if private { pill_w + 10 } else { 0 }).max(0);
     o.label(id::TITLE, [x, y, title_w, 28], title, Font::Title, Role::Text);
-    if p.view.private {
+    if private {
         o.item(id::PRIVATE, [x + title_w + 10, y, pill_w, 28], "Private", Look::Pill { tone: Tone::Off, glyph: Some(glyph::LOCK) }, true);
     }
-    let h = o.para(id::SUB, [x, y + 28, room], source_sub(p.view, p.now), Font::Caption, Role::Text2);
+    let subtitle = p.draft.map_or_else(|| source_sub(p.view, p.now), |_| preview_sub(p.view, p.source));
+    let h = o.para(id::SUB, [x, y + 28, room], subtitle, Font::Caption, Role::Text2);
     y = (y + 28 + h).max(y + 32) + GAP + 4;
-    if let Some(detail) = &p.view.detail {
-        y = infobar(&mut o, p.view, detail, x, y, cw) + GAP;
+    if let Some(draft) = p.draft {
+        y = preview_banner(&mut o, draft, p.global, x, y, cw) + GAP;
+        if matches!(draft.stage, DraftStage::AlreadySetUp(_)) {
+            return o.done(y + 16);
+        }
     }
-    y = interval_card(&mut o, p.source.interval, p.source.enabled, p.default, x, y, cw) + GAP;
+    if let Some(detail) = &p.view.detail {
+        y = if preview { preview_detail(&mut o, detail, x, y, cw) } else { infobar(&mut o, p.view, detail, x, y, cw) } + GAP;
+    }
+    y = interval_card(&mut o, p, x, y, cw) + GAP;
     y = what_to_sync(&mut o, p, x, y, cw) + GAP;
     y = sections(&mut o, p, x, y, cw);
-    y = never_synced(&mut o, p.view, x, y, cw);
+    y = never_synced(&mut o, p, x, y, cw);
     o.done(y + 16)
+}
+
+fn draft_repo(text: &str) -> String {
+    crate::location::Location::parse(text)
+        .map(|location| format!("{}/{}", location.owner, location.name))
+        .unwrap_or_else(|_| printable(text.trim()).into_owned())
 }
 
 /// Why a source can't be read, or why it lists nothing, with what can be done about it.
@@ -930,45 +968,150 @@ fn infobar(o: &mut Out, view: &SourceView, detail: &str, x: i32, y: i32, cw: i32
     bottom
 }
 
+fn preview_detail(o: &mut Out, detail: &str, x: i32, y: i32, cw: i32) -> i32 {
+    let mark = o.s.decos.len();
+    o.glyph([x + 16, y + 12, 16, 20], glyph::WARN, 16, Role::Warn);
+    let (tx, tw) = (x + 44, cw - 44 - 16);
+    o.label(id::INFO_LEAD, [tx, y + 12, tw, 20], "Preview note", Font::Strong, Role::Text);
+    let h = o.para(id::PREVIEW_NOTE_TEXT, [tx, y + 32, tw], printable_lines(detail), Font::Body, Role::Text);
+    let bottom = y + 32 + h + 12;
+    o.s.decos.insert(mark, Deco::Fill { at: [x, y, cw, bottom - y], radius: 6, fill: Role::WarnBg, border: Role::CardBorder });
+    bottom
+}
+
 /// Check every and Keep in sync, for the whole source, on one row when they fit, else on two.
-fn interval_card(o: &mut Out, interval: Option<Interval>, enabled: bool, default: Interval, x: i32, y: i32, cw: i32) -> i32 {
-    let (items, shown) = every_choices(interval, Some(default));
-    let (every, keep) = ("Check every", "Keep in sync");
-    let labels = o.width(every, Font::Body).max(o.width(keep, Font::Body));
+fn interval_card(o: &mut Out, p: &SourcePage, x: i32, y: i32, cw: i32) -> i32 {
+    let editable = p.draft.is_none_or(|draft| !matches!(draft.stage, DraftStage::Loading | DraftStage::Saving | DraftStage::AlreadySetUp(_)));
+    let (items, shown) = every_choices(p.source.interval, Some(p.default));
+    let every = "Check every";
+    let keep_label = "Keep in sync";
+    let keep_text = if p.source.enabled { "Keep in sync: On" } else { "Keep in sync: Off" };
+    let shown_text = format!("{every}\n{shown}");
+    let labels = o.width(every, Font::Body).max(o.width(keep_label, Font::Body));
     let fixed = 16 + 20 + 16 + 16 + COMBO_W + 16 + 1 + 16 + 16 + TOGGLE_W + 16;
     let mark = o.s.decos.len();
-    let toggle = Look::Toggle { on: enabled };
+    let toggle = Look::Toggle { on: p.source.enabled };
     let h = if (cw - fixed) / 2 >= labels {
         let flex = (cw - fixed) / 2;
         o.glyph([x + 16, y, 20, 56], glyph::TIMER, 16, Role::Text);
         o.text([x + 52, y, flex, 56], every, Font::Body, Role::Text, ONE_LINE);
         let cx = x + 52 + flex + 16;
-        o.item(id::EVERY, [cx, y + 12, COMBO_W, 32], shown, Look::Combo { items }, true);
+        o.item(id::EVERY, [cx, y + 12, COMBO_W, 32], shown_text.clone(), Look::Combo { items }, editable);
         let sx = cx + COMBO_W + 16;
         o.fill([sx, y + 12, 1, 32], 0, Role::Divider, Role::None);
-        o.text([sx + 17, y, flex, 56], keep, Font::Body, Role::Text, ONE_LINE);
-        o.item(id::ENABLED, [x + cw - 16 - TOGGLE_W, y + 12, TOGGLE_W, 32], keep, toggle, true);
+        o.text([sx + 17, y, flex, 56], keep_label, Font::Body, Role::Text, ONE_LINE);
+        o.item(id::ENABLED, [x + cw - 16 - TOGGLE_W, y + 12, TOGGLE_W, 32], keep_text, toggle, editable);
         56
     } else {
         let combo = COMBO_W.min(cw - 52 - 16 - 8 - labels).max(120);
         let lw = cw - 52 - 16 - combo - 8;
         o.glyph([x + 16, y, 20, 52], glyph::TIMER, 16, Role::Text);
         o.text([x + 52, y, lw, 52], every, Font::Body, Role::Text, ONE_LINE);
-        o.item(id::EVERY, [x + cw - 16 - combo, y + 10, combo, 32], shown, Look::Combo { items }, true);
+        o.item(id::EVERY, [x + cw - 16 - combo, y + 10, combo, 32], shown_text, Look::Combo { items }, editable);
         o.fill([x + 1, y + 52, cw - 2, 1], 0, Role::Divider, Role::None);
-        o.text([x + 52, y + 53, cw - 52 - 16 - TOGGLE_W - 8, 52], keep, Font::Body, Role::Text, ONE_LINE);
-        o.item(id::ENABLED, [x + cw - 16 - TOGGLE_W, y + 63, TOGGLE_W, 32], keep, toggle, true);
+        o.text([x + 52, y + 53, cw - 52 - 16 - TOGGLE_W - 8, 52], keep_label, Font::Body, Role::Text, ONE_LINE);
+        o.item(id::ENABLED, [x + cw - 16 - TOGGLE_W, y + 63, TOGGLE_W, 32], keep_text, toggle, editable);
         105
     };
     o.card(mark, [x, y, cw, h]);
     y + h
 }
 
+fn preview_banner(o: &mut Out, draft: &SourceDraft, global: &GlobalSettings, x: i32, y: i32, cw: i32) -> i32 {
+    let (heading, detail, actions) = match &draft.stage {
+        DraftStage::Loading => {
+            let refreshing = draft.previous_preview.is_some();
+            (
+                if refreshing { "Refreshing preview" } else { "Preview" },
+                if refreshing {
+                    "The previous preview stays visible while the updated folder rules are checked. Nothing has been saved or installed.".to_string()
+                } else {
+                    "Reading the source. Nothing has been saved or installed.".to_string()
+                },
+                vec![btn(id::CANCEL_SOURCE, "Cancel", Kind::Standard, None)],
+            )
+        }
+        DraftStage::AlreadySetUp(id) => (
+            "Already added",
+            duplicate_source_message(id),
+            vec![btn(id::EDIT_SOURCE, "Edit location", Kind::Accent, None), btn(id::CANCEL_SOURCE, "Cancel", Kind::Standard, None)],
+        ),
+        DraftStage::Failed(why) => (
+            "Preview unavailable",
+            if draft.previous_preview.is_some() {
+                format!("The previous preview is shown below. The updated source could not be read: {}", printable(why))
+            } else {
+                format!("The source could not be read: {}", printable(why))
+            },
+            vec![
+                btn(id::RETRY_SOURCE, "Retry", Kind::Accent, None),
+                btn(id::EDIT_SOURCE, "Edit location", Kind::Standard, None),
+                btn(id::CANCEL_SOURCE, "Cancel", Kind::Standard, None),
+            ],
+        ),
+        DraftStage::Saving => ("Adding source", "Checking the preview again and saving the source…".to_string(), Vec::new()),
+        DraftStage::Reviewed(preview) => {
+            let syncs = KINDS.iter().any(|&kind| preview_syncs_for_settings(preview, &draft.settings, global, kind));
+            let plugins = preview_syncs_for_settings(preview, &draft.settings, global, SourceKind::Plugins);
+            let any_type_on = KINDS.iter().any(|&kind| type_enabled_settings(&draft.settings, global, kind));
+            let detail = if !syncs {
+                if any_type_on {
+                    "No syncable items were found. Change the location or folder rules before adding this source.".to_string()
+                } else {
+                    "All item types are turned off. Turn on a type before adding this source.".to_string()
+                }
+            } else if plugins {
+                "Preview only. Nothing has been saved or installed. Plugin installation requires the separate approval action.".to_string()
+            } else {
+                "Preview only. Nothing has been saved or installed. Add this source to save it and start its first check.".to_string()
+            };
+            let actions = if syncs {
+                let mut actions = vec![btn(id::CONFIRM_SOURCE, "Add and keep in sync", Kind::Accent, None)];
+                if plugins {
+                    actions.push(btn(id::APPROVE_SOURCE, "Add and approve plugins", Kind::Standard, None));
+                }
+                actions.push(btn(id::CANCEL_SOURCE, "Cancel", Kind::Standard, None));
+                actions
+            } else {
+                vec![
+                    btn(id::EDIT_SOURCE, "Edit location", Kind::Accent, None),
+                    btn(id::RETRY_SOURCE, "Retry", Kind::Standard, None),
+                    btn(id::CANCEL_SOURCE, "Cancel", Kind::Standard, None),
+                ]
+            };
+            ("Preview", detail, actions)
+        }
+    };
+    let mark = o.s.decos.len();
+    o.text([x + 16, y + 12, cw - 32, 24], heading, Font::Strong, Role::Text, ONE_LINE);
+    let buttons_y = y + 12 + 24 + 6;
+    let bottom = o.flow(x + 16, buttons_y, x + cw - 16, 32, actions);
+    let body_y = bottom + 8;
+    let body_h = o.para(id::INFO_TEXT, [x + 16, body_y, cw - 32], printable(&detail).into_owned(), Font::Caption, Role::Text2);
+    let bottom = body_y + body_h + 12;
+    o.card(mark, [x, y, cw, bottom - y]);
+    bottom
+}
+
 /// Which types the source syncs, whether it takes repository-specific items, and its folder rules.
 fn what_to_sync(o: &mut Out, p: &SourcePage, x: i32, y: i32, cw: i32) -> i32 {
     let mark = o.s.decos.len();
-    o.text([x + 16, y + 12, cw - 32, 20], "What to sync", Font::Strong, Role::Text, ONE_LINE);
-    let mut ly = y + 12 + 20 + 4;
+    let open = section_open(p, SectionKey::WhatToSync, true);
+    let marks = KINDS
+        .into_iter()
+        .map(|kind| {
+            let on = type_enabled(p, kind);
+            (if on { glyph::OK } else { glyph::PAUSE }, if on { Role::Ok } else { Role::Text3 })
+        })
+        .collect::<Vec<_>>();
+    let states =
+        KINDS.into_iter().map(|kind| format!("{} {}", kind.heading(), if type_enabled(p, kind) { "on" } else { "off" })).collect::<Vec<_>>().join("; ");
+    section_header(o, id::SECTION_WHAT, [x + 8, y + 8, cw - 16, 32], format!("What to sync, {}. {states}", expanded_text(open)), "What to sync", open, marks);
+    if !open {
+        o.card(mark, [x, y, cw, 48]);
+        return y + 48;
+    }
+    let mut ly = y + 48;
     let mut rows = KINDS
         .into_iter()
         .enumerate()
@@ -986,19 +1129,31 @@ fn what_to_sync(o: &mut Out, p: &SourcePage, x: i32, y: i32, cw: i32) -> i32 {
     let combo = longest.max(COMBO_W).min(room).max(0);
     let titles = rows.iter().map(|r| o.width(r.1, Font::Body) + 2).max().unwrap_or(0);
     let beside = room - combo - 8 >= titles;
-    for (mark, title, n, (items, shown), purpose) in rows {
+    for (kind_mark, title, n, (items, shown), purpose) in rows {
         let text = two_lines(&purpose, &shown);
         if beside {
-            o.glyph([x + 16, ly, 20, 44], mark, 16, Role::Text);
+            o.glyph([x + 16, ly, 20, 44], kind_mark, 16, Role::Text);
             o.text([x + 52, ly, room - combo - 8, 44], title, Font::Body, Role::Text, ONE_LINE);
-            o.item(n, [x + cw - 16 - combo, ly + 6, combo, 32], text, Look::Combo { items }, true);
+            o.item(
+                n,
+                [x + cw - 16 - combo, ly + 6, combo, 32],
+                text,
+                Look::Combo { items },
+                p.draft.is_none_or(|d| !matches!(d.stage, DraftStage::Loading | DraftStage::Saving | DraftStage::AlreadySetUp(_))),
+            );
             ly += 44;
         } else {
             let one = o.width(title, Font::Body) + 2 <= room;
             let th = if one { line_height(Font::Body) } else { (o.fit)(title, Font::Body, room.max(1)).1.max(line_height(Font::Body)) };
-            o.glyph([x + 16, ly + 8, 20, line_height(Font::Body)], mark, 16, Role::Text);
+            o.glyph([x + 16, ly + 8, 20, line_height(Font::Body)], kind_mark, 16, Role::Text);
             o.text([x + 52, ly + 8, room, th], title, Font::Body, Role::Text, if one { ONE_LINE } else { WRAP });
-            o.item(n, [x + 52, ly + 8 + th + 4, combo, 32], text, Look::Combo { items }, true);
+            o.item(
+                n,
+                [x + 52, ly + 8 + th + 4, combo, 32],
+                text,
+                Look::Combo { items },
+                p.draft.is_none_or(|d| !matches!(d.stage, DraftStage::Loading | DraftStage::Saving | DraftStage::AlreadySetUp(_))),
+            );
             ly += 8 + th + 4 + 32 + 4;
         }
     }
@@ -1028,6 +1183,9 @@ fn what_to_sync(o: &mut Out, p: &SourcePage, x: i32, y: i32, cw: i32) -> i32 {
 fn sections(o: &mut Out, p: &SourcePage, x: i32, mut y: i32, cw: i32) -> i32 {
     let v = p.view;
     if v.kinds.is_empty() {
+        if p.draft.is_some() {
+            return y - GAP;
+        }
         let text = if !v.enabled {
             "Nothing from this source is kept up to date while Keep in sync is off."
         } else if v.detail.is_some() {
@@ -1041,18 +1199,30 @@ fn sections(o: &mut Out, p: &SourcePage, x: i32, mut y: i32, cw: i32) -> i32 {
     }
     let mut index = 0;
     for k in &v.kinds {
-        let head = k.kind.heading();
-        let head_w = o.width(head, Font::Strong) + 2;
-        o.glyph([x, y, 20, 24], kind_glyph(k.kind), 16, Role::Text);
-        o.text([x + 28, y, head_w, 24], head, Font::Strong, Role::Text, ONE_LINE);
-        let count = k.found.map_or(k.rows.len(), |n| n as usize).to_string();
-        let count = if k.on { count } else { format!("{count} · Sync off") };
-        o.text([x + 28 + head_w + 8, y, (cw - 36 - head_w).max(0), 24], count, Font::Caption, Role::Text2, ONE_LINE);
-        y += 30;
+        let open = section_open(p, SectionKey::Kind(k.kind), false);
+        let detected = v.detected.map(|found| found[kind_index(k.kind)]).unwrap_or(k.found.unwrap_or(k.rows.len() as u32));
+        let on = kind_is_on(p, k);
+        let count = if on { detected.to_string() } else { format!("{detected} · Sync off") };
+        let heading = format!("{} ({count})", k.kind.heading());
+        section_header(
+            o,
+            id::SECTION_KIND + kind_index(k.kind) as i32,
+            [x, y, cw, 28],
+            format!("{heading}, {}.", expanded_text(open)),
+            &heading,
+            open,
+            Vec::new(),
+        );
+        y += 32;
+        let first = index;
+        index += k.rows.len();
+        if !open {
+            y += GAP;
+            continue;
+        }
         if !k.rows.is_empty() {
-            y = rows_card(o, p, k, index, x, y, cw) + 8;
-            index += k.rows.len();
-        } else if k.on && k.notes.is_empty() && k.filtered == 0 {
+            y = rows_card(o, p, k, first, x, y, cw) + 8;
+        } else if on && k.notes.is_empty() && k.filtered == 0 {
             let text = format!("Its {} are listed here after the next check.", k.kind.nouns().1);
             y += o.para(0, [x, y, cw], text, Font::Caption, Role::Text2) + 8;
         }
@@ -1069,11 +1239,20 @@ fn sections(o: &mut Out, p: &SourcePage, x: i32, mut y: i32, cw: i32) -> i32 {
 }
 
 /// Files the listing had that are never synced, such as AGENTS.md.
-fn never_synced(o: &mut Out, v: &SourceView, x: i32, mut y: i32, cw: i32) -> i32 {
+fn never_synced(o: &mut Out, p: &SourcePage, x: i32, mut y: i32, cw: i32) -> i32 {
+    let v = p.view;
     if v.notes.is_empty() {
         return y;
     }
     y += GAP;
+    let open = section_open(p, SectionKey::NeverSynced, false);
+    let count = v.notes.len() + v.more_notes as usize;
+    let heading = format!("Never synced ({count})");
+    section_header(o, id::SECTION_NEVER, [x, y, cw, 28], format!("{heading}, {}.", expanded_text(open)), &heading, open, Vec::new());
+    y += 32;
+    if !open {
+        return y;
+    }
     for note in &v.notes {
         let text = format!("Never synced: {}: {}", printable(&note.path), printable(&note.reason));
         y += o.para(0, [x, y, cw], wrap_report(text, cw, Font::Caption, o.fit), Font::Caption, Role::Text2) + 4;
@@ -1084,11 +1263,38 @@ fn never_synced(o: &mut Out, v: &SourceView, x: i32, mut y: i32, cw: i32) -> i32
     y
 }
 
+fn section_open(p: &SourcePage, key: SectionKey, default: bool) -> bool {
+    p.sections.get(&key).copied().unwrap_or(default)
+}
+
+fn expanded_text(open: bool) -> &'static str {
+    if open { "expanded" } else { "collapsed" }
+}
+
+fn section_header(o: &mut Out, id: i32, at: Rect, accessible: String, title: &str, open: bool, marks: Vec<(char, Role)>) {
+    o.item(id, at, accessible, Look::Section { title: title.to_owned(), open, marks }, true);
+}
+
+fn type_enabled(p: &SourcePage, kind: SourceKind) -> bool {
+    type_enabled_settings(p.source, p.global, kind)
+}
+
+fn kind_is_on(p: &SourcePage, kind: &KindView) -> bool {
+    p.draft.map_or(kind.on, |_| type_enabled(p, kind.kind))
+}
+
+fn type_enabled_settings(source: &SourceConfig, global: &GlobalSettings, kind: SourceKind) -> bool {
+    source.types.get(kind).unwrap_or_else(|| global.types.enabled(kind))
+}
+
+fn kind_index(kind: SourceKind) -> usize {
+    KINDS.iter().position(|&item| item == kind).expect("all source kinds are listed in KINDS")
+}
+
 /// The rows of one type, each with its status and, once opened, what can be done about it. `first` is the index of
 /// its first row on the page.
 fn rows_card(o: &mut Out, p: &SourcePage, k: &KindView, first: usize, x: i32, mut y: i32, cw: i32) -> i32 {
     let (mark, top) = (o.s.decos.len(), y);
-    let linkable = crate::github::web_url(&lane_config(p.source, k.kind, &k.lane), None).is_some();
     for (j, row) in k.rows.iter().enumerate() {
         if j > 0 {
             o.fill([x + 1, y, cw - 2, 1], 0, Role::Divider, Role::None);
@@ -1096,7 +1302,7 @@ fn rows_card(o: &mut Out, p: &SourcePage, k: &KindView, first: usize, x: i32, mu
         let base = skill_id(first + j, 0);
         let (tone, pill) = pill_of(row);
         let open = is_open(row, &k.lane, p.toggled);
-        let look = Look::Row { tone, glyph: pill, commands: kind_commands(row, k, linkable), disclosure: expandable(row).then_some(open) };
+        let look = Look::Row { tone, glyph: pill, commands: source_row_commands(p, k, row), disclosure: expandable(row).then_some(open) };
         let facts = match &row.plugin {
             Some(plugin) => printable(&plugin.facts()).into_owned(),
             None => row.facts.as_ref().map(|f| printable(&board::facts_text(f, p.now)).into_owned()).unwrap_or_default(),
@@ -1121,6 +1327,19 @@ fn rows_card(o: &mut Out, p: &SourcePage, k: &KindView, first: usize, x: i32, mu
     }
     o.card(mark, [x, top, cw, y - top]);
     y
+}
+
+fn source_row_commands(p: &SourcePage, k: &KindView, row: &Row) -> Vec<RowCmd> {
+    let lane = lane_config(p.source, k.kind, &k.lane);
+    if p.draft.is_some() {
+        return row
+            .remote_path
+            .as_deref()
+            .filter(|path| crate::github::web_url_path(&lane, path).is_some())
+            .map(|_| vec![RowCmd::CopyLink, RowCmd::OnGitHub])
+            .unwrap_or_default();
+    }
+    kind_commands(row, k, crate::github::web_url(&lane, None).is_some())
 }
 
 /// An open card contains just the comparison and repair choices. Returns the bottom.
@@ -1910,7 +2129,18 @@ pub(super) mod tests {
     }
 
     fn row(name: &str, level: Level, tag: &'static str, actions: Vec<Action>) -> Row {
-        Row { name: name.to_string(), text: format!("about {name}"), tag, level, actions, facts: None, listed: true, folder_missing: false, plugin: None }
+        Row {
+            name: name.to_string(),
+            text: format!("about {name}"),
+            tag,
+            level,
+            actions,
+            facts: None,
+            listed: true,
+            remote_path: None,
+            folder_missing: false,
+            plugin: None,
+        }
     }
 
     fn ok(name: &str) -> Row {
@@ -1945,6 +2175,7 @@ pub(super) mod tests {
             level,
             last_check: Some(NOW - 120),
             private: false,
+            detected: None,
             kinds,
             notes: Vec::new(),
             more_notes: 0,
@@ -1973,7 +2204,27 @@ pub(super) mod tests {
 
     fn page_of(v: &SourceView, s: &SourceConfig, toggled: &HashSet<String>, w: i32) -> Surface {
         let global = GlobalSettings::default();
-        source_page(&SourcePage { view: v, source: s, global: &global, default: DEFAULT_INTERVAL, now: NOW, toggled }, w, &fit)
+        let sections = [
+            (SectionKey::WhatToSync, true),
+            (SectionKey::Kind(SourceKind::Skills), true),
+            (SectionKey::Kind(SourceKind::Agents), true),
+            (SectionKey::Kind(SourceKind::Instructions), true),
+            (SectionKey::Kind(SourceKind::Plugins), true),
+            (SectionKey::NeverSynced, true),
+        ]
+        .into();
+        source_page(
+            &SourcePage { view: v, source: s, global: &global, default: DEFAULT_INTERVAL, now: NOW, toggled, draft: None, sections: &sections },
+            w,
+            &fit,
+        )
+    }
+
+    fn preview_page(draft: &SourceDraft, w: i32, measure: Fit) -> Surface {
+        let global = GlobalSettings::default();
+        let toggled = HashSet::new();
+        let sections = HashMap::new();
+        source_preview(&PreviewPage { draft, global: &global, default: DEFAULT_INTERVAL, now: NOW, toggled: &toggled, sections: &sections }, w, measure)
     }
 
     fn settings<'a>(startup: Result<&'a Startup, &'a str>) -> SettingsPage<'a> {
@@ -2268,11 +2519,12 @@ pub(super) mod tests {
             let s = page_of(&v, &cfg, &HashSet::new(), w);
             fits_in(&s, w);
             let heads: Vec<(i32, &str)> = s
-                .decos
+                .items
                 .iter()
-                .filter_map(|d| match d {
-                    Deco::Text { text, font: Font::Strong, at, .. } if ["Skills", "Agents", "Instructions", "Plugins"].contains(&text.as_str()) => {
-                        Some((at[1], text.as_str()))
+                .filter_map(|item| match &item.look {
+                    Look::Section { title, .. } => {
+                        let name = title.split_once(" (")?.0;
+                        ["Skills", "Agents", "Instructions", "Plugins"].contains(&name).then_some((item.at[1], name))
                     }
                     _ => None,
                 })
@@ -2280,14 +2532,11 @@ pub(super) mod tests {
             assert_eq!(heads.iter().map(|h| h.1).collect::<Vec<_>>(), ["Skills", "Agents", "Instructions", "Plugins"]);
             assert!(heads.windows(2).all(|p| p[0].0 < p[1].0), "in that order down the page");
             let text = all_text(&s);
-            for expected in [
-                "3",
-                "1 · Sync off",
-                "2 skipped by folder rules",
-                "Not synced: x/b.agent.md: the name is taken",
-                "Never synced: AGENTS.md: it is never synced",
-                "and 3 more",
-            ] {
+            assert!(text.iter().any(|t| t.contains("Skills (3)")));
+            assert!(text.iter().any(|t| t.contains("Instructions (1 · Sync off)")));
+            for expected in
+                ["2 skipped by folder rules", "Not synced: x/b.agent.md: the name is taken", "Never synced: AGENTS.md: it is never synced", "and 3 more"]
+            {
                 assert!(text.iter().any(|t| t == expected), "{expected:?} is not in {text:?}");
             }
             assert!(!text.iter().any(|t| t.contains("Skills [")), "the sub line does not name a lane");
@@ -2350,6 +2599,7 @@ pub(super) mod tests {
         });
         let items = s.items.iter().filter_map(|i| match &i.look {
             Look::Text { font, flags, .. } if same(&i.text) => Some((i.at, *flags, *font)),
+            Look::Section { title, .. } if same(title) => Some((i.at, ONE_LINE, Font::Strong)),
             _ => None,
         });
         decos.chain(items).find(|(at, ..)| top <= at[1] && at[1] < bottom).unwrap_or_else(|| panic!("no text {text:?}"))
@@ -2538,7 +2788,12 @@ pub(super) mod tests {
     fn plugin_rows_show_facts_and_choices_but_no_file_commands() {
         use RowCmd::{CopyLink, OnGitHub};
         let r = SourceConfig { path: "pack".into(), lanes: crate::sources::Lanes::default().with(SourceKind::Plugins, "o/a".into()), ..source_cfg("o/a") };
-        let details = board::PluginDetails { version: Some("1.2.3".into()), publisher: Some("Review Team".into()), path: Some("pack/plugin-folder".into()) };
+        let details = board::PluginDetails {
+            version: Some("1.2.3".into()),
+            publisher: Some("Review Team".into()),
+            path: Some("pack/plugin-folder".into()),
+            capabilities: None,
+        };
         let explanation =
             "Needs your approval. Plugins can run programs on this PC. Approve installs it now and its new versions from this branch automatically.";
         let plugin =
@@ -2706,7 +2961,7 @@ pub(super) mod tests {
         for w in [344, 900] {
             let s = page_of(&v, &r, &none, w);
             fits_in(&s, w);
-            assert_eq!(item(&s, id::EVERY).text, "2 hours");
+            assert_eq!(item(&s, id::EVERY).text, "Check every\n2 hours");
             assert!(item(&s, id::PRIVATE).at[0] > 24);
             let mut tops: Vec<i32> = s.items.iter().map(|i| i.at[1]).collect();
             tops.dedup();
@@ -3096,6 +3351,10 @@ pub(super) mod tests {
         crate::engine::LocationPreview { source, branch: "main".into(), follows_default: true, types: Types::default(), inventory, destinations: vec![] }
     }
 
+    fn preview_snapshot(preview: crate::engine::LocationPreview) -> std::sync::Arc<crate::app::PreviewSnapshot> {
+        std::sync::Arc::new(crate::app::PreviewSnapshot::new(preview))
+    }
+
     #[test]
     fn add_source_duplicate_refusal_wraps_and_is_replaced_by_the_next_preview() {
         use crate::app::App;
@@ -3116,59 +3375,184 @@ pub(super) mod tests {
             (w.max(longest), h)
         };
         let width = 980 - NAV_W;
-        let skills = std::path::Path::new(r"X:\skills");
-        let refusal = source_preview(app.draft().unwrap(), skills, width, &measure);
-        let body = item(&refusal, id::INFO_TEXT);
-        assert_eq!(body.look, Look::Text { font: Font::Body, ink: Role::Text, flags: WRAP });
-        assert_eq!(body.text.replace('\n', ""), format!("This source is already set up. Its ID is '{id}'."));
-        assert!(measure(&body.text, Font::Body, body.at[2]).0 <= body.at[2], "the whole ID must fit");
-        assert_eq!(item(&refusal, id::EDIT_SOURCE).text, "Edit");
+        let refusal = preview_page(app.draft().unwrap(), width, &measure);
+        assert_eq!(item(&refusal, id::INFO_TEXT).text, format!("This source is already set up. Its ID is '{id}'."));
+        assert_eq!(item(&refusal, id::EDIT_SOURCE).text, "Edit location");
         assert_eq!(item(&refusal, id::CANCEL_SOURCE).text, "Cancel");
         assert!(!refusal.items.iter().any(|i| i.id == id::CONFIRM_SOURCE));
         assert!(refusal.height <= 680 - HERO_H);
+        assert_eq!(item(&refusal, id::TITLE).text, "team/tools");
         fits_in(&refusal, width);
 
         app.preview_location("team/other", None).unwrap();
-        let next = source_preview(app.draft().unwrap(), skills, width, &measure);
+        let next = preview_page(app.draft().unwrap(), width, &measure);
         assert!(next.items.iter().all(|i| !i.text.contains("already set up") && !i.text.contains(&id)));
     }
 
     #[test]
     fn source_preview_asks_for_plugin_consent_only_when_plugins_would_sync() {
         use crate::app::DraftInput;
-        let input = std::sync::Arc::new(DraftInput { ticket: 1, text: "team/tools".into(), every: None });
-        let skills = std::path::Path::new(r"X:\skills");
+        let settings = SourceConfig { enabled: false, ..SourceConfig::default() };
+        let input = std::sync::Arc::new(DraftInput { ticket: 1, request: 1, text: "team/tools".into(), settings: settings.clone() });
         let mut nothing = location_preview(false);
         nothing.inventory.skills.clear();
-        // (stage, Add and check, both consent buttons, Cancel)
-        for (stage, add, consent, cancel) in [
+        for (stage, can_add, can_approve, cancel) in [
             (DraftStage::Loading, false, false, true),
             (DraftStage::Failed("Cannot read the listing.".into()), false, false, true),
-            (DraftStage::Reviewed(nothing.into()), false, false, true),
-            (DraftStage::Reviewed(location_preview(false).into()), true, false, true),
-            (DraftStage::Reviewed(location_preview(true).into()), false, true, true),
+            (DraftStage::Reviewed(preview_snapshot(nothing)), false, false, true),
+            (DraftStage::Reviewed(preview_snapshot(location_preview(false))), true, false, true),
+            (DraftStage::Reviewed(preview_snapshot(location_preview(true))), true, true, true),
             (DraftStage::Saving, false, false, false),
         ] {
             for width in [360, 980 - NAV_W] {
-                let surface = source_preview(&SourceDraft { input: input.clone(), stage: stage.clone() }, skills, width, &fit);
+                let surface =
+                    preview_page(&SourceDraft { input: input.clone(), settings: settings.clone(), previous_preview: None, stage: stage.clone() }, width, &fit);
                 let text = |id| surface.items.iter().find(|i| i.id == id).map(|i| i.text.as_str());
-                assert_eq!(text(id::CONFIRM_SOURCE) == Some("Add and check"), add, "{stage:?}");
-                assert_eq!(text(id::CONFIRM_SOURCE) == Some("Add without approving plugins"), consent, "{stage:?}");
-                assert_eq!(text(id::APPROVE_SOURCE) == Some("Add and approve these plugins"), consent, "{stage:?}");
+                assert_eq!(text(id::CONFIRM_SOURCE) == Some("Add and keep in sync"), can_add, "{stage:?}");
+                assert_eq!(text(id::APPROVE_SOURCE) == Some("Add and approve plugins"), can_approve, "{stage:?}");
                 assert_eq!(text(id::CANCEL_SOURCE).is_some(), cancel);
-                if add || consent {
-                    let body = text(id::INFO_TEXT).unwrap().replace('\n', " ");
-                    assert!(body.contains("Branch: main (default branch)") && body.contains("alpha") && body.contains(r"X:\skills"), "{body}");
-                    assert!(body.contains("Plugins: Sync on"), "{body}");
-                }
-                if consent {
-                    let body = text(id::INFO_TEXT).unwrap().replace('\n', " ");
-                    assert!(body.contains("Publisher: Team") && body.contains("1.0.0"), "{body}");
+                if can_add {
+                    assert!(text(id::INFO_TEXT).unwrap().contains("Preview only"), "{stage:?}");
                 }
                 fits_in(&surface, width);
                 no_overlaps(&surface);
             }
         }
+    }
+
+    #[test]
+    fn source_preview_distinguishes_empty_inventory_from_types_turned_off() {
+        use crate::app::DraftInput;
+        let global = GlobalSettings::default();
+        let mut settings = SourceConfig { enabled: false, ..SourceConfig::default() };
+        settings.types.skills = Some(true);
+        let input = std::sync::Arc::new(DraftInput { ticket: 1, request: 1, text: "team/tools".into(), settings: settings.clone() });
+        let mut empty = location_preview(false);
+        empty.inventory.skills.clear();
+        empty.inventory.plugins.clear();
+        let empty_draft =
+            SourceDraft { input: input.clone(), settings: settings.clone(), previous_preview: None, stage: DraftStage::Reviewed(preview_snapshot(empty)) };
+        let empty_surface = source_preview(
+            &PreviewPage { draft: &empty_draft, global: &global, default: DEFAULT_INTERVAL, now: NOW, toggled: &HashSet::new(), sections: &HashMap::new() },
+            720,
+            &fit,
+        );
+        let empty_message = item(&empty_surface, id::INFO_TEXT).text.as_str();
+        assert_eq!(empty_message, "No syncable items were found. Change the location or folder rules before adding this source.");
+
+        let mut off = settings.clone();
+        off.types.skills = Some(false);
+        off.types.agents = Some(false);
+        off.types.instructions = Some(false);
+        off.types.plugins = Some(false);
+        let off_input = std::sync::Arc::new(DraftInput { settings: off.clone(), ..(*input).clone() });
+        let off_draft =
+            SourceDraft { input: off_input, settings: off, previous_preview: None, stage: DraftStage::Reviewed(preview_snapshot(location_preview(false))) };
+        let off_surface = preview_page(&off_draft, 720, &fit);
+        assert_eq!(item(&off_surface, id::INFO_TEXT).text, "All item types are turned off. Turn on a type before adding this source.");
+        assert!(!off_surface.items.iter().any(|item| item.id == id::CONFIRM_SOURCE));
+
+        let mut plugin_off = settings.clone();
+        plugin_off.types.plugins = Some(false);
+        let plugin_input = std::sync::Arc::new(DraftInput { settings: plugin_off.clone(), ..(*input).clone() });
+        let plugin_draft = SourceDraft {
+            input: plugin_input,
+            settings: plugin_off,
+            previous_preview: None,
+            stage: DraftStage::Reviewed(preview_snapshot(location_preview(true))),
+        };
+        let plugin_surface = preview_page(&plugin_draft, 720, &fit);
+        assert!(plugin_surface.items.iter().any(|item| item.id == id::CONFIRM_SOURCE));
+        assert!(!plugin_surface.items.iter().any(|item| item.id == id::APPROVE_SOURCE));
+
+        let failed = SourceDraft { input, settings, previous_preview: None, stage: DraftStage::Failed("Cannot read the listing.".into()) };
+        let failed_surface = preview_page(&failed, 720, &fit);
+        assert!(item(&failed_surface, id::INFO_TEXT).text.contains("The source could not be read"));
+        assert!(!item(&failed_surface, id::INFO_TEXT).text.contains("No syncable items"));
+    }
+
+    #[test]
+    fn source_preview_controls_name_their_purpose_and_current_state() {
+        use crate::app::DraftInput;
+        let global = GlobalSettings::default();
+        let settings = SourceConfig { enabled: false, ..SourceConfig::default() };
+        let input = std::sync::Arc::new(DraftInput { ticket: 1, request: 1, text: "team/tools".into(), settings: settings.clone() });
+        let draft = SourceDraft {
+            input: input.clone(),
+            settings: settings.clone(),
+            previous_preview: None,
+            stage: DraftStage::Reviewed(preview_snapshot(location_preview(false))),
+        };
+        let render = |draft: &SourceDraft| {
+            source_preview(
+                &PreviewPage { draft, global: &global, default: DEFAULT_INTERVAL, now: NOW, toggled: &HashSet::new(), sections: &HashMap::new() },
+                720,
+                &fit,
+            )
+        };
+
+        let off = render(&draft);
+        assert_eq!(item(&off, id::EVERY).text, "Check every\nDefault (1 day)");
+        assert_eq!(item(&off, id::ENABLED).text, "Keep in sync: Off");
+        assert!(matches!(item(&off, id::ENABLED).look, Look::Toggle { on: false }));
+
+        let mut enabled = draft.clone();
+        enabled.settings.enabled = true;
+        let on = render(&enabled);
+        assert_eq!(item(&on, id::ENABLED).text, "Keep in sync: On");
+        assert!(matches!(item(&on, id::ENABLED).look, Look::Toggle { on: true }));
+    }
+
+    #[test]
+    fn preview_uses_shared_editable_source_sections_with_detected_zero_counts() {
+        use crate::inventory::{Item, Status};
+        let mut preview = location_preview(false);
+        preview.inventory.agents.push(Item {
+            path: ".github/agents/review.agent.md".into(),
+            install_name: "review.agent.md".into(),
+            status: Status::Installable,
+            data: None,
+        });
+        preview.inventory.instructions.push(Item {
+            path: ".github/instructions/style.instructions.md".into(),
+            install_name: "style.instructions.md".into(),
+            status: Status::Installable,
+            data: None,
+        });
+        preview.inventory.plugins.clear();
+        let settings = SourceConfig { enabled: false, ..preview.source.clone() };
+        let input = std::sync::Arc::new(crate::app::DraftInput { ticket: 1, request: 1, text: "team/tools".into(), settings: settings.clone() });
+        let draft = SourceDraft { input, settings, previous_preview: None, stage: DraftStage::Reviewed(preview_snapshot(preview)) };
+        let surface = preview_page(&draft, 720, &fit);
+        assert!(matches!(item(&surface, id::SECTION_WHAT).look, Look::Section { open: true, .. }));
+        assert!(item(&surface, id::SECTION_WHAT).text.contains("Skills on; Agents on; Instructions on; Plugins on"));
+        assert_eq!(item(&surface, id::SECTION_KIND).text, "Skills (1), collapsed.");
+        assert_eq!(item(&surface, id::SECTION_KIND + 1).text, "Agents (1), collapsed.");
+        assert_eq!(item(&surface, id::SECTION_KIND + 2).text, "Instructions (1), collapsed.");
+        assert_eq!(item(&surface, id::SECTION_KIND + 3).text, "Plugins (0), collapsed.");
+        assert!(matches!(item(&surface, id::SECTION_KIND).look, Look::Section { open: false, .. }));
+        assert!(!surface.items.iter().any(|item| item.id == id::SKILL), "item rows start collapsed");
+        assert!(matches!(item(&surface, id::ENABLED).look, Look::Toggle { on: false }));
+        assert_eq!(item(&surface, id::ENABLED).text, "Keep in sync: Off");
+        let mut sections = HashMap::new();
+        sections.insert(SectionKey::Kind(SourceKind::Skills), true);
+        sections.insert(SectionKey::Kind(SourceKind::Agents), true);
+        sections.insert(SectionKey::Kind(SourceKind::Instructions), true);
+        let global = GlobalSettings::default();
+        let toggled = HashSet::new();
+        let open = source_preview(
+            &PreviewPage { draft: &draft, global: &global, default: DEFAULT_INTERVAL, now: NOW, toggled: &toggled, sections: &sections },
+            720,
+            &fit,
+        );
+        assert!(matches!(item(&open, id::SECTION_KIND).look, Look::Section { open: true, .. }));
+        assert!(matches!(&item(&open, id::SKILL).look, Look::Row { commands, .. } if commands == &[RowCmd::CopyLink, RowCmd::OnGitHub]));
+        assert!(matches!(&item(&open, skill_id(1, 0)).look, Look::Row { commands, .. } if commands == &[RowCmd::CopyLink, RowCmd::OnGitHub]));
+        assert!(matches!(&item(&open, skill_id(2, 0)).look, Look::Row { commands, .. } if commands == &[RowCmd::CopyLink, RowCmd::OnGitHub]));
+        fits_in(&surface, 720);
+        no_overlaps(&surface);
+        fits_in(&open, 720);
+        no_overlaps(&open);
     }
 
     fn no_overlaps(surface: &Surface) {
@@ -3185,13 +3569,35 @@ pub(super) mod tests {
         use crate::app::DraftInput;
         let mut nothing = location_preview(false);
         nothing.inventory.skills.clear();
-        for stage in [DraftStage::Reviewed(nothing.into()), DraftStage::Failed("No such branch.".into())] {
-            let draft = SourceDraft { input: std::sync::Arc::new(DraftInput { ticket: 1, text: "team/tools".into(), every: None }), stage };
-            let surface = source_preview(&draft, std::path::Path::new(r"X:\skills"), 360, &fit);
+        for stage in [DraftStage::Reviewed(preview_snapshot(nothing)), DraftStage::Failed("No such branch.".into())] {
+            let settings = SourceConfig { enabled: false, ..SourceConfig::default() };
+            let draft = SourceDraft {
+                input: std::sync::Arc::new(DraftInput { ticket: 1, request: 1, text: "team/tools".into(), settings: settings.clone() }),
+                settings,
+                previous_preview: None,
+                stage,
+            };
+            let surface = preview_page(&draft, 360, &fit);
             assert!(surface.items.iter().any(|i| i.text == "Retry"), "a preview that could not be added needs Retry");
-            assert!(surface.items.iter().any(|i| i.text == "Edit"), "a preview that could not be added needs Edit");
+            assert!(surface.items.iter().any(|i| i.text == "Edit location"), "a preview that could not be added needs Edit");
             assert!(!surface.items.iter().any(|i| i.id == id::CONFIRM_SOURCE || i.id == id::APPROVE_SOURCE));
             fits_in(&surface, 360);
+        }
+
+        let settings = SourceConfig { enabled: false, ..SourceConfig::default() };
+        let input = std::sync::Arc::new(DraftInput { ticket: 1, request: 2, text: "team/tools".into(), settings: settings.clone() });
+        let previous_preview = preview_snapshot(location_preview(false));
+        for stage in [DraftStage::Loading, DraftStage::Failed("No network.".into())] {
+            let draft = SourceDraft { input: input.clone(), settings: settings.clone(), previous_preview: Some(previous_preview.clone()), stage };
+            let surface = preview_page(&draft, 360, &fit);
+            assert!(surface.items.iter().any(|i| i.id == id::SECTION_KIND && i.text == "Skills (1), collapsed."));
+            assert!(!surface.items.iter().any(|i| i.id == id::CONFIRM_SOURCE || i.id == id::APPROVE_SOURCE));
+            if matches!(draft.stage, DraftStage::Loading) {
+                assert!(surface.decos.iter().any(|deco| matches!(deco, Deco::Text { text, .. } if text == "Refreshing preview")));
+                assert!(item(&surface, id::INFO_TEXT).text.contains("previous preview stays visible"));
+            } else {
+                assert!(item(&surface, id::INFO_TEXT).text.contains("previous preview is shown below"));
+            }
         }
     }
 
@@ -3200,15 +3606,16 @@ pub(super) mod tests {
         use crate::app::DraftInput;
         let mut nothing = location_preview(false);
         nothing.inventory.skills.clear();
-        let input = std::sync::Arc::new(DraftInput { ticket: 1, text: "team/tools".into(), every: None });
+        let settings = SourceConfig { enabled: false, ..SourceConfig::default() };
+        let input = std::sync::Arc::new(DraftInput { ticket: 1, request: 1, text: "team/tools".into(), settings: settings.clone() });
         let (accent, standard) = (Look::Button { kind: Kind::Accent, glyph: None }, Look::Button { kind: Kind::Standard, glyph: None });
         let cases = [
-            (DraftStage::Reviewed(nothing.into()), id::EDIT_SOURCE, id::RETRY_SOURCE),
+            (DraftStage::Reviewed(preview_snapshot(nothing)), id::EDIT_SOURCE, id::RETRY_SOURCE),
             (DraftStage::Failed("No network.".into()), id::RETRY_SOURCE, id::EDIT_SOURCE),
         ];
         for (stage, lead, other) in cases {
-            let draft = SourceDraft { input: input.clone(), stage };
-            let s = source_preview(&draft, std::path::Path::new(r"X:\skills"), 360, &fit);
+            let draft = SourceDraft { input: input.clone(), settings: settings.clone(), previous_preview: None, stage };
+            let s = preview_page(&draft, 360, &fit);
             let (first, second) = (item(&s, lead), item(&s, other));
             assert_eq!((&first.look, &second.look), (&accent, &standard), "{:?} leads with {:?}", draft.stage, first.text);
             assert!((first.at[1], first.at[0]) < (second.at[1], second.at[0]), "{:?}: the leading button comes first", draft.stage);

@@ -19,7 +19,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
-use crate::board::{Board, Health, Level, Row, capitalized, preview_syncs, previewed_plugins, recorded_plugin_rows, source_label};
+use crate::board::{Board, Health, Level, Row, SourceView, capitalized, preview_source_view, previewed_plugins, recorded_plugin_rows, source_label};
 use crate::config::{Config, Paths};
 use crate::engine::{
     Access, DiffReport, Engine, EngineError, LocationPreview, Outcome, RemoveReport, RepoReport, Resolution, ResolveReport, SkillFacts, Stamp, StartupReport,
@@ -65,7 +65,7 @@ pub enum Job {
     Check(Option<String>),
     PreviewSource(Arc<DraftInput>),
     /// Save the reviewed location; with `true`, approve the reviewed plugins after the save.
-    SaveSource(Arc<DraftInput>, Arc<LocationPreview>, bool),
+    SaveSource(Arc<DraftInput>, Arc<PreviewSnapshot>, Box<SourceConfig>, bool),
     AppUpdate(Action),
     ScheduledUpdate,
     /// Only after receiving a successful Flush during an explicit Quit, not on logoff.
@@ -105,21 +105,49 @@ pub enum Job {
 #[derive(Clone, Debug, PartialEq)]
 pub struct DraftInput {
     pub ticket: u64,
+    /// A preview request identity: settings may be changed back to earlier values while an older request is in flight.
+    pub request: u64,
     /// The location as the user typed it.
     pub text: String,
-    pub every: Option<Interval>,
+    /// An immutable snapshot of the discovery choices for this request.
+    pub settings: SourceConfig,
 }
 
 #[derive(Clone, Debug)]
 pub struct SourceDraft {
     pub input: Arc<DraftInput>,
+    /// Editable choices stay separate from the remote facts being revalidated.
+    pub settings: SourceConfig,
+    /// The last result, retained only as stale content while refreshing or after a failure.
+    pub previous_preview: Option<Arc<PreviewSnapshot>>,
     pub stage: DraftStage,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct PreviewSnapshot {
+    location: LocationPreview,
+    view: SourceView,
+}
+
+impl PreviewSnapshot {
+    pub fn new(location: LocationPreview) -> PreviewSnapshot {
+        let view = preview_source_view(&location);
+        PreviewSnapshot { location, view }
+    }
+
+    pub fn location(&self) -> &LocationPreview {
+        &self.location
+    }
+
+    pub fn view(&self) -> &SourceView {
+        &self.view
+    }
 }
 
 #[derive(Clone, Debug)]
 pub enum DraftStage {
     Loading,
-    Reviewed(Arc<LocationPreview>),
+    Reviewed(Arc<PreviewSnapshot>),
     /// The location is already a source, with this ID.
     AlreadySetUp(String),
     Failed(String),
@@ -140,6 +168,36 @@ fn already_added(cfg: &Config, preview: &LocationPreview) -> Option<String> {
     same_location(cfg, &s.repo, &s.branch, &s.path).map(|old| old.id.clone())
 }
 
+fn preview_with_settings(preview: &LocationPreview, settings: &SourceConfig, global: &GlobalSettings) -> LocationPreview {
+    let mut preview = preview.clone();
+    preview.source.interval = settings.interval;
+    preview.source.enabled = settings.enabled;
+    preview.source.types = settings.types;
+    preview.source.include_repo_items = settings.include_repo_items;
+    preview.source.ignore_add.clone_from(&settings.ignore_add);
+    preview.source.ignore_allow.clone_from(&settings.ignore_allow);
+    preview.types = preview.source.effective_types(global);
+    preview
+}
+
+fn generated_settings(preview: &LocationPreview, settings: &SourceConfig) -> SourceConfig {
+    let mut generated = preview.source.clone();
+    generated.interval = settings.interval;
+    generated.enabled = settings.enabled;
+    generated.types = settings.types;
+    generated.include_repo_items = settings.include_repo_items;
+    generated.ignore_add.clone_from(&settings.ignore_add);
+    generated.ignore_allow.clone_from(&settings.ignore_allow);
+    generated
+}
+
+pub(crate) fn preview_syncs_for_settings(preview: &PreviewSnapshot, settings: &SourceConfig, global: &GlobalSettings, kind: SourceKind) -> bool {
+    if !settings.effective_types(global).enabled(kind) {
+        return false;
+    }
+    preview.view().kinds.iter().find(|view| view.kind == kind).is_some_and(|view| view.found.unwrap_or(0) > 0)
+}
+
 /// Save a reviewed location as a new source, after proving that what GitHub has, where it would go and the settings
 /// are all as they were when the user looked. Plugins are approved only after the save, and only the reviewed ones.
 #[allow(clippy::too_many_arguments)]
@@ -149,18 +207,20 @@ fn save_source(
     store: Option<&SettingsSource>,
     (portable_mode, skills_dir): (bool, &PathBuf),
     input: &DraftInput,
-    reviewed: &LocationPreview,
+    reviewed: &PreviewSnapshot,
+    settings: &SourceConfig,
     approve_plugins: bool,
     cancel: &AtomicBool,
 ) -> Result<Answer, EngineError> {
-    if let Some(id) = already_added(cfg, reviewed) {
+    let reviewed_location = preview_with_settings(reviewed.location(), settings, cfg.global());
+    if let Some(id) = already_added(cfg, &reviewed_location) {
         return Err(EngineError::Failed(duplicate_source_message(&id)));
     }
-    if engine.preview_location(cfg, &input.text, false, cancel)? != *reviewed {
+    if engine.preview_location_with_settings(cfg, &input.text, false, settings, cancel)? != reviewed_location {
         return Err(EngineError::Failed("What GitHub has, or where it would go, changed since the preview. Preview the source again.".into()));
     }
     // A record left on this PC under one of the new lane IDs would be taken over by the new source.
-    for id in KINDS.into_iter().filter_map(|kind| reviewed.source.lanes.id(kind)) {
+    for id in KINDS.into_iter().filter_map(|kind| reviewed_location.source.lanes.id(kind)) {
         engine.check_fresh_id(id)?;
     }
     let store = store.ok_or_else(|| EngineError::Failed("The settings folder is unavailable.".into()))?;
@@ -168,16 +228,17 @@ fn save_source(
     if !active.is_some_and(|s| s.config == *cfg && s.portable == portable_mode && s.skills_dir == *skills_dir) {
         return Err(EngineError::Failed("The settings changed. Preview the source again.".into()));
     }
-    let mut source = reviewed.source.clone();
-    source.interval = input.every;
+    let source = reviewed_location.source.clone();
     let mut after = cfg.clone();
     after.add_source_config(source.clone()).map_err(EngineError::Failed)?;
     if cancel.load(Ordering::Acquire) {
         return Err(EngineError::Failed("Adding the source was cancelled.".into()));
     }
     store.save(cfg, &after, portable_mode).map_err(EngineError::Failed)?;
-    let approved = if approve_plugins && !previewed_plugins(reviewed).is_empty() {
-        engine.approve_location_plugins(&after, &source.id, reviewed).map_err(|e| format!("The source was saved, but its plugins could not be approved: {e}"))
+    let approved = if approve_plugins && !previewed_plugins(&reviewed_location).is_empty() {
+        engine
+            .approve_location_plugins(&after, &source.id, &reviewed_location)
+            .map_err(|e| format!("The source was saved, but its plugins could not be approved: {e}"))
     } else {
         Ok(())
     };
@@ -386,7 +447,7 @@ pub enum Answer {
     Looked(VerifyReport),
     Checked { verified: Option<VerifyReport>, sync: SyncReport },
     SettingsLoaded,
-    SourcePreview(Arc<LocationPreview>),
+    SourcePreview(Arc<PreviewSnapshot>),
     SourceSaved { source: SourceConfig, approved: Result<(), String> },
     Resolved(ResolveReport),
     PluginResolved(RepoReport),
@@ -623,8 +684,12 @@ pub(crate) fn perform_with_updates(engine: &mut Engine, order: &Order, cancel: &
             Job::LoadSettings => Ok(Answer::SettingsLoaded),
             Job::Startup => engine.startup(&cfg).map(Answer::Started),
             Job::Look => engine.verify(&cfg, Access::ReadOnly).map(Answer::Looked),
-            Job::PreviewSource(input) => engine.preview_location(&cfg, &input.text, false, cancel).map(|p| Answer::SourcePreview(Arc::new(p))),
-            Job::SaveSource(input, reviewed, approve) => save_source(engine, &mut cfg, source, (portable_mode, &skills_dir), input, reviewed, *approve, cancel),
+            Job::PreviewSource(input) => engine
+                .preview_location_with_settings(&cfg, &input.text, false, &input.settings, cancel)
+                .map(|preview| Answer::SourcePreview(Arc::new(PreviewSnapshot::new(preview)))),
+            Job::SaveSource(input, reviewed, settings, approve) => {
+                save_source(engine, &mut cfg, source, (portable_mode, &skills_dir), input, reviewed, settings, *approve, cancel)
+            }
             Job::Poll => {
                 engine.retain_plugin_attention_rows(&order.plugin_rows);
                 engine.sync(&cfg, &Which::Due, &SyncOptions::default(), cancel).map(|sync| Answer::Checked { verified: None, sync })
@@ -726,6 +791,7 @@ pub struct App {
     config_saves: Vec<ConfigSave>,
     draft: Option<SourceDraft>,
     next_ticket: u64,
+    next_request: u64,
     queue: VecDeque<Job>,
     busy: Option<Job>,
     next_wake: Option<UnixSecs>,
@@ -768,6 +834,7 @@ impl App {
             config_saves: Vec::new(),
             draft: None,
             next_ticket: 0,
+            next_request: 0,
             queue: VecDeque::from([Job::Startup]),
             busy: None,
             next_wake: None,
@@ -814,17 +881,110 @@ impl App {
         };
         self.dismiss_source();
         self.next_ticket += 1;
-        let input = Arc::new(DraftInput { ticket: self.next_ticket, text: text.trim().to_string(), every });
+        self.next_request += 1;
+        let settings = SourceConfig { interval: every, enabled: false, ..SourceConfig::default() };
+        let input = Arc::new(DraftInput { ticket: self.next_ticket, request: self.next_request, text: text.trim().to_string(), settings: settings.clone() });
         let stage = match known {
             Some(id) => DraftStage::AlreadySetUp(id),
             None => DraftStage::Loading,
         };
         let read = matches!(stage, DraftStage::Loading);
-        self.draft = Some(SourceDraft { input: input.clone(), stage });
+        self.draft = Some(SourceDraft { input: input.clone(), settings, previous_preview: None, stage });
         if read {
             self.want(Job::PreviewSource(input));
         }
         Ok(self.next_ticket)
+    }
+
+    /// Retry the current preview with its existing settings and retain any previous result as stale content.
+    pub fn retry_source(&mut self, ticket: u64) -> Result<(), String> {
+        if self.quitting || self.saving_source() {
+            return Err("Cannot retry this preview now.".into());
+        }
+        let Some(draft) = self.draft.as_mut().filter(|d| d.input.ticket == ticket) else {
+            return Err("This preview is no longer current.".into());
+        };
+        let previous_preview = match &draft.stage {
+            DraftStage::Reviewed(preview) => Some(preview.clone()),
+            _ => draft.previous_preview.clone(),
+        };
+        self.next_request += 1;
+        let input = Arc::new(DraftInput { ticket, request: self.next_request, text: draft.input.text.clone(), settings: draft.settings.clone() });
+        draft.input = input.clone();
+        draft.previous_preview = previous_preview;
+        draft.stage = DraftStage::Loading;
+        self.queue.retain(|job| !matches!(job, Job::PreviewSource(_)));
+        self.want(Job::PreviewSource(input));
+        Ok(())
+    }
+
+    /// Change the location of an unsaved source while keeping its staged type, interval and folder choices.
+    pub fn edit_draft_location(&mut self, ticket: u64, text: &str, every: Option<Interval>) -> Result<(), String> {
+        if self.quitting || self.saving_source() {
+            return Err("Cannot edit this preview now.".into());
+        }
+        let location = Location::parse(text)?;
+        let Some(draft) = self.draft.as_mut().filter(|d| d.input.ticket == ticket) else {
+            return Err("This preview is no longer current.".into());
+        };
+        let mut settings = draft.settings.clone();
+        settings.id.clear();
+        settings.repo = format!("{}/{}", location.owner, location.name);
+        settings.branch.clear();
+        settings.path.clear();
+        settings.lanes = Default::default();
+        settings.use_token = false;
+        settings.enabled = false;
+        settings.interval = every;
+        let known = match location.target {
+            Target::Bare => same_location(&self.cfg, &settings.repo, "", "").map(|old| old.id.clone()),
+            _ => None,
+        };
+        self.next_request += 1;
+        let input = Arc::new(DraftInput { ticket, request: self.next_request, text: text.trim().to_string(), settings: settings.clone() });
+        draft.input = input.clone();
+        draft.settings = settings;
+        draft.previous_preview = None;
+        draft.stage = known.map_or(DraftStage::Loading, DraftStage::AlreadySetUp);
+        self.queue.retain(|job| !matches!(job, Job::PreviewSource(_)));
+        if matches!(draft.stage, DraftStage::Loading) {
+            self.want(Job::PreviewSource(input));
+        }
+        Ok(())
+    }
+
+    /// Edit an unsaved source. Folder rules and repository-specific-item choices rediscover the preview.
+    pub fn edit_draft(&mut self, ticket: u64, change: impl FnOnce(&mut SourceConfig)) -> Result<bool, String> {
+        if self.quitting || self.saving_source() {
+            return Err("Cannot edit this preview now.".into());
+        }
+        let Some(draft) = self.draft.as_mut().filter(|d| d.input.ticket == ticket) else {
+            return Err("This preview is no longer current.".into());
+        };
+        let before = draft.settings.clone();
+        change(&mut draft.settings);
+        if draft.settings == before {
+            return Ok(false);
+        }
+        draft.settings.effective_policy(self.cfg.global()).map_err(|why| capitalized(&why))?;
+
+        let rediscover = draft.settings.ignore_add != before.ignore_add
+            || draft.settings.ignore_allow != before.ignore_allow
+            || draft.settings.include_repo_items != before.include_repo_items;
+        if rediscover {
+            let previous_preview = match &draft.stage {
+                DraftStage::Reviewed(preview) => Some(preview.clone()),
+                _ => draft.previous_preview.clone(),
+            };
+            self.next_request += 1;
+            let input = Arc::new(DraftInput { ticket, request: self.next_request, text: draft.input.text.clone(), settings: draft.settings.clone() });
+            draft.input = input.clone();
+            draft.previous_preview = previous_preview;
+            draft.stage = DraftStage::Loading;
+            self.queue.retain(|job| !matches!(job, Job::PreviewSource(_)));
+            self.want(Job::PreviewSource(input));
+        }
+        Ok(true)
     }
 
     pub fn dismiss_source(&mut self) {
@@ -837,11 +997,13 @@ impl App {
     /// Save the reviewed preview. `approve_plugins` approves the plugins it showed, after the save, and only those.
     pub fn confirm_source(&mut self, ticket: u64, approve_plugins: bool) -> Result<(), String> {
         let draft = self.draft.as_mut().filter(|d| !self.quitting && d.input.ticket == ticket).ok_or("This preview is no longer current.")?;
-        let DraftStage::Reviewed(preview) = &draft.stage else { return Err("There is no finished preview to save.".into()) };
-        if !KINDS.iter().any(|&kind| preview_syncs(preview, kind)) {
-            return Err("Nothing here would sync. Check the branch and folder, or edit the location.".into());
+        let DraftStage::Reviewed(preview) = &draft.stage else { return Err("There is no finished preview to add.".into()) };
+        if !KINDS.iter().any(|&kind| preview_syncs_for_settings(preview, &draft.settings, self.cfg.global(), kind)) {
+            return Err("Nothing here would sync. Turn on an item type or change the folder rules.".into());
         }
-        let job = Job::SaveSource(draft.input.clone(), preview.clone(), approve_plugins);
+        draft.settings.enabled = true;
+        let job = Job::SaveSource(draft.input.clone(), preview.clone(), Box::new(draft.settings.clone()), approve_plugins);
+        draft.previous_preview = Some(preview.clone());
         draft.stage = DraftStage::Saving;
         self.want(job);
         Ok(())
@@ -1179,12 +1341,17 @@ impl App {
         }
         match done.result {
             Err(e) if matches!(job, Job::PreviewSource(_) | Job::SaveSource(..)) => {
-                let input = match &job {
-                    Job::PreviewSource(i) | Job::SaveSource(i, ..) => i,
+                let (input, failed_preview) = match &job {
+                    Job::PreviewSource(i) => (i, None),
+                    Job::SaveSource(i, preview, ..) => (i, Some(preview.clone())),
                     _ => unreachable!(),
                 };
                 if let Some(draft) = self.draft.as_mut().filter(|d| d.input == *input) {
                     let text = format!("Source not added: {e}");
+                    if let Some(preview) = failed_preview {
+                        draft.settings.enabled = false;
+                        draft.previous_preview = Some(preview);
+                    }
                     draft.stage = DraftStage::Failed(text.clone());
                     settled.feedback = Some(text);
                 }
@@ -1238,11 +1405,18 @@ impl App {
                 match answer {
                     Answer::SourcePreview(preview) => {
                         if let Job::PreviewSource(input) = &job {
-                            let known = already_added(&self.cfg, &preview);
+                            let known = already_added(&self.cfg, preview.location());
                             if let Some(d) = self.draft.as_mut().filter(|d| d.input == *input && matches!(d.stage, DraftStage::Loading)) {
                                 d.stage = match known {
-                                    Some(id) => DraftStage::AlreadySetUp(id),
-                                    None => DraftStage::Reviewed(preview),
+                                    Some(id) => {
+                                        d.previous_preview = None;
+                                        DraftStage::AlreadySetUp(id)
+                                    }
+                                    None => {
+                                        d.settings = generated_settings(preview.location(), &d.settings);
+                                        d.previous_preview = None;
+                                        DraftStage::Reviewed(preview)
+                                    }
                                 };
                             }
                         }
@@ -1821,7 +1995,7 @@ mod tests {
             inventory: crate::inventory::Inventory::default(),
             destinations: vec![],
         };
-        let job = Job::SaveSource(draft.input.clone(), Arc::new(preview), true);
+        let job = Job::SaveSource(draft.input.clone(), Arc::new(PreviewSnapshot::new(preview)), Box::new(draft.settings.clone()), true);
         let message = "The source was saved, but its plugins could not be approved.";
         let done = app_update_done(job, app.update_generation, Ok(Answer::SourceSaved { source, approved: Err(message.into()) }));
         assert_eq!(app.finish(done, 10).feedback.as_deref(), Some(message));

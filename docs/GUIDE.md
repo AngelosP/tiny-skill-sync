@@ -94,21 +94,26 @@ allows the same current-or-historical adoption checks.
    are not signed, so if a browser downloaded them, Windows may ask before the first start (**More info**, **Run
    anyway**).
 3. Click the icon to open the window. Click **Add source**, paste `owner/name`, a repository address, or the address
-   of a branch or folder (`.../tree/BRANCH/FOLDER`), and click **Preview**. There is no type to choose: the preview
-   shows what it found. For example:
+   of a branch or folder (`.../tree/BRANCH/FOLDER`), and click **Preview**. There is no type to choose. The same
+   source page used for saved sources opens with the GitHub preview. For example:
 
    ```text
    https://github.com/anthropics/skills/tree/main/skills
    ```
 
-4. Check what was found, grouped as Skills, Agents, Instructions and Plugins, what was skipped and why, and where it
-   will go (see [What a source finds](#what-a-source-finds)). **Cancel** saves and installs nothing. If the preview
-   was rejected, use **Retry** with the same details, or **Edit** to change them; if it found nothing that would sync,
-   **Edit** comes first. If a source attempt
-   is rejected (for example, because that source is already set up), the next **Add source** attempt keeps the
-   address you entered. **Add and check** saves the source and starts the first check, then checks once a day by
-   default. When the location holds plugins, the buttons are **Add without approving plugins** (files only; the
-   plugins wait for your approval) and **Add and approve these plugins**. Esc does not cancel a save already in
+4. Review the source page. Its type sections show detected counts, including zero and types set to **Sync off**;
+   plugin rows include their declared details. Preview rows have no local status or repair actions, and links use the
+   discovered GitHub paths. The **Check every**, **Keep in sync**, **What to sync** and folder-rule settings remain
+   editable. **Keep in sync** starts off while you review. **What to sync** is open by default; content sections
+   start collapsed. **What to sync** can also collapse; its green indicators mean on and grey mean off, with adjacent
+   text spelling out each type's state. Type-section text says the detected count, whether syncing is off, and whether
+   the section is open. Changing type choices or **Check every** reuses the preview; changing repository-specific
+   inclusion or folder rules refreshes it.
+   **Cancel** saves nothing and installs nothing. **Add and keep in sync** saves the source and starts its first check. When
+   approvable plugins are present, **Add and approve plugins** is a separate explicit choice; using the regular Add
+   action leaves them waiting for approval. A failed preview offers **Retry** or **Edit location**; a preview with no items to sync
+   offers **Edit location** before it can be added. If a source attempt is rejected (for example, because it is already
+   set up), the next **Add source** attempt keeps the address you entered. Esc does not cancel a save already in
    progress. The app also asks whether to start with Windows.
 
 ### Updating the app
@@ -232,9 +237,10 @@ declares and the files and folders Copilot picks up by name even when undeclared
 `hooks/hooks.json`, `lsp.json` or an `agents`, `skills` or `commands` folder. Publishers are declared by the plugin or
 its marketplace, not verified by GitHub. Then choose:
 
-- **Add without approving plugins** (the default button): the source is saved and its skills, agents and instructions
-  sync. The plugins wait as **Needs your approval** until you approve each one.
-- **Add and approve these plugins**: also approves exactly the names and publishers you reviewed, on this PC.
+- **Add and keep in sync**: saves the source and starts its first check. Plugin installation still waits for your
+  separate approval; the plugin rows show **Needs your approval** until you approve them.
+- **Add and approve plugins**: explicitly approves exactly the plugin names and publishers you reviewed, on this PC,
+  as well as adding the source.
 
 `tss add LOCATION --approve-plugins` is the same as the second choice; without it, `tss add` leaves them waiting.
 Approve one later with **Approve** in the window or `tss resolve ID PLUGIN approve PUBLISHER`, giving the publisher
@@ -427,11 +433,12 @@ number in `window.txt`). Nothing widens or narrows when you move the mouse over 
     When it syncs skills, it asks whether to leave its files installed (they become yours) or to delete its skills too
     (skills you edited are kept, and files you added stay where they are); agents, instruction files and plugins stay
     installed either way.
-- **What it holds,** grouped under **Skills**, **Agents**, **Instructions** and **Plugins**, each heading with its count
-  ("2 · Sync off" for a type that is off). A type is shown only when the source holds some of it or the app installed
-  some from it. Under each group are the items, then how many were skipped by folder rules and anything of that type
-  that is not synced, with the reason; at the end, **Never synced** lists files such as `AGENTS.md`. Before the first
-  check it says "What it holds is listed here after the first check."
+- **What it holds,** grouped under **Skills**, **Agents**, **Instructions** and **Plugins**. Each type shows its
+  detected count, including zero; a type that is off also says **Sync off**. Sections can be expanded or collapsed.
+  Type-section text names the type, its detected count and expanded/collapsed state. **What to sync** also collapses;
+  its green on and grey off indicators are paired with adjacent text spelling out each type's state. Under each open
+  group are the items, folder-rule skips and other
+  unsynced items with their reasons. **Never synced** lists files such as `AGENTS.md`.
 - **Each item,** on one line with its state. Rest the mouse on the name or status badge to see the explanation
   and any known version, file count, size and update time. Only an item with a problem you can act on has an arrow: its choices start open.
   Click the row or press Enter on it to hide or show those choices.
@@ -484,6 +491,9 @@ number in `window.txt`). Nothing widens or narrows when you move the mouse over 
   - **GitHub sign-in for private repositories**: **Save a token…**, and once one is saved, **Replace token…** and
     **Delete token**.
   - **About**.
+
+Section open/closed choices are remembered separately for each source until the app exits; they are not saved in
+settings. A preview keeps its choices when it is added as a source.
 
 Every change is saved at once; there is no OK button. **Skill** intervals are a number and a unit: `30m`, `6h`, `1d`, `2w` or
 `1mo` (a calendar month), at least 5 minutes. **Custom…** also takes words, such as `45 minutes` or `3 days`.
@@ -881,9 +891,10 @@ ended at 3.2 MiB of private memory. Each change reached the disk within one inte
   to.
 - The window opens at 980 by 680 at 100% scale (smaller if the screen has less room) and can be made as small as 640
   by 480. It has been tried only at 100% scale.
-- The window's controls are drawn by the app. Each is a real window with its text, and Tab, Enter, Space and Esc work,
-  but they do not tell a screen reader what kind of control they are. A skill's icons are drawn inside its row, not
-  separate Tab stops. Use Shift+F10 on the row to choose an action by name.
+- The window's controls are drawn by the app. Section text names the heading, count and expanded/collapsed state;
+  section controls can be opened with Enter or Space. Most custom-drawn controls do not tell a screen reader what
+  kind of control they are. A skill's icons are drawn inside its row, not separate Tab stops. Use Shift+F10 on the
+  row to choose an action by name.
 - Changing the skills folder does not move installed skills (see [Files](#files)). Once more than four other folders
   have been used, the oldest record is forgotten; going back to that folder then works like a damaged `state.json`.
   Two names for one folder that only the disk could tell apart (a short 8.3 name, a mapped drive, a link) count as two

@@ -538,13 +538,13 @@ function Test-Mixed {
             $ask = Wait-Live { $d = Find-Ask $c.Tray; if ($d -ne [IntPtr]::Zero) { $d } } 'the Add source question' 10
             Set-UiText (Get-Ui $ask $AskPanel $AskId.Edit) $Url
             Click-Ui $ask $AskPanel $AskId.Ok
-            [void](Wait-Live { (Read-Ui $win $UiPanel.Page $UiId.ConfirmSource) -eq 'Add and check' } 'the read-only source preview' 60)
-            Read-Ui $win $UiPanel.Page $UiId.InfoText
+            [void](Wait-Live { (Read-Ui $win $UiPanel.Page $UiId.ConfirmSource) -eq 'Add and keep in sync' } 'the read-only source preview' 60)
+            Read-SourcePage $win
         }
         # What the tray showed instead of an installation: its status line (a refused click says why there), the page
         # (a save that failed says why there) and its last jobs.
         $trayShowed = {
-            $page = ((Read-Ui $win $UiPanel.Page $UiId.InfoText) -replace '\s+', ' ')
+            $page = ((Read-SourcePage $win) -replace '\s+', ' ')
             if ($page.Length -gt 240) { $page = $page.Substring(0, 240) + '...' }
             $jobs = @(Read-Marks $second.TSS_BENCH_REPORT | Select-Object -Last 6 | ForEach-Object { $_.Mark }) -join ', '
             "status: '$(Read-Ui $win $UiPanel.Hero $UiId.HeroSub)'; page: '$page'; last jobs: $jobs"
@@ -557,9 +557,16 @@ function Test-Mixed {
         $sourceHash = Get-BlobId $sources
         $previewText = & $previewInTray $agentsUrl
         [void](Save-Shot $win 'mixed-agent-preview')
-        Check 'the tray preview finds both types in the folder, syncs only the agent, and writes nothing' (
-            $previewText -match '(?m)^Agents: Sync on\r?$' -and $previewText -match '(?m)^  review\.agent\.md\b.*: will sync\r?$' -and
-            $previewText -match '(?m)^Instructions: Sync off\r?$' -and $previewText -match '(?m)^  ignore\.instructions\.md\b.*: Sync off\r?$' -and
+        $previewRows = @(Read-Skills $win)
+        Check 'the tray preview shows both found rows, keeps the off type visible, and writes nothing' (
+            $previewText -match 'Agents \(1\), expanded\.' -and $previewText -match 'Instructions \(1 \u00B7 Sync off\), expanded\.' -and
+            $previewRows.Count -eq 2 -and @($previewRows | Where-Object { $_.Tag -ne 'Preview' -or $_.Buttons.Count }).Count -eq 0 -and
+            @($previewRows | Where-Object { $_.Name -eq 'review.agent.md' }).Count -eq 1 -and
+            @($previewRows | Where-Object { $_.Name -eq 'ignore.instructions.md' }).Count -eq 1 -and
+            $previewText -match 'Preview only\. Nothing has been saved or installed\.' -and
+            (Read-Ui $win $UiPanel.Page $UiId.ConfirmSource) -eq 'Add and keep in sync' -and
+            -not (Get-Checked $win $UiPanel.Page $UiId.Enabled) -and
+            (Test-SourceSettingsEditable $win) -and
             (Get-BlobId $sources) -eq $sourceHash -and (Get-Entries $second.TSS_AGENTS_DIR) -eq ''
         ) ($previewText -replace '\s+', ' ')
         Click-Ui $win $UiPanel.Page $UiId.CancelSource
@@ -594,9 +601,12 @@ function Test-Mixed {
         # The instructions folder holds an instructions file and an agent: the same again with agents off.
         & $globalSwitch 1 $false
         $previewText = & $previewInTray $rulesUrl
-        Check 'the instructions folder preview syncs only its instructions file' (
-            $previewText -match '(?m)^Instructions: Sync on\r?$' -and $previewText -match '(?m)^  style\.instructions\.md\b.*: will sync\r?$' -and
-            $previewText -match '(?m)^Agents: Sync off\r?$' -and $previewText -match '(?m)^  ignore\.agent\.md\b.*: Sync off\r?$'
+        $previewRows = @(Read-Skills $win)
+        Check 'the instructions folder preview shows both found rows and keeps the off type visible' (
+            $previewText -match 'Instructions \(1\), expanded\.' -and $previewText -match 'Agents \(1 \u00B7 Sync off\), expanded\.' -and
+            $previewRows.Count -eq 2 -and @($previewRows | Where-Object { $_.Tag -ne 'Preview' -or $_.Buttons.Count }).Count -eq 0 -and
+            @($previewRows | Where-Object { $_.Name -eq 'style.instructions.md' }).Count -eq 1 -and
+            @($previewRows | Where-Object { $_.Name -eq 'ignore.agent.md' }).Count -eq 1
         ) ($previewText -replace '\s+', ' ')
         $checks = Get-MarkCount $second.TSS_BENCH_REPORT 'job-check'
         Click-Ui $win $UiPanel.Page $UiId.ConfirmSource
@@ -2004,15 +2014,27 @@ function Test-Ui {
         Test-TabOrder $ask 'the Add question'
         Click-Ui $ask $AskPanel $AskId.Ok
         Check 'the question closed once Preview was clicked' ($null -ne (Wait-Maybe { if ((Find-Ask $tray) -eq [IntPtr]::Zero) { $true } } 5))
-        $preview = Wait-Maybe { if ((Read-Ui $win $UiPanel.Page $UiId.ConfirmSource) -eq 'Add and check') { Read-Ui $win $UiPanel.Page $UiId.InfoText } } 60
+        $preview = Wait-Maybe {
+            if ((Read-Ui $win $UiPanel.Page $UiId.ConfirmSource) -eq 'Add and keep in sync') { Read-SourcePage $win }
+        } 60
+        $previewRows = @(Read-Skills $win)
         Note "the preview: $($preview -replace '\s+', ' ')"
-        Check 'the preview names the folder, finds the three skills and no other type, shows the skills folder, and saves and installs nothing' (
-            $preview -match "(?m)^Branch: $([regex]::Escape($c.Ref))\r?$" -and $preview -match '(?m)^Folder: skills\r?$' -and $preview -match '(?m)^Skills: Sync on\r?$' -and
-            @('alpha', 'beta', 'gamma' | Where-Object { $preview -notmatch "(?m)^  $_ \(skills/$_\): will sync\r?$" }).Count -eq 0 -and
-            ([regex]::Matches($preview, '(?m)^  None found\.\r?$')).Count -eq 3 -and
-            $preview -match "Destination: $([regex]::Escape($c.Skills))\r?\n" -and $preview -match 'Add this source to save it and start its first check\.' -and
+        Check 'the shared source page shows the location and detected counts, starts paused, and saves and installs nothing' (
+            $preview -match [regex]::Escape($c.Repo) -and $preview -match [regex]::Escape($c.Ref) -and $preview -match 'the skills folder' -and
+            $preview -match 'Skills \(3\), expanded\.' -and $preview -match 'Agents \(0\), expanded\.' -and
+            $preview -match 'Instructions \(0\), expanded\.' -and $preview -match 'Plugins \(0\), expanded\.' -and
+            $preview -match 'Preview only\. Nothing has been saved or installed\.' -and
+            (Read-Ui $win $UiPanel.Page $UiId.ConfirmSource) -eq 'Add and keep in sync' -and
+            -not (Get-Checked $win $UiPanel.Page $UiId.Enabled) -and
+            (Test-SourceSettingsEditable $win) -and
+            $previewRows.Count -eq 3 -and @($previewRows | Where-Object { $_.Tag -ne 'Preview' -or $_.Buttons.Count }).Count -eq 0 -and
+            ($previewRows.Name -join ',') -eq 'alpha,beta,gamma' -and
+            $null -eq (Read-Ui $win $UiPanel.Page $UiId.More) -and
             (Get-Entries $c.Skills) -eq '' -and @(Read-Nav $win).Count -eq 0
         ) "$(Get-Entries $c.Skills); $(@(Read-Nav $win).Count) source(s)"
+        Check 'the preview switch text says Keep in sync: Off' (
+            (Read-Ui $win $UiPanel.Page $UiId.Enabled) -eq 'Keep in sync: Off'
+        ) (Read-Ui $win $UiPanel.Page $UiId.Enabled)
         $pic = Save-Shot $win '03b-preview'
         Test-Painted $pic $win 'the preview' @(@($UiPanel.Page, $UiId.Title), @($UiPanel.Page, $UiId.InfoText), @($UiPanel.Page, $UiId.ConfirmSource), @($UiPanel.Page, $UiId.CancelSource))
         Test-Layout $win 'the preview'
@@ -2074,7 +2096,10 @@ function Test-Ui {
         Note ('the skills: ' + (($skills | ForEach-Object { "$($_.Name) / $($_.Tag)" }) -join ' ;; '))
         Check 'alpha, beta and gamma each show installed status and facts without repair buttons' ((($skills | ForEach-Object { $_.Name }) -join ',') -eq 'alpha,beta,gamma' -and @($skills | Where-Object { $_.Tag -notmatch '^(Installed|Up to date)$' -or -not $_.Facts -or $_.Buttons.Count }).Count -eq 0)
         Check 'the skills are on disk, equal to upstream' ((Compare-WithUpstream $c.Skills $c.Repo $c.Ref 'skills').Count -eq 0)
-        Check 'Check every shows the default, and Keep in sync is on' ((Read-Ui $win $UiPanel.Page $UiId.Every) -eq 'Default (1 day)' -and (Get-Checked $win $UiPanel.Page $UiId.Enabled)) (Read-Ui $win $UiPanel.Page $UiId.Every)
+        Check 'Check every shows the default, and Keep in sync is on' (
+            (Read-Ui $win $UiPanel.Page $UiId.Every) -match '^Check every\r?\nDefault \(1 day\)$' -and
+            (Get-Checked $win $UiPanel.Page $UiId.Enabled)
+        ) (Read-Ui $win $UiPanel.Page $UiId.Every)
         $hero = Wait-Maybe { $h = Read-Hero $win; if ($h.Title -eq 'All skills are up to date') { $h } } 8
         Check 'the top of the window says all skills are up to date, and how the check the user asked for ended' ($null -ne $hero -and $hero.Sub -like 'Checked: skills were updated*') $(if ($hero) { "$($hero.Title) / $($hero.Sub)" } else { (Read-Hero $win).Title })
         $pic = Save-Shot $win '05-installed'
@@ -2093,7 +2118,9 @@ function Test-Ui {
         Open-Repo $win 0
         Choose-Ui $win $UiPanel.Page $UiId.Every '12 hours'
         $cfg = Wait-Maybe { $x = Get-Config $c; if ($x -and $x.sources[0].interval -eq '12h') { $x } } 8
-        Check 'choosing 12 hours in "Check every" is saved for that repository, and shown' ($null -ne $cfg -and (Read-Ui $win $UiPanel.Page $UiId.Every) -eq '12 hours') (Read-Ui $win $UiPanel.Page $UiId.Every)
+        Check 'choosing 12 hours in "Check every" is saved for that repository, and shown' (
+            $null -ne $cfg -and (Read-Ui $win $UiPanel.Page $UiId.Every) -match '^Check every\r?\n12 hours$'
+        ) (Read-Ui $win $UiPanel.Page $UiId.Every)
         $hero = Wait-Maybe { $h = Read-Hero $win; if ($h.Sub -like "3 skills from 1 source $dot checked * $dot next check in *") { $h } } 5
         Check 'once the user does something else, the top of the window sums up: the skills, when they were checked, the next check' ($null -ne $hero) ((Read-Hero $win).Sub)
         Click-Ui $win $UiPanel.Nav $UiId.NavSettings
@@ -2127,7 +2154,9 @@ function Test-Ui {
         Open-Repo $win 0
         Choose-Ui $win $UiPanel.Page $UiId.Every 'Default (6 hours)'
         $cfg = Wait-Maybe { $x = Get-Config $c; if ($x -and -not $x.sources[0].interval) { $x } } 8
-        Check 'choosing "Default (6 hours)" makes the repository follow the default' ($null -ne $cfg -and (Read-Ui $win $UiPanel.Page $UiId.Every) -eq 'Default (6 hours)') (Read-Ui $win $UiPanel.Page $UiId.Every)
+        Check 'choosing "Default (6 hours)" makes the repository follow the default' (
+            $null -ne $cfg -and (Read-Ui $win $UiPanel.Page $UiId.Every) -match '^Check every\r?\nDefault \(6 hours\)$'
+        ) (Read-Ui $win $UiPanel.Page $UiId.Every)
 
         # ---- Keep in sync
         $checks = Get-MarkCount $c.Report 'job-check'
@@ -2172,6 +2201,40 @@ function Test-Ui {
         Choose-Ui $win $UiPanel.Page $UiId.RepoItems 'Include'
         $cfg = Wait-Maybe { $x = Get-Config $c; if ($x -and $x.sources[0].include_repo_items -eq $true) { $x } } 8
         Check 'choosing Include for repository-specific items is saved for that source' ($null -ne $cfg -and (Read-Ui $win $UiPanel.Page $UiId.RepoItems) -match '\nInclude$') (Read-Ui $win $UiPanel.Page $UiId.RepoItems)
+        Click-Ui $win $UiPanel.Page $UiId.SectionWhat
+        $whatCollapsed = Wait-Maybe {
+            $t = Read-Ui $win $UiPanel.Page $UiId.SectionWhat
+            if ($t -match '^What to sync, collapsed\.') { $t }
+        } 5
+        $whatControlsHidden = $null -eq (Read-Ui $win $UiPanel.Page $UiId.SourceType) -and
+            $null -eq (Read-Ui $win $UiPanel.Page $UiId.RepoItems) -and $null -eq (Read-Ui $win $UiPanel.Page $UiId.FolderRules)
+        Check 'collapsing What to sync hides its settings controls' ($null -ne $whatCollapsed -and $whatControlsHidden) $whatCollapsed
+        Click-Ui $win $UiPanel.Page $UiId.SectionWhat
+        $whatExpanded = Wait-Maybe {
+            $t = Read-Ui $win $UiPanel.Page $UiId.SectionWhat
+            if ($t -match '^What to sync, expanded\.' -and
+                (Read-Ui $win $UiPanel.Page $UiId.SourceType) -and
+                (Read-Ui $win $UiPanel.Page $UiId.RepoItems) -and
+                (Read-Ui $win $UiPanel.Page $UiId.FolderRules)) { $t }
+        } 5
+        Check 'reopening What to sync restores its controls and the Include choice' (
+            $null -ne $whatExpanded -and (Read-Ui $win $UiPanel.Page $UiId.RepoItems) -match '\nInclude$'
+        ) (Read-Ui $win $UiPanel.Page $UiId.RepoItems)
+        $skillRow = Read-Ui $win $UiPanel.Page $UiId.Skill
+        Click-Ui $win $UiPanel.Page $UiId.SectionKind
+        $skillsCollapsed = Wait-Maybe {
+            $t = Read-Ui $win $UiPanel.Page $UiId.SectionKind
+            if ($t -match '^Skills \(\d+\), collapsed\.' -and $null -eq (Read-Ui $win $UiPanel.Page $UiId.Skill)) { $t }
+        } 5
+        Check 'collapsing Skills hides its item row' ($null -ne $skillsCollapsed -and $null -ne $skillRow) $skillsCollapsed
+        Click-Ui $win $UiPanel.Page $UiId.SectionKind
+        $skillsExpanded = Wait-Maybe {
+            $t = Read-Ui $win $UiPanel.Page $UiId.SectionKind
+            if ($t -match '^Skills \(\d+\), expanded\.' -and (Read-Ui $win $UiPanel.Page $UiId.Skill) -match '^alpha\r?\n') {
+                Read-Ui $win $UiPanel.Page $UiId.Skill
+            }
+        } 5
+        Check 'reopening Skills restores its item row' ($null -ne $skillsExpanded) $skillsExpanded
         Choose-Ui $win $UiPanel.Page $UiId.RepoItems 'Default (skip)'
         $cfg = Wait-Maybe { $x = Get-Config $c; if ($x -and -not $x.sources[0].PSObject.Properties['include_repo_items']) { $x } } 8
         Check 'choosing "Default (skip)" removes the source''s own choice' ($null -ne $cfg) (Read-Ui $win $UiPanel.Page $UiId.RepoItems)
@@ -2447,7 +2510,7 @@ function Test-Ui {
                 $expected = if ($saved -and @($saved.sources).Count -eq 1) { "This source is already set up. Its ID is '$($saved.sources[0].id)'." }
                 $told = Wait-Maybe { $t = Read-Ui $win $UiPanel.Page $UiId.InfoText; if ($t -and $t -ceq $expected) { $t } } 5
                 Check 'the Add source page refuses the duplicate and shows its full ID, not in the header' (
-                    $null -ne $told -and (Read-Ui $win $UiPanel.Page $UiId.Title) -eq 'Add source' -and
+                    $null -ne $told -and (Read-Ui $win $UiPanel.Page $UiId.Title) -eq $c.Repo -and
                     (Read-Hero $win).Sub -notlike '*already set up*' -and (Find-Ask $tray) -eq [IntPtr]::Zero -and
                     @(Read-Nav $win).Count -eq 1 -and $null -eq (Read-Ui $win $UiPanel.Page $UiId.ConfirmSource)
                 ) "page: $(Read-Ui $win $UiPanel.Page $UiId.InfoText); header: $((Read-Hero $win).Sub)"
@@ -2466,14 +2529,20 @@ function Test-Ui {
                 [void](Wait-Maybe { $t = Read-Ui $ask $AskPanel $AskId.Hint; if ($t -match 'alpha/scripts \(GitHub tells where the branch name ends\)') { $t } } 5)
                 Click-Ui $ask $AskPanel $AskId.Ok
                 $why = Wait-Maybe {
-                    $t = Read-Ui $win $UiPanel.Page $UiId.InfoText
-                    if (($t -match '(?m)^Folder: skills/alpha/scripts\r?$') -and ([regex]::Matches($t, '(?m)^  None found\.\r?$')).Count -eq 4 -and $t -clike '*Nothing here would sync. Check the branch and folder, or edit the location.*') { $t }
+                    $t = Read-SourcePage $win
+                    if (($t -match 'skills/alpha/scripts') -and
+                        ([regex]::Matches($t, '(?:Skills|Agents|Instructions|Plugins) \(0\), expanded\.')).Count -eq 4 -and
+                        $t -like '*No syncable items were found. Change the location or folder rules before adding this source.*') { $t }
                 } 40
                 Check 'the next preview does not show the duplicate refusal' ((Read-Hero $win).Sub -notlike '*already set up*' -and $why -notlike '*already set up*') ((Read-Hero $win).Sub)
                 Note "the preview: $($why -replace '\s+', ' ')"
                 $offered = @($UiId.ConfirmSource, $UiId.RetrySource, $UiId.EditSource, $UiId.CancelSource | Where-Object { $null -ne (Read-Ui $win $UiPanel.Page $_) }) -join ','
                 $want = "$($UiId.RetrySource),$($UiId.EditSource),$($UiId.CancelSource)"
-                Check 'a folder with nothing to sync: the preview says nothing was found and offers Retry, Edit and Cancel, not Add' ($null -ne $why -and $offered -eq $want -and @(Read-Nav $win).Count -eq 1) "buttons $offered"
+                Check 'a folder with nothing to sync shows zero counts and offers Retry, Edit and Cancel, not Add' (
+                    $null -ne $why -and $offered -eq $want -and
+                    (Read-Ui $win $UiPanel.Page $UiId.ConfirmSource) -eq $null -and
+                    -not (Get-Checked $win $UiPanel.Page $UiId.Enabled) -and @(Read-Nav $win).Count -eq 1
+                ) "buttons $offered"
                 $pic = Save-Shot $win '16-nothing-found'
                 Test-Painted $pic $win 'a preview with nothing to sync' @(@($UiPanel.Page, $UiId.InfoText), @($UiPanel.Page, $UiId.RetrySource), @($UiPanel.Page, $UiId.EditSource), @($UiPanel.Page, $UiId.CancelSource))
                 Test-Layout $win 'a preview with nothing to sync'
@@ -2501,8 +2570,10 @@ function Test-Ui {
                 Set-UiText (Get-Ui $ask $AskPanel $AskId.Edit) (Get-Address $c $longFolder)
                 Start-Sleep -Milliseconds 300
                 Click-Ui $ask $AskPanel $AskId.Ok
-                $offer = Wait-Maybe { if ((Read-Ui $win $UiPanel.Page $UiId.ConfirmSource) -eq 'Add and check') { $true } } 40
-                Check 'the long folder previews with an Add and check button' ($null -ne $offer) ((Read-Ui $win $UiPanel.Page $UiId.InfoText) -replace '\s+', ' ')
+                $offer = Wait-Maybe { if ((Read-Ui $win $UiPanel.Page $UiId.ConfirmSource) -eq 'Add and keep in sync') { $true } } 40
+                Check 'the long folder preview offers Add and keep in sync, with Keep in sync initially off' (
+                    $null -ne $offer -and -not (Get-Checked $win $UiPanel.Page $UiId.Enabled)
+                ) ((Read-SourcePage $win) -replace '\s+', ' ')
                 if ($null -ne $offer) { Click-Ui $win $UiPanel.Page $UiId.ConfirmSource }
                 $two = Wait-Maybe { $n = @(Read-Nav $win); if ($n.Count -eq 2 -and @($n | Where-Object { $_.Folder -eq $longFolder -and $_.Kinds -eq 'Skills 1' -and $_.Sub -eq 'Up to date' }).Count -eq 1) { $n } } 60
                 Check 'the list has one row per source, and the long one keeps its whole folder and branch in its accessible name' (
@@ -2826,10 +2897,18 @@ function Test-Plugins {
         Check 'Add source asks for the location only, with no type picker' ($null -eq (Read-Ui $ask $AskPanel $AskId.Choice)) (Read-Panel $ask $AskPanel)
         Click-Ui $ask $AskPanel $AskId.Ok
         [void](Wait-Live { (Read-Ui $win $UiPanel.Page $UiId.ConfirmSource) -or (Read-Ui $win $UiPanel.Page $UiId.RetrySource) -eq 'Retry' } 'the tray plugin preview' 60)
-        $previewText = Read-Ui $win $UiPanel.Page $UiId.InfoText
-        Check 'the window previews both plugins with publisher and version, and offers to add with or without approving them, without touching Copilot' (
-            (& $matchesPreview $previewText) -and $previewText.Contains('Plugins can run programs on this PC.') -and $previewText -match 'GitHub Copilot CLI' -and
-            (Read-Ui $win $UiPanel.Page $UiId.ConfirmSource) -eq 'Add without approving plugins' -and (Read-Ui $win $UiPanel.Page $UiId.ApproveSource) -eq 'Add and approve these plugins' -and
+        $previewText = Read-SourcePage $win
+        $previewRows = @(Read-Skills $win)
+        Check 'the shared page lists both plugins and their metadata, starts paused, and leaves approval separate' (
+            $previewRows.Count -eq 2 -and @($previewRows | Where-Object { $_.Tag -ne 'Preview' -or $_.Buttons.Count }).Count -eq 0 -and
+            $previewRows[0].Name -eq $alpha -and $previewRows[0].Facts -match '1\.0\.0.*TSS Fixture' -and
+            $previewRows[1].Name -eq $beta -and $previewRows[1].Facts -match '1\.0\.0.*TSS Fixture' -and
+            $previewText -match 'Plugin installation requires the separate approval action' -and
+            (Read-Ui $win $UiPanel.Page $UiId.ConfirmSource) -eq 'Add and keep in sync' -and
+            (Read-Ui $win $UiPanel.Page $UiId.ApproveSource) -eq 'Add and approve plugins' -and
+            -not (Get-Checked $win $UiPanel.Page $UiId.Enabled) -and
+            (Test-SourceSettingsEditable $win) -and
+            $null -eq (Read-Ui $win $UiPanel.Page $UiId.More) -and
             (& $emptyHomes)) ($previewText -replace '\s+', ' ')
         Test-Layout $win 'plugin preview'
         $shot = Save-Shot $win 'plugins-preview'

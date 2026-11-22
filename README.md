@@ -34,9 +34,13 @@ Windows 10 or 11, x64. No runtime or installer is needed. The exes are not signe
    https://github.com/anthropics/skills/tree/main/skills
    ```
 
-4. Click **Preview** to see what was found, grouped by type, and where it will go. **Cancel** saves and installs
-   nothing. **Add and check** saves the source and starts the first check. The default interval is one day.
-   When the location has plugins, choose **Add without approving plugins** or **Add and approve these plugins**.
+4. Click **Preview** to open the shared source page. It shows detected items and counts, including types with zero
+   matches or syncing turned off. The **What to sync** settings, interval and folder rules remain editable; **Keep in
+   sync** starts off while you review. **What to sync** can also collapse; its green and grey indicators mean on and
+   off, and adjacent text spells out each type's state. The item sections can be collapsed, and preview rows have no
+   local status or repair actions. **Cancel** saves nothing and installs nothing. Choose **Add and keep in sync** to save the source
+   and start its first check; the default interval is one day. If approvable plugins were found, **Add and approve
+   plugins** is a separate, explicit choice. Using the regular Add action leaves them waiting for approval.
 
 Public repositories need no sign-in. For private ones, sign in with `gh auth login` or save a read-only token
 in the app's Settings. See [private repositories](docs/GUIDE.md#private-repositories).

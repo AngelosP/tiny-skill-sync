@@ -215,7 +215,8 @@ pub struct LocationPreview {
     /// Every item found below the folder, with its install name and status (installable, or why not), collisions,
     /// files that are never synced, and each plugin's publisher, version and capabilities.
     pub inventory: Inventory,
-    /// Where each file type that is on and has items would be placed, or why it cannot be.
+    /// Where each file type with installable items would be placed, or why it cannot be. Types may be off in preview
+    /// so their local setting can be changed without requesting another GitHub listing.
     pub destinations: Vec<(SourceKind, PreviewDestination)>,
 }
 
@@ -230,6 +231,19 @@ impl Engine {
     /// Reads `input` (`owner/repo`, its GitHub address, or a branch or folder address) and lists what is there,
     /// without writing anything and without launching Copilot CLI.
     pub fn preview_location(&mut self, cfg: &Config, input: &str, use_token: bool, cancel: &AtomicBool) -> Result<LocationPreview, EngineError> {
+        self.preview_location_with_settings(cfg, input, use_token, &SourceConfig::default(), cancel)
+    }
+
+    /// Like `preview_location`, with source choices applied to the unsaved draft. These choices do not authorize a
+    /// save or plugin approval; `save_source` re-runs discovery with the same settings before writing.
+    pub fn preview_location_with_settings(
+        &mut self,
+        cfg: &Config,
+        input: &str,
+        use_token: bool,
+        settings: &SourceConfig,
+        cancel: &AtomicBool,
+    ) -> Result<LocationPreview, EngineError> {
         stopped(cancel).map_err(failed)?;
         let location = Location::parse(input).map_err(failed)?;
         let repo = format!("{}/{}", location.owner, location.name);
@@ -257,7 +271,19 @@ impl Engine {
         };
         super::root::check_root(&snapshot, &repo, &lane.path).map_err(|e| failed(e.message))?;
 
-        let draft = SourceConfig { repo: repo.clone(), branch: lane.branch.clone(), path: lane.path.clone(), use_token, ..Default::default() };
+        let draft = SourceConfig {
+            repo: repo.clone(),
+            branch: lane.branch.clone(),
+            path: lane.path.clone(),
+            interval: settings.interval,
+            use_token,
+            enabled: settings.enabled,
+            types: settings.types,
+            include_repo_items: settings.include_repo_items,
+            ignore_add: settings.ignore_add.clone(),
+            ignore_allow: settings.ignore_allow.clone(),
+            ..Default::default()
+        };
         let global = cfg.global();
         let types = draft.effective_types(global);
         let policy = draft.effective_policy(global).map_err(failed)?;
@@ -289,7 +315,7 @@ impl Engine {
         let mut destinations = Vec::new();
         for (kind, items) in [(SourceKind::Agents, &inventory.agents), (SourceKind::Instructions, &inventory.instructions)] {
             let names: Vec<String> = items.iter().filter(|i| i.status == Status::Installable).map(|i| i.install_name.clone()).collect();
-            if !types.enabled(kind) || names.is_empty() {
+            if names.is_empty() {
                 continue;
             }
             let view = RepoConfig { id: source.lanes.id(kind).unwrap_or_default().to_owned(), kind, ..lane.clone() };

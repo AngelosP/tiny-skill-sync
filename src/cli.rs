@@ -2105,6 +2105,7 @@ mod tests {
             actions: actions.to_vec(),
             facts: None,
             listed: true,
+            remote_path: None,
             folder_missing: false,
             plugin: None,
         };

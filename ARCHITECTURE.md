@@ -710,6 +710,14 @@ everything they show.
   and menus are asked to match through DWM and uxtheme, both loaded only when a window opens.
 - **`page.rs`** builds every page as a `Surface` from what the app knows. It calls no Windows function (text is
   measured through a `Fit` the window passes in), so every layout and sentence is tested without a screen.
+- A saved source and an unsaved location preview use the same source-page renderer. Preview settings remain editable,
+  while rows contain only discovered GitHub facts, detected counts and validated remote paths, never local status or
+  repair actions. The worker packages each discovery with its page projection in an immutable snapshot; the window
+  reuses that projection for type, interval and enabled edits. Repository-specific-item inclusion and folder-rule edits
+  trigger a new discovery, retaining the old snapshot while it refreshes. Keep in sync starts off; the main Add action
+  saves the source and starts its check, while plugin approval remains a separate explicit choice. Type sections show
+  detected counts, including zero and Sync off, and their section text spells out the count, type state and
+  expanded/collapsed state.
 - **`window.rs`** is the main window: the band at the top, the repositories down the left, the page on the right.
   "Show changes" turns the whole window into the differences of one skill until Back (or Esc); the worker reads them
   with `engine::diff`, which only reads, and `diff.rs` lines them up from this PC (`−`) to GitHub (`+`), so they read
@@ -717,7 +725,8 @@ everything they show.
   there are compared; files the user added are never read or shown. "Preview" uses the same view (`DiffView.preview`)
   with nothing to choose: `engine::preview` asks GitHub nothing, reads only the files the record lists through
   `win::fs` on the worker, with the same size limits, and `diff::whole` shows each one whole with one column of line
-  numbers. The window is made when opened and destroyed when
+  numbers. Source-section collapse choices live in UI memory per source until the app exits, not in settings; choices
+  made in a draft carry over when that source is saved. The window is made when opened and destroyed when
   closed (its fonts and bitmap released, the memory trimmed), so it costs nothing while closed. Its size is saved in
   `window.txt` when you finish resizing it.
 - **The same splitter resizes the list on the left** in the main and diff views. Its own strip separates the panes;

@@ -84,6 +84,15 @@ pub fn web_url(cfg: &RepoConfig, skill: Option<&str>) -> Option<String> {
     Some(url)
 }
 
+/// Link directly to an item path from a branch-root preview listing.
+pub fn web_url_path(cfg: &RepoConfig, path: &str) -> Option<String> {
+    let plain = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b));
+    let repo = RepoRef::of(cfg).ok().filter(|r| plain(r.owner) && plain(r.name))?;
+    crate::pathsafe::check_rel_path(path).ok()?;
+    let page = if matches!(cfg.kind, crate::source::SourceKind::Agents | crate::source::SourceKind::Instructions) { "blob" } else { "tree" };
+    Some(format!("https://github.com/{}/{}/{}/{}/{}", repo.owner, repo.name, page, percent_encode_path(repo.reference()), percent_encode_path(path)))
+}
+
 pub enum TreeReply {
     /// The listing is the one the stored ETag stands for.
     NotModified,
@@ -717,5 +726,13 @@ mod tests {
         for odd in ["o/n?x", "o/n#x", "o/n/x", "o%2f/n", "/n", "o/", "o\u{202e}/n", "nothing"] {
             assert_eq!(web_url(&cfg(odd, "", ""), Some("s")), None, "{odd}");
         }
+        let mut agent = deep.clone();
+        agent.kind = crate::source::SourceKind::Agents;
+        assert_eq!(
+            web_url_path(&agent, ".github/agents/team%20lead.agent.md").as_deref(),
+            Some("https://github.com/o/n/blob/feature/x%20y/.github/agents/team%2520lead.agent.md")
+        );
+        assert_eq!(web_url_path(&deep, "plugins/team #1").as_deref(), Some("https://github.com/o/n/tree/feature/x%20y/plugins/team%20%231"));
+        assert_eq!(web_url_path(&deep, "../outside"), None);
     }
 }

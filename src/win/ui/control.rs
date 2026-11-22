@@ -152,6 +152,12 @@ pub enum Look {
         ink: Role,
         selected: bool,
     },
+    /// A page section header. Its window text names the section and its expanded state.
+    Section {
+        title: String,
+        open: bool,
+        marks: Vec<(char, Role)>,
+    },
     /// A skill header. `disclosure` is its expanded state, or None for a flat row.
     Row {
         tone: Tone,
@@ -645,6 +651,18 @@ fn draw_ctl(hwnd: HWND) {
                 let top = y + (h - 36) / 2;
                 paint::line([left, top, w - left + x - 8, 20], text, Font::Body, *ink);
                 paint::line([left, top + 20, w - left + x - 8, 16], sub, Font::Caption, Role::Text2);
+            }
+        }
+        Look::Section { title, open, marks } => {
+            if tint != Role::None {
+                paint::fill(c.at, 4, tint, Role::None);
+            }
+            paint::glyph([x + 4, y, 20, h], if *open { glyph::CHEVRON_DOWN } else { glyph::CHEVRON_RIGHT }, 14, Role::Text2);
+            let marks_width = marks.len() as i32 * 22;
+            paint::line([x + 28, y, (w - 36 - marks_width).max(0), h], title, Font::Strong, Role::Text);
+            for (index, (mark, ink)) in marks.iter().enumerate() {
+                let at = x + w - marks_width + index as i32 * 22;
+                paint::glyph([at, y, 18, h], *mark, 14, *ink);
             }
         }
         Look::Row { tone, glyph, disclosure, commands } => {

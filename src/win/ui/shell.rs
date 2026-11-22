@@ -691,6 +691,18 @@ pub fn preview_location(text: &str, every: Option<Interval>) -> Result<u64, Stri
     with_source_edit(|app| app.preview_location(text, every))
 }
 
+pub fn retry_source(ticket: u64) -> Result<(), String> {
+    with_source_edit(|app| app.retry_source(ticket))
+}
+
+pub fn edit_draft(ticket: u64, change: impl FnOnce(&mut SourceConfig)) -> Result<bool, String> {
+    with_source_edit(|app| app.edit_draft(ticket, change))
+}
+
+pub fn edit_draft_location(ticket: u64, text: &str, every: Option<Interval>) -> Result<(), String> {
+    with_source_edit(|app| app.edit_draft_location(ticket, text, every))
+}
+
 pub fn confirm_source(ticket: u64, approve_plugins: bool) {
     let _ = with_source_edit(|app| app.confirm_source(ticket, approve_plugins));
 }
