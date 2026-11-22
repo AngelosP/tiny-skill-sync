@@ -1039,7 +1039,7 @@ function Test-Unmanaged {
         $win = Wait-Live { $w = Find-LiveWindow $c.Tray.Id $WINDOW_CLASS -Visible; if ($w -ne [IntPtr]::Zero) { $w } } 'the history window' 10
         [void][TssLive]::SetWindowPos($win, [IntPtr](-1), 0, 0, 0, 0, 0x13)
         Start-Sleep -Milliseconds 500
-        Check 'the window shows the paused search and its choices' ((Read-Panel $win $UiPanel.Page) -match 'Resume search')
+        Check 'the window shows the paused search and its choices' ((Read-SourcePage $win) -match 'Resume search')
         [void][TssLive]::SendMessageW([TssLive]::GetDlgItem($win, $UiPanel.Page), 0x115, [IntPtr]7, [IntPtr]::Zero)
         Start-Sleep -Milliseconds 300
         [void](Save-Shot $win 'unmanaged-history-paused')
