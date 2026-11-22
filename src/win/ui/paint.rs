@@ -17,7 +17,7 @@ use windows_sys::Win32::Graphics::Gdi::{
 };
 
 use super::scale;
-use super::theme::{Role, color, colorref};
+use super::theme::{self, Role, color, colorref};
 
 /// x, y, width, height in DIPs.
 pub type Rect = [i32; 4];
@@ -387,18 +387,31 @@ pub fn fill(at: Rect, radius: i32, fill: Role, border: Role) {
     fill_argb(at, radius, color(fill), color(border));
 }
 
-/// The thresholds of a 4 by 4 ordered dither, in sixteenths of a level.
-const DITHER: [[i32; 4]; 4] = [[0, 8, 2, 10], [12, 4, 14, 6], [3, 11, 1, 9], [15, 7, 13, 5]];
+fn smooth(from: f32, to: f32, x: f32) -> f32 {
+    let t = ((x - from) / (to - from)).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
 
-/// A rectangle shaded from `from` at its left edge to `to` at its right, both drawn opaque. The shade between them is
-/// worked out in sixteenths of a level and dithered, so no steps show. Both depend only on the pixel's place in the
-/// window, never on the canvas, so a control that draws what is under it into a small canvas gets the same pixels as
-/// the whole window.
-pub fn gradient_argb(at: Rect, from: u32, to: u32) {
-    if from == to {
-        fill_argb(at, 0, from, 0);
-        return;
-    }
+/// How tall hill `k` (0 is the farthest) stands `v` DIPs from the band's right edge, in DIPs. The hills keep their
+/// shape at the right edge whatever the width; toward the left they sink to an eighth of their height, leaving the
+/// sky clear for the heading. The farthest climbs off the top at the right edge.
+pub fn hill(k: usize, v: f32) -> f32 {
+    let lift = 0.12 + 0.88 * (1.0 - smooth(150.0, 470.0, v));
+    let height = match k {
+        0 => 58.0 + 7.0 * (v / 70.0 + 2.0).sin() + 22.0 * (1.0 - smooth(0.0, 110.0, v)),
+        1 => 47.0 + 8.0 * (v / 55.0 + 0.6).sin(),
+        2 => 36.0 + 7.0 * (v / 46.0 + 4.0).sin(),
+        3 => 25.0 + 6.0 * (v / 38.0 + 2.4).sin(),
+        _ => 13.0 + 4.0 * (v / 29.0 + 0.9).sin(),
+    };
+    height * lift
+}
+
+/// The header's picture: a sky fading down to its low colour, behind five hills, each with an anti-aliased top.
+/// Measured from the right edge of `at`, not the repaint rectangle, so a child repainting itself sees the same hills.
+/// High contrast has no picture.
+pub fn band_print(at: Rect) {
+    let Some(print) = theme::print() else { return };
     CANVAS.with(|cell| {
         let cell = cell.borrow();
         let Some(c) = cell.as_ref() else { return };
@@ -408,39 +421,32 @@ pub fn gradient_argb(at: Rect, from: u32, to: u32) {
             return;
         }
         unsafe { GdiFlush() };
-        let span = i64::from((r - l - 1).max(1));
+        let s = c.dpi as f32 / 96.0;
+        let sky: Vec<u32> = (y0..y1).map(|y| blend(print.sky, print.low, ((((y - t) as f32 + 0.5) / (b - t) as f32) * 256.0) as u32)).collect();
         let stride = c.cap.0 as usize;
         let bits = unsafe { std::slice::from_raw_parts_mut(c.bits, stride * c.cap.1 as usize) };
-        // The dither repeats every four rows and the shade does not change down the rect, so four rows are worked out
-        // and the rest copied.
-        for y in y0..y1.min(y0 + 4) {
-            let thresholds = DITHER[((y + c.oy) & 3) as usize];
-            let row = &mut bits[y as usize * stride..][..stride];
-            for x in x0..x1 {
-                let (pos, step) = (i64::from(x - l), i64::from(thresholds[((x + c.ox) & 3) as usize]));
-                let mix = |shift: u32| {
-                    let (a, z) = (i64::from((from >> shift) & 0xFF), i64::from((to >> shift) & 0xFF));
-                    let sixteenths = a * 16 + (z - a) * 16 * pos / span;
-                    (((sixteenths + step) >> 4) as u32) << shift
-                };
-                row[x as usize] = 0xFF00_0000 | mix(16) | mix(8) | mix(0);
+        for x in x0..x1 {
+            let v = ((r - x) as f32 - 0.5) / s;
+            let tops: [f32; 5] = std::array::from_fn(|k| b as f32 - hill(k, v) * s);
+            for y in y0..y1 {
+                let mut px = sky[(y - y0) as usize];
+                for (top, ink) in tops.iter().zip(print.hills) {
+                    // How much of this pixel's height lies below the hill's top.
+                    let cover = ((y + 1) as f32 - top).clamp(0.0, 1.0);
+                    if cover > 0.0 {
+                        px = blend(px, ink, (cover * 256.0) as u32);
+                    }
+                }
+                bits[y as usize * stride + x as usize] = px;
             }
-        }
-        for y in (y0 + 4)..y1 {
-            let above = (y - 4) as usize * stride;
-            bits.copy_within(above + x0 as usize..above + x1 as usize, y as usize * stride + x0 as usize);
         }
     });
 }
 
-pub fn gradient(at: Rect, from: Role, to: Role) {
-    gradient_argb(at, color(from), color(to));
-}
-
-/// Text in a rect, with `DT_*` flags; `&` is shown as it is.
+/// Text in a rect, with `DT_*` flags; `&` is shown as it is. An ink that high contrast clears draws nothing.
 pub fn text(at: Rect, s: &str, font_: Font, ink: Role, flags: u32) {
     // DrawTextW reads the pointer of an empty buffer, which points nowhere.
-    if s.is_empty() {
+    if s.is_empty() || color(ink) >> 24 == 0 {
         return;
     }
     let Some((dc, rc, dpi)) = CANVAS.with(|c| {
@@ -556,6 +562,16 @@ pub fn dot(at: Rect, tone: Tone) {
     }
 }
 
+/// RGB pixels of the current paint rectangle, without the unused bitmap stride.
+#[cfg(test)]
+pub(super) fn pixels() -> Vec<u32> {
+    CANVAS.with(|cell| {
+        let c = cell.borrow();
+        let c = c.as_ref().expect("a canvas");
+        (0..c.h).flat_map(|y| (0..c.w).map(move |x| unsafe { *c.bits.add((y * c.cap.0 + x) as usize) } & 0xFFFFFF)).collect()
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -610,59 +626,6 @@ mod tests {
         line([0, 0, 64, 32], "", Font::Mono, Role::Text);
         text([0, 0, 64, 32], "", Font::Body, Role::Text, DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_CENTER);
         assert_eq!(CANVAS.with(|c| c.borrow().as_ref().map(|c| unsafe { *c.bits })), before);
-        release();
-    }
-
-    /// The `w` by `h` pixels at the canvas's top-left, row by row.
-    fn pixels(w: i32, h: i32) -> Vec<u32> {
-        CANVAS.with(|cell| {
-            let c = cell.borrow();
-            let c = c.as_ref().expect("a canvas");
-            (0..h).flat_map(|y| (0..w).map(move |x| unsafe { *c.bits.add((y * c.cap.0 + x) as usize) })).collect()
-        })
-    }
-
-    // A control draws what is under it into a canvas of its own size, whose origin is its place in the window. A
-    // gradient worked out from that canvas, or dithered by it, would show a seam around every button in the band.
-    #[test]
-    fn a_gradient_drawn_in_parts_matches_the_one_drawn_whole() {
-        let (from, to) = (0xFFD9E8FA, 0xFF1B3150);
-        let at = [3, 2, 301, 37];
-        for dpi in [96, 120, 144] {
-            let s = |v| scale(v, dpi);
-            let (l, t, r, b) = (s(at[0]), s(at[1]), s(at[0] + at[2]), s(at[1] + at[3]));
-            let (w, h) = (r + 2, b + 2);
-            assert!(begin(dpi, w, h, 0, 0));
-            gradient_argb(at, from, to);
-            let whole = pixels(w, h);
-            let at_px = |x: i32, y: i32| whole[(y * w + x) as usize];
-            for y in t..b {
-                assert_eq!((at_px(l, y), at_px(r - 1, y)), (from, to), "the ends are exact at {dpi} DPI");
-                for x in l..r {
-                    for shift in [16, 8, 0] {
-                        let (a, z) = (f64::from((from >> shift) & 0xFF), f64::from((to >> shift) & 0xFF));
-                        let exact = a + (z - a) * f64::from(x - l) / f64::from(r - l - 1);
-                        let got = f64::from((at_px(x, y) >> shift) & 0xFF);
-                        assert!((got - exact).abs() < 1.0, "({x}, {y}) at {dpi} DPI is {got}, not about {exact}");
-                    }
-                }
-            }
-            assert!((l..r).any(|x| (t..b - 1).any(|y| at_px(x, y) != at_px(x, y + 1))), "the shade is dithered, not stepped");
-            for (ox, oy, pw, ph) in [(5, 3, 40, 9), (r - 7, b - 6, 7, 6), (l + 1, t + 2, 3, 1), (0, 0, w, h)] {
-                assert!(begin(dpi, pw, ph, ox, oy));
-                gradient_argb(at, from, to);
-                let part = pixels(pw, ph);
-                for y in 0..ph {
-                    for x in 0..pw {
-                        let (wx, wy) = (x + ox, y + oy);
-                        if (l..r).contains(&wx) && (t..b).contains(&wy) {
-                            let got = part[(y * pw + x) as usize];
-                            assert_eq!(got, at_px(wx, wy), "({wx}, {wy}) at {dpi} DPI, painted from ({ox}, {oy})");
-                        }
-                    }
-                }
-            }
-        }
         release();
     }
 }

@@ -529,6 +529,7 @@ function Test-Mixed {
             $name = @('skills', 'agents', 'instructions')[$Kind]
             $row = Wait-Live { @(Read-Nav $win | Where-Object { $_.Folder -eq $Path })[0] } "the list row of $Path" 30
             Open-Repo $win $row.Index
+            Expand-SourceSections $win
             Choose-Ui $win $UiPanel.Page ($UiId.SourceType + $Kind) 'Off'
             [void](Wait-Live { $s = & $sourceAt $Path; if ($s -and $s.types -and $s.types.PSObject.Properties[$name] -and $s.types.$name -eq $false) { $true } } "$Path to save $name off" 10)
         }
@@ -1482,12 +1483,8 @@ function Test-Unchanged($Before, $After, [IntPtr]$Window, [string]$State, [objec
     Check "${State}: $What looks the same as before" ($n -eq 0) $(if ($n -lt 0) { 'the two pictures are not the same size' } else { "$n pixels of $($Part[0])/$($Part[1]) changed" })
 }
 
-# The band at the top stands apart from the content: a free spot in the band and one in the content just below its
-# edge must differ by at least 24, summed over red, green and blue. The spot in the band is between a control (a pair
-# of a panel and an id) and the next control to its right on that panel (or the panel's edge), level with the middle
-# of the control; the one in the content is 6 DIP below the band. $Band is the band's top and bottom on the screen,
-# read from the hero panel. Each spot is 4 DIP square and must be flat (no colour in it varies by more than 12, which a
-# dithered gradient never does), so it shows the background and not a control.
+# Sample the clear sky beside the title and the content 6 DIP below the band. The farthest hill climbs off the top near
+# the right edge; it too must differ from the sky. Use flat, control-free 4-DIP swatches. Returns the sky's colour.
 function Test-Band($Shot, [IntPtr]$Window, [string]$State, [int[]]$Band, [object[]]$Left) {
     $what = "${State}: the band at the top is a different colour from the content below it"
     if (-not $Shot) { Check "${State}: a picture of the window was taken" $false; return }
@@ -1497,35 +1494,48 @@ function Test-Band($Shot, [IntPtr]$Window, [string]$State, [int[]]$Band, [object
     $panel = [TssLive]::GetDlgItem($Window, $Left[0])
     $w = [int[]](([TssLive]::Bounds($Window)) -split ',')
     $lb = [int[]](([TssLive]::Bounds($l)) -split ',')
-    $right = ([int[]](([TssLive]::Bounds($panel)) -split ','))[2]
-    foreach ($o in @(Get-Layout $panel | Where-Object { $_.Shown -and $_.Handle -ne $l })) {
-        $ob = [int[]](([TssLive]::Bounds($o.Handle)) -split ',')
-        if ($ob[0] -ge $lb[2] -and $ob[0] -lt $right -and $ob[1] -lt $lb[3] -and $ob[3] -gt $lb[1]) { $right = $ob[0] }
-    }
+    $pb = [int[]](([TssLive]::Bounds($panel)) -split ',')
     $dpi = [int][TssLive]::GetDpiForWindow($Window)
     $size = [math]::Max(2, [int](4 * $dpi / 96))
-    $x = [int][math]::Floor(($lb[2] + $right) / 2)
+    $margin = [int][math]::Round(6 * $dpi / 96)
+    $x = $pb[0] + $margin
     $y = [int][math]::Floor(($lb[1] + $lb[3]) / 2)
-    if ($right - $lb[2] -lt $size + 2 -or $y - $size -lt $Band[0] -or $y + $size -gt $Band[1] - 1) {
-        Check $what $false "no free spot in the band: $($right - $lb[2]) px between the control and the next, band $($Band[0])-$($Band[1]), control middle $y"
-        return
-    }
     $spots = @(
-        [pscustomobject]@{ Name = 'band'; X = $x; Y = $y },
-        [pscustomobject]@{ Name = 'content'; X = $x; Y = $Band[1] + [int][math]::Round(6 * $dpi / 96) }
+        [pscustomobject]@{ Name = 'sky'; X = $x; Y = $y },
+        [pscustomobject]@{ Name = 'content'; X = $x; Y = $Band[1] + $margin },
+        [pscustomobject]@{ Name = 'hill'; X = $pb[2] - [int][math]::Round(14 * $dpi / 96); Y = $Band[0] + $size }
     )
+    $children = @(Get-Layout $panel | Where-Object { $_.Shown })
     foreach ($s in $spots) {
-        $px = $s.X - $w[0] - [int][math]::Floor($size / 2)
-        $py = $s.Y - $w[1] - [int][math]::Floor($size / 2)
+        $sx = $s.X - [int][math]::Floor($size / 2)
+        $sy = $s.Y - [int][math]::Floor($size / 2)
+        if ($sx -le $pb[0] -or $sx + $size -ge $pb[2] -or $sy -lt $w[1] -or $sy + $size -gt $w[3] -or
+            ($s.Name -ne 'content' -and ($sy -le $Band[0] -or $sy + $size -ge $Band[1]))) {
+            Check $what $false "$($s.Name) sample outside its area: $sx,$sy"; return
+        }
+        foreach ($o in $children) {
+            $cx = $pb[0] + $o.X
+            $cy = $pb[1] + $o.Y
+            if ($sx -lt $cx + $o.W -and $sx + $size -gt $cx -and $sy -lt $cy + $o.H -and $sy + $size -gt $cy) {
+                Check $what $false "$($s.Name) sample overlaps control $($o.Id)"; return
+            }
+        }
+        $px = $sx - $w[0]
+        $py = $sy - $w[1]
         $s | Add-Member -NotePropertyName Rgb -NotePropertyValue ([TssLive]::Mean($Shot.Path, $px, $py, $size, $size))
         $s | Add-Member -NotePropertyName Varies -NotePropertyValue ([TssLive]::Contrast($Shot.Path, $px, $py, $size, $size))
         $s | Add-Member -NotePropertyName At -NotePropertyValue "$px,$py"
     }
     $apart = 0
-    for ($k = 0; $k -lt 3; $k++) { $apart += [math]::Abs($spots[0].Rgb[$k] - $spots[1].Rgb[$k]) }
+    $ink = 0
+    for ($k = 0; $k -lt 3; $k++) {
+        $apart += [math]::Abs($spots[0].Rgb[$k] - $spots[1].Rgb[$k])
+        $ink += [math]::Abs($spots[0].Rgb[$k] - $spots[2].Rgb[$k])
+    }
     $flat = @($spots | Where-Object { $_.Varies -lt 0 -or $_.Varies -gt 12 -or $_.Rgb[0] -lt 0 }).Count -eq 0
     $seen = (@($spots | ForEach-Object { "$($_.Name) rgb($($_.Rgb -join ',')) at $($_.At), varies by $($_.Varies)" }) -join '; ') + "; apart by $apart"
-    Check $what ($flat -and $apart -ge 24) $seen
+    Check $what ($flat -and $apart -ge 24 -and $ink -ge 24) "$seen; hill from sky by $ink"
+    , $spots[0].Rgb
 }
 
 # Each part of the window shown is inside it and none is over another; inside each part, every control that can be
@@ -1850,7 +1860,7 @@ function Test-SkillRow($c, [IntPtr]$Window) {
             $icons = @(if ($away.Screen -and $onRow.Screen -and [TssLive]::Bounds($rowH) -eq $at) {
                 [TssLive]::NewGlyphs($away.Path, $onRow.Path, $x, $y, $w, $h, (& $px 6))
             })
-            $counts = if ($mode -eq 'compact') { 2..4 } else { 5 }
+            $counts = if ($mode -eq 'compact') { 2..5 } else { 5 }
             Check "${mode}: hover reveals the expected targets after the name" ($icons.Count -in $counts -and $icons[0] -lt ($w / 2)) "expected $($counts -join '/'); new glyph centres: $($icons -join ', ') in $w px"
             if ($icons.Count -notin $counts) { return }
 
@@ -2131,6 +2141,12 @@ function Test-Ui {
         $sub = Read-Ui $win $UiPanel.Page $UiId.Sub
         Note "the page: $title / $sub"
         Check 'the page of the new source is shown: public, its folder and branch, when it was checked' ($title -eq $c.Repo -and $sub -match "^Public $dot the skills folder on $([regex]::Escape($c.Ref)) $dot checked ") "$title / $sub"
+        Check 'the saved source starts with What to sync collapsed and its skills visible' (
+            (Read-Ui $win $UiPanel.Page $UiId.SectionWhat) -match '^What to sync, collapsed\.' -and
+            (Read-Ui $win $UiPanel.Page $UiId.SectionKind) -eq 'Skills (3), expanded.' -and
+            $null -ne (Read-Ui $win $UiPanel.Page $UiId.Skill)
+        )
+        Expand-SourceSections $win
         $types = @(0..3 | ForEach-Object { (Read-Ui $win $UiPanel.Page ($UiId.SourceType + $_)) -replace "`r?`n", ' / ' })
         Check 'its What to sync card follows Settings for every type, repo-specific items and folder rules' (
             ($types -join ' ;; ') -eq 'Sync skills / Default (On) ;; Sync agents / Default (On) ;; Sync instruction files / Default (On) ;; Sync plugins / Default (On)' -and
@@ -2149,6 +2165,11 @@ function Test-Ui {
         $hero = Wait-Maybe { $h = Read-Hero $win; if ($h.Title -eq 'All skills are up to date') { $h } } 8
         Check 'the top of the window says all skills are up to date, and how the check the user asked for ended' ($null -ne $hero -and $hero.Sub -like 'Checked: skills were updated*') $(if ($hero) { "$($hero.Title) / $($hero.Sub)" } else { (Read-Hero $win).Title })
         $pic = Save-Shot $win '05-installed'
+        $sourceBox = [int[]](([TssLive]::Bounds((Get-Ui $win $UiPanel.Nav $UiId.NavRepo))) -split ',')
+        $sourceDpi = [int][TssLive]::GetDpiForWindow($win)
+        Check 'the source list entry uses two lines at this display scale' (
+            [math]::Abs(($sourceBox[3] - $sourceBox[1]) - 50 * $sourceDpi / 96) -le 1
+        ) "$($sourceBox[3] - $sourceBox[1]) px at $sourceDpi dpi"
         Test-Painted $pic $win 'a repository added' @(@($UiPanel.Hero, $UiId.HeroTitle), @($UiPanel.Hero, $UiId.Sync), @($UiPanel.Nav, $UiId.NavRepo), @($UiPanel.Nav, $UiId.NavSettings), @($UiPanel.Page, $UiId.Title), @($UiPanel.Page, $UiId.Every), @($UiPanel.Page, $UiId.Skill))
         Test-Layout $win 'a repository added'
         Test-TabOrder $win 'a repository added'
@@ -2685,16 +2706,19 @@ function Test-Ui {
         Check 'Quit ends the app' ($tray.WaitForExit(5000))
 
         # ---- the band at the top, in the light and the dark theme
-        # The pictures above follow this PC's theme; TSS_THEME sets each theme in turn. The band at the top of the window
-        # and of Show changes must stand apart from the content below it in both. High contrast overrides TSS_THEME and
-        # draws the band in the window colour, so then only the pictures and the painting are checked.
+        # The pictures above follow this PC's theme and accent colour; TSS_THEME and TSS_ACCENT set each in turn, light
+        # with Windows' gold accent and dark with its iris one, so the sky must take each accent's hue. The band at the
+        # top of the window and of Show changes must stand apart from the content below it in both. High contrast
+        # overrides both and draws the band in the window colour, so then only the pictures and the painting are checked.
         $highContrast = [System.Windows.Forms.SystemInformation]::HighContrast
         if ($highContrast) { Note 'high contrast is on, so the band has the window colour and its colour is not checked' }
-        foreach ($theme in @(@('light', '18'), @('dark', '19'))) {
+        $gold = 'FFEFD5,FFDCA0,FFC75E,FFB900,E0A203,986D02,5C4001'
+        $iris = 'E3D4FE,C2A6EF,A079D8,8764B8,7755A5,513279,321352'
+        foreach ($theme in @(@('light', '18', 'gold', $gold, { param($rgb) $rgb[0] - $rgb[2] -ge 16 }), @('dark', '19', 'iris', $iris, { param($rgb) $rgb[2] - $rgb[1] -ge 16 }))) {
             $mode = $theme[0]
             Stop-LiveTray $tray
             $started = Get-MarkCount $c.Report 'job-startup'
-            $tray = Start-Tray $c @{ TSS_THEME = $mode }
+            $tray = Start-Tray $c @{ TSS_THEME = $mode; TSS_ACCENT = $theme[3] }
             $up = Wait-Maybe { (Get-MarkCount $c.Report 'job-startup') -gt $started } 30
             Check "the $mode theme: the app starts" ($null -ne $up) "job-startup marks: $(Get-MarkCount $c.Report 'job-startup'), $started before"
             $win = Open-Window $tray
@@ -2710,7 +2734,10 @@ function Test-Ui {
             $pic = Save-Shot $win "$($theme[1])-band-$mode"
             Test-Painted $pic $win "the $mode theme" @(@($UiPanel.Hero, $UiId.HeroTitle), @($UiPanel.Hero, $UiId.Sync))
             Test-Layout $win "the $mode theme"
-            if (-not $highContrast) { Test-Band $pic $win "the $mode theme" $band @($UiPanel.Hero, $UiId.HeroTitle) }
+            if (-not $highContrast) {
+                $sky = Test-Band $pic $win "the $mode theme" $band @($UiPanel.Hero, $UiId.HeroTitle)
+                if ($sky) { Check "the $mode theme: the sky takes the $($theme[2]) accent" (& $theme[4] $sky) "sky rgb($($sky -join ','))" }
+            }
 
             # Show changes heads its view with the same band, as tall as the hero panel.
             $show = Wait-Maybe { @(@(Read-Skills $win | Where-Object { $_.Name -eq 'alpha' }) | ForEach-Object { $_.Buttons } | Where-Object { $_.Text -eq 'Show changes' })[0] } 10
@@ -2724,7 +2751,7 @@ function Test-Ui {
             $pic = Save-Shot $win "$($theme[1])b-band-$mode-changes"
             Test-Painted $pic $win "Show changes in the $mode theme" @(@($UiPanel.Head, $UiId.Back), @($UiPanel.Head, $UiId.Title), @($UiPanel.Head, $UiId.DiffAction), @($UiPanel.Files, $UiId.File))
             Test-Layout $win "Show changes in the $mode theme"
-            if (-not $highContrast) { Test-Band $pic $win "Show changes in the $mode theme" $band @($UiPanel.Head, $UiId.Title) }
+            if (-not $highContrast) { [void](Test-Band $pic $win "Show changes in the $mode theme" $band @($UiPanel.Head, $UiId.Title)) }
 
             # The narrowest window the app allows, where the line under the title has the least room. The band does not
             # move, so the band measured above still holds. The window then goes back to its size, which it saves, so
@@ -2739,7 +2766,7 @@ function Test-Ui {
             $pic = Save-Shot $win "$($theme[1])c-band-$mode-changes-narrow"
             Test-Painted $pic $win $narrow @(@($UiPanel.Head, $UiId.Back), @($UiPanel.Head, $UiId.Title), @($UiPanel.Head, $UiId.Sub))
             Test-Layout $win $narrow
-            if (-not $highContrast) { Test-Band $pic $win $narrow $band @($UiPanel.Head, $UiId.Title) }
+            if (-not $highContrast) { [void](Test-Band $pic $win $narrow $band @($UiPanel.Head, $UiId.Title)) }
             [void][TssLive]::SetWindowPos($win, [IntPtr]::Zero, 0, 0, $wide[2] - $wide[0], $wide[3] - $wide[1], 0x16)
             [void][TssLive]::PostMessageW($win, $WM_EXITSIZEMOVE, [IntPtr]::Zero, [IntPtr]::Zero)
             $restored = Wait-Maybe {

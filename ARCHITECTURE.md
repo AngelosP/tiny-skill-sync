@@ -713,16 +713,30 @@ everything they show.
 - **`paint.rs`** draws each paint into one off-screen bitmap and copies it to the screen at once, so nothing flickers.
   Rounded boxes are anti-aliased by hand (GDI cannot); text is drawn by GDI with ClearType. Positions are in DIPs and
   become pixels at the window's DPI. A control has no background of its own: it asks its parent to draw what is under
-  it into the same bitmap (`WM_PAINTBG`), so its corners blend with the card beneath. A gradient fill
-  (`Deco::Gradient`, used by the header band) blends two colours from left to right and hides the steps between them
-  with a 4 by 4 dither. The dither is keyed to the window's pixels, not the bitmap's, so a control or panel that
-  paints again by itself draws exactly the pixels that were there.
+  it into the same bitmap (`WM_PAINTBG`), so its corners blend with the card beneath. In the header, `Deco::BandPrint`
+  draws the band's picture across its whole width: a sky fading a little toward its low colour, behind five layered
+  hills, each with an anti-aliased top. The hills keep their shape at the band's right edge whatever the width and
+  sink toward the left, leaving the sky clear for the heading. Each pixel is worked out once, measured from the band's
+  edges rather than the bitmap's, so a control that repaints by itself sees the same hills. `paint::hill` gives a
+  hill's height at any distance from the right edge, so a layout can place things on it. Text in a clear ink is not
+  drawn.
 - **`theme.rs`** holds the Windows 11 light and dark colours and the high contrast colours. It follows the app mode the
-  user chose in Windows (`AppsUseLightTheme`); `TSS_THEME=dark` or `light` overrides it, for screenshots. The title bar
-  and menus are asked to match through DWM and uxtheme, both loaded only when a window opens. The title bar keeps the
-  window background (`Bg`), and the header band under it differs: `Band` and `BandEnd` are the two ends of its soft,
-  accent-tinted gradient and `BandEdge` is the line along its bottom, so the window reads as title bar, band, content.
-  In high contrast the band is the Window colour with a WindowText line.
+  user chose in Windows (`AppsUseLightTheme`) and the accent colour, as the seven shades Windows derives from it
+  (`Explorer\Accent\AccentPalette`). `TSS_THEME=dark` or `light` and `TSS_ACCENT` (seven `RRGGBB` shades separated by
+  commas, lightest first) override them, for screenshots. The window reads both again whenever Windows says a setting
+  or the theme changed, and repaints only when one did. The title bar and menus are asked to match through DWM and
+  uxtheme, both loaded only when a window opens. The title bar keeps the window background (`Bg`).
+  Every colour that depends on the accent is worked out once per look (`palette`): accent buttons, switches and links
+  (`Accent`, `AccentText`), the band's sky (`Band`) and picture (`Print`), its title, caption and bottom line
+  (`BandText`, `BandCaption`, `BandEdge`), and the type icons (`BandMark`). Each starts from the shade that suits it
+  and moves a step at a time only as far as it must: words 4.6:1 on every part of the band, buttons 3:1 and links
+  4.5:1 on every page and under a hovered or selected row, the status dots 3:1 on the sky, the icons 7:1 on their
+  discs (so the sky itself leaves room for 7:1 in black or white), the sky and the bottom line apart from the page, the
+  farthest hill apart from every shade of the sky's fade, and each other hill apart from the one behind it. A pale or
+  very dark accent can make a hill turn the other way to stay apart. **Sync now** and the diff header's primary choice are
+  accent buttons whose focus ring is drawn in their lettering (`Kind::BandAccent`), which reads on the button wherever
+  the band puts it. In high contrast nothing is worked out: buttons use Highlight and HighlightText, and the band is
+  Window with a WindowText line, without the picture or the icons.
 - **`page.rs`** builds every page as a `Surface` from what the app knows. It calls no Windows function (text is
   measured through a `Fit` the window passes in), so every layout and sentence is tested without a screen.
 - A saved source and an unsaved location preview use the same source-page renderer. Preview settings remain editable,
@@ -781,8 +795,13 @@ it). So the UI state lives in thread-local `RefCell`s borrowed only with `try_bo
 call that runs a message loop (a question, the tray menu, `DestroyWindow`).
 
 The band at the top holds the status circle, a title, the line under it and **Sync now**, on the hero panel. The
-band itself, a gradient with a hairline along its bottom, is part of the backdrop under that panel and under the diff
-view's header, so both views start with the same band. Its title says how everything is in one line, the worst
+band itself, including the picture and bottom line, is part of the backdrop under that panel and under the diff
+view's header, so both views start with the same band. Four discs of sky set into the middle hill, just under its top,
+hold the icons
+of the four types, in the list's order (`page::stations`). They sit at fixed points, so they never move as the text
+changes, and they show only when all four keep 12 DIPs clear of the measured title, the line under it and the
+buttons; otherwise none shows. They are decorations of the panel, not controls, so labels repaint over them. The
+band's title says how everything is in one line, the worst
 first: a problem of the app, sources that can't be read, items that need you, sources that need you, the first check
 still to come, or all up to date. The line under it
 says where, when the last check was, and when the next one is (`page::hero_of`). It counts sources, not lanes: it
@@ -793,10 +812,11 @@ just after it told you something, that line says so instead. After a check you a
 a failed check puts the reason first, and a check that found nothing new says "Checked: nothing new on GitHub" unless
 all is well. Each sentence names only the types of the lanes it is about (`item_nouns` over the lanes that need you,
 found nothing, or changed), so a source whose skills alone changed says "skills were updated". Each skill header
-paints only its name, actions and status badge. Its window text also carries the
+paints only its name, actions and status: an "Up to date" row uses the source list's green check-dot; other statuses keep
+their badges. Its window text also carries the
 explanation (`Row.text`, `board.rs`) and known facts for the row tooltip, whether open or closed; hovering an
 action shows that action's tooltip instead. A source entry in the list on the left uses the same tooltip for its whole
-window text (`page::nav_name`), which its painted lines may cut short.
+window text (`page::nav_name`), which its painted lines may cut short. `page::source_entry` keeps entries at two lines (50 DIPs): the repository, then measured type badges and status. Badges that cannot fit are replaced by a "+N" count with a warning if any hidden type needs attention. The full location, types and status remain in the window text and tooltip.
 Only attention/error rows with resolution choices expand. Routine commands remain beside the name even while
 those choices are open. The facts (`Row.facts`) come from the record after every job
 (`engine::facts`, which reads nothing from disk) and are worded by `board::facts_text`; a plain row ("Up to date",

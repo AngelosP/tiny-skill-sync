@@ -104,7 +104,7 @@ try {
     $up = Get-UpstreamFiles $fixture $commit 'demo-skills'
     Wait-PublicDemo $commit 'review-notes/SKILL.md' $up['review-notes/SKILL.md'].Id
     [IO.File]::WriteAllText((Join-Path $homeDir 'config.json'), '{"version":1,"default_interval":"5m","repos":[]}', $utf8)
-    $envMap = @{ TSS_BENCH_REPORT = $report; TSS_API_BASE = $null; TSS_RAW_BASE = $null; TSS_THEME = $null }
+    $envMap = @{ TSS_BENCH_REPORT = $report; TSS_API_BASE = $null; TSS_RAW_BASE = $null; TSS_THEME = $null; TSS_ACCENT = $null }
     $child = Get-LiveChildEnv $root $envMap
     Assert-Demo ($child.TSS_HOME -eq $homeDir -and $child.TSS_SKILLS_DIR -eq $skills -and $child.TSS_NO_SAVED_TOKEN -eq '1') 'the child uses only throwaway app data and skips the saved token'
     $tray = Start-LiveTray $root @() $envMap

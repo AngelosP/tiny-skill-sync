@@ -10,7 +10,7 @@ use std::collections::{HashMap, HashSet};
 use windows_sys::Win32::Graphics::Gdi::{DT_CENTER, DT_EDITCONTROL, DT_END_ELLIPSIS, DT_PATH_ELLIPSIS, DT_RIGHT, DT_SINGLELINE, DT_VCENTER, DT_WORDBREAK};
 
 use super::control::{Deco, Item, Kind, Look, Mark, RowCmd, Surface, two_lines};
-use super::paint::{Font, Rect, Tone, glyph};
+use super::paint::{Font, Rect, Tone, glyph, hill};
 use super::sentence;
 use super::theme::Role;
 use crate::app::{DraftStage, SourceDraft, duplicate_source_message, preview_syncs_for_settings};
@@ -194,9 +194,6 @@ pub enum Page {
     Settings,
 }
 
-/// The page to show now: the one shown while it is still there, else the first source that needs the user, else the
-/// first source. `None` is the welcome page, for when there are none. A lane ID (from a check, the tray or a source
-/// just added) shows its source.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum SectionKey {
     WhatToSync,
@@ -204,6 +201,19 @@ pub enum SectionKey {
     NeverSynced,
 }
 
+impl SectionKey {
+    pub fn is_open(self, choices: &HashMap<Self, bool>, preview: bool) -> bool {
+        let default = match self {
+            Self::WhatToSync => preview,
+            Self::Kind(_) | Self::NeverSynced => !preview,
+        };
+        choices.get(&self).copied().unwrap_or(default)
+    }
+}
+
+/// The page to show now: the one shown while it is still there, else the first source that needs the user, else the
+/// first source. `None` is the welcome page, for when there are none. A lane ID (from a check, the tray or a source
+/// just added) shows its source.
 pub fn settle(shown: Option<Page>, sources: &[SourceView], cfg: &Config) -> Option<Page> {
     let source_of = |id: &str| cfg.find_source(id).map(|s| s.id.as_str()).filter(|sid| sources.iter().any(|v| v.id == *sid));
     match shown {
@@ -424,10 +434,12 @@ pub fn hero(h: &Hero, can_sync: bool, w: i32, fit: Fit) -> Surface {
     o.glyph(mark, h.glyph, 18, ink);
     let bw = o.button_width(SYNC_NOW, Some(glyph::SYNC));
     let bx = w - PAD_X - bw;
-    o.button(Btn { enabled: can_sync, ..btn(id::SYNC, SYNC_NOW, Kind::Accent, Some(glyph::SYNC)) }, bx, in_band(32), 32);
+    o.button(Btn { enabled: can_sync, ..btn(id::SYNC, SYNC_NOW, Kind::BandAccent, Some(glyph::SYNC)) }, bx, in_band(32), 32);
     let (tw, top) = ((bx - 16 - 78).max(0), in_band(28 + 16));
-    o.label(id::HERO_TITLE, [78, top, tw, 28], &h.title, Font::Title, Role::Text);
-    o.label(id::HERO_SUB, [78, top + 28, tw, 16], &h.sub, Font::Caption, Role::Text2);
+    let taken = [[78, top, o.width(&h.title, Font::Title).min(tw), 28], [78, top + 28, o.width(&h.sub, Font::Caption).min(tw), 16], [bx, in_band(32), bw, 32]];
+    o.s.decos.extend(stations(w, &taken));
+    o.label(id::HERO_TITLE, [78, top, tw, 28], &h.title, Font::Title, Role::BandText);
+    o.label(id::HERO_SUB, [78, top + 28, tw, 16], &h.sub, Font::Caption, Role::BandCaption);
     o.done(HERO_H)
 }
 
@@ -488,38 +500,58 @@ pub fn nav_name(v: &SourceView) -> String {
 /// Where the text of a source's entry starts, from its left edge.
 const ENTRY_LEFT: i32 = 40;
 
-/// A source's entry in the list, `w` wide: its height, and what is drawn in it relative to its top-left corner. The
-/// repository, then the branch and folder, then an icon per type with its count (going on to more lines rather than
-/// being cut), then the status.
+/// Two lines: the repository, then type counts and status. Overflow and the location stay in `nav_name`.
 pub fn source_entry(v: &SourceView, w: i32, fit: Fit) -> (i32, Vec<Deco>) {
-    let (x, tw) = (ENTRY_LEFT, (w - ENTRY_LEFT - 8).max(1));
     let line = |at, text: String, font, ink| Deco::Text { at, text, font, ink, flags: ONE_LINE };
-    let mut parts = vec![
-        line([x, 6, tw, 20], printable(&v.repo).into_owned(), Font::Body, Role::Text),
-        line([x, 26, tw, 16], format!("{} · {}", branch_text(v), folder_text(v)), Font::Caption, Role::Text2),
-    ];
-    let mut y = 44;
-    if !v.kinds.is_empty() {
-        let (mut cx, mut cy) = (x, y);
-        for k in &v.kinds {
+    let mut parts = vec![line([ENTRY_LEFT, 6, w - ENTRY_LEFT - 8, 20], printable(&v.repo).into_owned(), Font::Body, Role::Text)];
+    let status = printable(&v.status).into_owned();
+    if v.kinds.is_empty() {
+        parts.push(line([ENTRY_LEFT, 26, w - ENTRY_LEFT - 8, 18], status, Font::Caption, Role::Text2));
+        return (50, parts);
+    }
+    let (x, tw) = (12, w - 20);
+    let badges: Vec<_> = v
+        .kinds
+        .iter()
+        .map(|k| {
             let (label, warn) = kind_badge(k);
             let lw = fit(&label, Font::Caption, 0).0 + 2;
-            let chip = 18 + lw + if warn { 16 } else { 0 };
-            if cx > x && cx + chip > x + tw {
-                (cx, cy) = (x, cy + 18);
+            (label, warn, lw, 16 + lw + if warn { 14 } else { 0 })
+        })
+        .collect();
+    let badges_width = badges.iter().map(|b| b.3 + 4).sum::<i32>() - 4;
+    let sw = (fit(&status, Font::Caption, 0).0 + 2).min((tw - badges_width - 8).max(64.min(tw / 3)));
+    let end = w - 8 - sw - 8;
+    let mut cx = x;
+    for (i, (label, warn, lw, chip)) in badges.iter().enumerate() {
+        let remaining = &badges[i + 1..];
+        let rest_width = remaining.iter().map(|b| b.3 + 4).sum::<i32>();
+        let overflow = |count: usize, warning: bool| {
+            let text = format!("+{count}");
+            let width = fit(&text, Font::Caption, 0).0 + 2 + if warning { 14 } else { 0 };
+            (text, width)
+        };
+        let reserve = if remaining.is_empty() { 0 } else { 4 + overflow(remaining.len(), remaining.iter().any(|b| b.1)).1 };
+        if cx + chip + rest_width > end && cx + chip + reserve > end {
+            let warning = badges[i..].iter().any(|b| b.1);
+            let (text, width) = overflow(badges.len() - i, warning);
+            if warning {
+                parts.push(Deco::Glyph { at: [cx, 26, 12, 18], ch: glyph::WARN, size: 12, ink: Tone::Warn.ink() });
             }
-            let ink = if k.on { Role::Text } else { Role::Text3 };
-            parts.push(Deco::Glyph { at: [cx, cy, 16, 18], ch: kind_glyph(k.kind), size: 14, ink });
-            parts.push(line([cx + 18, cy, lw, 18], label, Font::Caption, Role::Text2));
-            if warn {
-                parts.push(Deco::Glyph { at: [cx + 18 + lw + 2, cy, 14, 18], ch: glyph::WARN, size: 12, ink: Tone::Warn.ink() });
-            }
-            cx += chip + 10;
+            let offset = if warning { 14 } else { 0 };
+            parts.push(line([cx + offset, 26, width - offset, 18], text, Font::Caption, Role::Text2));
+            break;
         }
-        y = cy + 20;
+        let ink = if v.kinds[i].on { Role::Text } else { Role::Text3 };
+        parts.push(Deco::Glyph { at: [cx, 26, 14, 18], ch: kind_glyph(v.kinds[i].kind), size: 12, ink });
+        parts.push(line([cx + 16, 26, *lw, 18], label.clone(), Font::Caption, Role::Text2));
+        if *warn {
+            parts.push(Deco::Glyph { at: [cx + 16 + lw + 2, 26, 12, 18], ch: glyph::WARN, size: 12, ink: Tone::Warn.ink() });
+        }
+        cx += chip + 4;
     }
-    parts.push(line([x, y, tw, 16], printable(&v.status).into_owned(), Font::Caption, Role::Text2));
-    (y + 16 + 6, parts)
+    parts.push(Deco::Text { at: [w - 8 - sw, 26, sw, 18], text: status, font: Font::Caption, ink: Role::Text2, flags: ONE_LINE | DT_RIGHT });
+    (50, parts)
 }
 
 /// The list on the left: the sources, Add source, and at the bottom Activity and Settings.
@@ -1101,7 +1133,7 @@ fn preview_banner(o: &mut Out, draft: &SourceDraft, global: &GlobalSettings, x: 
 
 /// Which types the source syncs, whether it takes repository-specific items, and its folder rules.
 fn what_to_sync(o: &mut Out, p: &SourcePage, x: i32, y: i32, cw: i32) -> i32 {
-    let open = section_open(p, SectionKey::WhatToSync, true);
+    let open = SectionKey::WhatToSync.is_open(p.sections, p.draft.is_some());
     let marks = KINDS.into_iter().map(|kind| (kind_glyph(kind), if type_enabled(p, kind) { Role::Text } else { Role::Text3 })).collect::<Vec<_>>();
     let states =
         KINDS.into_iter().map(|kind| format!("{} {}", kind.heading(), if type_enabled(p, kind) { "on" } else { "off" })).collect::<Vec<_>>().join("; ");
@@ -1199,7 +1231,7 @@ fn sections(o: &mut Out, p: &SourcePage, x: i32, mut y: i32, cw: i32) -> i32 {
     }
     let mut index = 0;
     for k in &v.kinds {
-        let open = section_open(p, SectionKey::Kind(k.kind), false);
+        let open = SectionKey::Kind(k.kind).is_open(p.sections, p.draft.is_some());
         let detected = v.detected.map(|found| found[kind_index(k.kind)]).unwrap_or(k.found.unwrap_or(k.rows.len() as u32));
         let on = kind_is_on(p, k);
         let count = if on { detected.to_string() } else { format!("{detected} · Sync off") };
@@ -1240,7 +1272,7 @@ fn never_synced(o: &mut Out, p: &SourcePage, x: i32, mut y: i32, cw: i32) -> i32
         return y;
     }
     y += GAP;
-    let open = section_open(p, SectionKey::NeverSynced, false);
+    let open = SectionKey::NeverSynced.is_open(p.sections, p.draft.is_some());
     let count = v.notes.len() + v.more_notes as usize;
     let heading = format!("Never synced ({count})");
     let text = format!("{heading}, {}.", expanded_text(open));
@@ -1257,10 +1289,6 @@ fn never_synced(o: &mut Out, p: &SourcePage, x: i32, mut y: i32, cw: i32) -> i32
         y += o.para(0, [x, y, cw], format!("and {} more", v.more_notes), Font::Caption, Role::Text2) + 4;
     }
     y
-}
-
-fn section_open(p: &SourcePage, key: SectionKey, default: bool) -> bool {
-    p.sections.get(&key).copied().unwrap_or(default)
 }
 
 fn expanded_text(open: bool) -> &'static str {
@@ -1694,13 +1722,40 @@ pub fn splitter(w: i32, h: i32) -> Surface {
     Surface { items: vec![item], ..Surface::default() }
 }
 
-/// The band across the top of both views, behind the hero or the diff header: a soft shade of the accent's hue and
-/// one hairline at its foot, the only line between it and what is below.
-pub fn band(w: i32) -> [Deco; 2] {
+/// The sky, the hills in front of it and the line under the band.
+pub fn band(w: i32) -> [Deco; 3] {
     [
-        Deco::Gradient { at: [0, 0, w, HERO_H], from: Role::Band, to: Role::BandEnd },
+        Deco::Fill { at: [0, 0, w, HERO_H], radius: 0, fill: Role::Band, border: Role::None },
+        Deco::BandPrint { at: [0, 0, w, HERO_H] },
         Deco::Fill { at: [0, HERO_H - 1, w, 1], radius: 0, fill: Role::BandEdge, border: Role::None },
     ]
+}
+
+/// The four types, in the list's order, climbing the middle hill: each one's distance from the band's right edge.
+const STATIONS: [(f32, SourceKind); 4] =
+    [(304.0, SourceKind::Skills), (270.0, SourceKind::Agents), (236.0, SourceKind::Instructions), (202.0, SourceKind::Plugins)];
+const STATION_R: i32 = 10;
+
+fn overlaps([x, y, w, h]: Rect, [ox, oy, ow, oh]: Rect) -> bool {
+    x < ox + ow && ox < x + w && y < oy + oh && oy < y + h
+}
+
+/// Each type's icon in a disc of sky set into the middle hill, just under its top. All four or none: every disc keeps
+/// 12 DIPs to either side clear of what the header shows on the band (`taken`, text as wide as it is drawn, and
+/// buttons).
+pub fn stations(w: i32, taken: &[Rect]) -> Vec<Deco> {
+    let mut discs: Vec<Rect> = Vec::new();
+    for (v, _) in STATIONS {
+        let (x, y) = ((w as f32 - v).round() as i32, (HERO_H as f32 - hill(2, v) + 2.0).round() as i32);
+        let at = [x - STATION_R, y - STATION_R, 2 * STATION_R, 2 * STATION_R];
+        let air = [at[0] - 12, at[1] - 2, at[2] + 24, at[3] + 4];
+        if taken.iter().any(|t| overlaps(air, *t)) || discs.iter().any(|d| overlaps([at[0] - 2, at[1], at[2] + 4, at[3]], *d)) {
+            return Vec::new();
+        }
+        discs.push(at);
+    }
+    let disc = |at| Deco::Fill { at, radius: STATION_R, fill: Role::Band, border: Role::None };
+    discs.into_iter().zip(STATIONS).flat_map(|(at, (_, kind))| [disc(at), Deco::Glyph { at, ch: kind_glyph(kind), size: 12, ink: Role::BandMark }]).collect()
 }
 
 const LAYER_RADIUS: i32 = 8;
@@ -1827,7 +1882,7 @@ pub fn diff_head(v: &DiffView, l: &DiffLayout, fit: Fit) -> Surface {
         if *action == Action::RemoveThem {
             continue;
         }
-        let kind = if matches!(action, Action::Overwrite | Action::Restore) { Kind::Accent } else { Kind::Standard };
+        let kind = if matches!(action, Action::Overwrite | Action::Restore) { Kind::BandAccent } else { Kind::Standard };
         let b = btn(id::DIFF_ACTION + k as i32, action.label(), kind, action_glyph(*action));
         let bw = o.button_width(&b.text, b.glyph);
         if right - bw < 56 + 120 {
@@ -1848,17 +1903,23 @@ pub fn diff_head(v: &DiffView, l: &DiffLayout, fit: Fit) -> Surface {
         (8, 10, [56, 44, (w - 80).max(0), 16])
     };
     o.item(id::BACK, [12, row, 32, 32], "Back", Look::Button { kind: Kind::Icon, glyph: Some(glyph::BACK) }, true);
+    let mut taken = vec![[12, row, 32, 32]];
     for (b, x) in choices {
-        o.button(b, x, row, 32);
+        let bw = o.button(b, x, row, 32);
+        taken.push([x, row, bw, 32]);
     }
     let repo = format!("{}: {} [{}]", v.source.kind.heading(), printable(&v.source.label()), printable(&v.source.id));
     let skill = printable(&v.skill).into_owned();
     let repo_w = (o.width(&repo, Font::Title) + 2).min(room / 2);
-    o.text([56, top, repo_w, 28], repo, Font::Title, Role::Text2, ONE_LINE);
-    o.glyph([56 + repo_w + 8, top, 12, 28], glyph::CHEVRON_RIGHT, 12, Role::Text2);
+    o.text([56, top, repo_w, 28], repo, Font::Title, Role::BandCaption, ONE_LINE);
+    o.glyph([56 + repo_w + 8, top, 12, 28], glyph::CHEVRON_RIGHT, 12, Role::BandCaption);
     let sx = 56 + repo_w + 28;
-    o.label(id::TITLE, [sx, top, (right - 8 - sx).max(0), 28], skill, Font::Title, Role::Text);
-    o.label(id::SUB, sub_at, sub, Font::Caption, Role::Text2);
+    let title_w = (right - 8 - sx).max(0);
+    taken.push([56, top, sx + o.width(&skill, Font::Title).min(title_w) - 56, 28]);
+    taken.push([sub_at[0], sub_at[1], o.width(&sub, Font::Caption).min(sub_at[2]), sub_at[3]]);
+    o.s.decos.extend(stations(w, &taken));
+    o.label(id::TITLE, [sx, top, title_w, 28], skill, Font::Title, Role::BandText);
+    o.label(id::SUB, sub_at, sub, Font::Caption, Role::BandCaption);
     let files = v.files();
     if !files.is_empty() {
         let count = match (v.preview, files.len()) {
@@ -2460,15 +2521,16 @@ pub(super) mod tests {
             let diff = diff_backdrop(&diff_layout(w, 480, NAV_W), w, 480);
             for (view, decos) in [("main", &main), ("diff", &diff)] {
                 let find = |wanted: &Deco| decos.iter().position(|d| d == wanted);
-                let shade = find(&Deco::Gradient { at: [0, 0, w, HERO_H], from: Role::Band, to: Role::BandEnd });
+                let paper = find(&Deco::Fill { at: [0, 0, w, HERO_H], radius: 0, fill: Role::Band, border: Role::None });
+                let print = find(&Deco::BandPrint { at: [0, 0, w, HERO_H] });
                 let line = find(&Deco::Fill { at: [0, HERO_H - 1, w, 1], radius: 0, fill: Role::BandEdge, border: Role::None });
                 let layer = decos.iter().position(|d| matches!(d, Deco::Fill { fill: Role::Layer, .. }));
-                let (Some(layer), Some(shade), Some(line)) = (layer, shade, line) else { panic!("{view} at {w}: no band in {decos:?}") };
-                assert!(layer < shade && shade < line, "{view} at {w}: the layer, then the band, then its line: {decos:?}");
+                let (Some(layer), Some(paper), Some(print), Some(line)) = (layer, paper, print, line) else { panic!("{view} at {w}: no band in {decos:?}") };
+                assert!(layer < paper && paper < print && print < line, "{view} at {w}: the layer, paper, print and line: {decos:?}");
                 assert_eq!(decos.iter().filter(|d| matches!(d, Deco::Fill { fill: Role::BandEdge, .. })).count(), 1, "{view} at {w}");
                 for (k, d) in decos.iter().enumerate() {
                     let Deco::Fill { at, radius, border, .. } = d else { continue };
-                    if k < shade && (*border != Role::None || *radius > 0) {
+                    if k < paper && (*border != Role::None || *radius > 0) {
                         assert!(at[1] + radius < HERO_H - 1, "{view} at {w}: the band hides the top edge and corners of {d:?}");
                     }
                     if k > line {
@@ -2498,6 +2560,7 @@ pub(super) mod tests {
             let s = hero(&h, true, w, &fit);
             in_the_band(&s, w, "the hero");
             let (title, sub, sync) = (item(&s, id::HERO_TITLE), item(&s, id::HERO_SUB), item(&s, id::SYNC));
+            assert_eq!(sync.look, Look::Button { kind: Kind::BandAccent, glyph: Some(glyph::SYNC) });
             assert_eq!([title.at[1], sub.at[1], sub.at[1] + sub.at[3], sync.at[1]], [14, 42, 58, 20], "at {w}");
             assert!(centred(title.at[1], sub.at[1] + sub.at[3]) && centred(sync.at[1], sync.at[1] + sync.at[3]), "at {w}");
             let mark = [24, 16, 40, 40];
@@ -2525,9 +2588,99 @@ pub(super) mod tests {
                 }
                 for d in &s.decos {
                     let [_, y, _, dh] = deco_at(d);
-                    assert!(y == title.at[1] && dh == title.at[3] || y >= DIFF_TOP, "{what} at {w}: {d:?} is beside the title or in a card's header");
+                    let station = matches!(d, Deco::Fill { fill: Role::Band, .. } | Deco::Glyph { ink: Role::BandMark, .. });
+                    assert!(
+                        station || y == title.at[1] && dh == title.at[3] || y >= DIFF_TOP,
+                        "{what} at {w}: {d:?} is beside the title or in a card's header"
+                    );
                 }
             }
+        }
+    }
+
+    /// The type icons on the band, each with the disc under it, from left to right.
+    fn stations_of(s: &Surface) -> Vec<(Rect, char)> {
+        let mut out = Vec::new();
+        for (k, d) in s.decos.iter().enumerate() {
+            if let Deco::Glyph { at, ch, size: 12, ink: Role::BandMark } = d {
+                let disc = Deco::Fill { at: *at, radius: STATION_R, fill: Role::Band, border: Role::None };
+                assert_eq!(k.checked_sub(1).map(|p| &s.decos[p]), Some(&disc), "each icon sits on its disc");
+                out.push((*at, *ch));
+            }
+        }
+        assert_eq!(s.decos.iter().filter(|d| matches!(d, Deco::Fill { fill: Role::Band, .. })).count(), out.len(), "a disc without its icon");
+        out
+    }
+
+    /// Each disc keeps 12 DIPs to either side clear of these.
+    fn clear_of(got: &[(Rect, char)], taken: &[Rect], what: &str) {
+        for ([x, y, dw, dh], _) in got {
+            for t in taken {
+                assert!(!overlaps([x - 12, *y, dw + 24, *dh], *t), "{what}: the disc at {:?} is too close to {t:?}", [x, y, dw, dh]);
+            }
+        }
+    }
+
+    #[test]
+    fn the_type_icons_ride_the_middle_hill_clear_of_the_heading_and_the_button() {
+        let order = [SourceKind::Skills, SourceKind::Agents, SourceKind::Instructions, SourceKind::Plugins].map(kind_glyph);
+        let h = Hero {
+            tone: Tone::Ok,
+            glyph: glyph::OK,
+            title: "All skills are up to date".to_string(),
+            sub: "12 skills from 2 sources · checked 2 minutes ago · next check in 1 hour".to_string(),
+        };
+        for w in [860, 980, 1400] {
+            let s = hero(&h, true, w, &caption_fit);
+            let got = stations_of(&s);
+            assert_eq!(got.iter().map(|(_, ch)| *ch).collect::<Vec<_>>(), order, "at {w}: the four types, in the list's order");
+            let mut left = 0;
+            for ([x, y, dw, dh], _) in &got {
+                let (cx, cy) = (x + dw / 2, y + dh / 2);
+                let top = HERO_H as f32 - hill(2, (w - cx) as f32);
+                assert!((cy as f32 - top - 2.0).abs() <= 1.0, "at {w}: the disc at {cx},{cy} is not just under the middle hill's top, {top}");
+                assert!(*x > left, "at {w}: the discs are apart, from left to right");
+                left = x + dw;
+            }
+            let (title, sub) = (item(&s, id::HERO_TITLE).at, item(&s, id::HERO_SUB).at);
+            let text =
+                [[title[0], title[1], caption_fit(&h.title, Font::Title, 0).0, title[3]], [sub[0], sub[1], caption_fit(&h.sub, Font::Caption, 0).0, sub[3]]];
+            clear_of(&got, &[text[0], text[1], item(&s, id::SYNC).at], &format!("at {w}"));
+        }
+    }
+
+    #[test]
+    fn a_heading_that_needs_the_room_hides_every_type_icon_never_some() {
+        for w in [640, 860, 1400] {
+            let mut seen = [false; 2];
+            for n in 0..=180 {
+                let h = Hero { tone: Tone::Warn, glyph: glyph::WARN, title: "x".repeat(n), sub: String::new() };
+                let got = stations_of(&hero(&h, true, w, &fit)).len();
+                assert!(got == 0 || got == 4, "at {w}, a title of {n}: {got} icons");
+                seen[usize::from(got == 4)] = true;
+            }
+            assert_eq!(seen, [true; 2], "at {w}: a short title shows the icons and a long one hides them");
+        }
+    }
+
+    #[test]
+    fn a_preview_shows_the_type_icons_and_the_choices_of_show_changes_hide_them() {
+        let choices = diff_of("a\n", "b\n");
+        let preview = DiffView { preview: true, ..choices.clone() };
+        // From the window's first width up; narrower, the preview's long sentence can need the hill's room.
+        for w in [980, 1200, 1400] {
+            let l = diff_layout(w, 600, NAV_W);
+            let s = diff_head(&preview, &l, &caption_fit);
+            let got = stations_of(&s);
+            assert_eq!(got.len(), 4, "at {w}: a preview offers no choices, so the hill has room");
+            let (title, sub) = (item(&s, id::TITLE).at, item(&s, id::SUB).at);
+            let mut taken = vec![
+                [56, title[1], title[0] + fit(&choices.skill, Font::Title, 0).0 - 56, title[3]],
+                [sub[0], sub[1], caption_fit(&diff_sub(&preview), Font::Caption, 0).0, sub[3]],
+            ];
+            taken.extend(s.items.iter().filter(|i| matches!(i.look, Look::Button { .. })).map(|i| i.at));
+            clear_of(&got, &taken, &format!("the preview at {w}"));
+            assert!(stations_of(&diff_head(&choices, &l, &caption_fit)).is_empty(), "at {w}: the choices cross the hill");
         }
     }
 
@@ -2590,10 +2743,11 @@ pub(super) mod tests {
         let v = four_types();
         assert_eq!(nav_name(&v), "o/a, main, skills. Skills 3, Agents 1, Instructions: Sync off, Plugins 1 (needs approval). Up to date");
         let page = Page::Repo("o/a".to_string());
-        for w in [MIN_LIST_W, NAV_W] {
+        for w in [NAV_W, 400] {
             let s = nav(std::slice::from_ref(&v), &page, w, 600, &fit);
             fits_in(&s, w);
             let entry = item(&s, id::NAV_REPO);
+            assert_eq!(entry.at[3], 50, "a source uses only two text lines");
             assert_eq!(entry.text, nav_name(&v), "the window text spells out what the icons show");
             let Look::Source { selected: true, parts, .. } = &entry.look else { panic!("{:?}", entry.look) };
             let icons: Vec<(char, Rect)> = parts
@@ -2607,13 +2761,13 @@ pub(super) mod tests {
             let labels: Vec<&str> = parts
                 .iter()
                 .filter_map(|d| match d {
-                    Deco::Text { text, font: Font::Caption, at, .. } if at[1] >= 44 && at[2] < 60 => Some(text.as_str()),
+                    Deco::Text { text, font: Font::Caption, .. } if ["3", "1", "off"].contains(&text.as_str()) => Some(text.as_str()),
                     _ => None,
                 })
                 .collect();
             assert_eq!(labels, ["3", "1", "off", "1"]);
             assert_eq!(parts.iter().filter(|d| matches!(d, Deco::Glyph { ch: glyph::WARN, .. })).count(), 1, "the plugin to approve is marked");
-            // Nothing is cut or drawn over anything else: the icons go on to another line instead.
+            // Each badge and the status keep their own space on the second line.
             let [_, _, ew, eh] = entry.at;
             for (k, a) in parts.iter().map(deco_at).enumerate() {
                 assert!(a[0] >= 0 && a[1] >= 0 && a[0] + a[2] <= ew && a[1] + a[3] <= eh, "{a:?} is outside {ew}x{eh}");
@@ -2623,7 +2777,8 @@ pub(super) mod tests {
                 }
             }
             let lines: HashSet<i32> = icons.iter().map(|i| i.1[1]).collect();
-            assert_eq!(lines.len() > 1, w == MIN_LIST_W, "the icons wrap only when the list is narrow ({w}): {icons:?}");
+            assert_eq!(lines.len(), 1, "the icons never wrap ({w}): {icons:?}");
+            assert!(!parts.iter().any(|d| matches!(d, Deco::Text { text, .. } if text.contains("main") || text.contains("skills"))));
             assert!(item(&s, id::NAV_ADD).at[1] > entry.at[1] + entry.at[3], "rows never overlap");
         }
 
@@ -2640,6 +2795,38 @@ pub(super) mod tests {
         assert!(!parts.iter().any(|d| matches!(d, Deco::Glyph { .. })), "no icons before the first listing");
         assert!(parts.iter().any(|d| matches!(d, Deco::Text { text, .. } if text == "Not checked yet")));
         assert_eq!(item(&s, id::NAV_ADD).text, "Add source");
+    }
+
+    #[test]
+    fn narrow_source_entries_keep_two_lines_and_expose_overflow_in_the_full_label() {
+        for wide_counts in [false, true] {
+            let mut v = four_types();
+            v.repo = "owner/a-very-long-repository-name".into();
+            v.status = "Some items need your attention".into();
+            if wide_counts {
+                for k in &mut v.kinds {
+                    k.found = Some(u32::MAX);
+                }
+            }
+            for w in MIN_LIST_W..=400 {
+                let s = nav(std::slice::from_ref(&v), &Page::Activity, w, 600, &fit);
+                let entry = item(&s, id::NAV_REPO);
+                assert_eq!(entry.at[3], 50);
+                assert_eq!(entry.text, nav_name(&v), "no information is lost from the tooltip or accessible name");
+                let Look::Source { parts, .. } = &entry.look else { panic!() };
+                assert!(parts.iter().any(|d| matches!(d, Deco::Text { text, .. } if text == &v.status)));
+                if w == MIN_LIST_W {
+                    assert!(parts.iter().any(|d| matches!(d, Deco::Text { text, .. } if text.starts_with('+'))), "hidden types are signposted");
+                    assert!(parts.iter().any(|d| matches!(d, Deco::Glyph { ch: glyph::WARN, .. })), "overflow never hides a warning");
+                }
+                for (i, a) in parts.iter().map(deco_at).enumerate() {
+                    assert!(a[0] >= 0 && a[1] >= 0 && a[2] > 0 && a[0] + a[2] <= entry.at[2] && a[1] + a[3] <= entry.at[3], "{a:?} at {w}");
+                    for b in parts.iter().skip(i + 1).map(deco_at) {
+                        assert!(a[0] + a[2] <= b[0] || b[0] + b[2] <= a[0] || a[1] + a[3] <= b[1] || b[1] + b[3] <= a[1], "{a:?} overlaps {b:?} at {w}");
+                    }
+                }
+            }
+        }
     }
 
     /// Every text a surface shows, in its controls and drawn on it.
@@ -2786,12 +2973,25 @@ pub(super) mod tests {
                 assert!(cards.contains(&card), "at {w}: no card {card:?} under the header in {cards:?}");
                 let drawn = s.decos.iter().filter_map(|d| match d {
                     Deco::Glyph { at, .. } | Deco::Text { at, .. } => Some(at[1]),
-                    Deco::Fill { .. } | Deco::Gradient { .. } => None,
+                    Deco::Fill { .. } | Deco::BandPrint { .. } => None,
                 });
                 let first = s.items.iter().map(|i| i.at[1]).chain(drawn).filter(|&t| t > y && t < card[1] + card[3]).min();
                 assert_eq!(first, Some(y + if w == 900 { 40 } else { 48 }), "at {w}: the card's contents start 8 below its top");
             }
         }
+    }
+
+    #[test]
+    fn saved_source_starts_with_its_contents_visible_and_what_to_sync_closed() {
+        let mut v = four_types();
+        v.notes.push(crate::inventory::SummaryNote { kind: None, path: "AGENTS.md".into(), reason: "it is never synced".into() });
+        let s = page_with(&v, &source_cfg("o/a"), &HashSet::new(), &HashMap::new(), 720);
+        assert!(matches!(item(&s, id::SECTION_WHAT).look, Look::Section { open: false, .. }));
+        assert!(!s.items.iter().any(|i| i.id == id::SOURCE_TYPE));
+        for n in [id::SECTION_KIND, id::SECTION_KIND + 1, id::SECTION_KIND + 2, id::SECTION_KIND + 3, id::SECTION_NEVER] {
+            assert!(matches!(item(&s, n).look, Look::Section { open: true, .. }));
+        }
+        assert!(s.items.iter().any(|i| i.id == id::SKILL));
     }
 
     #[test]
@@ -2810,17 +3010,17 @@ pub(super) mod tests {
                 (i.text.clone(), warn)
             })
         };
-        let plugins_open = heads(HashMap::from([(SectionKey::Kind(SourceKind::Plugins), true)]));
+        let plugins_open = heads(HashMap::from([(SectionKey::Kind(SourceKind::Skills), false), (SectionKey::Kind(SourceKind::Instructions), false)]));
         let expected = [
-            ("What to sync, expanded. Skills on; Agents on; Instructions on; Plugins on", false),
+            ("What to sync, collapsed. Skills on; Agents on; Instructions on; Plugins on", false),
             ("Skills (3), collapsed. Needs your attention.", true),
-            ("Agents (1), collapsed.", false),
+            ("Agents (1), expanded.", false),
             ("Instructions (2 · Sync off), collapsed.", false),
             ("Plugins (1), expanded.", false),
-            ("Never synced (1), collapsed.", false),
+            ("Never synced (1), expanded.", false),
         ];
         assert_eq!(plugins_open, expected.map(|(t, w)| (t.to_string(), w)), "only a closed type that is on and needs you warns");
-        let skills_open = heads(HashMap::from([(SectionKey::Kind(SourceKind::Skills), true)]));
+        let skills_open = heads(HashMap::from([(SectionKey::Kind(SourceKind::Plugins), false)]));
         assert_eq!((skills_open[1].0.as_str(), skills_open[1].1), ("Skills (3), expanded.", false));
         assert_eq!((skills_open[4].0.as_str(), skills_open[4].1), ("Plugins (1), collapsed. Needs your attention.", true));
     }
@@ -3508,7 +3708,7 @@ pub(super) mod tests {
 
     fn deco_at(d: &Deco) -> Rect {
         match d {
-            Deco::Fill { at, .. } | Deco::Gradient { at, .. } | Deco::Glyph { at, .. } | Deco::Text { at, .. } => *at,
+            Deco::Fill { at, .. } | Deco::BandPrint { at } | Deco::Glyph { at, .. } | Deco::Text { at, .. } => *at,
         }
     }
 
@@ -3520,7 +3720,8 @@ pub(super) mod tests {
     fn the_diff_header_offers_the_skills_choices_with_the_github_version_accented() {
         let v = diff_of("a\n", "b\n");
         let s = diff_head(&v, &diff_layout(900, 600, NAV_W), &fit);
-        assert_eq!(item(&s, id::DIFF_ACTION).look, Look::Button { kind: Kind::Accent, glyph: None });
+        assert_eq!(item(&s, id::DIFF_ACTION).look, Look::Button { kind: Kind::BandAccent, glyph: None });
+        assert!(matches!(item(&s, id::DIFF_ACTION + 1).look, Look::Button { kind: Kind::Standard, .. }));
         assert_eq!(item(&s, id::DIFF_ACTION + 1).text, "Keep my version");
         assert!(item(&s, id::DIFF_ACTION).at[0] > item(&s, id::DIFF_ACTION + 1).at[0], "the accented choice is last");
         assert_eq!(hit(id::DIFF_ACTION + 1), Hit::DiffAction(1));

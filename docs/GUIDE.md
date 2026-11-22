@@ -406,8 +406,7 @@ update, the tray starts its new version with `--restarted` (or `--restarted-open
 
 ## The window
 
-A softly tinted band runs across the top of the window, under the title bar, with a thin line along its bottom (in
-high contrast it takes the window colour and a text-coloured line). The same band heads **Show changes** and
+A band runs across the top of the window, under the title bar: a sky in your Windows accent colour with layered hills on its right, in lighter and darker shades of the same colour, and a thin line along its bottom. It follows Windows' light or dark mode and your accent colour, and changes with them while the window is open; the app's buttons, switches and links take the accent colour too. Every shade is chosen so that the words on the band stay easy to read and each hill stands apart from the one behind it, whatever the accent. When the heading and the buttons leave room, the icons of the four types (skills, agents, instructions and plugins) sit in small circles of sky along the middle hill; they are decoration and do nothing when clicked. On a narrow window a long line under the heading can need their room, and then all four step aside. In high contrast the band takes the window colour and a text-coloured line, without the hills or the icons. The same band heads **Show changes** and
 **Preview**.
 
 The band says how everything is in one sentence ("All skills are up to date", "1 skill needs your
@@ -419,11 +418,7 @@ came of it ("Checked: skills were updated", "Checked: nothing new on GitHub"), n
 source that also syncs agents still says "skills were updated" when only its skills changed. **Sync now** checks every
 enabled source at once. Items you edited or deleted are never replaced without asking. Hover over it to read the same.
 
-Down the left are your sources, and **Add source**, **Activity** and **Settings**. Each source takes a few lines: the
-repository; the branch ("default branch" until a check names it) and the folder ("whole repository" when there is
-none); an icon for each type it holds, with its count or "off", and a warning mark when that type needs you; and its
-state. A screen reader hears the types spelled out, for example "Skills 3, Instructions: Sync off", and resting the
-mouse on a source shows the same whole text. Drag the splitter
+Down the left are your sources, and **Add source**, **Activity** and **Settings**. Each source takes two lines: the repository beside its status indicator, then type icons with their counts or "off", warning marks and the status text. The branch and folder stay in the source's details and hover text. When the list is too narrow for every type, "+2", for example, means two more types; a warning beside it means one of those needs you. A screen reader hears every type spelled out, for example "Skills 3, Instructions: Sync off", and resting the mouse on a source shows the full repository, branch, folder, type summary and status, even when the list cuts text short. Drag the splitter
 between the list and the page to see more of a long name. Or Tab to **Resize list** and use Left or Right to move it
 8 pixels at 100% display scale (hold Shift for 32); Home and End go to the narrowest and widest list. The list keeps at least 160 pixels and
 the page at least 360 when the window is wide enough. The window remembers the width you choose on this PC (the third
@@ -435,6 +430,8 @@ number in `window.txt`). Nothing widens or narrows when you move the mouse over 
   - **Check every** sets how often it is checked: **Default** (the interval in Settings), a common interval, or
     **Custom…**.
   - **Keep in sync** off pauses it: it is not checked, and nothing it installed is changed.
+  - On a saved source, **What to sync** starts collapsed and the content sections (including **Never synced**, when
+    present) start expanded. The app remembers sections you open or close for that source until you quit.
   - **What to sync** has a choice per type, **Default (On)** or **Default (Off)** to follow Settings, or **On** or
     **Off** for this source only; **Repository-specific skills and agents** (**Default**, **Include** or **Skip**); and
     **Folder rules…**, which asks for folder names this source should also skip and names it should never skip. See

@@ -162,10 +162,6 @@ fn section_choices(source: &str) -> HashMap<page::SectionKey, bool> {
     SECTION_STATE.with(|state| state.borrow().get(source).cloned().unwrap_or_default())
 }
 
-fn section_default(section: page::SectionKey) -> bool {
-    matches!(section, page::SectionKey::WhatToSync)
-}
-
 fn section_key_from_control(id: i32) -> Option<page::SectionKey> {
     if id == page::id::SECTION_WHAT {
         return Some(page::SectionKey::WhatToSync);
@@ -181,16 +177,16 @@ fn section_key_from_control(id: i32) -> Option<page::SectionKey> {
 
 fn toggle_section(hwnd: HWND, section: page::SectionKey) {
     let source = with_state(|st| match (&st.page, st.snap.as_ref()) {
-        (Some(Page::Repo(id)), _) => Some(id.clone()),
-        (Some(Page::Add), Some(snap)) => snap.draft.as_ref().map(|draft| draft_section_key(draft.input.ticket)),
+        (Some(Page::Repo(id)), _) => Some((id.clone(), false)),
+        (Some(Page::Add), Some(snap)) => snap.draft.as_ref().map(|draft| (draft_section_key(draft.input.ticket), true)),
         _ => None,
     })
     .flatten();
-    let Some(source) = source else { return };
+    let Some((source, preview)) = source else { return };
     SECTION_STATE.with(|state| {
         let mut state = state.borrow_mut();
         let choices = state.entry(source).or_default();
-        let current = choices.get(&section).copied().unwrap_or_else(|| section_default(section));
+        let current = section.is_open(choices, preview);
         choices.insert(section, !current);
     });
     render(hwnd);
@@ -1658,7 +1654,7 @@ fn on_activate(hwnd: HWND, active: bool) -> bool {
     false
 }
 
-/// Windows switched between light and dark, or to or from high contrast.
+/// Windows switched between light and dark, to or from high contrast, or to another accent colour.
 fn on_theme(hwnd: HWND) {
     if !theme::refresh() {
         return;

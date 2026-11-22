@@ -121,10 +121,24 @@ const NEAR: i32 = 1200;
 pub enum Kind {
     Standard,
     Accent,
+    /// The accent button on the header band: its focus ring is drawn in its lettering, which reads on its fill.
+    BandAccent,
     /// No fill until hovered, and only an icon.
     Icon,
     /// No fill until hovered, in the accent text colour: a quiet action inside content.
     Link,
+}
+
+impl Kind {
+    /// Fill, border and lettering before the hover or press tint.
+    pub(super) fn colors(self, enabled: bool) -> (Role, Role, Role) {
+        match self {
+            Self::Accent | Self::BandAccent if enabled => (Role::Accent, Role::None, Role::OnAccent),
+            Self::Standard | Self::Accent | Self::BandAccent => (Role::Ctl, Role::CtlBorder, if enabled { Role::Text } else { Role::Text3 }),
+            Self::Icon => (Role::None, Role::None, if enabled { Role::Text } else { Role::Text3 }),
+            Self::Link => (Role::None, Role::None, if enabled { Role::AccentText } else { Role::Text3 }),
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -209,12 +223,11 @@ pub struct Item {
     pub enabled: bool,
 }
 
-/// What a panel draws itself, behind its controls. A gradient is shaded from `from` at its left edge to `to` at its
-/// right.
+/// What a panel draws itself, behind its controls.
 #[derive(Clone, PartialEq, Debug)]
 pub enum Deco {
     Fill { at: Rect, radius: i32, fill: Role, border: Role },
-    Gradient { at: Rect, from: Role, to: Role },
+    BandPrint { at: Rect },
     Glyph { at: Rect, ch: char, size: u8, ink: Role },
     Text { at: Rect, text: String, font: Font, ink: Role, flags: u32 },
 }
@@ -496,6 +509,23 @@ struct RowParts {
     clipped_pill: bool,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum RowStatus {
+    Check,
+    Pill,
+}
+
+fn row_status(tag: &str, mark: Option<char>) -> RowStatus {
+    if tag == crate::board::UP_TO_DATE_TAG && mark == Some(glyph::OK) { RowStatus::Check } else { RowStatus::Pill }
+}
+
+fn row_status_width(tag: &str, mark: Option<char>, dpi: u32) -> i32 {
+    match row_status(tag, mark) {
+        RowStatus::Check => 16,
+        RowStatus::Pill => paint::pill_width(tag, mark, dpi),
+    }
+}
+
 fn row_parts([x, y, w, h]: Rect, name_w: i32, pill_w: i32, commands: &[RowCmd]) -> RowParts {
     const SLOT: i32 = 32;
     const GAP: i32 = 4;
@@ -561,7 +591,7 @@ impl Ctl {
         Some(self.layout.get_or_init(|| {
             let text = text_of(hwnd);
             let RowText { name, tag, .. } = RowText::parse(&text);
-            row_parts(self.at, paint::measure(name, Font::Body, 0, dpi).0, if tag.is_empty() { 0 } else { paint::pill_width(tag, *glyph, dpi) }, commands)
+            row_parts(self.at, paint::measure(name, Font::Body, 0, dpi).0, if tag.is_empty() { 0 } else { row_status_width(tag, *glyph, dpi) }, commands)
         }))
     }
 
@@ -613,22 +643,18 @@ fn draw_ctl(hwnd: HWND) {
     match &c.look {
         Look::Text { font, ink, flags } => paint::text(c.at, &text, *font, *ink, *flags),
         Look::Button { kind, glyph } => {
-            let (fill, border, ink) = match kind {
-                Kind::Accent if enabled => (Role::Accent, Role::None, Role::OnAccent),
-                Kind::Standard | Kind::Accent => (Role::Ctl, Role::CtlBorder, if enabled { Role::Text } else { Role::Text3 }),
-                Kind::Icon => (Role::None, Role::None, if enabled { Role::Text } else { Role::Text3 }),
-                Kind::Link => (Role::None, Role::None, if enabled { Role::AccentText } else { Role::Text3 }),
-            };
+            let primary = matches!(kind, Kind::Accent | Kind::BandAccent);
+            let (fill, border, ink) = kind.colors(enabled);
             paint::fill(c.at, 4, fill, border);
-            if matches!(kind, Kind::Standard | Kind::Accent) && !theme::contrast() {
+            if (*kind == Kind::Standard || primary) && !theme::contrast() {
                 // The darker bottom edge Windows 11 buttons have.
-                let bottom = if *kind == Kind::Accent && enabled { 0x40000000 } else { theme::color(Role::CtlBottom) };
+                let bottom = if primary && enabled { 0x40000000 } else { theme::color(Role::CtlBottom) };
                 paint::fill_argb([x + 3, y + h - 1, w - 6, 1], 0, bottom, 0);
             }
             if enabled && tint != Role::None {
                 paint::fill(c.at, 4, tint, Role::None);
             }
-            let ink = if c.down && c.hover && !matches!(kind, Kind::Accent | Kind::Link) { Role::Text2 } else { ink };
+            let ink = if c.down && c.hover && !primary && *kind != Kind::Link { Role::Text2 } else { ink };
             let size = if *kind == Kind::Icon {
                 16
             } else if *kind == Kind::Link {
@@ -661,7 +687,7 @@ fn draw_ctl(hwnd: HWND) {
             for part in parts {
                 match part {
                     Deco::Fill { at, radius, fill, border } => paint::fill(shift(*at), *radius, *fill, *border),
-                    Deco::Gradient { at, from, to } => paint::gradient(shift(*at), *from, *to),
+                    Deco::BandPrint { at } => paint::band_print(shift(*at)),
                     Deco::Glyph { at, ch, size, ink } => paint::glyph(shift(*at), *ch, *size, *ink),
                     Deco::Text { at, text, font, ink, flags } => paint::text(shift(*at), text, *font, *ink, *flags),
                 }
@@ -715,10 +741,12 @@ fn draw_ctl(hwnd: HWND) {
             let parts = c.row(hwnd, dpi).expect("row");
             paint::glyph(parts.mark, mark, 14, Role::Text2);
             let pill = parts.pill;
-            if parts.clipped_pill && pill[2] > 4 {
-                paint::line(pill, tag, Font::Caption, Role::Text2);
-            } else if !parts.clipped_pill && pill[2] > 0 {
-                paint::pill(pill[0], pill[1], tag, *tone, *glyph, dpi);
+            match row_status(tag, *glyph) {
+                RowStatus::Check if pill[2] >= 16 => paint::dot([pill[0], y + (h - 16) / 2, 16, 16], Tone::Ok),
+                RowStatus::Check => {}
+                RowStatus::Pill if parts.clipped_pill && pill[2] > 4 => paint::line(pill, tag, Font::Caption, Role::Text2),
+                RowStatus::Pill if !parts.clipped_pill && pill[2] > 0 => paint::pill(pill[0], pill[1], tag, *tone, *glyph, dpi),
+                RowStatus::Pill => {}
             }
             let focus = unsafe { GetFocus() } == hwnd;
             if c.hover || focus {
@@ -796,8 +824,9 @@ fn draw_ctl(hwnd: HWND) {
     }
     if !matches!(c.look, Look::Splitter) && focus_shown(hwnd) {
         let radius = if matches!(c.look, Look::Toggle { .. } | Look::Row { .. }) { 4 } else { 5 };
-        paint::fill(c.at, radius, Role::None, Role::Text);
-        paint::fill([x + 1, y + 1, w - 2, h - 2], radius - 1, Role::None, Role::Text);
+        let ink = if enabled && matches!(c.look, Look::Button { kind: Kind::BandAccent, .. }) { Role::OnAccent } else { Role::Text };
+        paint::fill(c.at, radius, Role::None, ink);
+        paint::fill([x + 1, y + 1, w - 2, h - 2], radius - 1, Role::None, ink);
     }
 }
 
@@ -1398,13 +1427,13 @@ fn draw_panel(hwnd: HWND) {
 /// Draws decorations into the canvas at its current origin, skipping those outside what is being painted.
 pub fn draw(decos: &[Deco]) {
     for deco in decos {
-        let (Deco::Fill { at, .. } | Deco::Gradient { at, .. } | Deco::Glyph { at, .. } | Deco::Text { at, .. }) = deco;
+        let (Deco::Fill { at, .. } | Deco::BandPrint { at } | Deco::Glyph { at, .. } | Deco::Text { at, .. }) = deco;
         if !paint::visible(*at) {
             continue;
         }
         match deco {
             Deco::Fill { at, radius, fill, border } => paint::fill(*at, *radius, *fill, *border),
-            Deco::Gradient { at, from, to } => paint::gradient(*at, *from, *to),
+            Deco::BandPrint { at } => paint::band_print(*at),
             Deco::Glyph { at, ch, size, ink } => paint::glyph(*at, *ch, *size, *ink),
             Deco::Text { at, text, font, ink, flags } => paint::text(*at, text, *font, *ink, *flags),
         }
@@ -1736,6 +1765,20 @@ mod tests {
     }
 
     #[test]
+    fn up_to_date_rows_use_the_source_list_checkmark() {
+        let dpi = 96;
+        let check_width = row_status_width("Up to date", Some(glyph::OK), dpi);
+        assert_eq!(row_status("Up to date", Some(glyph::OK)), RowStatus::Check);
+        assert_eq!(row_status("Installed", Some(glyph::OK)), RowStatus::Pill);
+        assert_eq!(check_width, 16);
+
+        let at = [0, 0, 500, 42];
+        let parts = row_parts(at, paint::measure("alpha", Font::Body, 0, dpi).0, check_width, &[RowCmd::Open, RowCmd::Preview]);
+        assert_eq!(parts.pill[2], 16);
+        assert!(client_rect(at, parts.icons.last().unwrap().1, dpi).right <= client_rect(at, parts.pill, dpi).left);
+    }
+
+    #[test]
     fn row_icons_follow_the_measured_name_and_overflow_before_the_badge() {
         let commands = [RowCmd::Preview, RowCmd::Open, RowCmd::CopyPath, RowCmd::CopyLink, RowCmd::OnGitHub];
         for dpi in [96, 120, 144, 192] {
@@ -2053,7 +2096,7 @@ mod tests {
         let parts = row_parts(
             at,
             paint::measure("alpha", Font::Body, 0, dpi).0,
-            paint::pill_width("Up to date", Some(glyph::OK), dpi),
+            row_status_width("Up to date", Some(glyph::OK), dpi),
             &[RowCmd::Open, RowCmd::Preview],
         );
         let [zx, zy, zw, zh] = parts.icons[0].1;
