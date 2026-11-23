@@ -714,42 +714,25 @@ everything they show.
   Rounded boxes are anti-aliased by hand (GDI cannot); text is drawn by GDI with ClearType. Positions are in DIPs and
   become pixels at the window's DPI. A control has no background of its own: it asks its parent to draw what is under
   it into the same bitmap (`WM_PAINTBG`), so its corners blend with the card beneath. In the header, `Deco::BandPrint`
-  draws the band's picture across its whole width: a sky fading a little toward its low colour, behind five layered
-  hills, each with an anti-aliased top. The hills keep their shape at the band's right edge whatever the width and
-  sink toward the left, leaving the sky clear for the heading. Each pixel is worked out once, measured from the band's
-  edges rather than the bitmap's, so a control that repaints by itself sees the same hills. `paint::hill` gives a
-  hill's height at any distance from the right edge, so a layout can place things on it. Text in a clear ink is not
-  drawn.
+  draws five overlapping mountain layers against a flat sky. Each ridge has its own peaks and slopes. The picture
+  is positioned relative to the band, not to the control being repainted, so the ridges line up behind the controls.
+  Text in a clear ink is not drawn.
 - **`theme.rs`** holds the Windows 11 light and dark colours and the high contrast colours. It follows the app mode the
   user chose in Windows (`AppsUseLightTheme`) and the accent colour, as the seven shades Windows derives from it
   (`Explorer\Accent\AccentPalette`). `TSS_THEME=dark` or `light` and `TSS_ACCENT` (seven `RRGGBB` shades separated by
   commas, lightest first) override them, for screenshots. The window reads both again whenever Windows says a setting
   or the theme changed, and repaints only when one did. The title bar and menus are asked to match through DWM and
   uxtheme, both loaded only when a window opens. The title bar keeps the window background (`Bg`).
-  Every colour that depends on the accent is worked out once per look (`palette`): accent buttons, switches and links
-  (`Accent`, `AccentText`), the band's sky (`Band`) and picture (`Print`), its title, caption and bottom line
-  (`BandText`, `BandCaption`, `BandEdge`), the type icons (`BandMark`), the band's status disc ring (`BandDotRing`),
-  the band's main button (`BandButton`, `BandButtonText`) and the check-dot (`DotOk`, `DotOkInk`, `DotOkEdge`). Each
-  starts from the shade that suits it and moves a step at a time only as far as it must: words 4.6:1 on every part of
-  the band, buttons 3:1 and links 4.5:1 on every page and under a hovered or selected row, the icons 7:1 on their
-  discs (so the sky itself leaves room for 7:1 in black or white), the sky and the bottom line apart from the page, the
-  farthest hill apart from every shade of the sky's fade, and each other hill apart from the one behind it. In light
-  mode the sky is a saturated mid-tone: the first shade along the accent's path (the lightest first) that is far
-  enough from white (`RICH`) and still meets the word, icon and page rules; the five hills then deepen in even
-  steps from the sky's low colour to the darkest shade that words still read on, and the title stays dark. Dark mode
-  keeps the same word, icon and page rules, but no longer holds the sky 3:1 from the status dots, since the ring does
-  that job. A soft disc cannot be 3:1 on both the pages and a mid-tone sky, so the band's status disc has a ring
-  (`BandDotRing`, drawn as the disc's border) that stays 3:1 from the sky and its fade, and the disc itself can be
-  soft. A pale or very dark accent can make a hill turn the other way to stay apart. The check-dot is a soft
-  mid-green disc (a muted sage in dark mode) with a thin edge: its check reads 3:1 on the disc, and the disc or its
-  edge reads 3:1 on the pages and under hovered or selected rows (`Tone::dot`, `dot_ink`, `dot_edge`; `paint::dot`
-  draws the edge and the ink). `Role::Ok` stays the ink for words that say "ok", not for the dot. **Sync now** and the
-  diff header's primary choice are accent buttons whose focus ring is drawn in their lettering (`Kind::BandAccent`),
-  which reads on the button wherever the band puts it. They use their own roles rather than `Accent`: a deep fill in
-  light mode and a pale fill in dark mode, lettering 4.5:1 on the fill, and the fill 3:1 from every layer of the band
-  at rest, hovered and pressed. Buttons on the pages still use `Accent` and `OnAccent`. In high contrast nothing is
-  worked out: buttons (the band's too) use Highlight and HighlightText, the ring is the band's colour so it does not
-  show, and the band is Window with a WindowText line, without the picture or the icons.
+  In the band, the sky is solid white in light mode and solid black in dark mode. The mountains take their shades
+  from the Windows accent. In dark mode, blue and other accents use brighter, more vivid shades.
+  The header text and controls use neutral colours. The status logo keeps the tray's colour and fill, not the accent.
+  In Windows high contrast the band uses Window with a WindowText line, without mountains or decorative type icons;
+  its primary buttons use Highlight and HighlightText.
+  On the pages, buttons, switches and links still use the accent colours (`Accent`, `AccentText`, `OnAccent`).
+  There the palette targets 3:1 for buttons and 4.5:1 for links, including on hovered or selected rows.
+  The check-dot is a soft mid-green disc (a muted sage in dark mode) with a thin edge: its check reads 3:1 on the
+  disc, and the disc or its edge reads 3:1 on the pages and under hovered or selected rows (`Tone::dot`, `dot_ink`,
+  `dot_edge`; `paint::dot` draws the edge and the ink). `Role::Ok` stays the ink for words that say "ok", not for the dot.
 - **`page.rs`** builds every page as a `Surface` from what the app knows. It calls no Windows function (text is
   measured through a `Fit` the window passes in), so every layout and sentence is tested without a screen.
 - A saved source and an unsaved location preview use the same source-page renderer. Preview settings remain editable,
@@ -763,10 +746,9 @@ everything they show.
   has something needing the user (an item needing attention or a plugin awaiting approval, as on its chip in the
   sources list) shows a warning after its title, and its section text adds "Needs your attention."
 - **`window.rs`** is the main window: the header band at the top, the repositories down the left, the page on the
-  right. The band is 72 DIPs high (`HERO_H` in `page.rs`) with its contents centred; it is drawn in the window's
-  background layer (`page::backdrop`, through the shared `page::band`), not by a control, and it heads the diff view
-  too (`page::diff_backdrop`), behind Back, the skill's name, the line under it and the choices, with the cards 12
-  DIPs below it.
+  right. The main view, **Show changes** and **Preview** share a 90-DIP band (`HERO_H` in `page.rs`), up from
+  72 DIPs without enlarging the controls. Both `page::backdrop` and `page::diff_backdrop` draw `page::band` in the
+  window's background layer, behind the header controls.
   "Show changes" turns the whole window into the differences of one skill until Back (or Esc); the worker reads them
   with `engine::diff`, which only reads, and `diff.rs` lines them up from this PC (`−`) to GitHub (`+`), so they read
   as what taking GitHub's version would do. Only upstream's files and the files the record says this repository put
@@ -796,6 +778,8 @@ everything they show.
   taskbar's DPI, one picture per `Health` made the first time it is shown (solid green, amber or red, or hollow blue
   or grey: the colour says how things are), and draws them again when the display or its scale changes
   (`tray::rescale`, on `WM_DISPLAYCHANGE`, `WM_DPICHANGED`, `WM_SETTINGCHANGE` and `TaskbarCreated`). The window
+  band's status mark uses that same `App::health` and `tray::look`, through `Deco::Logo` and `tray::icon`;
+  `paint` caches the icons at the window's scale and releases them when the window closes. The window
   draws its big and small icons at its own DPI when it opens and when it moves to a screen with another scale. The
   drawing uses no trigonometry (the arrows' directions are written out as numbers, checked by a test): with `atan2`,
   `sin` and `cos` the tray exe was 16 KB larger. The files in `assets\` are made from the same code by a test-only PNG and
@@ -807,15 +791,12 @@ A window procedure can be entered again while it runs (a control notifies its pa
 it). So the UI state lives in thread-local `RefCell`s borrowed only with `try_borrow_mut`, and no borrow is held across a
 call that runs a message loop (a question, the tray menu, `DestroyWindow`).
 
-The band at the top holds the status circle (`page::hero`), a title, the line under it and **Sync now**, on the hero
-panel. The circle is the list's dot for its tone (`Tone::dot`): the check-dot for Ok, the Warn and Err dots, and the
-Off tone's own pair of colours. It is drawn with the ring `BandDotRing` as its border. The
-band itself, including the picture and bottom line, is part of the backdrop under that panel and under the diff
-view's header, so both views start with the same band. Four discs of sky set into the middle hill, just under its top,
-hold the icons of the four types, in the list's order (`page::stations`). They sit at fixed points, so they never move
-as the text changes, and they show only when all four keep 12 DIPs clear of the measured title, the line under it and
-the buttons; otherwise none shows. They are decorations of the panel, not controls, so labels repaint over them. The
-band's title says how everything is in one line, the worst first: a problem of the app, sources that can't be read,
+The main header (`page::hero`) holds the tray status logo, a title, the line under it and **Sync now**. The logo
+shows the app's health; the check-dots in the list show the status of individual entries. The icons of the four
+types sit along a ridge in list order (`page::stations`). They are decorations, not controls, and appear only when
+all four fit clear of the measured text and buttons.
+
+The band's title says how everything is in one line, the worst first: a problem of the app, sources that can't be read,
 items that need you, sources that need you, the first check still to come, or all up to date. The line under it says
 where, when the last check was, and when the next one is (`page::hero_of`). It counts sources, not lanes: it takes the
 snapshot's `SourceView`s, so the four types of one source count once, and it says "items" instead of "skills" when

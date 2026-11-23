@@ -500,7 +500,7 @@ fn lay_out(st: &Win, preferred: i32, w: i32, h: i32, bar: i32, fit: Fit) -> Plan
     let welcome = Page::Repo(String::new());
     let shown = st.page.as_ref().unwrap_or(&welcome);
     vec![
-        (p.hero, Some(([0, 0, w, HERO_H], page::hero(&hero, can_sync, w, fit)))),
+        (p.hero, Some(([0, 0, w, HERO_H], page::hero(&hero, snap.health, can_sync, w, fit)))),
         (p.nav, fitted(l.list, &|w| page::nav(&snap.sources, shown, w, body, fit))),
         (p.splitter, splitter(l.splitter)),
         (p.page, fitted(l.page, &|w| page_of(st, snap, w, fit))),

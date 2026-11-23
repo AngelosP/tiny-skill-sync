@@ -33,7 +33,7 @@ pub const NAV_W: i32 = 248;
 pub const MIN_LIST_W: i32 = 160;
 const MIN_PAGE_W: i32 = 360;
 const SPLITTER_W: i32 = 12;
-pub const HERO_H: i32 = 72;
+pub const HERO_H: i32 = 90;
 pub const SYNC_NOW: &str = "Sync now";
 pub const SYNC_TIP: &str = "Checks every enabled source now. Items you edited or deleted are never replaced without asking.";
 pub const CUSTOM: &str = "Custom…";
@@ -425,14 +425,10 @@ fn in_band(h: i32) -> i32 {
     (HERO_H - h) / 2
 }
 
-pub fn hero(h: &Hero, can_sync: bool, w: i32, fit: Fit) -> Surface {
+pub fn hero(h: &Hero, health: board::Health, can_sync: bool, w: i32, fit: Fit) -> Surface {
     let mut o = Out::new(fit);
-    // A status is marked as in the list: the same dot, with a ring that sets it off from the band. The calm states
-    // (Off) keep their own pair of colours.
-    let (fill, ink) = if h.tone == Tone::Off { (h.tone.bg(), h.tone.ink()) } else { (h.tone.dot(), h.tone.dot_ink()) };
     let mark = [24, in_band(40), 40, 40];
-    o.fill(mark, 20, fill, Role::BandDotRing);
-    o.glyph(mark, h.glyph, 18, ink);
+    o.s.decos.push(Deco::Logo { at: mark, look: super::tray::look(health) });
     let bw = o.button_width(SYNC_NOW, Some(glyph::SYNC));
     let bx = w - PAD_X - bw;
     o.button(Btn { enabled: can_sync, ..btn(id::SYNC, SYNC_NOW, Kind::BandAccent, Some(glyph::SYNC)) }, bx, in_band(32), 32);
@@ -2025,7 +2021,8 @@ pub fn diff_head(v: &DiffView, l: &DiffLayout, fit: Fit) -> Surface {
         let top = in_band(28 + 16);
         (in_band(32), top, [56, top + 28, room, 16])
     } else {
-        (8, 10, [56, 44, (w - 80).max(0), 16])
+        let row = in_band(32 + 4 + 16);
+        (row, row + 2, [56, row + 32 + 4, (w - 80).max(0), 16])
     };
     o.item(id::BACK, [12, row, 32, 32], "Back", Look::Button { kind: Kind::Icon, glyph: Some(glyph::BACK) }, true);
     let mut taken = vec![[12, row, 32, 32]];
@@ -2630,17 +2627,19 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn the_top_mark_has_the_colours_of_the_marks_in_the_list_and_a_ring_on_the_band() {
-        let mark = [24, 16, 40, 40];
-        let top = |tone| hero(&Hero { tone, glyph: glyph::OK, title: "Title".to_string(), sub: String::new() }, true, 800, &fit);
-        for tone in [Tone::Ok, Tone::Warn, Tone::Err] {
-            let s = top(tone);
-            assert!(s.decos.contains(&Deco::Fill { at: mark, radius: 20, fill: tone.dot(), border: Role::BandDotRing }), "{tone:?}: {:?}", s.decos);
-            assert!(s.decos.contains(&Deco::Glyph { at: mark, ch: glyph::OK, size: 18, ink: tone.dot_ink() }), "{tone:?}: {:?}", s.decos);
+    fn the_top_mark_uses_the_tray_icon_even_when_the_heading_describes_a_different_state() {
+        let mark = [24, 25, 40, 40];
+        use board::Health;
+        for health in [Health::Ok, Health::Working, Health::Waiting, Health::NotConfigured, Health::Attention, Health::Error] {
+            for tone in [Tone::Ok, Tone::Off, Tone::Warn, Tone::Err] {
+                let h = Hero { tone, glyph: glyph::OK, title: "Title".to_string(), sub: "Details".to_string() };
+                let s = hero(&h, health, true, 800, &fit);
+                assert!(s.decos.contains(&Deco::Logo { at: mark, look: super::super::tray::look(health) }), "{health:?}: {:?}", s.decos);
+                assert_eq!(s.decos.iter().filter(|d| deco_at(d) == mark).count(), 1, "no old disc or glyph remains");
+                assert_eq!(item(&s, id::HERO_TITLE).text, h.title);
+                assert_eq!(item(&s, id::HERO_SUB).text, h.sub);
+            }
         }
-        let calm = top(Tone::Off);
-        assert!(calm.decos.contains(&Deco::Fill { at: mark, radius: 20, fill: Tone::Off.bg(), border: Role::BandDotRing }), "{:?}", calm.decos);
-        assert!(calm.decos.contains(&Deco::Glyph { at: mark, ch: glyph::OK, size: 18, ink: Tone::Off.ink() }), "{:?}", calm.decos);
     }
 
     #[test]
@@ -2672,6 +2671,7 @@ pub(super) mod tests {
 
     #[test]
     fn the_hero_and_the_diff_header_sit_centred_in_the_band() {
+        assert_eq!(HERO_H, 90);
         let in_the_band = |s: &Surface, w: i32, what: &str| {
             fits_in(s, w);
             for i in &s.items {
@@ -2679,6 +2679,10 @@ pub(super) mod tests {
             }
         };
         let centred = |top: i32, bottom: i32| top == HERO_H - bottom;
+        let check_labels = |title: &Item, sub: &Item| {
+            assert_eq!(title.look, Look::Text { font: Font::Title, ink: Role::BandText, flags: ONE_LINE });
+            assert_eq!(sub.look, Look::Text { font: Font::Caption, ink: Role::BandCaption, flags: ONE_LINE });
+        };
         let h = Hero {
             tone: Tone::Warn,
             glyph: glyph::WARN,
@@ -2686,14 +2690,16 @@ pub(super) mod tests {
             sub: "In o/a · checked 2 minutes ago · next check in 1 hour".to_string(),
         };
         for w in [640, 980, 1400] {
-            let s = hero(&h, true, w, &fit);
+            let s = hero(&h, board::Health::Attention, true, w, &fit);
             in_the_band(&s, w, "the hero");
             let (title, sub, sync) = (item(&s, id::HERO_TITLE), item(&s, id::HERO_SUB), item(&s, id::SYNC));
+            check_labels(title, sub);
             assert_eq!(sync.look, Look::Button { kind: Kind::BandAccent, glyph: Some(glyph::SYNC) });
-            assert_eq!([title.at[1], sub.at[1], sub.at[1] + sub.at[3], sync.at[1]], [14, 42, 58, 20], "at {w}");
+            assert_eq!(sync.at[2], 102, "the measured Sync now button keeps its width");
+            assert_eq!([title.at[1], sub.at[1], title.at[3], sub.at[3], sync.at[1], sync.at[3]], [23, 51, 28, 16, 29, 32], "at {w}");
             assert!(centred(title.at[1], sub.at[1] + sub.at[3]) && centred(sync.at[1], sync.at[1] + sync.at[3]), "at {w}");
-            let mark = [24, 16, 40, 40];
-            assert!(s.decos.iter().any(|d| matches!(d, Deco::Fill { at, .. } if *at == mark)) && centred(mark[1], mark[1] + mark[3]));
+            let mark = [24, 25, 40, 40];
+            assert!(s.decos.iter().any(|d| matches!(d, Deco::Logo { at, .. } if *at == mark)) && centred(mark[1], mark[1] + mark[3]));
 
             let l = diff_layout(w, 480, NAV_W);
             assert!(l.files_card[1] > HERO_H && l.code_card[1] > HERO_H, "at {w}: the cards start below the band");
@@ -2705,14 +2711,16 @@ pub(super) mod tests {
                 let row: Vec<&Item> = s.items.iter().filter(|i| i.id == id::BACK || matches!(hit(i.id), Hit::DiffAction(_))).collect();
                 assert_eq!(row.len(), if v.preview { 1 } else { 3 }, "{what} at {w}: Back and the choices");
                 let (title, sub) = (item(&s, id::TITLE), item(&s, id::SUB));
+                check_labels(title, sub);
+                assert_eq!(item(&s, id::BACK).at[2..], [32, 32], "{what}: unchanged Back target");
                 if !v.preview && w == 640 {
                     // The sentence is too long to go beside two choices, so it goes under them.
-                    assert!(row.iter().all(|i| [i.at[1], i.at[3]] == [8, 32]), "{what} at {w}: not on one row at the top: {row:?}");
-                    assert_eq!((title.at[1], sub.at), (10, [56, 44, w - 80, 16]), "{what} at {w}");
+                    assert!(row.iter().all(|i| [i.at[1], i.at[3]] == [19, 32]), "{what} at {w}: not on one row at the top: {row:?}");
+                    assert_eq!((title.at[1], sub.at), (21, [56, 55, w - 80, 16]), "{what} at {w}");
                 } else {
-                    let on_row = |i: &&Item| [i.at[1], i.at[3]] == [20, 32] && centred(i.at[1], i.at[1] + i.at[3]);
+                    let on_row = |i: &&Item| [i.at[1], i.at[3]] == [29, 32] && centred(i.at[1], i.at[1] + i.at[3]);
                     assert!(row.iter().all(on_row), "{what} at {w}: not on one centred row: {row:?}");
-                    assert_eq!([title.at[1], sub.at[1], sub.at[1] + sub.at[3]], [14, 42, 58], "{what} at {w}");
+                    assert_eq!([title.at[1], sub.at[1], sub.at[1] + sub.at[3]], [23, 51, 67], "{what} at {w}");
                     assert!(centred(title.at[1], sub.at[1] + sub.at[3]), "{what} at {w}");
                 }
                 for d in &s.decos {
@@ -2760,7 +2768,7 @@ pub(super) mod tests {
             sub: "12 skills from 2 sources · checked 2 minutes ago · next check in 1 hour".to_string(),
         };
         for w in [860, 980, 1400] {
-            let s = hero(&h, true, w, &caption_fit);
+            let s = hero(&h, board::Health::Ok, true, w, &caption_fit);
             let got = stations_of(&s);
             assert_eq!(got.iter().map(|(_, ch)| *ch).collect::<Vec<_>>(), order, "at {w}: the four types, in the list's order");
             let mut left = 0;
@@ -2784,7 +2792,7 @@ pub(super) mod tests {
             let mut seen = [false; 2];
             for n in 0..=180 {
                 let h = Hero { tone: Tone::Warn, glyph: glyph::WARN, title: "x".repeat(n), sub: String::new() };
-                let got = stations_of(&hero(&h, true, w, &fit)).len();
+                let got = stations_of(&hero(&h, board::Health::Attention, true, w, &fit)).len();
                 assert!(got == 0 || got == 4, "at {w}, a title of {n}: {got} icons");
                 seen[usize::from(got == 4)] = true;
             }
@@ -2850,7 +2858,7 @@ pub(super) mod tests {
             }
         }
         assert_eq!(sentences.len(), 10, "every sentence the header can show: {sentences:?}");
-        assert_eq!(tops.into_iter().collect::<Vec<_>>(), [42, 44], "both the centred and the stacked header");
+        assert_eq!(tops.into_iter().collect::<Vec<_>>(), [51, 55], "both the centred and the stacked header");
     }
 
     /// A source with all four types: three skills, an agent, instructions that do not sync and a plugin to approve.
@@ -3349,7 +3357,7 @@ pub(super) mod tests {
                 assert!(cards.contains(&card), "at {w}: no card {card:?} under the header in {cards:?}");
                 let drawn = s.decos.iter().filter_map(|d| match d {
                     Deco::Glyph { at, .. } | Deco::Text { at, .. } => Some(at[1]),
-                    Deco::Fill { .. } | Deco::BandPrint { .. } => None,
+                    Deco::Fill { .. } | Deco::BandPrint { .. } | Deco::Logo { .. } => None,
                 });
                 let first = s.items.iter().map(|i| i.at[1]).chain(drawn).filter(|&t| t > y && t < card[1] + card[3]).min();
                 assert_eq!(first, Some(y + if w == 900 { 40 } else { 48 }), "at {w}: the card's contents start 8 below its top");
@@ -3780,7 +3788,7 @@ pub(super) mod tests {
             fits_in(&settings_page(&settings, w, &fit), w);
             fits_in(&welcome(w, &fit), w);
             fits_in(&nav(std::slice::from_ref(&v), &Page::Settings, NAV_W, 480, &fit), NAV_W);
-            fits_in(&hero(&hero_of(std::slice::from_ref(&needy), None, "", false, NOW), true, w + NAV_W, &fit), w + NAV_W);
+            fits_in(&hero(&hero_of(std::slice::from_ref(&needy), None, "", false, NOW), board::Health::Attention, true, w + NAV_W, &fit), w + NAV_W);
         }
     }
 
@@ -4084,7 +4092,7 @@ pub(super) mod tests {
 
     fn deco_at(d: &Deco) -> Rect {
         match d {
-            Deco::Fill { at, .. } | Deco::BandPrint { at } | Deco::Glyph { at, .. } | Deco::Text { at, .. } => *at,
+            Deco::Fill { at, .. } | Deco::BandPrint { at } | Deco::Logo { at, .. } | Deco::Glyph { at, .. } | Deco::Text { at, .. } => *at,
         }
     }
 

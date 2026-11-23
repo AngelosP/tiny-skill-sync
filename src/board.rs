@@ -1237,7 +1237,16 @@ impl Board {
         cfg.sources().iter().map(|source| self.source_view(cfg, source, now)).collect()
     }
 
+    /// The window needs both the rows and the tray status for the same snapshot.
+    pub(crate) fn source_views_with_health(&self, cfg: &Config, now: UnixSecs) -> (Vec<SourceView>, Health) {
+        let views = self.source_views(cfg, now);
+        let health = self.health_with_views(cfg, || &views);
+        (views, health)
+    }
+
     fn source_view(&self, cfg: &Config, source: &SourceConfig, now: UnixSecs) -> SourceView {
+        #[cfg(test)]
+        tests::SOURCE_PROJECTIONS.with(|n| n.set(n.get() + 1));
         let types = source.effective_types(cfg.global());
         let seen = self.seen.get(&source.id);
         let mut kinds = Vec::new();
@@ -1314,13 +1323,17 @@ impl Board {
     }
 
     pub fn health(&self, cfg: &Config) -> Health {
+        self.health_with_views(cfg, || self.source_views(cfg, 0))
+    }
+
+    fn health_with_views<V: AsRef<[SourceView]>>(&self, cfg: &Config, views: impl FnOnce() -> V) -> Health {
         if self.working {
             return Health::Working;
         }
         if !cfg.repos().iter().any(|repo| repo.enabled) {
             return Health::NotConfigured;
         }
-        let from_repos = self.source_views(cfg, 0).iter().filter(|view| view.enabled).map(|view| view.level).max().unwrap_or(Level::Ok);
+        let from_repos = views().as_ref().iter().filter(|view| view.enabled).map(|view| view.level).max().unwrap_or(Level::Ok);
         let from_problem = if self.problem.is_some() || self.failure.is_some() { Level::Error } else { Level::Ok };
         match from_repos.max(from_problem) {
             // Nothing was looked at yet, so all is not known to be well.
@@ -1541,6 +1554,10 @@ fn cut(text: &str, max_units: usize) -> String {
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
+
+    thread_local! {
+        pub(super) static SOURCE_PROJECTIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
 
     #[test]
     fn preview_source_view_keeps_detected_counts_and_exact_remote_paths_without_local_status() {
@@ -2102,6 +2119,20 @@ mod tests {
         assert!(got.text.contains("next check") && got.actions.is_empty() && got.level == Level::Ok, "{got:?}");
         assert_eq!(got.tag, "Managed again");
         assert_eq!(names(&board), ["Mixed-Case"], "the skill stays one row, under the name it already had");
+    }
+
+    #[test]
+    fn window_health_does_not_project_a_source_twice() {
+        let mut board = after(Outcome::NeedsAttention, vec![deleted_locally("s")]);
+        SOURCE_PROJECTIONS.set(0);
+        let (sources, health) = board.source_views_with_health(&one(), NOW);
+        assert_eq!(health, Health::Attention);
+        assert_eq!(SOURCE_PROJECTIONS.replace(0), sources.len());
+
+        assert_eq!(board.health(&cfg(&[("a", false)])), Health::NotConfigured);
+        board.set_working(true);
+        assert_eq!(board.health(&one()), Health::Working);
+        assert_eq!(SOURCE_PROJECTIONS.get(), 0, "tray health needs no rows in either state");
     }
 
     #[test]

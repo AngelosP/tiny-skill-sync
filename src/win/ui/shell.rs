@@ -651,15 +651,17 @@ pub struct Snapshot {
     pub app_update_status: String,
     pub problem: Option<String>,
     pub news: bool,
+    pub health: crate::board::Health,
 }
 
 pub fn snapshot() -> Option<Snapshot> {
     with_shell(|s| {
         let now = now_secs();
+        let (sources, health) = s.app.board.source_views_with_health(s.app.cfg(), now);
         Snapshot {
             now,
             cfg: s.app.cfg().clone(),
-            sources: s.app.board.source_views(s.app.cfg(), now),
+            sources,
             draft: s.app.draft().cloned(),
             skills_dir: s.app.skills_dir().clone(),
             work_dir: s.paths().work_dir(),
@@ -668,6 +670,7 @@ pub fn snapshot() -> Option<Snapshot> {
             app_update_status: s.app.release_summary(),
             problem: s.problem(),
             news: s.news(),
+            health,
         }
     })
 }

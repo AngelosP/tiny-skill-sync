@@ -406,8 +406,16 @@ update, the tray starts its new version with `--restarted` (or `--restarted-open
 
 ## The window
 
-A band runs across the top of the window, under the title bar: a sky in your Windows accent colour with layered hills on its right, in deeper shades of the same colour, and a thin line along its bottom. In light mode the sky is a rich mid-tone rather than a pale wash, and the main button on it (**Sync now**) is a deep colour that stands out from it. The round mark at the left of the heading is a calm green check when everything is in sync. It follows Windows' light or dark mode and your accent colour, and changes with them while the window is open; the app's buttons, switches and links take the accent colour too. Every shade is chosen so that the words on the band stay easy to read and each hill stands apart from the one behind it, whatever the accent. When the heading and the buttons leave room, the icons of the four types (skills, agents, instructions and plugins) sit in small circles of sky along the middle hill; they are decoration and do nothing when clicked. On a narrow window a long line under the heading can need their room, and then all four step aside. In high contrast the band takes the window colour and a text-coloured line, without the hills or the icons. The same band heads **Show changes** and
-**Preview**.
+The main window, **Show changes** and **Preview** share the band just below the title bar. It is 90 pixels high
+at 100% display scale, up from 72; the controls stay the same size. Five mountain ridges overlap against a flat
+sky: white in light mode, black in dark mode. If you change your Windows accent while the window is open, the
+mountains change colour with it, but the header text and buttons stay neutral. Blue and other accents use brighter,
+more vivid shades in dark mode.
+
+The logo beside the main heading matches the [tray icon](#the-tray-icon) in both colour and fill, and changes with
+it. The four type icons (skills, agents, instructions and plugins) are decoration: they sit along a ridge when
+there is room and disappear together when the text or buttons need the space. In Windows high contrast, the band
+uses the system window colour with a line in the system text colour. The mountains and decorative icons are hidden.
 
 The band says how everything is in one sentence ("All skills are up to date", "1 skill needs your
 attention", "1 source can't be read"); when your sources hold more than one type, it says "items" ("All items are up

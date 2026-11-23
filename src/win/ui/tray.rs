@@ -172,7 +172,7 @@ pub fn remove() {
 
 /// How the logo shows each state: the colour says how things are, and a hollow logo says the app is busy or has nothing
 /// to do.
-fn look(health: Health) -> Look {
+pub(super) fn look(health: Health) -> Look {
     match health {
         Health::Ok => Look::Solid(logo::GREEN),
         Health::Working | Health::Waiting => Look::Hollow(logo::BLUE),

@@ -13,8 +13,9 @@ use windows_sys::Win32::Foundation::RECT;
 use windows_sys::Win32::Graphics::Gdi::{
     BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BitBlt, CreateCompatibleDC, CreateDIBSection, CreateFontIndirectW, DIB_RGB_COLORS, DT_CALCRECT, DT_CENTER,
     DT_EDITCONTROL, DT_END_ELLIPSIS, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, DT_WORDBREAK, DeleteDC, DeleteObject, DrawTextW, GdiFlush, GetTextFaceW, HBITMAP,
-    HDC, HFONT, HGDIOBJ, LOGFONTW, SRCCOPY, SelectObject, SetBkMode, SetTextColor,
+    HDC, HFONT, HGDIOBJ, LOGFONTW, OPAQUE, SRCCOPY, SelectObject, SetBkColor, SetBkMode, SetTextColor,
 };
+use windows_sys::Win32::UI::WindowsAndMessaging::{DI_NORMAL, DestroyIcon, DrawIconEx, HICON};
 
 use super::scale;
 use super::theme::{self, Role, color, colorref};
@@ -153,6 +154,7 @@ struct Canvas {
 thread_local! {
     static CANVAS: RefCell<Option<Canvas>> = const { RefCell::new(None) };
     static FONTS: RefCell<Vec<(Font, u32, HFONT)>> = const { RefCell::new(Vec::new()) };
+    static LOGOS: RefCell<Vec<(crate::logo::Look, i32, HICON)>> = const { RefCell::new(Vec::new()) };
     /// A DC for measuring text when nothing is being drawn.
     static MEASURE_DC: RefCell<HDC> = const { RefCell::new(null_mut()) };
 }
@@ -220,7 +222,7 @@ pub fn font(font: Font, dpi: u32) -> HFONT {
     made
 }
 
-/// Frees the bitmap and the fonts. They are made again when something is drawn.
+/// Frees the bitmap, fonts and logos. They are made again when something is drawn.
 pub fn release() {
     if let Some(c) = CANVAS.with(|c| c.borrow_mut().take()) {
         unsafe {
@@ -231,6 +233,9 @@ pub fn release() {
     }
     for (_, _, f) in FONTS.with(|f| std::mem::take(&mut *f.borrow_mut())) {
         unsafe { DeleteObject(f) };
+    }
+    for (_, _, icon) in LOGOS.with(|icons| std::mem::take(&mut *icons.borrow_mut())) {
+        unsafe { DestroyIcon(icon) };
     }
     MEASURE_DC.with(|d| {
         let dc = std::mem::replace(&mut *d.borrow_mut(), null_mut());
@@ -410,7 +415,7 @@ fn smooth(from: f32, to: f32, x: f32) -> f32 {
 
 /// How tall hill `k` (0 is the farthest) stands `v` DIPs from the band's right edge, in DIPs. The hills keep their
 /// shape at the right edge whatever the width; toward the left they sink to an eighth of their height, leaving the
-/// sky clear for the heading. The farthest climbs off the top at the right edge.
+/// sky clear for the heading.
 pub fn hill(k: usize, v: f32) -> f32 {
     let lift = 0.12 + 0.88 * (1.0 - smooth(150.0, 470.0, v));
     let height = match k {
@@ -423,11 +428,11 @@ pub fn hill(k: usize, v: f32) -> f32 {
     height * lift
 }
 
-/// The header's picture: a sky fading down to its low colour, behind five hills, each with an anti-aliased top.
+/// The five hills on the already painted sky, each with a single anti-aliased pixel per column at its top.
 /// Measured from the right edge of `at`, not the repaint rectangle, so a child repainting itself sees the same hills.
 /// High contrast has no picture.
 pub fn band_print(at: Rect) {
-    let Some(print) = theme::print() else { return };
+    let Some(hills) = theme::hills() else { return };
     CANVAS.with(|cell| {
         let cell = cell.borrow();
         let Some(c) = cell.as_ref() else { return };
@@ -438,22 +443,21 @@ pub fn band_print(at: Rect) {
         }
         unsafe { GdiFlush() };
         let s = c.dpi as f32 / 96.0;
-        let sky: Vec<u32> = (y0..y1).map(|y| blend(print.sky, print.low, ((((y - t) as f32 + 0.5) / (b - t) as f32) * 256.0) as u32)).collect();
         let stride = c.cap.0 as usize;
         let bits = unsafe { std::slice::from_raw_parts_mut(c.bits, stride * c.cap.1 as usize) };
         for x in x0..x1 {
             let v = ((r - x) as f32 - 0.5) / s;
-            let tops: [f32; 5] = std::array::from_fn(|k| b as f32 - hill(k, v) * s);
-            for y in y0..y1 {
-                let mut px = sky[(y - y0) as usize];
-                for (top, ink) in tops.iter().zip(print.hills) {
-                    // How much of this pixel's height lies below the hill's top.
-                    let cover = ((y + 1) as f32 - top).clamp(0.0, 1.0);
-                    if cover > 0.0 {
-                        px = blend(px, ink, (cover * 256.0) as u32);
-                    }
+            for (k, ink) in hills.into_iter().enumerate() {
+                let top = (b - t) as f32 - hill(k, v) * s;
+                let floor = top.floor();
+                let ridge = t + floor as i32;
+                if (y0..y1).contains(&ridge) {
+                    let px = &mut bits[ridge as usize * stride + x as usize];
+                    *px = blend(*px, ink, ((1.0 - (top - floor)) * 256.0) as u32);
                 }
-                bits[y as usize * stride + x as usize] = px;
+                for y in (ridge + 1).max(y0)..y1 {
+                    bits[y as usize * stride + x as usize] = ink;
+                }
             }
         }
     });
@@ -478,7 +482,13 @@ pub fn text(at: Rect, s: &str, font_: Font, ink: Role, flags: u32) {
     unsafe {
         let old = SelectObject(dc, font(font_, dpi));
         SetTextColor(dc, colorref(color(ink)));
+        // GDI backs only the measured glyph run (including an ellipsis), not the full-width label.
+        let backing = matches!(ink, Role::BandText | Role::BandCaption).then(|| (SetBkColor(dc, colorref(color(Role::Band))), SetBkMode(dc, OPAQUE as i32)));
         DrawTextW(dc, wide.as_ptr(), wide.len() as i32, &mut rc, flags | DT_NOPREFIX);
+        if let Some((bg, mode)) = backing {
+            SetBkMode(dc, mode);
+            SetBkColor(dc, bg);
+        }
         SelectObject(dc, old);
     }
 }
@@ -492,6 +502,38 @@ pub fn line(at: Rect, s: &str, font: Font, ink: Role) {
 pub fn glyph(at: Rect, ch: char, size: u8, ink: Role) {
     let mut buf = [0u8; 4];
     text(at, ch.encode_utf8(&mut buf), Font::Icon(size), ink, DT_SINGLELINE | DT_VCENTER | DT_CENTER);
+}
+
+/// The tray's logo at the window's scale, cached until the window closes.
+pub fn logo(at: Rect, look: crate::logo::Look) {
+    CANVAS.with(|cell| {
+        let cell = cell.borrow();
+        let Some(c) = cell.as_ref() else { return };
+        let (l, t, r, b) = edges(c, at);
+        let size = (r - l).min(b - t);
+        if size <= 0 {
+            return;
+        }
+        LOGOS.with(|icons| {
+            let mut icons = icons.borrow_mut();
+            let icon = if let Some((_, _, icon)) = icons.iter().find(|(drawn, pixels, _)| *drawn == look && *pixels == size) {
+                *icon
+            } else {
+                let icon = super::tray::icon(look, size);
+                if icon.is_null() {
+                    return;
+                }
+                icons.push((look, size, icon));
+                icon
+            };
+            if let Some(backing) = theme::logo_backing(look) {
+                let [x, y, w, h] = at;
+                let side = w.min(h);
+                fill_argb([x + (w - side) / 2, y + (h - side) / 2, side, side], side / 4, backing, 0);
+            }
+            unsafe { DrawIconEx(c.dc, l + (r - l - size) / 2, t + (b - t - size) / 2, icon, size, size, 0, null_mut(), DI_NORMAL) };
+        });
+    });
 }
 
 /// The 16-DIP Octicons mark, drawn in the same foreground colour as the neighbouring actions.
@@ -582,6 +624,7 @@ pub fn dot(at: Rect, tone: Tone) {
 /// RGB pixels of the current paint rectangle, without the unused bitmap stride.
 #[cfg(test)]
 pub(super) fn pixels() -> Vec<u32> {
+    unsafe { GdiFlush() };
     CANVAS.with(|cell| {
         let c = cell.borrow();
         let c = c.as_ref().expect("a canvas");
@@ -607,6 +650,43 @@ mod tests {
         assert_eq!(blend(0x000000, 0xFFFFFF, 256), 0xFFFFFF);
         assert_eq!(blend(0x204060, 0xFFFFFF, 0), 0x204060);
         assert_eq!(blend(0x000000, 0xFF8000, 128), 0x7F4000);
+    }
+
+    #[test]
+    fn the_status_logo_keeps_the_tray_pixels_at_each_scale_and_when_partly_repainted() {
+        theme::with_light_theme(check_tray_pixels);
+    }
+
+    fn check_tray_pixels() {
+        use crate::board::Health;
+        const BG: u32 = 0xFF203040;
+        for dpi in [96, 120, 192] {
+            let size = scale(40, dpi);
+            for health in [Health::Ok, Health::Working, Health::Waiting, Health::NotConfigured, Health::Attention, Health::Error] {
+                let look = super::super::tray::look(health);
+                let expected = crate::logo::draw(look, size as u32);
+                for origin in [0, size / 2] {
+                    let side = size - origin;
+                    assert!(begin(dpi, side, side, origin, origin));
+                    fill_argb([0, 0, 40, 40], 0, BG, 0);
+                    super::super::control::draw(&[super::super::control::Deco::Logo { at: [0, 0, 40, 40], look }]);
+                    unsafe { GdiFlush() };
+                    let got = pixels();
+                    for y in 0..side {
+                        for x in 0..side {
+                            let want = expected[((y + origin) * size + x + origin) as usize];
+                            let opaque = match want >> 24 {
+                                0 => BG & 0xFFFFFF,
+                                255 => want & 0xFFFFFF,
+                                _ => continue,
+                            };
+                            assert_eq!(got[(y * side + x) as usize], opaque, "{health:?}, {dpi} DPI, origin {origin}, at {x},{y}");
+                        }
+                    }
+                }
+            }
+        }
+        release();
     }
 
     #[test]

@@ -131,12 +131,18 @@ pub enum Kind {
 }
 
 impl Kind {
-    /// Fill, border and lettering before the hover or press tint.
-    pub(super) fn colors(self, enabled: bool) -> (Role, Role, Role) {
+    /// Fill, border and lettering. The band has its own neutral hover and pressed fills.
+    pub(super) fn colors(self, enabled: bool, tint: Role) -> (Role, Role, Role) {
         match self {
             Self::Accent if enabled => (Role::Accent, Role::None, Role::OnAccent),
-            // The edge repeats the fill: it draws the rounded corners a little fuller than no edge (as `Accent` has) does.
-            Self::BandAccent if enabled => (Role::BandButton, Role::BandButton, Role::BandButtonText),
+            Self::BandAccent if enabled => {
+                let fill = match tint {
+                    Role::Hover => Role::BandButtonHover,
+                    Role::Sel => Role::BandButtonDown,
+                    _ => Role::BandButton,
+                };
+                (fill, Role::BandButtonEdge, Role::BandButtonText)
+            }
             Self::Standard | Self::Accent | Self::BandAccent => (Role::Ctl, Role::CtlBorder, if enabled { Role::Text } else { Role::Text3 }),
             Self::Icon => (Role::None, Role::None, if enabled { Role::Text } else { Role::Text3 }),
             Self::Link => (Role::None, Role::None, if enabled { Role::AccentText } else { Role::Text3 }),
@@ -231,6 +237,7 @@ pub struct Item {
 pub enum Deco {
     Fill { at: Rect, radius: i32, fill: Role, border: Role },
     BandPrint { at: Rect },
+    Logo { at: Rect, look: crate::logo::Look },
     Glyph { at: Rect, ch: char, size: u8, ink: Role },
     Text { at: Rect, text: String, font: Font, ink: Role, flags: u32 },
 }
@@ -666,6 +673,7 @@ fn draw_source(at: Rect, mark: &Mark, selected: bool, tint: Role, parts: &[Deco]
         match part {
             Deco::Fill { at, radius, fill, border } => paint::fill(shift(*at), *radius, *fill, *border),
             Deco::BandPrint { at } => paint::band_print(shift(*at)),
+            Deco::Logo { at, look } => paint::logo(shift(*at), *look),
             Deco::Glyph { at, ch, size, ink } => paint::glyph(shift(*at), *ch, *size, *ink),
             Deco::Text { at, text, font, ink, flags } => paint::text(shift(*at), text, *font, *ink, *flags),
         }
@@ -709,15 +717,20 @@ fn draw_ctl(hwnd: HWND) {
         Look::Text { font, ink, flags } => paint::text(c.at, &text, *font, *ink, *flags),
         Look::Button { kind, glyph } => {
             let primary = matches!(kind, Kind::Accent | Kind::BandAccent);
-            let (fill, border, ink) = kind.colors(enabled);
+            let (fill, border, ink) = kind.colors(enabled, tint);
             paint::fill(c.at, 4, fill, border);
-            if (*kind == Kind::Standard || primary) && !theme::contrast() {
+            let band_face = *kind == Kind::BandAccent && enabled;
+            if (*kind == Kind::Standard || primary) && !band_face && !theme::contrast() {
                 // The darker bottom edge Windows 11 buttons have.
                 let bottom = if primary && enabled { 0x40000000 } else { theme::color(Role::CtlBottom) };
                 paint::fill_argb([x + 3, y + h - 1, w - 6, 1], 0, bottom, 0);
             }
             if enabled && tint != Role::None {
-                paint::fill(c.at, 4, tint, Role::None);
+                if !band_face {
+                    paint::fill(c.at, 4, tint, Role::None);
+                } else if theme::contrast() {
+                    paint::fill([x + 1, y + 1, w - 2, h - 2], 3, Role::None, ink);
+                }
             }
             let ink = if c.down && c.hover && !primary && *kind != Kind::Link { Role::Text2 } else { ink };
             let size = if *kind == Kind::Icon {
@@ -852,8 +865,11 @@ fn draw_ctl(hwnd: HWND) {
     if !matches!(c.look, Look::Splitter) && focus_shown(hwnd) {
         let radius = if matches!(c.look, Look::Toggle { .. } | Look::Row { .. }) { 4 } else { 5 };
         let ink = focus_ink(&c.look, enabled);
-        paint::fill(c.at, radius, Role::None, ink);
-        paint::fill([x + 1, y + 1, w - 2, h - 2], radius - 1, Role::None, ink);
+        // Separate keyboard focus from the band button's permanent contrast edge.
+        let inset = if matches!(c.look, Look::Button { kind: Kind::BandAccent, .. }) && enabled { 3 } else { 0 };
+        for n in [inset, inset + 1] {
+            paint::fill([x + n, y + n, w - 2 * n, h - 2 * n], radius - n, Role::None, ink);
+        }
     }
 }
 
@@ -1454,13 +1470,14 @@ fn draw_panel(hwnd: HWND) {
 /// Draws decorations into the canvas at its current origin, skipping those outside what is being painted.
 pub fn draw(decos: &[Deco]) {
     for deco in decos {
-        let (Deco::Fill { at, .. } | Deco::BandPrint { at } | Deco::Glyph { at, .. } | Deco::Text { at, .. }) = deco;
+        let (Deco::Fill { at, .. } | Deco::BandPrint { at } | Deco::Logo { at, .. } | Deco::Glyph { at, .. } | Deco::Text { at, .. }) = deco;
         if !paint::visible(*at) {
             continue;
         }
         match deco {
             Deco::Fill { at, radius, fill, border } => paint::fill(*at, *radius, *fill, *border),
             Deco::BandPrint { at } => paint::band_print(*at),
+            Deco::Logo { at, look } => paint::logo(*at, *look),
             Deco::Glyph { at, ch, size, ink } => paint::glyph(*at, *ch, *size, *ink),
             Deco::Text { at, text, font, ink, flags } => paint::text(*at, text, *font, *ink, *flags),
         }
@@ -1840,11 +1857,11 @@ mod tests {
     #[test]
     fn the_band_button_has_the_bands_own_colours_and_focus_ring() {
         let band = Look::Button { kind: Kind::BandAccent, glyph: None };
-        assert_eq!(Kind::BandAccent.colors(true), (Role::BandButton, Role::BandButton, Role::BandButtonText));
+        assert_eq!(Kind::BandAccent.colors(true, Role::None), (Role::BandButton, Role::BandButtonEdge, Role::BandButtonText));
         assert_eq!(focus_ink(&band, true), Role::BandButtonText);
-        assert_eq!(Kind::BandAccent.colors(false), Kind::Standard.colors(false), "disabled, it is a plain button");
+        assert_eq!(Kind::BandAccent.colors(false, Role::None), Kind::Standard.colors(false, Role::None), "disabled, it is a plain button");
         assert_eq!(focus_ink(&band, false), Role::Text);
-        assert_eq!(Kind::Accent.colors(true), (Role::Accent, Role::None, Role::OnAccent));
+        assert_eq!(Kind::Accent.colors(true, Role::None), (Role::Accent, Role::None, Role::OnAccent));
         assert_eq!(focus_ink(&Look::Button { kind: Kind::Accent, glyph: None }, true), Role::Text);
     }
 

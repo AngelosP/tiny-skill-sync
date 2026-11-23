@@ -56,7 +56,7 @@ pub enum Role {
     DialogFoot,
     DotWarn,
     DotGlyph,
-    /// The header band's sky (the picture's colours are in [`Print`]), its title, caption and bottom rule.
+    /// The header band's sky, title, caption and bottom rule.
     Band,
     BandText,
     BandCaption,
@@ -67,26 +67,26 @@ pub enum Role {
     DotOk,
     DotOkInk,
     DotOkEdge,
-    /// The ring around the band's status disc.
-    BandDotRing,
-    /// The band's main button (Sync now, Overwrite, Restore): its fill, which its edge repeats, and its lettering.
+    /// The band's main button (Sync now, Overwrite, Restore).
     BandButton,
+    BandButtonEdge,
     BandButtonText,
+    BandButtonHover,
+    BandButtonDown,
     None,
 }
 
 const COUNT: usize = Role::None as usize;
 
-/// 0xAARRGGBB, in the order of [`Role`]. The zeros (`Accent`, `AccentText`, the band's, the ring round its status disc
-/// and its button's) are worked out from the accent colour by [`palette`].
+/// 0xAARRGGBB, in the order of [`Role`]. `Accent` and `AccentText` are worked out by [`palette`].
 #[rustfmt::skip]
 const LIGHT: [u32; COUNT] = [
     0xFFF3F3F3, 0xFFF9F9F9, 0x0F000000, 0xFFFFFFFF, 0x13000000, 0x12000000, 0xFF1A1A1A, 0xFF5D5D5D, 0xFF8B8B8B,
     0, 0, 0xFFFFFFFF, 0xFFFDFDFD, 0x14000000, 0x2E000000, 0x09000000, 0x0E000000,
     0xFF0F7B0F, 0xFFDFF6DD, 0xFF905500, 0xFFFFF4CE, 0xFFBD291B, 0xFFFDE7E9, 0xFF6B6B6B, 0x0F000000,
     0xFFE7F3E7, 0xFFD3EAD3, 0xFFFCEBEA, 0xFFF6D5D2, 0xFFF2F5F9, 0xFFF3F3F3, 0xFFB07300, 0xFFFFFFFF,
-    0, 0, 0, 0, 0,
-    0xFF389457, 0xFFFFFFFF, 0xFF206F3A, 0, 0, 0,
+    0xFFFFFFFF, 0xFF202020, 0xFF505050, 0xFFC0C0C0, 0xFF404040,
+    0xFF389457, 0xFFFFFFFF, 0xFF206F3A, 0xFF252525, 0xFFFFFFFF, 0xFFFFFFFF, 0xFF383838, 0xFF484848,
 ];
 
 #[rustfmt::skip]
@@ -95,8 +95,8 @@ const DARK: [u32; COUNT] = [
     0, 0, 0xFF000000, 0xFF353535, 0x12FFFFFF, 0x1AFFFFFF, 0x0DFFFFFF, 0x14FFFFFF,
     0xFF6CCB5F, 0xFF393D1B, 0xFFFCE100, 0xFF433519, 0xFFFF99A4, 0xFF442726, 0xFFA8A8A8, 0x14FFFFFF,
     0xFF213226, 0xFF2A4231, 0xFF3B2528, 0xFF4F2E33, 0xFF2A2F36, 0xFF202020, 0xFFFCE100, 0xFF000000,
-    0, 0, 0, 0, 0,
-    0xFF5FB574, 0xFF000000, 0xFF5FB574, 0, 0, 0,
+    0xFF000000, 0xFFF8F8F8, 0xFFD0D0D0, 0xFF505050, 0xFFE0E0E0,
+    0xFF5FB574, 0xFF000000, 0xFF5FB574, 0xFFF2F2F2, 0xFF101010, 0xFF101010, 0xFFE0E0E0, 0xFFCCCCCC,
 ];
 
 // The system colour indexes high contrast uses.
@@ -117,7 +117,7 @@ const CONTRAST: [u8; COUNT] = [
     WINDOW_TEXT, WINDOW, WINDOW_TEXT, WINDOW, WINDOW_TEXT, WINDOW, WINDOW_TEXT, CLEAR,
     WINDOW, WINDOW, WINDOW, WINDOW, WINDOW, WINDOW, WINDOW_TEXT, WINDOW,
     WINDOW, WINDOW_TEXT, WINDOW_TEXT, WINDOW_TEXT, CLEAR,
-    WINDOW_TEXT, WINDOW, WINDOW_TEXT, WINDOW, HIGHLIGHT, HIGHLIGHT_TEXT,
+    WINDOW_TEXT, WINDOW, WINDOW_TEXT, HIGHLIGHT, HIGHLIGHT_TEXT, HIGHLIGHT_TEXT, HIGHLIGHT, HIGHLIGHT,
 ];
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -141,18 +141,9 @@ struct Look {
     ramp: Ramp,
 }
 
-/// The header band's picture, as 0xRRGGBB: a sky that fades from `sky` at the top to `low` at the bottom, behind five
-/// hills, the farthest first.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct Print {
-    pub sky: u32,
-    pub low: u32,
-    pub hills: [u32; 5],
-}
-
 struct Palette {
     roles: [u32; COUNT],
-    print: Print,
+    hills: [u32; 5],
 }
 
 struct State {
@@ -267,14 +258,21 @@ pub fn refresh() -> bool {
 }
 
 /// The header band's picture; none in high contrast, where the band stays plain.
-pub fn print() -> Option<Print> {
-    derived(|p| p.print)
+pub fn hills() -> Option<[u32; 5]> {
+    derived(|p| p.hills)
 }
 
 /// Puts a look in place of what Windows says (none detects it again on next use) and returns the one it replaced.
 #[cfg(test)]
 fn set(look: Option<Look>) -> Option<Look> {
     STATE.with(|s| s.replace(look.map(|look| State { look, palette: None })).map(|s| s.look))
+}
+
+#[cfg(test)]
+pub(super) fn with_light_theme(test: impl FnOnce()) {
+    let saved = set(Some(Look { mode: Mode::Light, ramp: BLUE }));
+    test();
+    set(saved);
 }
 
 pub fn dark() -> bool {
@@ -308,20 +306,10 @@ pub fn color(role: Role) -> u32 {
 
 const WHITE: u32 = 0xFF_FFFF;
 const BLACK: u32 = 0;
-/// Contrast for words, a little above WCAG's 4.5 so that the anti-aliased edges between two colours stay readable.
+/// Contrast for page links and button lettering.
 const READ: f64 = 4.6;
-/// Contrast for the type icons: thin strokes at 12 points.
-const MARK: f64 = 7.0;
-/// Contrast for shapes: buttons, switches and the ring round the band's status disc (WCAG asks 3:1 of graphics).
+/// Contrast for buttons and switches.
 const SHAPE: f64 = 3.0;
-/// How far apart (red, green and blue differences added up) neighbouring hills, the sky and the page, and the band's
-/// bottom rule and the page must be.
-const HILLS_APART: u32 = 24;
-const SKY_APART: u32 = 32;
-const EDGE_APART: u32 = 30;
-/// How far from white (the same sum) a light band's sky must be, so that it is a colour and not a wash; the hills
-/// only get deeper.
-const RICH: u32 = 150;
 
 /// `a` moved `t` of the way to `b`, channel by channel.
 fn mix(a: u32, b: u32, t: f64) -> u32 {
@@ -346,9 +334,13 @@ fn ratio(a: u32, b: u32) -> f64 {
     (a.max(b) + 0.05) / (a.min(b) + 0.05)
 }
 
-/// The red, green and blue differences added up.
-fn apart(a: u32, b: u32) -> u32 {
-    [16, 8, 0].into_iter().map(|shift| ((a >> shift) & 0xFF).abs_diff((b >> shift) & 0xFF)).sum()
+/// Back a hollow mark only when its fixed tray ink would disappear against the high contrast band.
+pub(super) fn logo_backing(look: crate::logo::Look) -> Option<u32> {
+    let crate::logo::Look::Hollow(ink) = look else { return None };
+    if !contrast() || ratio(ink, color(Role::Band)) >= SHAPE {
+        return None;
+    }
+    Some(0xFF00_0000 | if ratio(ink, BLACK) > ratio(ink, WHITE) { BLACK } else { WHITE })
 }
 
 /// The first colour from `from` toward `to`, in twentieths, that is `ok`; `to` when none is.
@@ -356,108 +348,53 @@ fn toward(from: u32, to: u32, ok: impl Fn(u32) -> bool) -> u32 {
     (0..=20).map(|k| mix(from, to, f64::from(k) / 20.0)).find(|c| ok(*c)).unwrap_or(to)
 }
 
-/// The colours along a path of colours, in twentieths of each step.
-fn steps(path: &[u32]) -> impl Iterator<Item = u32> {
-    path.windows(2).flat_map(|w| (0..20).map(move |k| mix(w[0], w[1], f64::from(k) / 20.0))).chain(path.last().copied())
+/// Transfer the five reference tones to the Windows hue. Each swatch gives a channel curve (shadow,
+/// midtone, highlight); the accent's saturation determines how much colour to use.
+fn hill_colors(light: bool, ramp: Ramp) -> [u32; 5] {
+    let swatches = if light { [0xDAEBF8, 0xB2D4EF, 0x7CB3DF, 0x438FC8, 0x186BA9] } else { [0x76CFFF, 0x44B5FF, 0x1599FA, 0x087FD9, 0x0665B5] };
+    let channels = |c: u32| [16, 8, 0].map(|s| f64::from((c >> s) & 255u32));
+    let range = |[r, g, b]: [f64; 3]| (r.min(g).min(b), r.max(g).max(b));
+    let shade = channels(ramp[2]);
+    let (lo, hi) = range(shade);
+    let base = channels(ramp[3]);
+    let (base_lo, base_hi) = range(base);
+    let saturation = 0.75 * (base_hi - base_lo) / base_hi.max(1.0) + 0.25 * (hi - lo) / hi.max(1.0);
+    // A grey shade contributes to saturation as before, but has no hue of its own.
+    let (shade, lo, hi) = if hi == lo { (base, base_lo, base_hi) } else { (shade, lo, hi) };
+    let hue = shade.map(|c| (c - lo) / (hi - lo).max(1.0));
+    let blue_mid = 145.0 / 248.0; // middle channel of BLUE[2], normalized between its red and blue
+    std::array::from_fn(|k| {
+        let [shadow, mid, highlight] = channels(swatches[k]);
+        let strength = if light { saturation } else { saturation.powf(0.70 - 0.14 * k.saturating_sub(2) as f64) };
+        // Muted accents approach a stepped grey, not five whites. Give warm dark-mode highlights some headroom.
+        let grey = shadow + (highlight - shadow) * (0.35 + 0.30 * base_hi / 255.0);
+        let peak = if light { highlight } else { highlight + (255.0 - highlight) * 0.36 * shade[0] / hi.max(1.0) };
+        let peak = grey + (peak - grey) * (3.0 * saturation).min(1.0);
+        hue.into_iter().fold(0, |rgb, u| {
+            let tone = if u <= blue_mid { shadow + (mid - shadow) * u / blue_mid } else { mid + (highlight - mid) * (u - blue_mid) / (1.0 - blue_mid) };
+            (rgb << 8) | (peak * (1.0 - strength * (1.0 - tone / highlight))).round() as u32
+        })
+    })
 }
 
-/// The first colour along a path of colours, in twentieths of each step, that is `ok`.
-fn first(path: &[u32], ok: impl Fn(u32) -> bool) -> Option<u32> {
-    steps(path).find(|c| ok(*c))
-}
-
-/// Works out every colour that depends on the accent from its seven shades. Each starts from the shade that suits it
-/// and moves, a step at a time, only as far as it must to stay readable and distinct: buttons and links on the
-/// pages, the type icons on the sky, the ring round the band's status disc on the sky, the band's own button on every
-/// part of the band, words on every part of the band, and each hill from the one behind it. A light band is made of
-/// colours with body (the sky a lighter shade of the accent, the hills deepening toward the front), never a wash. A
-/// pale or a very dark accent can make a hill turn the other way (lighter where the others get darker) to stay apart.
 fn palette(Look { mode, ramp }: Look) -> Palette {
     let light = mode != Mode::Dark;
     let table = if light { &LIGHT } else { &DARK };
     let rgb = |role: Role| table[role as usize] & WHITE;
-    let [l3, l2, l1, base, d1, d2, d3] = ramp;
+    let [l3, l2, _, _, d1, _, _] = ramp;
     let pages = [Role::Bg, Role::Layer, Role::Card].map(rgb);
     // Every surface a button or link sits on: the pages, and the pages under a hovered or selected row.
-    let mut surfaces = pages.to_vec();
-    for tint in [Role::Hover, Role::Sel].map(|role| table[role as usize]) {
-        surfaces.extend(pages.map(|page| mix(page, tint & WHITE, f64::from(tint >> 24) / 255.0)));
-    }
-    let (text, on, end) = (rgb(Role::Text), rgb(Role::OnAccent), if light { BLACK } else { WHITE });
-    let readable = |c| ratio(text, c) >= READ;
-    let accent = toward(if light { d1 } else { l2 }, end, |c| ratio(c, on) >= READ && surfaces.iter().all(|s| ratio(c, *s) >= SHAPE));
-    let accent_text = toward(if light { d1 } else { l3 }, end, |c| surfaces.iter().all(|s| ratio(c, *s) >= READ));
+    let surfaces =
+        [0, table[Role::Hover as usize], table[Role::Sel as usize]].map(|tint| pages.map(|page| mix(page, tint & WHITE, f64::from(tint >> 24) / 255.0)));
+    let (on, end) = (rgb(Role::OnAccent), if light { BLACK } else { WHITE });
+    let against_pages = |c, minimum| surfaces.iter().flatten().all(|s| ratio(c, *s) >= minimum);
+    let accent = toward(if light { d1 } else { l2 }, end, |c| ratio(c, on) >= READ && against_pages(c, SHAPE));
+    let accent_text = toward(if light { d1 } else { l3 }, end, |c| against_pages(c, READ));
 
-    // The sky must also leave the icons room to reach their contrast, at worst in pure black or white.
-    let roomy = |c| readable(c) && ratio(c, end) >= MARK && pages.iter().all(|page| apart(c, *page) >= SKY_APART);
-    let sky = if light {
-        let path = [mix(l3, l2, 0.5), l2, l1, base, d1, d2, d3];
-        first(&path, |c| apart(c, WHITE) >= RICH && roomy(c)).unwrap_or(path[0])
-    } else {
-        first(&[mix(pages[0], d3, 0.55), d3, BLACK], roomy).unwrap_or(BLACK)
-    };
-    // A light band's hills deepen in even steps from the sky's low colour to the darkest shade that words still read on
-    // (`deep`), so the sky's fade stops short of it, leaving room for five steps between.
-    let deep = steps(&[sky, l1, base, d1, d2, d3]).take_while(|c| readable(*c)).last().unwrap_or(sky);
-    let low = if light {
-        toward(mix(sky, l1, 0.4), sky, |c| readable(c) && apart(c, deep) >= 5 * (HILLS_APART + 2))
-    } else {
-        toward(mix(pages[0], d3, 0.8), sky, readable)
-    };
-    let (mut hills, title, caption, edge, mark) = if light {
-        ([1, 2, 3, 4, 5].map(|k| mix(low, deep, f64::from(k) / 5.0)), mix(d3, BLACK, 0.25), mix(d3, sky, 0.1), base, d2)
-    } else {
-        // In dark mode each hill is the one behind it moved toward the next shade down, so the far hills glow and the
-        // near ones sink into the darkest shade.
-        let mut under = mix(sky, low, 0.5);
-        let hills = [(l1, 0.3), (base, 0.5), (d1, 0.75), (d2, 0.9), (d3, 1.0)].map(|(shade, t)| {
-            under = mix(under, shade, t);
-            under
-        });
-        (hills, WHITE, mix(l3, WHITE, 0.4), mix(d3, BLACK, 0.4), l2)
-    };
-    // The farthest hill meets the sky at every height, so it stands apart from all of the sky's fade; each other hill
-    // stands apart from the one behind it.
-    let fade: Vec<u32> = (0..=16).map(|i| mix(sky, low, f64::from(i) / 16.0)).collect();
-    let mut behind = fade.clone();
-    for (k, hill) in hills.iter_mut().enumerate() {
-        let h = *hill;
-        // Light hills darken toward the front; in dark mode the far ones lighten first, then the near ones darken.
-        let up = !light && k <= 2;
-        let lighter: Vec<u32> = std::iter::once(h).chain(ramp.iter().rev().copied().filter(|c| lum(*c) > lum(h))).chain([WHITE]).collect();
-        let darker: Vec<u32> = std::iter::once(h).chain(ramp.iter().copied().filter(|c| lum(*c) < lum(h))).chain([BLACK]).collect();
-        let paths = if up { [lighter, darker] } else { [darker, lighter] };
-        let fits = |c: u32, strict: bool| {
-            readable(c) && behind.iter().all(|b| apart(c, *b) >= HILLS_APART && (!strict || if up { lum(c) >= lum(*b) } else { lum(c) <= lum(*b) }))
-        };
-        *hill = [true, false]
-            .into_iter()
-            .find_map(|strict| paths.iter().find_map(|path| first(path, |c| fits(c, strict))))
-            .unwrap_or_else(|| toward(h, sky, readable));
-        behind = vec![*hill];
-    }
-    let band: Vec<u32> = fade.iter().copied().chain(hills).collect();
-    let on_band = |c: u32| band.iter().all(|b| ratio(c, *b) >= READ);
-    // The status disc sits on the sky and its fade, so its ring need only stand out from those; the band's button can
-    // sit on any layer, and its lettering is the one the accent buttons use.
-    let ring = toward(if light { d2 } else { l2 }, end, |c| fade.iter().all(|s| ratio(c, *s) >= SHAPE));
-    let button = toward(if light { d2 } else { l2 }, end, |c| ratio(c, on) >= READ && band.iter().all(|b| ratio(c, *b) >= SHAPE));
     let mut roles = *table;
-    for (role, c) in [
-        (Role::Accent, accent),
-        (Role::AccentText, accent_text),
-        (Role::Band, sky),
-        (Role::BandText, toward(title, end, on_band)),
-        (Role::BandCaption, toward(caption, end, on_band)),
-        (Role::BandEdge, toward(edge, BLACK, |c| pages.iter().all(|page| apart(c, *page) >= EDGE_APART))),
-        (Role::BandMark, toward(mark, end, |c| ratio(c, sky) >= MARK)),
-        (Role::BandDotRing, ring),
-        (Role::BandButton, button),
-        (Role::BandButtonText, on),
-    ] {
-        roles[role as usize] = 0xFF00_0000 | c;
-    }
-    Palette { roles, print: Print { sky, low, hills } }
+    roles[Role::Accent as usize] = 0xFF00_0000 | accent;
+    roles[Role::AccentText as usize] = 0xFF00_0000 | accent_text;
+    Palette { roles, hills: hill_colors(light, ramp) }
 }
 
 /// A Windows COLORREF (0x00BBGGRR) as an opaque 0xAARRGGBB.
@@ -563,7 +500,7 @@ mod tests {
         decos
     }
 
-    /// Every colour the band shows, its sky and fade and its hills with their soft tops, apart from the rule under it.
+    /// All painted backgrounds including the soft edges of the hills, apart from the bottom rule.
     fn band_colors(w: i32) -> Vec<u32> {
         let mut pixels = render_band(w, 96, [0, 0, w, page::HERO_H]);
         pixels.truncate(pixels.len() - w as usize);
@@ -628,54 +565,51 @@ mod tests {
     }
 
     #[test]
-    fn the_bands_of_pale_accents_are_made_of_colours_with_body_and_keep_their_hue() {
-        // A light band used to be a wash: the default blue's sky was #E2F9FF, 35 from white. The sky, its low colour and
-        // every hill must be 150 from white at least, about a fifth of the way to black.
-        let (iris, gold) = (RAMPS[1], RAMPS[5]);
-        let saved = set(None);
-        for ramp in [BLUE, iris, gold] {
-            set(Some(Look { mode: Mode::Light, ramp }));
-            let Print { sky, low, hills } = print().expect("a picture outside high contrast");
-            for shade in [sky, low].into_iter().chain(hills) {
-                assert!(distance(shade, WHITE) >= 150, "accent #{:06x}: #{shade:06x} is a wash", ramp[3]);
+    fn blue_matches_the_approved_swatches_and_iris_and_gold_keep_their_glow() {
+        assert_eq!(hill_colors(true, BLUE), [0xDAEBF8, 0xB2D4EF, 0x7CB3DF, 0x438FC8, 0x186BA9]);
+        assert_eq!(hill_colors(false, BLUE), [0x76CFFF, 0x44B5FF, 0x1599FA, 0x087FD9, 0x0665B5]);
+        let iris = [0xCFB0FF, 0xB892FF, 0xA477FC, 0x8959E9, 0x713ECF];
+        let gold = [0xFFDA80, 0xFFC150, 0xF9AA2A, 0xE99212, 0xC9790D];
+        for (ramp, sample) in [(RAMPS[1], iris), (RAMPS[5], gold)] {
+            for (hill, want) in hill_colors(false, ramp).into_iter().zip(sample) {
+                for shift in [16, 8, 0] {
+                    assert!(((hill >> shift) & 255u32).abs_diff((want >> shift) & 255) <= 14, "got #{hill:06x}, target #{want:06x}");
+                }
             }
         }
-        // The e2e run samples the sky on screen: gold's is warm and iris's, in the dark, is violet.
-        set(Some(Look { mode: Mode::Light, ramp: gold }));
-        let sky = print().expect("a picture").sky;
-        assert!(((sky >> 16) & 0xFF) >= (sky & 0xFF) + 16, "gold's sky #{sky:06x} is warm");
-        set(Some(Look { mode: Mode::Dark, ramp: iris }));
-        let sky = print().expect("a picture").sky;
-        assert!((sky & 0xFF) >= ((sky >> 8) & 0xFF) + 16, "iris's dark sky #{sky:06x} is violet");
-        set(saved);
     }
 
     #[test]
-    fn the_ring_round_the_status_disc_stands_out_from_the_sky_the_disc_sits_on() {
-        let w = 860;
-        each_look(|look| {
-            let ring = color(Role::BandDotRing);
-            assert_eq!(ring >> 24, 255, "{look:?}: the ring is opaque");
-            let Print { sky, low, .. } = print().expect("a picture outside high contrast");
-            // The hills are under 8 DIPs tall at the left, so the rows above them show only the sky and its fade.
-            let pixels = render_band(w, 96, [0, 0, w, page::HERO_H]);
-            let fade = (0..60).flat_map(|y| pixels[(y * w) as usize..(y * w + 100) as usize].iter().copied());
-            for under in [sky, low].into_iter().chain(fade) {
-                assert!(contrast_of(ring, under) >= 3.0, "{look:?}: the ring on #{under:06x}");
+    fn hills_keep_the_base_hue_when_the_lighter_accent_is_grey() {
+        let mut ramp = BLUE;
+        ramp[2] = 0xBBBBBB;
+        ramp[3] = 0x008040;
+        for light in [true, false] {
+            for hill in hill_colors(light, ramp) {
+                let [_, r, g, b] = hill.to_be_bytes();
+                assert!(g > b && b > r, "#{hill:06x} lost the base accent's green hue (light={light})");
             }
-        });
+        }
     }
 
     #[test]
     fn the_band_button_reads_and_stands_out_from_every_layer_of_the_band_at_rest_hovered_and_pressed() {
         each_look(|look| {
-            let layers: Vec<u32> = [640, 860].into_iter().flat_map(band_colors).collect();
-            assert_eq!(color(Role::BandButton) >> 24, 255, "{look:?}: the band must not show through the button");
+            let layers = band_colors(640);
+            let mut fills = Vec::new();
             for tint in [Role::None, Role::Hover, Role::Sel] {
-                let fill = layered(&[Role::BandButton, tint]);
-                assert!(contrast_of(color(Role::BandButtonText), fill) >= 4.5, "{look:?}: the lettering on the button under {tint:?}");
+                let (face, border, ink) = control::Kind::BandAccent.colors(true, tint);
+                let (fill, edge, text) = (color(face), color(border), color(ink));
+                for c in [fill, edge, text] {
+                    assert_eq!(c >> 24, 255);
+                    assert_eq!(c & 0xFFFF, (c >> 8) & 0xFFFF, "{look:?}: neutral button");
+                }
+                assert_eq!(luminance_of(fill) > 0.5, look.mode == Mode::Dark);
+                assert!(contrast_of(text, fill) >= 4.5 && contrast_of(edge, fill) >= 3.0);
+                assert!(!fills.contains(&fill), "{look:?}: the fill changes for {tint:?}");
+                fills.push(fill);
                 for under in &layers {
-                    let shown = contrast_of(fill, *under);
+                    let shown = contrast_of(fill, *under).max(contrast_of(edge, *under));
                     assert!(shown >= 3.0, "{look:?}: the button under {tint:?} on #{under:06x} stands out {shown:.2}:1");
                 }
             }
@@ -799,14 +733,20 @@ mod tests {
     }
 
     #[test]
-    fn high_contrast_keeps_the_system_colours_for_the_dots_the_ring_and_the_band_button() {
+    fn high_contrast_keeps_the_system_colours_for_the_dots_and_header() {
         let saved = set(Some(Look { mode: Mode::Contrast, ramp: BLUE }));
         for (new, old) in [
             (Role::DotOk, Role::Ok),
             (Role::DotOkInk, Role::DotGlyph),
             (Role::DotOkEdge, Role::Ok),
-            (Role::BandDotRing, Role::Band),
+            (Role::Band, Role::Bg),
+            (Role::BandEdge, Role::Text),
+            (Role::BandText, Role::Text),
+            (Role::BandCaption, Role::Text),
             (Role::BandButton, Role::Accent),
+            (Role::BandButtonHover, Role::Accent),
+            (Role::BandButtonDown, Role::Accent),
+            (Role::BandButtonEdge, Role::OnAccent),
             (Role::BandButtonText, Role::OnAccent),
         ] {
             assert_eq!(color(new), color(old), "{new:?} in high contrast");
@@ -815,23 +755,49 @@ mod tests {
     }
 
     #[test]
-    fn the_band_is_hills_under_a_sky_in_the_accent_with_readable_words_and_a_plain_system_alternative() {
+    fn a_hollow_logo_stays_visible_when_its_ink_matches_the_high_contrast_window() {
+        let saved = set(Some(Look { mode: Mode::Contrast, ramp: BLUE }));
+        let at = [0, 0, 40, 40];
+        let window = color(Role::Band) & WHITE;
+        let opposite = if contrast_of(window, BLACK) > contrast_of(window, WHITE) { BLACK } else { WHITE };
+        // Match the ink to Window here rather than changing the user's system colours.
+        for ink in [window, opposite] {
+            assert!(paint::begin(96, 40, 40, 0, 0));
+            paint::fill(at, 0, Role::Band, Role::None);
+            paint::logo(at, crate::logo::Look::Hollow(ink));
+            let pixels = paint::pixels();
+            assert_eq!(pixels[20 * 40 + 20], ink, "the spark keeps its tray colour");
+            assert_eq!(pixels[0], window, "no backing outside the tile");
+            let gap = pixels[20 * 40 + 10];
+            if ink == window {
+                assert_eq!(gap, opposite, "the hollow space must contrast with the spark");
+            } else {
+                assert_eq!(gap, window, "no backing when the ink already contrasts");
+            }
+        }
+        set(saved);
+        paint::release();
+    }
+
+    #[test]
+    fn the_band_renders_five_accent_hills_on_flat_neutral_sky_or_a_plain_system_band() {
         let band_at = |w| [0, 0, w, page::HERO_H];
         let rgb = |role| color(role) & 0xFFFFFF;
         let saved = set(Some(Look { mode: Mode::Contrast, ramp: BLUE }));
-        assert_eq!(print(), None);
+        assert_eq!(hills(), None);
         let mut pixels = render_band(640, 96, band_at(640));
         let rule = pixels.split_off(pixels.len() - 640);
         assert!(rule.iter().all(|p| *p == rgb(Role::Text)) && pixels.iter().all(|p| *p == rgb(Role::Bg)), "high contrast keeps the band plain");
         set(saved);
         let mut prints = Vec::new();
         each_look(|look| {
-            let Print { sky, low, hills } = print().expect("a picture outside high contrast");
-            prints.push((look.mode == Mode::Dark, sky, low, hills));
+            let hills = hills().expect("a picture outside high contrast");
+            let sky = if look.mode == Mode::Dark { BLACK } else { WHITE };
+            prints.push((look.mode == Mode::Dark, hills));
             assert_eq!(rgb(Role::Band), sky, "{look:?}: the icons' discs are sky");
             let w = 860;
             let pixels = render_band(w, 96, band_at(w));
-            assert!(distance(pixels[0], sky) <= 3, "{look:?}: sky at the top");
+            assert!(pixels[..w as usize].iter().all(|p| *p == sky), "{look:?}: sky at the top");
             assert!(pixels[(w * (page::HERO_H - 1)) as usize..].iter().all(|p| *p == rgb(Role::BandEdge)), "{look:?}: the rule under the band");
             // A hundred DIPs from the right edge every hill is up, each top at least 4 DIPs under the one behind it. Just
             // under its top, each hill shows its own colour, at 100% and at 200%.
@@ -846,34 +812,77 @@ mod tests {
                     assert_eq!(pixels[(y * width + x) as usize], ink, "{look:?}: hill {k} at {x},{y} at {dpi} DPI");
                 }
             }
-            // Toward the left the hills sink, and the sky above them fades toward its low colour.
-            let fade = pixels[(56 * w + 10) as usize];
-            assert!(low == sky || distance(fade, low) < distance(fade, sky), "{look:?}: #{fade:06x} low in the sky is nearer #{sky:06x} than #{low:06x}");
-            let layers: Vec<u32> = std::iter::once(sky).chain(hills).collect();
-            for pair in layers.windows(2) {
-                assert!(distance(pair[0], pair[1]) >= 24, "{look:?}: #{:06x} and #{:06x} must stand apart", pair[0], pair[1]);
-            }
-            // The farthest hill meets the sky at every height, so it stands apart from all of the sky's fade.
-            for y in 0..60 {
-                let shade = pixels[(y * w + 10) as usize];
-                assert!(distance(shade, hills[0]) >= 24, "{look:?}: the farthest hill #{:06x} and the sky's #{shade:06x} at {y}", hills[0]);
+            assert!((0..80).all(|y| pixels[(y * w + 10) as usize] == sky), "{look:?}: no sky gradient");
+            for pair in hills.windows(2) {
+                assert!(distance(pair[0], pair[1]) >= 24 && luminance_of(pair[0]) > luminance_of(pair[1]), "{look:?}: distinct receding hills {pair:x?}");
             }
             for page in [Role::Bg, Role::Layer] {
-                assert!(distance(sky, rgb(page)) >= 30, "{look:?}: the sky stands apart from {page:?}");
                 assert!(distance(rgb(Role::BandEdge), rgb(page)) >= 30, "{look:?}: the rule stands apart from {page:?}");
             }
-            for w in [640, 860] {
-                for bg in band_colors(w) {
-                    for ink in [Role::Text, Role::BandText, Role::BandCaption] {
-                        assert!(contrast_of(rgb(ink), bg) >= 4.5, "{look:?}: {ink:?} on #{bg:06x} at {w} DIPs");
-                    }
-                }
+            for ink in [Role::BandText, Role::BandCaption, Role::BandMark] {
+                let c = rgb(ink);
+                assert_eq!(c & 0xFFFF, (c >> 8) & 0xFFFF, "{look:?}: neutral ink");
+                assert!(contrast_of(c, sky) >= 4.5);
             }
         });
         let looks = prints.len();
         prints.sort_unstable();
         prints.dedup();
         assert_eq!(prints.len(), looks, "every accent paints its own picture");
+    }
+
+    #[test]
+    fn header_text_reads_as_on_sky_across_a_bright_ridge_without_erasing_the_rest_of_the_label() {
+        use windows_sys::Win32::Graphics::Gdi::{DT_END_ELLIPSIS, DT_SINGLELINE, DT_VCENTER};
+        let saved = set(None);
+        for look in [Look { mode: Mode::Dark, ramp: RAMPS[5] }, Look { mode: Mode::Light, ramp: BLUE }] {
+            set(Some(look));
+            let sky = color(Role::Band) & WHITE;
+            for (w, text) in [(640, "Long source and skill name · ".repeat(10)), (980, "Up to date".into())] {
+                let title = ([78, 23, w - 220, 28], paint::Font::Title, Role::BandText);
+                let sub = ([56, 55, w - 80, 16], paint::Font::Caption, Role::BandCaption);
+                for (at, font, ink) in [title, sub] {
+                    let dpi = 120;
+                    let rect = [0, 0, scale(w, dpi), scale(page::HERO_H, dpi)];
+                    let band = page::band(w);
+                    let label = || paint::text(at, &text, font, ink, DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
+                    render(&band[..1], dpi, rect);
+                    label();
+                    let on_sky = paint::pixels();
+                    let artwork = render(&band, dpi, rect);
+                    label();
+                    let drawn = paint::pixels();
+                    let end = scale(at[0] + paint::measure(&text, font, 0, dpi).0.min(at[2]) + 1, dpi);
+                    let right = scale(at[0] + at[2], dpi);
+                    let rows = scale(at[1], dpi)..scale(at[1] + at[3], dpi);
+                    let lettering = color(ink) & WHITE;
+                    let (mut visible_glyph, mut spare_art) = (false, false);
+                    let mut backed = 0;
+                    for (i, &pixel) in drawn.iter().enumerate() {
+                        if on_sky[i] != sky {
+                            assert_eq!(pixel, on_sky[i], "{look:?}: lettering crossing hills must read as on sky");
+                            visible_glyph |= distance(pixel, lettering) < distance(pixel, sky);
+                        }
+                        let x = i as i32 % rect[2];
+                        if x >= end {
+                            assert_eq!(pixel, artwork[i], "{look:?}: no fill after the measured words");
+                            spare_art |= x < right && rows.contains(&(i as i32 / rect[2])) && pixel != sky;
+                        } else if artwork[i] != sky && pixel == sky {
+                            backed += 1;
+                        }
+                    }
+                    assert!(visible_glyph, "{look:?}: the {font:?} glyphs are visible");
+                    if w == 640 {
+                        assert!(backed > 10, "{look:?}: the long {font:?} run crosses the artwork");
+                    } else {
+                        assert_eq!(backed, 0, "{look:?}: the short run leaves the artwork alone");
+                        assert!(spare_art, "{look:?}: hills show in the unused part of the {font:?} label");
+                    }
+                }
+            }
+        }
+        set(saved);
+        paint::release();
     }
 
     #[test]
